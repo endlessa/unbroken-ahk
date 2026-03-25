@@ -21,3 +21,4 @@ pub mod impl_progress;
 pub mod impl_discovery;
 pub mod impl_reporter;
 pub mod impl_manager;
+pub mod console;
