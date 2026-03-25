@@ -3,8 +3,9 @@
 ## Unbroken Test Platform — Rust Trait Definitions
 
 This document describes the interfaces (Rust traits) that form the contract
-between components of the test platform. All implementations must be pure Rust
-with zero third-party dependencies and must be WASM-compatible.
+between components of the test platform, and the concrete implementations
+behind them. All code is pure Rust with zero third-party dependencies and
+is WASM-compatible.
 
 ---
 
@@ -12,20 +13,89 @@ with zero third-party dependencies and must be WASM-compatible.
 
 ```
 src/
-├── lib.rs          Module root
-├── types.rs        Core data structures (no behavior)
-├── registry.rs     TestRegistry trait — source of truth for test definitions
-├── filter.rs       TestFilter trait — selects test subsets from config
-├── executor.rs     RunnableTest + TestExecutor traits — runs tests
-├── progress.rs     ProgressTracker trait — real-time run monitoring
-├── discovery.rs    TestDiscovery trait — caller-facing search/explore API
-├── reporter.rs     TestReporter trait — formats results for output
-└── manager.rs      TestManager trait — top-level orchestrator
+├── lib.rs                Module root
+│
+│   Traits (interfaces)
+├── types.rs              Core data structures (no behavior)
+├── registry.rs           TestRegistry trait
+├── filter.rs             TestFilter trait
+├── executor.rs           RunnableTest + TestExecutor traits
+├── progress.rs           ProgressTracker trait
+├── discovery.rs          TestDiscovery trait
+├── reporter.rs           TestReporter trait
+├── manager.rs            TestManager trait
+│
+│   Infrastructure
+├── json.rs               Hand-rolled JSON parser + serializer
+├── json_types.rs         ToJson/FromJson for all domain types
+├── storage.rs            JSON file persistence (with WASM stubs)
+│
+│   Concrete implementations
+├── impl_registry.rs      InMemoryRegistry
+├── impl_filter.rs        StandardFilter
+├── impl_executor.rs      SequentialExecutor
+├── impl_progress.rs      InMemoryProgressTracker
+├── impl_discovery.rs     RegistryDiscovery
+├── impl_reporter.rs      StandardReporter (JSON + Text)
+├── impl_manager.rs       PlatformManager (top-level orchestrator)
+│
+│   Caller interfaces
+├── console.rs            Console interface (human operators)
+└── mcp.rs                MCP tool interface (AI agents)
 ```
 
 ---
 
-## Interface Dependency Diagram
+## System Architecture
+
+```mermaid
+graph TB
+    subgraph Callers["Caller Layer"]
+        AI[AI Agent]
+        Human[Human Operator]
+    end
+
+    subgraph Interface["Interface Layer"]
+        MCP[MCP Tools<br/>mcp.rs]
+        CON[Console<br/>console.rs]
+    end
+
+    subgraph Orchestration["Orchestration Layer"]
+        MGR[PlatformManager<br/>impl_manager.rs]
+    end
+
+    subgraph Core["Core Layer"]
+        REG[InMemoryRegistry<br/>impl_registry.rs]
+        FILT[StandardFilter<br/>impl_filter.rs]
+        EXEC[SequentialExecutor<br/>impl_executor.rs]
+        PROG[InMemoryProgressTracker<br/>impl_progress.rs]
+        DISC[RegistryDiscovery<br/>impl_discovery.rs]
+        RPT[StandardReporter<br/>impl_reporter.rs]
+    end
+
+    subgraph Infrastructure["Infrastructure Layer"]
+        JSON[JSON Module<br/>json.rs + json_types.rs]
+        STORE[Storage<br/>storage.rs]
+    end
+
+    AI --> MCP
+    Human --> CON
+    MCP --> MGR
+    CON --> MGR
+    MGR --> REG
+    MGR --> FILT
+    MGR --> EXEC
+    MGR --> PROG
+    MGR --> DISC
+    MGR --> RPT
+    REG --> JSON
+    STORE --> JSON
+    MGR --> STORE
+```
+
+---
+
+## Interface Dependency Diagram (Traits)
 
 ```mermaid
 graph TD
@@ -57,12 +127,16 @@ graph TD
 ```mermaid
 flowchart LR
     subgraph Input
-        JSON[JSON RunConfig]
+        JSON[JSON Request]
+    end
+
+    subgraph Interfaces
+        MCP[MCP Tool]
+        CON[Console]
     end
 
     subgraph Manager
-        direction TB
-        M[TestManager]
+        M[PlatformManager]
     end
 
     subgraph Pipeline
@@ -73,14 +147,20 @@ flowchart LR
     subgraph Output
         direction TB
         PROG[Progress Snapshots]
-        SUM[RunSummary]
+        SUM[RunSummary JSON]
+        TEXT[Text Report]
     end
 
-    JSON --> M
+    JSON --> MCP
+    JSON --> CON
+    MCP --> M
+    CON --> M
     M --> D
     E -.->|real-time| PROG
     C --> SUM
-    SUM --> M
+    C --> TEXT
+    SUM --> MCP
+    TEXT --> CON
 ```
 
 ---
@@ -104,6 +184,8 @@ Source of truth for all known tests.
 | `all_tags` | `(&self) -> Vec<String>` | Known tags |
 | `all_groups` | `(&self) -> Vec<String>` | Known groups |
 
+**Implementation**: `InMemoryRegistry` — Vec-backed, JSON serializable.
+
 ### `TestFilter` — `src/filter.rs`
 
 Applies RunConfig criteria to produce the execution subset.
@@ -113,6 +195,8 @@ Applies RunConfig criteria to produce the execution subset.
 | `apply` | `(&self, &[&TestDefinition], &RunConfig) -> Vec<&TestDefinition>` | Filter tests |
 
 Filter precedence: include IDs → include tags → name pattern → exclude tags.
+
+**Implementation**: `StandardFilter` — supports glob patterns, tag intersection, exclusion.
 
 ### `RunnableTest` — `src/executor.rs`
 
@@ -133,6 +217,8 @@ Runs a batch of tests and reports results as they complete.
 
 Supports `fail_fast` and per-test `on_result` callback for progress.
 
+**Implementation**: `SequentialExecutor` — runs tests one at a time, skips remaining on fail_fast.
+
 ### `ProgressTracker` — `src/progress.rs`
 
 Real-time visibility into running suites.
@@ -146,6 +232,8 @@ Real-time visibility into running suites.
 | `finish_run` | `(&mut self, &str)` | Mark complete |
 | `active_runs` | `(&self) -> Vec<RunId>` | List in-flight runs |
 
+**Implementation**: `InMemoryProgressTracker` — pluggable clock, JSON serializable.
+
 ### `TestDiscovery` — `src/discovery.rs`
 
 Caller-facing search and explore API.
@@ -154,6 +242,8 @@ Caller-facing search and explore API.
 |---|---|---|
 | `discover` | `(&self, &DiscoveryQuery) -> DiscoveryResult` | Search tests |
 | `summary` | `(&self) -> DiscoverySummary` | Overview stats |
+
+**Implementation**: `RegistryDiscovery` — delegates to registry, supports pagination.
 
 ### `TestReporter` — `src/reporter.rs`
 
@@ -165,6 +255,8 @@ Formats output for delivery.
 | `format_progress` | `(&self, &RunProgress, ReportFormat) -> String` | Format progress |
 
 Supports `Json` and `Text` output formats.
+
+**Implementation**: `StandardReporter` — JSON for AI, text with progress bars for humans.
 
 ### `TestManager` — `src/manager.rs`
 
@@ -180,6 +272,79 @@ Top-level orchestrator. Both MCP and console interfaces talk to this.
 | `active_runs` | `(&self) -> Vec<RunId>` | List running |
 | `get_results` | `(&self, &str) -> Result<RunSummary, ManagerError>` | Final results |
 
+**Implementation**: `PlatformManager` — wires all components, persists to JSON storage.
+
+---
+
+## MCP Tools — `src/mcp.rs`
+
+The AI-facing interface. Each tool accepts JSON params and returns a JSON response.
+
+```mermaid
+flowchart TD
+    AI[AI Agent] -->|JSON request| PARSE[parse_request]
+    PARSE --> DISPATCH[handle_request]
+    DISPATCH --> TL[tool_list]
+    DISPATCH --> TS[test_summary]
+    DISPATCH --> TD[test_discover]
+    DISPATCH --> TR[test_run]
+    DISPATCH --> TP[test_progress]
+    DISPATCH --> TRS[test_results]
+    DISPATCH --> TLT[test_list_tags]
+    DISPATCH --> TLG[test_list_groups]
+    TL --> RESP[McpResponse JSON]
+    TS --> RESP
+    TD --> RESP
+    TR --> RESP
+    TP --> RESP
+    TRS --> RESP
+    TLT --> RESP
+    TLG --> RESP
+    RESP -->|JSON response| AI
+```
+
+| Tool | Parameters | Returns |
+|---|---|---|
+| `tool_list` | — | Array of tool descriptors with parameter schemas |
+| `test_summary` | — | Total tests, tags with counts, groups with counts |
+| `test_discover` | `name_pattern`, `tags`, `group`, `limit`, `offset` | Matching tests, total count, available tags/groups |
+| `test_run` | `run_all`, `include_ids`, `include_tags`, `exclude_tags`, `name_pattern`, `fail_fast`, `timeout_ms` | RunSummary with per-test results |
+| `test_progress` | `run_id` (optional) | RunProgress or list of active runs |
+| `test_results` | `run_id` | RunSummary |
+| `test_list_tags` | — | Tags with counts |
+| `test_list_groups` | — | Groups with counts |
+
+---
+
+## Console Commands — `src/console.rs`
+
+The human-facing interface. Text commands in, text + JSON out.
+
+```mermaid
+flowchart TD
+    Human[Human Operator] -->|text command| PARSE[split_args + match]
+    PARSE --> HELP[help]
+    PARSE --> SUM[summary]
+    PARSE --> DISC[discover]
+    PARSE --> RUN[run]
+    PARSE --> PROG[progress]
+    PARSE --> RES[results]
+    PARSE --> TAGS[tags]
+    PARSE --> GRP[groups]
+    HELP --> OUT[ConsoleOutput]
+    SUM --> OUT
+    DISC --> OUT
+    RUN --> OUT
+    PROG --> OUT
+    RES --> OUT
+    TAGS --> OUT
+    GRP --> OUT
+    OUT -->|text + json| Human
+```
+
+Every command returns `ConsoleOutput { text, json }` — text for the terminal,
+JSON for debugging/storage.
+
 ---
 
 ## Caller Interaction Sequence
@@ -187,18 +352,23 @@ Top-level orchestrator. Both MCP and console interfaces talk to this.
 ```mermaid
 sequenceDiagram
     participant Caller as Caller (AI / Human)
-    participant MGR as TestManager
-    participant REG as TestRegistry
-    participant FILT as TestFilter
-    participant EXEC as TestExecutor
+    participant IF as Interface (MCP / Console)
+    participant MGR as PlatformManager
+    participant REG as InMemoryRegistry
+    participant FILT as StandardFilter
+    participant EXEC as SequentialExecutor
     participant PROG as ProgressTracker
+    participant STORE as JSON Storage
 
-    Caller->>MGR: discover(query)
+    Caller->>IF: discover(query)
+    IF->>MGR: discover(query)
     MGR->>REG: search/filter
     REG-->>MGR: matching tests
-    MGR-->>Caller: DiscoveryResult
+    MGR-->>IF: DiscoveryResult
+    IF-->>Caller: JSON / Text
 
-    Caller->>MGR: start_run(config)
+    Caller->>IF: start_run(config)
+    IF->>MGR: start_run(config)
     MGR->>FILT: apply(all_tests, config)
     FILT-->>MGR: filtered subset
     MGR->>PROG: start_run(run_id, count)
@@ -209,18 +379,54 @@ sequenceDiagram
     end
 
     par While running
-        Caller->>MGR: check_progress(run_id)
+        Caller->>IF: check_progress(run_id)
+        IF->>MGR: check_progress(run_id)
         MGR->>PROG: get_progress(run_id)
         PROG-->>MGR: RunProgress
-        MGR-->>Caller: progress snapshot
+        MGR-->>IF: progress snapshot
+        IF-->>Caller: JSON / Text
     end
 
     EXEC-->>MGR: all results
     MGR->>PROG: finish_run(run_id)
-    Caller->>MGR: get_results(run_id)
-    MGR-->>Caller: RunSummary
+    MGR->>STORE: save RunSummary JSON
+    Caller->>IF: get_results(run_id)
+    IF->>MGR: get_results(run_id)
+    MGR-->>IF: RunSummary
+    IF-->>Caller: JSON / Text
 ```
 
 ---
 
-*Next step: Implement concrete structs behind these traits.*
+## JSON Storage Layout
+
+All platform state persists as human-readable JSON files:
+
+```
+<storage_dir>/
+├── registry.json              All registered test definitions
+└── runs/
+    ├── run_0001.json          Results of first run
+    ├── run_0002.json          Results of second run
+    └── ...
+```
+
+---
+
+## Test Coverage
+
+72 tests across all modules:
+
+| Module | Tests | Coverage |
+|---|---|---|
+| `json` | 4 | Parse, serialize, round-trip, escaping |
+| `impl_registry` | 5 | Register, deregister, search, filter, JSON round-trip |
+| `impl_filter` | 4 | Run all, include by ID, exclude by tag, name pattern |
+| `impl_executor` | 2 | Sequential execution, fail_fast skip |
+| `impl_progress` | 2 | Progress tracking, finish/active |
+| `impl_discovery` | 4 | Discover all, by group, pagination, summary |
+| `impl_reporter` | 2 | Text format, JSON format |
+| `impl_manager` | 2 | Full lifecycle, filtered run |
+| `storage` | 1 | Path formatting |
+| `console` | 20 | All commands, error cases, output formats |
+| `mcp` | 26 | All tools, error handling, full AI workflow |
