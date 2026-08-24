@@ -223,10 +223,12 @@ pub fn parse_request(json_input: &str) -> Result<McpRequest, String> {
         .get_str("tool")
         .ok_or("Missing 'tool' field")?
         .to_string();
-    let params = value
-        .get("params")
-        .cloned()
-        .unwrap_or(JsonValue::Object(vec![]));
+    // Absent params — or explicit null, the JSON convention for "not set" —
+    // means an empty parameter object.
+    let params = match value.get("params") {
+        None | Some(JsonValue::Null) => JsonValue::Object(vec![]),
+        Some(other) => other.clone(),
+    };
     Ok(McpRequest { tool, params })
 }
 
@@ -307,6 +309,14 @@ fn handle_run(manager: &mut PlatformManager, params: &JsonValue) -> McpResponse 
 }
 
 fn handle_progress(manager: &PlatformManager, params: &JsonValue) -> McpResponse {
+    // A non-object params (e.g. a bare run-id string) is a caller mistake;
+    // get("run_id") on it would return None and silently list active runs.
+    if !matches!(params, JsonValue::Object(_)) {
+        return McpResponse::err(&format!(
+            "Parameters must be an object like {{\"run_id\": \"...\"}}, got: {}",
+            crate::json::to_json_compact(params)
+        ));
+    }
     match params.get("run_id") {
         Some(JsonValue::Str(run_id)) => {
             match manager.check_progress(run_id) {
@@ -330,6 +340,12 @@ fn handle_progress(manager: &PlatformManager, params: &JsonValue) -> McpResponse
 }
 
 fn handle_results(manager: &PlatformManager, params: &JsonValue) -> McpResponse {
+    if !matches!(params, JsonValue::Object(_)) {
+        return McpResponse::err(&format!(
+            "Parameters must be an object like {{\"run_id\": \"...\"}}, got: {}",
+            crate::json::to_json_compact(params)
+        ));
+    }
     match params.get("run_id") {
         Some(JsonValue::Str(run_id)) => {
             match manager.get_results(run_id) {
@@ -769,6 +785,37 @@ mod tests {
         assert_eq!(val.get_bool("success"), Some(true));
         let data = val.get("data").unwrap();
         assert_eq!(data.get("total").and_then(|v| v.as_f64()), Some(2.0));
+    }
+
+    #[test]
+    fn null_params_treated_as_absent() {
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": null}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(true));
+        assert_eq!(val.get("data").unwrap().get("total").and_then(|v| v.as_f64()), Some(3.0));
+    }
+
+    #[test]
+    fn non_object_params_error_on_progress_and_results() {
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_progress", "params": "run_0001"}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("must be an object"));
+
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_results", "params": "run_0001"}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+    }
+
+    #[test]
+    fn empty_include_ids_is_no_tests_matched() {
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"include_ids": []}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("NoTestsMatched"));
     }
 
     #[test]

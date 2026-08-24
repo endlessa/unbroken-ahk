@@ -101,13 +101,24 @@ impl PlatformManager {
             return Ok(());
         }
         let (tests, mut failures) = storage::load_registry(&self.storage)?;
+        // Distinguish two kinds of duplicate: an id already in memory
+        // BEFORE this load is the normal embedder-re-registered overlap
+        // (skip silently); a second occurrence of an id WITHIN the file
+        // is corruption whose data would silently vanish — report it.
+        let mut seen_in_file: Vec<String> = Vec::new();
         for test in tests {
-            // Already present in memory (typically re-registered by
-            // the embedder before loading) — not an error.
-            if self.registry.get(&test.id).is_some() {
+            let id = test.id.clone();
+            if seen_in_file.iter().any(|s| *s == id) {
+                failures.push(format!(
+                    "{}: duplicate id within registry.json (later definition ignored)",
+                    id
+                ));
                 continue;
             }
-            let id = test.id.clone();
+            seen_in_file.push(id.clone());
+            if self.registry.get(&id).is_some() {
+                continue;
+            }
             if let Err(e) = self.registry.register(test) {
                 failures.push(format!("{}: {:?}", id, e));
             }
@@ -452,6 +463,30 @@ mod tests {
         mgr2.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
         assert!(mgr2.load_from_storage().is_ok());
         assert_eq!(mgr2.summary().total_tests, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_ids_within_registry_file_are_reported() {
+        let dir = crate::test_util::temp_storage_dir("mgr-filedupe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            format!("{}/registry.json", dir),
+            r#"[
+              {"id": "t1", "name": "first_definition", "tags": []},
+              {"id": "t1", "name": "conflicting_second", "tags": []}
+            ]"#,
+        ).unwrap();
+
+        let mut mgr = PlatformManager::new(&dir);
+        let result = mgr.load_from_storage();
+        // The in-file duplicate is reported, the first definition wins.
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("duplicate id within registry.json"));
+        assert_eq!(mgr.summary().total_tests, 1);
+        let found = mgr.discover(&DiscoveryQuery::default());
+        assert_eq!(found.tests[0].name, "first_definition");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

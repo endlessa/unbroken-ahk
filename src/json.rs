@@ -130,7 +130,12 @@ fn write_value_to_string(out: &mut String, val: &JsonValue, indent: usize, prett
             if !n.is_finite() {
                 // JSON has no NaN/Infinity — emit null rather than invalid output.
                 out.push_str("null");
-            } else if *n == (*n as i64) as f64 {
+            } else if *n == (*n as i64) as f64
+                && *n >= -9_223_372_036_854_775_808.0
+                && *n < 9_223_372_036_854_775_808.0
+            {
+                // Integer formatting only inside i64's exact range: at 2^63
+                // the cast saturates to i64::MAX and would print off by one.
                 out.push_str(&format!("{}", *n as i64));
             } else {
                 out.push_str(&format!("{}", n));
@@ -677,5 +682,18 @@ mod tests {
     fn non_finite_numbers_serialize_as_null() {
         assert_eq!(to_json_compact(&JsonValue::Number(f64::NAN)), "null");
         assert_eq!(to_json_compact(&JsonValue::Number(f64::INFINITY)), "null");
+    }
+
+    #[test]
+    fn i64_boundary_numbers_round_trip() {
+        // 2^63 saturates an i64 cast; it must not print off by one.
+        let two_63 = 9_223_372_036_854_775_808.0f64;
+        let s = to_json_compact(&JsonValue::Number(two_63));
+        assert_ne!(s, "9223372036854775807");
+        let parsed = parse_json(&s).unwrap();
+        assert_eq!(parsed.as_f64(), Some(two_63));
+        // i64::MIN is exactly representable and stays integer-formatted.
+        let min = -9_223_372_036_854_775_808.0f64;
+        assert_eq!(to_json_compact(&JsonValue::Number(min)), "-9223372036854775808");
     }
 }

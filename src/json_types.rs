@@ -116,7 +116,18 @@ impl FromJson for ExecutionModel {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
         reject_unknown_keys(value, "execution_model", &["type", "max_concurrency"])?;
         match value.get("type") {
-            None | Some(JsonValue::Null) => Ok(ExecutionModel::Sequential),
+            None | Some(JsonValue::Null) => {
+                // max_concurrency without a type is a clear parallel intent
+                // that would otherwise silently run sequentially.
+                if matches!(value.get("max_concurrency"), Some(v) if !matches!(v, JsonValue::Null))
+                {
+                    return Err(JsonError::InvalidField(
+                        "execution_model.type".into(),
+                        "required when max_concurrency is given (use \"parallel\")".into(),
+                    ));
+                }
+                Ok(ExecutionModel::Sequential)
+            }
             Some(JsonValue::Str(s)) if s == "sequential" => Ok(ExecutionModel::Sequential),
             Some(JsonValue::Str(s)) if s == "parallel" => {
                 let mc = match value.get("max_concurrency") {
@@ -199,14 +210,14 @@ impl FromJson for RunConfig {
         let include_tags = strict_string_array(value, "include_tags")?;
         let exclude_tags = strict_string_array(value, "exclude_tags")?;
         let name_pattern = strict_opt_string(value, "name_pattern")?;
-        // run_all defaults to true only when NO filters were supplied.
-        // A caller passing filters without an explicit run_all means
-        // "run the filtered set", never "run everything".
-        let has_filters = !include_ids.is_empty()
-            || !include_tags.is_empty()
-            || !exclude_tags.is_empty()
-            || name_pattern.is_some();
-        let run_all = strict_opt_bool(value, "run_all")?.unwrap_or(!has_filters);
+        // run_all defaults to true only when NO filter key was supplied.
+        // Key PRESENCE decides, not emptiness: a caller passing
+        // {"include_ids": []} selected zero tests — that must become
+        // NoTestsMatched, never run-everything.
+        let filters_supplied = ["include_ids", "include_tags", "exclude_tags", "name_pattern"]
+            .iter()
+            .any(|k| matches!(value.get(k), Some(v) if !matches!(v, JsonValue::Null)));
+        let run_all = strict_opt_bool(value, "run_all")?.unwrap_or(!filters_supplied);
         let fail_fast = strict_opt_bool(value, "fail_fast")?.unwrap_or(false);
         let timeout_ms = strict_opt_u64(value, "timeout_ms")?;
         let execution_model = match value.get("execution_model") {
@@ -401,8 +412,12 @@ impl FromJson for DiscoveryQuery {
             name_pattern: strict_opt_string(value, "name_pattern")?,
             tags: strict_string_array(value, "tags")?,
             group: strict_opt_string(value, "group")?,
-            limit: strict_opt_u64(value, "limit")?.map(|n| n as usize),
-            offset: strict_opt_u64(value, "offset")?.map(|n| n as usize),
+            // Saturate rather than truncate: on 32-bit targets (wasm32) an
+            // oversized limit must clamp to "everything", not wrap to 0.
+            limit: strict_opt_u64(value, "limit")?
+                .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
+            offset: strict_opt_u64(value, "offset")?
+                .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
         })
     }
 }
@@ -581,6 +596,23 @@ mod tests {
             let val = parse_json(bad).unwrap();
             assert!(RunConfig::from_json(&val).is_err(), "should reject: {}", bad);
         }
+    }
+
+    #[test]
+    fn empty_filter_array_means_zero_tests_not_everything() {
+        // {"include_ids": []} selected zero tests — run_all must NOT
+        // default to true just because the array is empty.
+        let val = parse_json(r#"{"include_ids": []}"#).unwrap();
+        let config = RunConfig::from_json(&val).unwrap();
+        assert!(!config.run_all);
+        let val = parse_json(r#"{"include_tags": []}"#).unwrap();
+        assert!(!RunConfig::from_json(&val).unwrap().run_all);
+    }
+
+    #[test]
+    fn max_concurrency_without_type_errors() {
+        let val = parse_json(r#"{"max_concurrency": 8}"#).unwrap();
+        assert!(ExecutionModel::from_json(&val).is_err());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Simple, predictable, debuggable. All data lives in memory and
 //! can be serialized to JSON for inspection.
 
-use crate::json::{JsonValue, ToJson, FromJson, parse_json, to_json_pretty};
+use crate::json::{JsonValue, ToJson, to_json_pretty};
 use crate::registry::{RegistryError, TestRegistry};
 use crate::types::TestDefinition;
 
@@ -18,20 +18,12 @@ impl InMemoryRegistry {
     }
 
     /// Serialize the entire registry to a JSON string for storage/debugging.
+    /// Loading persisted registries goes through storage::load_registry,
+    /// which tolerates individual corrupt entries — there is deliberately
+    /// no second, stricter loader here to diverge from it.
     pub fn to_json_string(&self) -> String {
         let arr = JsonValue::Array(self.tests.iter().map(|t| t.to_json()).collect());
         to_json_pretty(&arr)
-    }
-
-    /// Load a registry from a JSON string.
-    pub fn from_json_string(json: &str) -> Result<Self, String> {
-        let value = parse_json(json).map_err(|e| format!("{}", e))?;
-        let arr = value.as_array().ok_or("expected JSON array")?;
-        let mut tests = Vec::new();
-        for item in arr {
-            tests.push(TestDefinition::from_json(item).map_err(|e| format!("{}", e))?);
-        }
-        Ok(Self { tests })
     }
 }
 
@@ -162,12 +154,21 @@ mod tests {
 
     #[test]
     fn json_round_trip() {
+        use crate::json::{parse_json, FromJson};
+        use crate::types::TestDefinition;
         let mut reg = InMemoryRegistry::new();
         reg.register(make_test("t1", "auth_basic", &["smoke"], Some("auth"))).unwrap();
         reg.register(make_test("t2", "net_ping", &["slow"], Some("network"))).unwrap();
         let json = reg.to_json_string();
-        let reg2 = InMemoryRegistry::from_json_string(&json).unwrap();
-        assert_eq!(reg2.count(), 2);
-        assert_eq!(reg2.get("t1").unwrap().name, "auth_basic");
+        let parsed = parse_json(&json).unwrap();
+        let defs: Vec<TestDefinition> = parsed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| TestDefinition::from_json(v).unwrap())
+            .collect();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].name, "auth_basic");
+        assert_eq!(defs[1].tags, vec!["slow".to_string()]);
     }
 }
