@@ -704,6 +704,11 @@ impl TestManager for PlatformManager {
             running: 0,
             percent_complete,
             elapsed_ms: summary.completed_at.saturating_sub(summary.started_at),
+            // A persisted summary IS a finished run — this flag, not
+            // percent_complete, is the poll-until signal: a legacy file
+            // with fewer results than total truthfully reports <100%
+            // and would otherwise look permanently in-progress.
+            finished: true,
         })
     }
 
@@ -1168,6 +1173,9 @@ mod tests {
         assert_eq!(progress.completed, 3);
         assert!((progress.percent_complete - 60.0).abs() < 1e-9);
         assert_eq!(progress.elapsed_ms, 3000);
+        // The truthful <100% must not read as "still running": finished
+        // is the poll-until signal, and a persisted summary IS finished.
+        assert!(progress.finished);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

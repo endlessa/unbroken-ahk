@@ -83,6 +83,7 @@ impl InMemoryProgressTracker {
                 .finished_ms
                 .unwrap_or_else(|| self.now())
                 .saturating_sub(state.started_ms),
+            finished: state.finished_ms.is_some(),
         }
     }
 

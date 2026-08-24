@@ -127,6 +127,7 @@ mod tests {
             running: 1,
             percent_complete: 50.0,
             elapsed_ms: 1500,
+            finished: false,
         };
         let text = reporter.format_progress(&progress, ReportFormat::Text);
         assert!(text.contains("50.0%"));

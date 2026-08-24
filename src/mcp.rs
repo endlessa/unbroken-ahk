@@ -184,7 +184,7 @@ pub fn list_tools() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "test_progress".into(),
-            description: "Check the progress of a running test suite. Returns completion percentage, pass/fail counts.".into(),
+            description: "Check the progress of a running test suite. Returns completion percentage, pass/fail counts, and a 'finished' flag. Poll until finished is true — not until percent_complete reaches 100, which a finished legacy run may truthfully never report.".into(),
             parameters: obj(vec![
                 ("run_id", obj(vec![
                     ("type", str_val("string")),
@@ -644,6 +644,8 @@ mod tests {
         let data = val.get("data").unwrap();
         assert_eq!(data.get("completed").and_then(|v| v.as_f64()), Some(3.0));
         assert_eq!(data.get("percent_complete").and_then(|v| v.as_f64()), Some(100.0));
+        // The poll-until signal an agent should watch.
+        assert_eq!(data.get_bool("finished"), Some(true));
     }
 
     #[test]

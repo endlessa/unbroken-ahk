@@ -379,7 +379,14 @@ impl FromJson for TestResult {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
         // Strict like every other loader: a result whose identity or
         // status is missing/mistyped is a damaged record (CorruptRun
-        // upstream), never a silent Error-status placeholder.
+        // upstream), never a silent Error-status placeholder. Run files
+        // are as hand-inspectable as registry.json — a misspelled field
+        // silently dropped is the same invisible corruption there.
+        reject_unknown_keys(
+            value,
+            "test result",
+            &["test_id", "status", "duration_ms", "message", "stdout", "stderr"],
+        )?;
         let test_id = match value.get_str("test_id") {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return Err(JsonError::MissingField("test_id".into())),
@@ -418,6 +425,7 @@ impl ToJson for RunProgress {
             ("running", JsonValue::Number(self.running as f64)),
             ("percent_complete", JsonValue::Number(self.percent_complete)),
             ("elapsed_ms", u64_json(self.elapsed_ms)),
+            ("finished", JsonValue::Bool(self.finished)),
         ])
     }
 }
@@ -428,6 +436,25 @@ impl FromJson for RunProgress {
         // in-tree reads progress documents back yet — but the first caller
         // that does (a WASM host bridge) must get an error for a mistyped
         // field, never a snapshot silently claiming zero progress.
+        // "errored" and "finished" are newer than the earliest writers;
+        // absent is fine, unknown keys are not.
+        reject_unknown_keys(
+            value,
+            "run progress",
+            &[
+                "run_id",
+                "total",
+                "completed",
+                "passed",
+                "failed",
+                "errored",
+                "skipped",
+                "running",
+                "percent_complete",
+                "elapsed_ms",
+                "finished",
+            ],
+        )?;
         let run_id = match value.get_str("run_id") {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return Err(JsonError::MissingField("run_id".into())),
@@ -456,6 +483,7 @@ impl FromJson for RunProgress {
             running: counter("running")?,
             percent_complete,
             elapsed_ms: strict_opt_u64(value, "elapsed_ms")?.unwrap_or(0),
+            finished: strict_opt_bool(value, "finished")?.unwrap_or(false),
         })
     }
 }
@@ -487,7 +515,25 @@ impl FromJson for RunSummary {
         // Strictly typed when present: a summary whose results field or
         // counters are mistyped is a damaged record and must load as an
         // error (surfaced upstream as CorruptRun), never as a summary
-        // silently claiming zero results.
+        // silently claiming zero results. Unknown keys are rejected like
+        // every sibling loader — "complated_at" must not vanish quietly.
+        reject_unknown_keys(
+            value,
+            "run summary",
+            &[
+                "run_id",
+                "config",
+                "results",
+                "total",
+                "passed",
+                "failed",
+                "skipped",
+                "errored",
+                "total_duration_ms",
+                "started_at",
+                "completed_at",
+            ],
+        )?;
         let run_id = match value.get_str("run_id") {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return Err(JsonError::MissingField("run_id".into())),
@@ -995,6 +1041,31 @@ mod tests {
             let val = parse_json(bad).unwrap();
             assert!(RunConfig::from_json(&val).is_err(), "should reject: {}", bad);
         }
+    }
+
+    #[test]
+    fn run_file_loaders_reject_unknown_keys() {
+        // Run files are as hand-inspectable as registry.json — a
+        // misspelled field must error, never vanish silently.
+        let summary = parse_json(
+            r#"{"run_id": "run_0001", "results": [], "complated_at": 5}"#,
+        )
+        .unwrap();
+        let err = RunSummary::from_json(&summary).unwrap_err();
+        assert!(format!("{}", err).contains("complated_at"));
+
+        let result = parse_json(
+            r#"{"run_id": "run_0001", "results": [
+                {"test_id": "t1", "status": "passed", "mesage": "x"}
+            ]}"#,
+        )
+        .unwrap();
+        let err = RunSummary::from_json(&result).unwrap_err();
+        assert!(format!("{}", err).contains("mesage"));
+
+        let progress =
+            parse_json(r#"{"run_id": "run_0001", "totl": 5}"#).unwrap();
+        assert!(RunProgress::from_json(&progress).is_err());
     }
 
     #[test]

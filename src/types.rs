@@ -151,6 +151,11 @@ pub struct RunProgress {
     pub running: u32,
     pub percent_complete: f64,
     pub elapsed_ms: DurationMs,
+    /// True once the run has finished executing. THIS is the poll-until
+    /// signal — percent_complete alone cannot distinguish a live
+    /// 60%-done run from a finished legacy run whose file holds fewer
+    /// results than selected tests (which reports its truthful <100%).
+    pub finished: bool,
 }
 
 // ---------------------------------------------------------------------------
