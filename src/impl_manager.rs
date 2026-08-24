@@ -158,12 +158,15 @@ impl PlatformManager {
     }
 
     /// Persist the registry, MERGED with what the file holds RIGHT NOW:
-    /// stored definitions not present in memory are preserved, so neither
-    /// a register-before-load restart nor a concurrent session's
-    /// registrations get clobbered. In-memory definitions win on id
-    /// conflict. The file is deliberately re-read on every persist —
-    /// correctness under concurrent sessions over speed; registering N
-    /// tests costs N file reads, acceptable at test-registry sizes. A
+    /// stored definitions not present in memory are preserved. This makes
+    /// register-before-load restarts and SEQUENTIALLY interleaved sessions
+    /// lossless; two sessions whose read-merge-write windows truly OVERLAP
+    /// can still lose the later-loser's entries until that session
+    /// persists again — full multi-writer safety would need file locking,
+    /// deliberately out of scope for the zero-dependency JSON store.
+    /// In-memory definitions win on id conflict. The file is re-read on
+    /// every persist — correctness over speed; registering N tests costs
+    /// N file reads, acceptable at test-registry sizes. A
     /// corrupt file — whole-file or individual entries — is backed up to
     /// a unique registry.json.corrupt-* name before the rewrite would
     /// destroy the evidence. Write errors are returned, never swallowed.
@@ -190,14 +193,10 @@ impl PlatformManager {
         } else {
             Vec::new()
         };
-        let in_memory: std::collections::HashSet<String> = self
-            .registry
-            .list_all()
-            .iter()
-            .map(|t| t.id.clone())
-            .collect();
         let mut all: Vec<TestDefinition> =
             self.registry.list_all().into_iter().cloned().collect();
+        let in_memory: std::collections::HashSet<String> =
+            all.iter().map(|t| t.id.clone()).collect();
         all.extend(
             stored
                 .into_iter()
@@ -247,6 +246,18 @@ impl TestManager for PlatformManager {
     }
 
     fn register_test(&mut self, definition: TestDefinition) -> Result<(), ManagerError> {
+        // Same load-then-register restart tolerance as register_runnable:
+        // an identical definition already restored from storage is a
+        // no-op; a conflicting one is an error.
+        if let Some(existing) = self.registry.get(&definition.id) {
+            if *existing != definition {
+                return Err(ManagerError::RegistrationFailed(format!(
+                    "definition for '{}' conflicts with the already-registered one",
+                    definition.id
+                )));
+            }
+            return Ok(());
+        }
         let id = definition.id.clone();
         self.registry
             .register(definition)
@@ -628,6 +639,32 @@ mod tests {
         assert_eq!(mgr2.summary().total_tests, 2);
         let run_id = mgr2.start_run(RunConfig::default()).unwrap();
         assert_eq!(mgr2.get_results(&run_id).unwrap().total, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_test_tolerates_load_then_register_restart() {
+        // Same restart symmetry as register_runnable: re-registering an
+        // identical definition-only test after load_from_storage is a
+        // no-op, and a conflicting one errors.
+        let dir = crate::test_util::temp_storage_dir("mgr-regtest-restart");
+        let def = TestDefinition {
+            id: "d1".into(),
+            name: "definition_only".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+        let mut mgr1 = PlatformManager::new(&dir);
+        mgr1.register_test(def.clone()).unwrap();
+
+        let mut mgr2 = PlatformManager::new(&dir);
+        assert!(mgr2.load_from_storage().unwrap().is_empty());
+        mgr2.register_test(def.clone()).unwrap();
+        assert_eq!(mgr2.summary().total_tests, 1);
+        let conflicting = TestDefinition { name: "renamed".into(), ..def };
+        assert!(mgr2.register_test(conflicting).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

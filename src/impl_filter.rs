@@ -38,10 +38,12 @@ impl TestFilter for StandardFilter {
             // Set-based dedup so a large registry stays O(n) per step.
             let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
-            // Step 1: Include by ID
+            // Step 1: Include by ID (set-based membership, O(n + m))
             if !config.include_ids.is_empty() {
+                let wanted: std::collections::HashSet<&str> =
+                    config.include_ids.iter().map(|s| s.as_str()).collect();
                 for test in tests {
-                    if config.include_ids.contains(&test.id) && seen.insert(test.id.as_str()) {
+                    if wanted.contains(test.id.as_str()) && seen.insert(test.id.as_str()) {
                         candidates.push(test);
                     }
                 }

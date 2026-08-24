@@ -137,11 +137,15 @@ impl FromJson for ExecutionModel {
             Some(JsonValue::Str(s)) if s == "parallel" => {
                 let mc = match value.get("max_concurrency") {
                     None | Some(JsonValue::Null) => 4,
-                    Some(JsonValue::Number(n)) if *n >= 1.0 && n.fract() == 0.0 => *n as u32,
+                    Some(JsonValue::Number(n))
+                        if *n >= 1.0 && n.fract() == 0.0 && *n <= u32::MAX as f64 =>
+                    {
+                        *n as u32
+                    }
                     Some(_) => {
                         return Err(JsonError::InvalidField(
                             "execution_model.max_concurrency".into(),
-                            "a positive integer".into(),
+                            "a positive integer that fits in 32 bits".into(),
                         ))
                     }
                 };
@@ -605,15 +609,22 @@ fn strict_opt_bool(value: &JsonValue, field: &str) -> Result<Option<bool>, JsonE
     }
 }
 
+/// Largest integer a JSON double represents exactly (2^53). Values above
+/// it have already lost integer precision in transit, so the strict
+/// loaders reject them rather than fabricating a number.
+const MAX_SAFE_JSON_INT: f64 = 9_007_199_254_740_992.0;
+
 fn strict_opt_u64(value: &JsonValue, field: &str) -> Result<Option<u64>, JsonError> {
     match value.get(field) {
         None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Number(n)) if *n >= 0.0 && n.is_finite() && n.fract() == 0.0 => {
+        Some(JsonValue::Number(n))
+            if *n >= 0.0 && n.is_finite() && n.fract() == 0.0 && *n <= MAX_SAFE_JSON_INT =>
+        {
             Ok(Some(*n as u64))
         }
         Some(_) => Err(JsonError::InvalidField(
             field.into(),
-            "a non-negative integer".into(),
+            "a non-negative integer within the exact JSON range (<= 2^53)".into(),
         )),
     }
 }
@@ -674,6 +685,8 @@ mod tests {
             r#"{"run_all": "yes"}"#,
             r#"{"fail_fast": "no"}"#,
             r#"{"timeout_ms": "5s"}"#,
+            // Beyond exact-JSON-integer range: reject, never saturate.
+            r#"{"timeout_ms": 1e300}"#,
         ] {
             let val = parse_json(bad).unwrap();
             assert!(RunConfig::from_json(&val).is_err(), "should reject: {}", bad);
@@ -797,6 +810,7 @@ mod tests {
             r#"{"type": 7}"#,
             r#"{"type": "parallel", "max_concurrency": "eight"}"#,
             r#"{"type": "parallel", "max_concurrency": 0}"#,
+            r#"{"type": "parallel", "max_concurrency": 5000000000}"#,
         ] {
             let val = parse_json(bad).unwrap();
             assert!(ExecutionModel::from_json(&val).is_err(), "should reject: {}", bad);
