@@ -1,6 +1,6 @@
 //! Concrete implementation of TestFilter.
 
-use crate::filter::TestFilter;
+use crate::filter::{name_matches, TestFilter};
 use crate::types::{RunConfig, TestDefinition};
 
 /// Standard filter that applies RunConfig criteria in precedence order.
@@ -46,17 +46,10 @@ impl TestFilter for StandardFilter {
 
         // Step 3: Include by name pattern
         if let Some(ref pattern) = config.name_pattern {
-            let pattern_lower = pattern.to_lowercase();
             for test in tests {
-                let name_lower = test.name.to_lowercase();
-                let matches = if let Some(prefix) = pattern_lower.strip_suffix('*') {
-                    name_lower.starts_with(prefix)
-                } else if let Some(suffix) = pattern_lower.strip_prefix('*') {
-                    name_lower.ends_with(suffix)
-                } else {
-                    name_lower.contains(&pattern_lower)
-                };
-                if matches && !candidates.iter().any(|c| c.id == test.id) {
+                if name_matches(pattern, &test.name)
+                    && !candidates.iter().any(|c| c.id == test.id)
+                {
                     candidates.push(test);
                 }
             }

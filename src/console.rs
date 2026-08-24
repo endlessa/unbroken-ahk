@@ -46,12 +46,16 @@ pub fn execute_command(manager: &mut PlatformManager, input: &str) -> ConsoleOut
     let parts: Vec<&str> = split_args(input);
     let command = parts[0].to_lowercase();
     let args = &parts[1..];
+    // The raw text after the command word, whitespace preserved — needed
+    // for inline JSON configs, where tokenizing would corrupt whitespace
+    // inside string values.
+    let rest = input[parts[0].len()..].trim_start();
 
     match command.as_str() {
         "help" => cmd_help(),
         "summary" => cmd_summary(manager),
         "discover" | "search" | "find" => cmd_discover(manager, args),
-        "run" | "execute" | "start" => cmd_run(manager, args),
+        "run" | "execute" | "start" => cmd_run(manager, args, rest),
         "progress" | "status" => cmd_progress(manager, args),
         "results" | "result" => cmd_results(manager, args),
         "tags" => cmd_tags(manager),
@@ -176,13 +180,13 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
     ConsoleOutput { text, json }
 }
 
-fn cmd_run(manager: &mut PlatformManager, args: &[&str]) -> ConsoleOutput {
+fn cmd_run(manager: &mut PlatformManager, args: &[&str], rest: &str) -> ConsoleOutput {
     let config = if args.is_empty() {
         RunConfig::default()
-    } else if args[0].starts_with('{') {
-        // JSON config
-        let json_str = args.join(" ");
-        match parse_json(&json_str) {
+    } else if rest.starts_with('{') {
+        // JSON config — parse the raw remainder so whitespace inside
+        // string values survives intact.
+        match parse_json(rest) {
             Ok(val) => match RunConfig::from_json(&val) {
                 Ok(c) => c,
                 Err(e) => return error_output(&format!("Invalid config JSON: {}", e)),
@@ -191,7 +195,10 @@ fn cmd_run(manager: &mut PlatformManager, args: &[&str]) -> ConsoleOutput {
         }
     } else {
         // Parse flag-based config
-        parse_run_args(args)
+        match parse_run_args(args) {
+            Ok(c) => c,
+            Err(e) => return error_output(&e),
+        }
     };
 
     let config_json = to_json_pretty(&config.to_json());
@@ -271,14 +278,7 @@ fn cmd_tags(manager: &PlatformManager) -> ConsoleOutput {
     if summary.tags.is_empty() {
         text.push_str("  (none)\n");
     }
-    let json = to_json_pretty(&crate::json::JsonValue::Array(
-        summary.tags.iter().map(|(t, c)| {
-            crate::json::obj(vec![
-                ("tag", crate::json::str_val(t)),
-                ("count", crate::json::JsonValue::Number(*c as f64)),
-            ])
-        }).collect(),
-    ));
+    let json = to_json_pretty(&crate::json_types::counts_json("tag", &summary.tags));
     ConsoleOutput { text, json }
 }
 
@@ -291,14 +291,7 @@ fn cmd_groups(manager: &PlatformManager) -> ConsoleOutput {
     if summary.groups.is_empty() {
         text.push_str("  (none)\n");
     }
-    let json = to_json_pretty(&crate::json::JsonValue::Array(
-        summary.groups.iter().map(|(g, c)| {
-            crate::json::obj(vec![
-                ("group", crate::json::str_val(g)),
-                ("count", crate::json::JsonValue::Number(*c as f64)),
-            ])
-        }).collect(),
-    ));
+    let json = to_json_pretty(&crate::json_types::counts_json("group", &summary.groups));
     ConsoleOutput { text, json }
 }
 
@@ -306,7 +299,7 @@ fn cmd_groups(manager: &PlatformManager) -> ConsoleOutput {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn parse_run_args(args: &[&str]) -> RunConfig {
+fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
     let mut config = RunConfig {
         run_all: false,
         ..Default::default()
@@ -324,7 +317,7 @@ fn parse_run_args(args: &[&str]) -> RunConfig {
                     config.include_tags.push(args[i + 1].to_string());
                     i += 2;
                 } else {
-                    i += 1;
+                    return Err("--tag requires a value".into());
                 }
             }
             "--exclude" | "-e" => {
@@ -332,14 +325,18 @@ fn parse_run_args(args: &[&str]) -> RunConfig {
                     config.exclude_tags.push(args[i + 1].to_string());
                     i += 2;
                 } else {
-                    i += 1;
+                    return Err("--exclude requires a value".into());
                 }
             }
             "--id" => {
                 i += 1;
+                let start = i;
                 while i < args.len() && !args[i].starts_with('-') {
                     config.include_ids.push(args[i].to_string());
                     i += 1;
+                }
+                if i == start {
+                    return Err("--id requires at least one test ID".into());
                 }
             }
             "--pattern" | "-p" => {
@@ -347,7 +344,7 @@ fn parse_run_args(args: &[&str]) -> RunConfig {
                     config.name_pattern = Some(args[i + 1].to_string());
                     i += 2;
                 } else {
-                    i += 1;
+                    return Err("--pattern requires a value".into());
                 }
             }
             "--fail-fast" | "-f" => {
@@ -356,11 +353,18 @@ fn parse_run_args(args: &[&str]) -> RunConfig {
             }
             "--timeout" => {
                 if i + 1 < args.len() {
-                    config.timeout_ms = args[i + 1].parse().ok();
+                    config.timeout_ms = Some(
+                        args[i + 1]
+                            .parse()
+                            .map_err(|_| format!("--timeout: '{}' is not a number", args[i + 1]))?,
+                    );
                     i += 2;
                 } else {
-                    i += 1;
+                    return Err("--timeout requires a value in milliseconds".into());
                 }
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown flag '{}'", other));
             }
             _ => {
                 // Treat bare args as test IDs
@@ -379,7 +383,7 @@ fn parse_run_args(args: &[&str]) -> RunConfig {
         config.run_all = true;
     }
 
-    config
+    Ok(config)
 }
 
 fn split_args(input: &str) -> Vec<&str> {
@@ -583,8 +587,10 @@ mod tests {
     #[test]
     fn results_after_run() {
         let mut mgr = setup_manager();
-        execute_command(&mut mgr, "run");
-        let out = execute_command(&mut mgr, "results run_0001");
+        let run_out = execute_command(&mut mgr, "run");
+        let run_id = crate::json::parse_json(&run_out.json).unwrap()
+            .get_str("run_id").unwrap().to_string();
+        let out = execute_command(&mut mgr, &format!("results {}", run_id));
         assert!(out.text.contains("Run Summary"));
     }
 
@@ -593,6 +599,48 @@ mod tests {
         let mut mgr = setup_manager();
         let out = execute_command(&mut mgr, "results bogus_id");
         assert!(out.text.contains("Error"));
+    }
+
+    #[test]
+    fn run_flag_missing_value_errors() {
+        // A truncated command must error, never fall back to running
+        // the entire suite.
+        let mut mgr = setup_manager();
+        let out = execute_command(&mut mgr, "run --tag");
+        assert!(out.text.contains("Error"));
+        assert!(out.text.contains("--tag requires a value"));
+
+        let out = execute_command(&mut mgr, "run --id");
+        assert!(out.text.contains("Error"));
+
+        let out = execute_command(&mut mgr, "run --timeout abc");
+        assert!(out.text.contains("Error"));
+
+        let out = execute_command(&mut mgr, "run --bogus-flag");
+        assert!(out.text.contains("unknown flag"));
+    }
+
+    #[test]
+    fn run_json_config_preserves_inner_whitespace() {
+        let mut mgr = setup_manager();
+        mgr.register_runnable(
+            TestDefinition {
+                id: "ws".into(),
+                name: "double  space".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(StubTest { id: "ws".into(), pass: true }),
+        ).unwrap();
+        // The two spaces inside the pattern must survive tokenization.
+        let out = execute_command(
+            &mut mgr,
+            r#"run {"run_all": false, "name_pattern": "double  space"}"#,
+        );
+        assert!(out.text.contains("Total: 1"), "got: {}", out.text);
+        assert!(out.json.contains("\"ws\""));
     }
 
     #[test]

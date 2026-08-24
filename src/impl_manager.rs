@@ -39,16 +39,20 @@ pub struct PlatformManager {
 
 impl PlatformManager {
     pub fn new(storage_dir: &str) -> Self {
+        let storage = StoragePaths::new(storage_dir);
+        // Resume the run counter from persisted runs so a new session never
+        // reuses — and overwrites — a previous session's run IDs.
+        let run_counter = storage::max_existing_run_number(&storage);
         Self {
             registry: InMemoryRegistry::new(),
             filter: StandardFilter::new(),
             executor: SequentialExecutor::new(),
-            progress: InMemoryProgressTracker::new(),
+            progress: InMemoryProgressTracker::new().with_clock(storage::now_ms),
             reporter: StandardReporter::new(),
-            storage: StoragePaths::new(storage_dir),
+            storage,
             runnables: Vec::new(),
             completed_runs: Vec::new(),
-            run_counter: 0,
+            run_counter,
         }
     }
 
@@ -84,13 +88,29 @@ impl PlatformManager {
     }
 
     /// Load registry from JSON storage.
+    ///
+    /// Definitions that fail to register (e.g. duplicates of already-
+    /// registered tests) are reported in the error rather than silently
+    /// dropped.
     pub fn load_from_storage(&mut self) -> Result<(), String> {
         match storage::load_registry(&self.storage) {
             Ok(tests) => {
+                let mut failures: Vec<String> = Vec::new();
                 for test in tests {
-                    let _ = self.registry.register(test);
+                    let id = test.id.clone();
+                    if let Err(e) = self.registry.register(test) {
+                        failures.push(format!("{}: {:?}", id, e));
+                    }
                 }
-                Ok(())
+                if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "failed to register {} stored definition(s): {}",
+                        failures.len(),
+                        failures.join("; ")
+                    ))
+                }
             }
             Err(e) => {
                 // If no file exists yet, that's fine
@@ -143,6 +163,16 @@ impl TestManager for PlatformManager {
     }
 
     fn start_run(&mut self, config: RunConfig) -> Result<RunId, ManagerError> {
+        // The sequential executor is the only implementation so far —
+        // reject a parallel request instead of silently running sequentially.
+        if let ExecutionModel::Parallel { .. } = config.execution_model {
+            return Err(ManagerError::UnsupportedConfig(
+                "parallel execution is not supported yet; \
+                 use \"execution_model\": {\"type\": \"sequential\"}"
+                    .into(),
+            ));
+        }
+
         // Collect selected test IDs upfront to avoid borrow conflicts
         let selected_ids: Vec<String> = {
             let all_defs = self.registry.list_all();
@@ -166,27 +196,45 @@ impl TestManager for PlatformManager {
             .map(|r| r.as_ref())
             .collect();
 
-        let started_at = 0u64; // Would use real clock in production
+        let started_at = storage::now_ms();
 
-        // Execute — collect results then update progress after
-        // (avoids borrowing self mutably while executor holds immutable refs)
-        let results = {
-            let executor = &self.executor;
-            let mut pending_results: Vec<TestResult> = Vec::new();
-            let all_results = executor.execute(
-                &runnables,
-                config.timeout_ms,
-                config.fail_fast,
-                &mut |result| {
-                    pending_results.push(result.clone());
-                },
-            );
-            all_results
-        };
+        // Execute, streaming each result into the progress tracker as it
+        // lands (disjoint field borrows: executor and runnables are borrowed
+        // immutably, progress mutably).
+        let progress = &mut self.progress;
+        let mut results = self.executor.execute(
+            &runnables,
+            config.timeout_ms,
+            config.fail_fast,
+            &mut |result| {
+                progress.test_completed(&run_id, result);
+            },
+        );
 
-        // Now update progress with all results
-        for result in &results {
-            self.progress.test_completed(&run_id, result);
+        // Selected definitions with no registered runnable cannot execute.
+        // Surface each as an explicit Error result instead of silently
+        // shrinking the run (the classic case: definitions restored from
+        // storage after a restart, with no runnables re-attached).
+        let executed: Vec<&str> = results.iter().map(|r| r.test_id.as_str()).collect();
+        let missing: Vec<String> = selected_ids
+            .iter()
+            .filter(|id| !executed.contains(&id.as_str()))
+            .cloned()
+            .collect();
+        for id in missing {
+            let result = TestResult {
+                test_id: id.clone(),
+                status: TestStatus::Error,
+                duration_ms: 0,
+                message: Some(format!(
+                    "no runnable registered for test '{}' (definition only)",
+                    id
+                )),
+                stdout: None,
+                stderr: None,
+            };
+            self.progress.test_completed(&run_id, &result);
+            results.push(result);
         }
 
         self.progress.finish_run(&run_id);
@@ -219,7 +267,7 @@ impl TestManager for PlatformManager {
             errored,
             total_duration_ms: total_duration,
             started_at,
-            completed_at: started_at + total_duration,
+            completed_at: storage::now_ms().max(started_at),
         };
 
         self.persist_run(&summary);
@@ -329,6 +377,135 @@ mod tests {
         assert!(content.contains("\"test_id\": \"t1\""));
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn definition_only_tests_error_instead_of_vanishing() {
+        let dir = "/tmp/unbroken-test-ghost";
+        let _ = std::fs::remove_dir_all(dir);
+        let mut mgr = PlatformManager::new(dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "runnable".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        ).unwrap();
+        // Definition with no runnable attached.
+        mgr.register_test(TestDefinition {
+            id: "t2".into(),
+            name: "definition_only".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        }).unwrap();
+
+        let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        let results = mgr.get_results(&run_id).unwrap();
+        // Both tests are accounted for: one executed, one explicit Error.
+        assert_eq!(results.total, 2);
+        assert_eq!(results.results.len(), 2);
+        assert_eq!(results.passed, 1);
+        assert_eq!(results.errored, 1);
+        let ghost = results.results.iter().find(|r| r.test_id == "t2").unwrap();
+        assert_eq!(ghost.status, TestStatus::Error);
+        assert!(ghost.message.as_deref().unwrap().contains("no runnable"));
+        // Progress reaches 100% and the run is not stuck active.
+        let prog = mgr.check_progress(&run_id).unwrap();
+        assert_eq!(prog.completed, 2);
+        assert_eq!(prog.percent_complete, 100.0);
+        assert!(mgr.active_runs().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_counter_survives_restart() {
+        let dir = "/tmp/unbroken-test-counter";
+        let _ = std::fs::remove_dir_all(dir);
+
+        let def = TestDefinition {
+            id: "t1".into(),
+            name: "t".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+
+        let mut mgr1 = PlatformManager::new(dir);
+        mgr1.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        let first = mgr1.start_run(RunConfig::default()).unwrap();
+        assert_eq!(first, "run_0001");
+
+        // A fresh manager over the same storage must not reuse run_0001.
+        let mut mgr2 = PlatformManager::new(dir);
+        mgr2.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        let second = mgr2.start_run(RunConfig::default()).unwrap();
+        assert_eq!(second, "run_0002");
+        // The first session's persisted run file is intact.
+        assert!(std::fs::metadata(format!("{}/runs/run_0001.json", dir)).is_ok());
+        assert!(std::fs::metadata(format!("{}/runs/run_0002.json", dir)).is_ok());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn timestamps_are_real_on_native() {
+        let dir = "/tmp/unbroken-test-clock";
+        let _ = std::fs::remove_dir_all(dir);
+        let mut mgr = PlatformManager::new(dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "t".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        ).unwrap();
+        let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        let summary = mgr.get_results(&run_id).unwrap();
+        // Sanity floor: well past 2020-01-01 in epoch ms.
+        assert!(summary.started_at > 1_577_836_800_000);
+        assert!(summary.completed_at >= summary.started_at);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parallel_execution_model_is_rejected() {
+        let dir = "/tmp/unbroken-test-parallel";
+        let _ = std::fs::remove_dir_all(dir);
+        let mut mgr = PlatformManager::new(dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "t".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        ).unwrap();
+        let config = RunConfig {
+            execution_model: ExecutionModel::Parallel { max_concurrency: 8 },
+            ..Default::default()
+        };
+        match mgr.start_run(config) {
+            Err(ManagerError::UnsupportedConfig(msg)) => {
+                assert!(msg.contains("parallel"));
+            }
+            other => panic!("expected UnsupportedConfig, got {:?}", other.map(|_| ())),
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

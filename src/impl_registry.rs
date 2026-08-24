@@ -62,21 +62,9 @@ impl TestRegistry for InMemoryRegistry {
     }
 
     fn search_by_name(&self, pattern: &str) -> Vec<&TestDefinition> {
-        let pattern_lower = pattern.to_lowercase();
         self.tests
             .iter()
-            .filter(|t| {
-                let name_lower = t.name.to_lowercase();
-                // Support simple glob: "auth_*" matches "auth_basic", "auth_token"
-                if let Some(prefix) = pattern_lower.strip_suffix('*') {
-                    name_lower.starts_with(prefix)
-                } else if let Some(suffix) = pattern_lower.strip_prefix('*') {
-                    name_lower.ends_with(suffix)
-                } else {
-                    // Substring match
-                    name_lower.contains(&pattern_lower)
-                }
-            })
+            .filter(|t| crate::filter::name_matches(pattern, &t.name))
             .collect()
     }
 

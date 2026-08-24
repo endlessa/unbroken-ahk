@@ -307,13 +307,19 @@ fn handle_run(manager: &mut PlatformManager, params: &JsonValue) -> McpResponse 
 }
 
 fn handle_progress(manager: &PlatformManager, params: &JsonValue) -> McpResponse {
-    match params.get_str("run_id") {
-        Some(run_id) => {
+    match params.get("run_id") {
+        Some(JsonValue::Str(run_id)) => {
             match manager.check_progress(run_id) {
                 Ok(progress) => McpResponse::ok(progress.to_json()),
                 Err(e) => McpResponse::err(&format!("{:?}", e)),
             }
         }
+        // Present but not a string: a caller mistake, not a request to
+        // list active runs — error so the caller can correct it.
+        Some(other) => McpResponse::err(&format!(
+            "Parameter 'run_id' must be a string, got: {}",
+            crate::json::to_json_compact(other)
+        )),
         None => {
             let active = manager.active_runs();
             McpResponse::ok(str_array(&active))
@@ -322,35 +328,27 @@ fn handle_progress(manager: &PlatformManager, params: &JsonValue) -> McpResponse
 }
 
 fn handle_results(manager: &PlatformManager, params: &JsonValue) -> McpResponse {
-    match params.get_str("run_id") {
-        Some(run_id) => {
+    match params.get("run_id") {
+        Some(JsonValue::Str(run_id)) => {
             match manager.get_results(run_id) {
                 Ok(summary) => McpResponse::ok(summary.to_json()),
                 Err(e) => McpResponse::err(&format!("{:?}", e)),
             }
         }
+        Some(other) => McpResponse::err(&format!(
+            "Parameter 'run_id' must be a string, got: {}",
+            crate::json::to_json_compact(other)
+        )),
         None => McpResponse::err("Missing required parameter: 'run_id'"),
     }
 }
 
 fn handle_list_tags(manager: &PlatformManager) -> McpResponse {
-    let summary = manager.summary();
-    let arr = JsonValue::Array(
-        summary.tags.iter().map(|(t, c)| {
-            obj(vec![("tag", str_val(t)), ("count", JsonValue::Number(*c as f64))])
-        }).collect(),
-    );
-    McpResponse::ok(arr)
+    McpResponse::ok(crate::json_types::counts_json("tag", &manager.summary().tags))
 }
 
 fn handle_list_groups(manager: &PlatformManager) -> McpResponse {
-    let summary = manager.summary();
-    let arr = JsonValue::Array(
-        summary.groups.iter().map(|(g, c)| {
-            obj(vec![("group", str_val(g)), ("count", JsonValue::Number(*c as f64))])
-        }).collect(),
-    );
-    McpResponse::ok(arr)
+    McpResponse::ok(crate::json_types::counts_json("group", &manager.summary().groups))
 }
 
 // ---------------------------------------------------------------------------
@@ -587,8 +585,11 @@ mod tests {
     #[test]
     fn progress_after_run_completed() {
         let mut mgr = setup_manager();
-        execute_mcp(&mut mgr, r#"{"tool": "test_run"}"#);
-        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_progress", "params": {"run_id": "run_0001"}}"#);
+        let run_resp = execute_mcp(&mut mgr, r#"{"tool": "test_run"}"#);
+        let run_id = parse_json(&run_resp).unwrap()
+            .get("data").unwrap().get_str("run_id").unwrap().to_string();
+        let resp = execute_mcp(&mut mgr, &format!(
+            r#"{{"tool": "test_progress", "params": {{"run_id": "{}"}}}}"#, run_id));
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(true));
         let data = val.get("data").unwrap();
@@ -609,8 +610,11 @@ mod tests {
     #[test]
     fn results_after_run() {
         let mut mgr = setup_manager();
-        execute_mcp(&mut mgr, r#"{"tool": "test_run"}"#);
-        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_results", "params": {"run_id": "run_0001"}}"#);
+        let run_resp = execute_mcp(&mut mgr, r#"{"tool": "test_run"}"#);
+        let run_id = parse_json(&run_resp).unwrap()
+            .get("data").unwrap().get_str("run_id").unwrap().to_string();
+        let resp = execute_mcp(&mut mgr, &format!(
+            r#"{{"tool": "test_results", "params": {{"run_id": "{}"}}}}"#, run_id));
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(true));
         let data = val.get("data").unwrap();
@@ -699,6 +703,48 @@ mod tests {
         assert_eq!(val.get_bool("success"), Some(true));
         let data = val.get("data").unwrap();
         assert_eq!(data.get("total").and_then(|v| v.as_f64()), Some(3.0));
+    }
+
+    #[test]
+    fn run_filters_without_run_all_are_honored() {
+        // The MCP contract: filters alone imply run_all=false. Passing only
+        // include_tags must NOT run the whole suite.
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"include_tags": ["slow"]}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(true));
+        let data = val.get("data").unwrap();
+        assert_eq!(data.get("total").and_then(|v| v.as_f64()), Some(1.0));
+
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"exclude_tags": ["slow"]}}"#);
+        let val = parse_json(&resp).unwrap();
+        let data = val.get("data").unwrap();
+        assert_eq!(data.get("total").and_then(|v| v.as_f64()), Some(2.0));
+    }
+
+    #[test]
+    fn progress_rejects_mistyped_run_id() {
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_progress", "params": {"run_id": 1}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("must be a string"));
+
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_results", "params": {"run_id": 1}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("must be a string"));
+    }
+
+    #[test]
+    fn parallel_model_returns_error() {
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr,
+            r#"{"tool": "test_run", "params": {"execution_model": {"type": "parallel", "max_concurrency": 8}}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("UnsupportedConfig"));
     }
 
     // -- Full workflow (AI perspective) --

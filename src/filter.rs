@@ -24,3 +24,21 @@ pub trait TestFilter {
         config: &RunConfig,
     ) -> Vec<&'a TestDefinition>;
 }
+
+/// Case-insensitive name matching shared by discovery search and run
+/// filtering, so `discover <pattern>` and `run --pattern <pattern>`
+/// always select the same tests.
+///
+/// Supports simple globs: "auth_*" (prefix), "*_ping" (suffix),
+/// otherwise substring match.
+pub fn name_matches(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.to_lowercase();
+    let name = name.to_lowercase();
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        name.ends_with(suffix)
+    } else {
+        name.contains(&pattern)
+    }
+}

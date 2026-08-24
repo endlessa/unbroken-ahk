@@ -67,6 +67,52 @@ pub fn read_json_file(_path: &str) -> Result<String, String> {
     Err("WASM storage not yet implemented".into())
 }
 
+/// Current wall-clock time in milliseconds since the Unix epoch.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// WASM stub: no wall clock available; timestamps are 0 until the host
+/// provides a clock import.
+#[cfg(target_arch = "wasm32")]
+pub fn now_ms() -> u64 {
+    0
+}
+
+/// Highest run number among already-persisted run summaries
+/// (files named `run_NNNN.json` in the runs directory).
+///
+/// Used to seed the run counter so a new session never reuses —
+/// and overwrites — a previous session's run IDs.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn max_existing_run_number(paths: &StoragePaths) -> u64 {
+    let mut max = 0u64;
+    if let Ok(entries) = std::fs::read_dir(paths.runs_dir()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(num) = name
+                .strip_prefix("run_")
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .and_then(|digits| digits.parse::<u64>().ok())
+            {
+                max = max.max(num);
+            }
+        }
+    }
+    max
+}
+
+/// WASM stub: no persisted runs to scan.
+#[cfg(target_arch = "wasm32")]
+pub fn max_existing_run_number(_paths: &StoragePaths) -> u64 {
+    0
+}
+
 /// Save the test registry to JSON.
 pub fn save_registry(paths: &StoragePaths, tests: &[&TestDefinition]) -> Result<(), String> {
     let arr = JsonValue::Array(tests.iter().map(|t| t.to_json()).collect());

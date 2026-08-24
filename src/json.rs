@@ -123,7 +123,10 @@ fn write_value(f: &mut fmt::Formatter<'_>, val: &JsonValue, indent: usize, prett
         JsonValue::Null => write!(f, "null"),
         JsonValue::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
         JsonValue::Number(n) => {
-            if *n == (*n as i64) as f64 {
+            if !n.is_finite() {
+                // JSON has no NaN/Infinity — emit null rather than invalid output.
+                write!(f, "null")
+            } else if *n == (*n as i64) as f64 {
                 write!(f, "{}", *n as i64)
             } else {
                 write!(f, "{}", n)
@@ -187,7 +190,10 @@ fn write_value_to_string(out: &mut String, val: &JsonValue, indent: usize, prett
         JsonValue::Null => out.push_str("null"),
         JsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         JsonValue::Number(n) => {
-            if *n == (*n as i64) as f64 {
+            if !n.is_finite() {
+                // JSON has no NaN/Infinity — emit null rather than invalid output.
+                out.push_str("null");
+            } else if *n == (*n as i64) as f64 {
                 out.push_str(&format!("{}", *n as i64));
             } else {
                 out.push_str(&format!("{}", n));
@@ -307,6 +313,7 @@ pub enum JsonError {
     InvalidNumber(usize),
     InvalidEscape(usize),
     TrailingData(usize),
+    MissingField(String),
 }
 
 impl fmt::Display for JsonError {
@@ -319,6 +326,9 @@ impl fmt::Display for JsonError {
             JsonError::InvalidNumber(pos) => write!(f, "invalid number at position {}", pos),
             JsonError::InvalidEscape(pos) => write!(f, "invalid escape at position {}", pos),
             JsonError::TrailingData(pos) => write!(f, "trailing data at position {}", pos),
+            JsonError::MissingField(name) => {
+                write!(f, "missing or invalid required field '{}'", name)
+            }
         }
     }
 }
@@ -383,29 +393,74 @@ impl<'a> Parser<'a> {
     fn parse_string(&mut self) -> Result<String, JsonError> {
         self.expect(b'"')?;
         let mut s = String::new();
+        // Start of the current run of unescaped bytes. The input came from a
+        // &str, so any run delimited by ASCII bytes ('"' or '\\') is valid
+        // UTF-8 and can be copied wholesale — multi-byte sequences are never
+        // split because their continuation bytes are all >= 0x80.
+        let mut run_start = self.pos;
         loop {
             match self.next_byte() {
                 None => return Err(JsonError::UnexpectedEnd),
-                Some(b'"') => return Ok(s),
+                Some(b'"') => {
+                    self.push_run(&mut s, run_start, self.pos - 1);
+                    return Ok(s);
+                }
                 Some(b'\\') => {
+                    self.push_run(&mut s, run_start, self.pos - 1);
                     match self.next_byte() {
                         Some(b'"') => s.push('"'),
                         Some(b'\\') => s.push('\\'),
                         Some(b'/') => s.push('/'),
+                        Some(b'b') => s.push('\u{0008}'),
+                        Some(b'f') => s.push('\u{000C}'),
                         Some(b'n') => s.push('\n'),
                         Some(b'r') => s.push('\r'),
                         Some(b't') => s.push('\t'),
                         Some(b'u') => {
                             let cp = self.parse_hex4()?;
-                            if let Some(ch) = char::from_u32(cp) {
-                                s.push(ch);
-                            }
+                            let ch = match cp {
+                                // High surrogate: must be followed by \u + low
+                                // surrogate; combine into one code point.
+                                0xD800..=0xDBFF => {
+                                    if self.next_byte() != Some(b'\\')
+                                        || self.next_byte() != Some(b'u')
+                                    {
+                                        return Err(JsonError::InvalidEscape(self.pos));
+                                    }
+                                    let lo = self.parse_hex4()?;
+                                    if !(0xDC00..=0xDFFF).contains(&lo) {
+                                        return Err(JsonError::InvalidEscape(self.pos));
+                                    }
+                                    let combined =
+                                        0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                    char::from_u32(combined)
+                                        .ok_or(JsonError::InvalidEscape(self.pos))?
+                                }
+                                // Lone low surrogate is invalid.
+                                0xDC00..=0xDFFF => {
+                                    return Err(JsonError::InvalidEscape(self.pos))
+                                }
+                                _ => char::from_u32(cp)
+                                    .ok_or(JsonError::InvalidEscape(self.pos))?,
+                            };
+                            s.push(ch);
                         }
                         _ => return Err(JsonError::InvalidEscape(self.pos)),
                     }
+                    run_start = self.pos;
                 }
-                Some(b) => s.push(b as char),
+                Some(_) => {}
             }
+        }
+    }
+
+    /// Append input[start..end] (a run of unescaped bytes) to the output
+    /// string. Valid UTF-8 by construction — see parse_string.
+    fn push_run(&self, s: &mut String, start: usize, end: usize) {
+        if end > start {
+            // The unwrap is safe: the parser input is a &str and runs are
+            // delimited only at ASCII bytes.
+            s.push_str(core::str::from_utf8(&self.input[start..end]).unwrap_or(""));
         }
     }
 
@@ -605,5 +660,55 @@ mod tests {
         let s = to_json_compact(&val);
         let parsed = parse_json(&s).unwrap();
         assert_eq!(val, parsed);
+    }
+
+    #[test]
+    fn utf8_round_trip() {
+        let original = "héllo wörld — 你好 🎉";
+        let val = JsonValue::Str(original.into());
+        let s = to_json_compact(&val);
+        let parsed = parse_json(&s).unwrap();
+        assert_eq!(parsed.as_str(), Some(original));
+        // A second cycle must be stable (no compounding corruption).
+        let s2 = to_json_compact(&parsed);
+        assert_eq!(s, s2);
+    }
+
+    #[test]
+    fn utf8_raw_parse() {
+        let parsed = parse_json("\"héllo — 你好\"").unwrap();
+        assert_eq!(parsed.as_str(), Some("héllo — 你好"));
+    }
+
+    #[test]
+    fn surrogate_pair_escape() {
+        // Build the 12-char escape sequence 😀 — the standard
+        // JSON encoding of U+1F600 (grinning face) as a surrogate pair.
+        let input = format!("\"{}ud83d{}ude00\"", '\\', '\\');
+        let parsed = parse_json(&input).unwrap();
+        assert_eq!(parsed.as_str(), Some("\u{1F600}"));
+    }
+
+    #[test]
+    fn lone_surrogate_is_error() {
+        assert!(parse_json(r#""\ud83d""#).is_err());
+        assert!(parse_json(r#""\ude00""#).is_err());
+        assert!(parse_json(r#""\ud83dA""#).is_err());
+    }
+
+    #[test]
+    fn backspace_formfeed_escapes() {
+        let parsed = parse_json(r#""a\bb\fc""#).unwrap();
+        assert_eq!(parsed.as_str(), Some("a\u{0008}b\u{000C}c"));
+        // Round-trip through the serializer's \uXXXX form.
+        let val = JsonValue::Str("a\u{0008}b\u{000C}c".into());
+        let s = to_json_compact(&val);
+        assert_eq!(parse_json(&s).unwrap(), val);
+    }
+
+    #[test]
+    fn non_finite_numbers_serialize_as_null() {
+        assert_eq!(to_json_compact(&JsonValue::Number(f64::NAN)), "null");
+        assert_eq!(to_json_compact(&JsonValue::Number(f64::INFINITY)), "null");
     }
 }

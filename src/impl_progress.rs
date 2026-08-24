@@ -67,7 +67,9 @@ impl InMemoryProgressTracker {
                 failed: r.failed,
                 skipped: r.skipped,
                 running: r.running,
-                percent_complete: if r.total > 0 {
+                percent_complete: if r.finished {
+                    100.0
+                } else if r.total > 0 {
                     (r.completed as f64 / r.total as f64) * 100.0
                 } else {
                     0.0
@@ -126,7 +128,12 @@ impl ProgressTracker for InMemoryProgressTracker {
             failed: state.failed,
             skipped: state.skipped,
             running: state.running,
-            percent_complete: if state.total > 0 {
+            // Trait contract: after finish_run, progress reports 100%.
+            // The per-status counts stay truthful even if fewer results
+            // arrived than expected.
+            percent_complete: if state.finished {
+                100.0
+            } else if state.total > 0 {
                 (state.completed as f64 / state.total as f64) * 100.0
             } else {
                 0.0
@@ -180,6 +187,21 @@ mod tests {
         assert_eq!(prog.passed, 1);
         assert_eq!(prog.total, 3);
         assert!((prog.percent_complete - 33.333).abs() < 1.0);
+    }
+
+    #[test]
+    fn finish_forces_hundred_percent() {
+        // Trait contract: after finish_run, get_progress shows 100% even if
+        // fewer results arrived than expected.
+        let mut tracker = InMemoryProgressTracker::new();
+        tracker.start_run("run1".into(), 2);
+        tracker.test_completed("run1", &result("t1", TestStatus::Passed));
+        tracker.finish_run("run1");
+        let prog = tracker.get_progress("run1").unwrap();
+        assert_eq!(prog.percent_complete, 100.0);
+        // Counts stay truthful.
+        assert_eq!(prog.completed, 1);
+        assert_eq!(prog.total, 2);
     }
 
     #[test]

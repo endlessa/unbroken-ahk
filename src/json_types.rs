@@ -33,8 +33,16 @@ impl ToJson for TestDefinition {
 
 impl FromJson for TestDefinition {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
-        let id = value.get_str("id").unwrap_or("").to_string();
-        let name = value.get_str("name").unwrap_or("").to_string();
+        // id and name are the test's identity — a missing, mistyped, or empty
+        // value must be a load error, not a silent ghost entry.
+        let id = match value.get_str("id") {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return Err(JsonError::MissingField("id".into())),
+        };
+        let name = match value.get_str("name") {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return Err(JsonError::MissingField("name".into())),
+        };
         let tags = value
             .get("tags")
             .and_then(|v| v.as_array())
@@ -142,11 +150,18 @@ impl ToJson for RunConfig {
 
 impl FromJson for RunConfig {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
-        let run_all = value.get_bool("run_all").unwrap_or(true);
         let include_ids = parse_string_array(value.get("include_ids"));
         let include_tags = parse_string_array(value.get("include_tags"));
         let exclude_tags = parse_string_array(value.get("exclude_tags"));
         let name_pattern = value.get_str("name_pattern").map(String::from);
+        // run_all defaults to true only when NO filters were supplied.
+        // A caller passing filters without an explicit run_all means
+        // "run the filtered set", never "run everything".
+        let has_filters = !include_ids.is_empty()
+            || !include_tags.is_empty()
+            || !exclude_tags.is_empty()
+            || name_pattern.is_some();
+        let run_all = value.get_bool("run_all").unwrap_or(!has_filters);
         let fail_fast = value.get_bool("fail_fast").unwrap_or(false);
         let timeout_ms = value.get_u64("timeout_ms");
         let execution_model = value
@@ -354,22 +369,23 @@ impl ToJson for DiscoveryResult {
 
 impl ToJson for DiscoverySummary {
     fn to_json(&self) -> JsonValue {
-        let tags = JsonValue::Array(
-            self.tags.iter().map(|(t, c)| {
-                obj(vec![("tag", str_val(t)), ("count", JsonValue::Number(*c as f64))])
-            }).collect(),
-        );
-        let groups = JsonValue::Array(
-            self.groups.iter().map(|(g, c)| {
-                obj(vec![("group", str_val(g)), ("count", JsonValue::Number(*c as f64))])
-            }).collect(),
-        );
         obj(vec![
             ("total_tests", JsonValue::Number(self.total_tests as f64)),
-            ("tags", tags),
-            ("groups", groups),
+            ("tags", counts_json("tag", &self.tags)),
+            ("groups", counts_json("group", &self.groups)),
         ])
     }
+}
+
+/// Serialize a (name, count) list as [{<key>: name, "count": n}, ...].
+/// Single source of truth for the tag/group count shape used by the
+/// summary, the MCP list tools, and the console commands.
+pub fn counts_json(key: &str, items: &[(String, usize)]) -> JsonValue {
+    JsonValue::Array(
+        items.iter().map(|(name, count)| {
+            obj(vec![(key, str_val(name)), ("count", JsonValue::Number(*count as f64))])
+        }).collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -381,4 +397,49 @@ fn parse_string_array(value: Option<&JsonValue>) -> Vec<String> {
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_config_filters_imply_run_all_false() {
+        // Filters without an explicit run_all must NOT default to run-everything.
+        let val = parse_json(r#"{"include_tags": ["fast"]}"#).unwrap();
+        let config = RunConfig::from_json(&val).unwrap();
+        assert!(!config.run_all);
+        assert_eq!(config.include_tags, vec!["fast".to_string()]);
+
+        let val = parse_json(r#"{"exclude_tags": ["slow"]}"#).unwrap();
+        let config = RunConfig::from_json(&val).unwrap();
+        assert!(!config.run_all);
+
+        let val = parse_json(r#"{"name_pattern": "auth_*"}"#).unwrap();
+        let config = RunConfig::from_json(&val).unwrap();
+        assert!(!config.run_all);
+    }
+
+    #[test]
+    fn run_config_no_filters_defaults_run_all() {
+        let val = parse_json("{}").unwrap();
+        let config = RunConfig::from_json(&val).unwrap();
+        assert!(config.run_all);
+    }
+
+    #[test]
+    fn run_config_explicit_run_all_wins() {
+        let val = parse_json(r#"{"run_all": true, "include_tags": ["fast"]}"#).unwrap();
+        let config = RunConfig::from_json(&val).unwrap();
+        assert!(config.run_all);
+    }
+
+    #[test]
+    fn test_definition_requires_id_and_name() {
+        assert!(TestDefinition::from_json(&parse_json(r#"{"name": "x"}"#).unwrap()).is_err());
+        assert!(TestDefinition::from_json(&parse_json(r#"{"id": "x"}"#).unwrap()).is_err());
+        assert!(TestDefinition::from_json(&parse_json(r#"{"id": "", "name": "x"}"#).unwrap()).is_err());
+        assert!(TestDefinition::from_json(&parse_json(r#"{"id": 7, "name": "x"}"#).unwrap()).is_err());
+        assert!(TestDefinition::from_json(&parse_json(r#"{"id": "t", "name": "x"}"#).unwrap()).is_ok());
+    }
 }

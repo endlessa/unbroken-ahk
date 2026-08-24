@@ -66,4 +66,6 @@ pub enum ManagerError {
     NoTestsMatched,
     /// A test registration failed.
     RegistrationFailed(String),
+    /// The configuration requests something this build cannot do.
+    UnsupportedConfig(String),
 }
