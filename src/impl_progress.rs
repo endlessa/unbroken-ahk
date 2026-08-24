@@ -11,10 +11,13 @@ struct RunState {
     completed: u32,
     passed: u32,
     failed: u32,
+    errored: u32,
     skipped: u32,
     running: u32,
     started_ms: u64,
-    finished: bool,
+    /// Set by finish_run so elapsed_ms freezes at the run's duration
+    /// instead of growing forever after completion.
+    finished_ms: Option<u64>,
 }
 
 /// In-memory progress tracker that can be serialized to JSON.
@@ -65,16 +68,21 @@ impl InMemoryProgressTracker {
             completed: state.completed,
             passed: state.passed,
             failed: state.failed,
+            errored: state.errored,
             skipped: state.skipped,
             running: state.running,
-            percent_complete: if state.finished {
+            percent_complete: if state.finished_ms.is_some() {
                 100.0
             } else if state.total > 0 {
                 (state.completed as f64 / state.total as f64) * 100.0
             } else {
                 0.0
             },
-            elapsed_ms: self.now().saturating_sub(state.started_ms),
+            // Frozen at finish; live while running.
+            elapsed_ms: state
+                .finished_ms
+                .unwrap_or_else(|| self.now())
+                .saturating_sub(state.started_ms),
         }
     }
 
@@ -94,10 +102,11 @@ impl ProgressTracker for InMemoryProgressTracker {
             completed: 0,
             passed: 0,
             failed: 0,
+            errored: 0,
             skipped: 0,
             running: 0,
             started_ms: self.now(),
-            finished: false,
+            finished_ms: None,
         });
     }
 
@@ -116,7 +125,9 @@ impl ProgressTracker for InMemoryProgressTracker {
             match result.status {
                 TestStatus::Passed => state.passed += 1,
                 TestStatus::Failed => state.failed += 1,
-                TestStatus::Error => state.failed += 1,
+                // Tracked separately so progress and final results agree
+                // on failed-vs-errored counts.
+                TestStatus::Error => state.errored += 1,
                 TestStatus::Skipped => state.skipped += 1,
             }
         }
@@ -127,8 +138,11 @@ impl ProgressTracker for InMemoryProgressTracker {
     }
 
     fn finish_run(&mut self, run_id: &str) {
+        let now = self.now();
         if let Some(state) = self.find_mut(run_id) {
-            state.finished = true;
+            if state.finished_ms.is_none() {
+                state.finished_ms = Some(now.max(state.started_ms));
+            }
             state.running = 0;
         }
     }
@@ -136,7 +150,7 @@ impl ProgressTracker for InMemoryProgressTracker {
     fn active_runs(&self) -> Vec<RunId> {
         self.runs
             .iter()
-            .filter(|r| !r.finished)
+            .filter(|r| r.finished_ms.is_none())
             .map(|r| r.run_id.clone())
             .collect()
     }
@@ -171,6 +185,38 @@ mod tests {
         assert_eq!(prog.passed, 1);
         assert_eq!(prog.total, 3);
         assert!((prog.percent_complete - 33.333).abs() < 1.0);
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FAKE_NOW: AtomicU64 = AtomicU64::new(0);
+    fn fake_clock() -> u64 {
+        FAKE_NOW.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn elapsed_freezes_when_run_finishes() {
+        let mut tracker = InMemoryProgressTracker::new().with_clock(fake_clock);
+        FAKE_NOW.store(1_000, Ordering::Relaxed);
+        tracker.start_run("run1".into(), 1);
+        tracker.test_completed("run1", &result("t1", TestStatus::Passed));
+        FAKE_NOW.store(1_500, Ordering::Relaxed);
+        tracker.finish_run("run1");
+        // Long after the run finished, elapsed reports the run's duration,
+        // not the age of the run.
+        FAKE_NOW.store(9_999_999, Ordering::Relaxed);
+        let prog = tracker.get_progress("run1").unwrap();
+        assert_eq!(prog.elapsed_ms, 500);
+    }
+
+    #[test]
+    fn error_status_counted_separately_from_failed() {
+        let mut tracker = InMemoryProgressTracker::new();
+        tracker.start_run("run1".into(), 2);
+        tracker.test_completed("run1", &result("t1", TestStatus::Failed));
+        tracker.test_completed("run1", &result("t2", TestStatus::Error));
+        let prog = tracker.get_progress("run1").unwrap();
+        assert_eq!(prog.failed, 1);
+        assert_eq!(prog.errored, 1);
     }
 
     #[test]

@@ -96,38 +96,31 @@ impl PlatformManager {
     /// malformed; an Err reports what was skipped or corrupt, after
     /// loading everything that could be loaded.
     pub fn load_from_storage(&mut self) -> Result<(), String> {
-        match storage::load_registry(&self.storage) {
-            Ok((tests, mut failures)) => {
-                for test in tests {
-                    // Already present in memory (typically re-registered by
-                    // the embedder before loading) — not an error.
-                    if self.registry.get(&test.id).is_some() {
-                        continue;
-                    }
-                    let id = test.id.clone();
-                    if let Err(e) = self.registry.register(test) {
-                        failures.push(format!("{}: {:?}", id, e));
-                    }
-                }
-                if failures.is_empty() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "loaded registry with {} problem entr{}: {}",
-                        failures.len(),
-                        if failures.len() == 1 { "y" } else { "ies" },
-                        failures.join("; ")
-                    ))
-                }
+        // No file yet (first launch, or WASM) is not an error.
+        if !storage::registry_exists(&self.storage) {
+            return Ok(());
+        }
+        let (tests, mut failures) = storage::load_registry(&self.storage)?;
+        for test in tests {
+            // Already present in memory (typically re-registered by
+            // the embedder before loading) — not an error.
+            if self.registry.get(&test.id).is_some() {
+                continue;
             }
-            Err(e) => {
-                // If no file exists yet, that's fine
-                if e.contains("No such file") || e.contains("not found") {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
+            let id = test.id.clone();
+            if let Err(e) = self.registry.register(test) {
+                failures.push(format!("{}: {:?}", id, e));
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "loaded registry with {} problem entr{}: {}",
+                failures.len(),
+                if failures.len() == 1 { "y" } else { "ies" },
+                failures.join("; ")
+            ))
         }
     }
 
@@ -339,8 +332,8 @@ mod tests {
 
     #[test]
     fn full_lifecycle() {
-        let dir = "/tmp/unbroken-test-lifecycle";
-        let mut mgr = PlatformManager::new(dir);
+        let dir = crate::test_util::temp_storage_dir("mgr-lifecycle");
+        let mut mgr = PlatformManager::new(&dir);
 
         // Register tests
         mgr.register_runnable(
@@ -387,14 +380,13 @@ mod tests {
         assert!(content.contains("\"test_id\": \"t1\""));
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn definition_only_tests_error_instead_of_vanishing() {
-        let dir = "/tmp/unbroken-test-ghost";
-        let _ = std::fs::remove_dir_all(dir);
-        let mut mgr = PlatformManager::new(dir);
+        let dir = crate::test_util::temp_storage_dir("mgr-ghost");
+        let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
             TestDefinition {
                 id: "t1".into(),
@@ -432,7 +424,7 @@ mod tests {
         assert_eq!(prog.percent_complete, 100.0);
         assert!(mgr.active_runs().is_empty());
 
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -440,8 +432,7 @@ mod tests {
         // The normal restart sequence: register runnables (which persists
         // their definitions), then load_from_storage. The stored duplicates
         // must be skipped silently, not reported as failures.
-        let dir = "/tmp/unbroken-test-restart";
-        let _ = std::fs::remove_dir_all(dir);
+        let dir = crate::test_util::temp_storage_dir("mgr-restart");
 
         let def = TestDefinition {
             id: "t1".into(),
@@ -453,23 +444,22 @@ mod tests {
         };
 
         // Session 1 persists the definition.
-        let mut mgr1 = PlatformManager::new(dir);
+        let mut mgr1 = PlatformManager::new(&dir);
         mgr1.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
 
         // Session 2 re-registers, then loads — must succeed.
-        let mut mgr2 = PlatformManager::new(dir);
+        let mut mgr2 = PlatformManager::new(&dir);
         mgr2.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
         assert!(mgr2.load_from_storage().is_ok());
         assert_eq!(mgr2.summary().total_tests, 1);
 
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn corrupt_registry_entry_does_not_discard_the_rest() {
-        let dir = "/tmp/unbroken-test-corrupt";
-        let _ = std::fs::remove_dir_all(dir);
-        std::fs::create_dir_all(dir).unwrap();
+        let dir = crate::test_util::temp_storage_dir("mgr-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
         // Two valid entries around one with a missing id.
         std::fs::write(
             format!("{}/registry.json", dir),
@@ -480,7 +470,7 @@ mod tests {
             ]"#,
         ).unwrap();
 
-        let mut mgr = PlatformManager::new(dir);
+        let mut mgr = PlatformManager::new(&dir);
         let result = mgr.load_from_storage();
         // The corrupt entry is reported...
         assert!(result.is_err());
@@ -488,13 +478,12 @@ mod tests {
         // ...but both valid definitions loaded.
         assert_eq!(mgr.summary().total_tests, 2);
 
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn run_counter_survives_restart() {
-        let dir = "/tmp/unbroken-test-counter";
-        let _ = std::fs::remove_dir_all(dir);
+        let dir = crate::test_util::temp_storage_dir("mgr-counter");
 
         let def = TestDefinition {
             id: "t1".into(),
@@ -505,13 +494,13 @@ mod tests {
             metadata: vec![],
         };
 
-        let mut mgr1 = PlatformManager::new(dir);
+        let mut mgr1 = PlatformManager::new(&dir);
         mgr1.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
         let first = mgr1.start_run(RunConfig::default()).unwrap();
         assert_eq!(first, "run_0001");
 
         // A fresh manager over the same storage must not reuse run_0001.
-        let mut mgr2 = PlatformManager::new(dir);
+        let mut mgr2 = PlatformManager::new(&dir);
         mgr2.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
         let second = mgr2.start_run(RunConfig::default()).unwrap();
         assert_eq!(second, "run_0002");
@@ -519,14 +508,13 @@ mod tests {
         assert!(std::fs::metadata(format!("{}/runs/run_0001.json", dir)).is_ok());
         assert!(std::fs::metadata(format!("{}/runs/run_0002.json", dir)).is_ok());
 
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn timestamps_are_real_on_native() {
-        let dir = "/tmp/unbroken-test-clock";
-        let _ = std::fs::remove_dir_all(dir);
-        let mut mgr = PlatformManager::new(dir);
+        let dir = crate::test_util::temp_storage_dir("mgr-clock");
+        let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
             TestDefinition {
                 id: "t1".into(),
@@ -543,14 +531,13 @@ mod tests {
         // Sanity floor: well past 2020-01-01 in epoch ms.
         assert!(summary.started_at > 1_577_836_800_000);
         assert!(summary.completed_at >= summary.started_at);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn parallel_execution_model_is_rejected() {
-        let dir = "/tmp/unbroken-test-parallel";
-        let _ = std::fs::remove_dir_all(dir);
-        let mut mgr = PlatformManager::new(dir);
+        let dir = crate::test_util::temp_storage_dir("mgr-parallel");
+        let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
             TestDefinition {
                 id: "t1".into(),
@@ -572,12 +559,13 @@ mod tests {
             }
             other => panic!("expected UnsupportedConfig, got {:?}", other.map(|_| ())),
         }
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn run_with_filter() {
-        let mut mgr = PlatformManager::new("/tmp/unbroken-test-filter");
+        let dir = crate::test_util::temp_storage_dir("mgr-filter");
+        let mut mgr = PlatformManager::new(&dir);
 
         mgr.register_runnable(
             TestDefinition {
@@ -613,6 +601,6 @@ mod tests {
         assert_eq!(results.total, 1);
         assert_eq!(results.results[0].test_id, "t1");
 
-        let _ = std::fs::remove_dir_all("/tmp/unbroken-test-filter");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

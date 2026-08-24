@@ -23,3 +23,7 @@ pub mod impl_reporter;
 pub mod impl_manager;
 pub mod console;
 pub mod mcp;
+
+// -- Test-only helpers --
+#[cfg(test)]
+pub mod test_util;

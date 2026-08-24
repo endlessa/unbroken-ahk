@@ -44,7 +44,9 @@ pub struct TestDefinition {
 /// What the caller sends to request a test run.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    /// If true, execute every registered test. Filters are ignored.
+    /// If true, start from every registered test. Include filters are
+    /// ignored, but exclude_tags still applies — "run everything except
+    /// the slow tag" honors the exclusion.
     pub run_all: bool,
     /// Run only these specific test IDs.
     pub include_ids: Vec<TestId>,
@@ -129,6 +131,7 @@ pub struct RunProgress {
     pub completed: u32,
     pub passed: u32,
     pub failed: u32,
+    pub errored: u32,
     pub skipped: u32,
     pub running: u32,
     pub percent_complete: f64,

@@ -34,7 +34,9 @@ impl ToJson for TestDefinition {
 impl FromJson for TestDefinition {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
         // id and name are the test's identity — a missing, mistyped, or empty
-        // value must be a load error, not a silent ghost entry.
+        // value must be a load error, not a silent ghost entry. The remaining
+        // fields are equally strict when present: silently-dropped tags or
+        // metadata are invisible corruption.
         let id = match value.get_str("id") {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return Err(JsonError::MissingField("id".into())),
@@ -43,22 +45,26 @@ impl FromJson for TestDefinition {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return Err(JsonError::MissingField("name".into())),
         };
-        let tags = value
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        let group = value.get_str("group").map(String::from);
-        let description = value.get_str("description").map(String::from);
-        let metadata = value
-            .get("metadata")
-            .and_then(|v| v.as_object())
-            .map(|pairs| {
-                pairs.iter().filter_map(|(k, v)| {
-                    v.as_str().map(|s| (k.clone(), s.to_string()))
-                }).collect()
-            })
-            .unwrap_or_default();
+        let tags = strict_string_array(value, "tags")?;
+        let group = strict_opt_string(value, "group")?;
+        let description = strict_opt_string(value, "description")?;
+        let metadata = match value.get("metadata") {
+            None | Some(JsonValue::Null) => Vec::new(),
+            Some(JsonValue::Object(pairs)) => pairs
+                .iter()
+                .map(|(k, v)| {
+                    v.as_str().map(|s| (k.clone(), s.to_string())).ok_or_else(|| {
+                        JsonError::InvalidField(format!("metadata.{}", k), "a string".into())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(JsonError::InvalidField(
+                    "metadata".into(),
+                    "an object with string values".into(),
+                ))
+            }
+        };
         Ok(TestDefinition { id, name, tags, group, description, metadata })
     }
 }
@@ -108,6 +114,7 @@ impl ToJson for ExecutionModel {
 
 impl FromJson for ExecutionModel {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
+        reject_unknown_keys(value, "execution_model", &["type", "max_concurrency"])?;
         match value.get("type") {
             None | Some(JsonValue::Null) => Ok(ExecutionModel::Sequential),
             Some(JsonValue::Str(s)) if s == "sequential" => Ok(ExecutionModel::Sequential),
@@ -170,9 +177,24 @@ impl ToJson for RunConfig {
 
 impl FromJson for RunConfig {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
-        // Every field is strictly typed when present: a mistyped filter
-        // (string instead of array, number in a tag list...) must be an
-        // error, never a silently-empty filter that runs the whole suite.
+        // Every field is strictly typed when present, and unknown keys are
+        // rejected: a mistyped filter — wrong type OR wrong name ("tags"
+        // instead of "include_tags") — must be an error, never a
+        // silently-empty filter that runs the whole suite.
+        reject_unknown_keys(
+            value,
+            "run config",
+            &[
+                "run_all",
+                "include_ids",
+                "include_tags",
+                "exclude_tags",
+                "name_pattern",
+                "fail_fast",
+                "timeout_ms",
+                "execution_model",
+            ],
+        )?;
         let include_ids = strict_string_array(value, "include_ids")?;
         let include_tags = strict_string_array(value, "include_tags")?;
         let exclude_tags = strict_string_array(value, "exclude_tags")?;
@@ -187,11 +209,18 @@ impl FromJson for RunConfig {
         let run_all = strict_opt_bool(value, "run_all")?.unwrap_or(!has_filters);
         let fail_fast = strict_opt_bool(value, "fail_fast")?.unwrap_or(false);
         let timeout_ms = strict_opt_u64(value, "timeout_ms")?;
-        let execution_model = value
-            .get("execution_model")
-            .map(|v| ExecutionModel::from_json(v))
-            .transpose()?
-            .unwrap_or(ExecutionModel::Sequential);
+        let execution_model = match value.get("execution_model") {
+            None | Some(JsonValue::Null) => ExecutionModel::Sequential,
+            Some(obj @ JsonValue::Object(_)) => ExecutionModel::from_json(obj)?,
+            // A bare string like "parallel" must not silently become
+            // Sequential — the caller's intent would be ignored.
+            Some(_) => {
+                return Err(JsonError::InvalidField(
+                    "execution_model".into(),
+                    "an object like {\"type\": \"sequential\"}".into(),
+                ))
+            }
+        };
         Ok(RunConfig {
             run_all,
             include_ids,
@@ -258,6 +287,7 @@ impl ToJson for RunProgress {
             ("completed", JsonValue::Number(self.completed as f64)),
             ("passed", JsonValue::Number(self.passed as f64)),
             ("failed", JsonValue::Number(self.failed as f64)),
+            ("errored", JsonValue::Number(self.errored as f64)),
             ("skipped", JsonValue::Number(self.skipped as f64)),
             ("running", JsonValue::Number(self.running as f64)),
             ("percent_complete", JsonValue::Number(self.percent_complete)),
@@ -274,6 +304,7 @@ impl FromJson for RunProgress {
             completed: value.get_u32("completed").unwrap_or(0),
             passed: value.get_u32("passed").unwrap_or(0),
             failed: value.get_u32("failed").unwrap_or(0),
+            errored: value.get_u32("errored").unwrap_or(0),
             skipped: value.get_u32("skipped").unwrap_or(0),
             running: value.get_u32("running").unwrap_or(0),
             percent_complete: value.get("percent_complete").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -361,6 +392,11 @@ impl ToJson for DiscoveryQuery {
 
 impl FromJson for DiscoveryQuery {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
+        reject_unknown_keys(
+            value,
+            "discovery query",
+            &["name_pattern", "tags", "group", "limit", "offset"],
+        )?;
         Ok(DiscoveryQuery {
             name_pattern: strict_opt_string(value, "name_pattern")?,
             tags: strict_string_array(value, "tags")?,
@@ -415,6 +451,33 @@ pub fn counts_json(key: &str, items: &[(String, usize)]) -> JsonValue {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Reject caller-supplied input that is not an object, or that carries
+/// keys outside the known set — a misspelled key ("tags" for
+/// "include_tags") must error, never act as "no filter".
+fn reject_unknown_keys(
+    value: &JsonValue,
+    what: &str,
+    known: &[&str],
+) -> Result<(), JsonError> {
+    match value {
+        JsonValue::Object(pairs) => {
+            for (key, _) in pairs {
+                if !known.contains(&key.as_str()) {
+                    return Err(JsonError::InvalidField(
+                        key.clone(),
+                        format!("no such {} parameter; valid keys: {}", what, known.join(", ")),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(JsonError::InvalidField(
+            what.into(),
+            "a JSON object".into(),
+        )),
+    }
+}
+
 /// Strictly-typed optional field accessors. An absent field (or explicit
 /// null, the JSON convention for "not set") yields the default; a present
 /// field of the wrong type is an error, never a silent fallback.
@@ -456,10 +519,12 @@ fn strict_opt_bool(value: &JsonValue, field: &str) -> Result<Option<bool>, JsonE
 fn strict_opt_u64(value: &JsonValue, field: &str) -> Result<Option<u64>, JsonError> {
     match value.get(field) {
         None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Number(n)) if *n >= 0.0 && n.is_finite() => Ok(Some(*n as u64)),
+        Some(JsonValue::Number(n)) if *n >= 0.0 && n.is_finite() && n.fract() == 0.0 => {
+            Ok(Some(*n as u64))
+        }
         Some(_) => Err(JsonError::InvalidField(
             field.into(),
-            "a non-negative number".into(),
+            "a non-negative integer".into(),
         )),
     }
 }
@@ -516,6 +581,48 @@ mod tests {
             let val = parse_json(bad).unwrap();
             assert!(RunConfig::from_json(&val).is_err(), "should reject: {}", bad);
         }
+    }
+
+    #[test]
+    fn run_config_unknown_keys_error() {
+        // A misspelled key must error, never act as "no filter".
+        for bad in [
+            r#"{"tags": ["fast"]}"#,
+            r#"{"include_tag": ["fast"]}"#,
+            r#"{"ids": ["t1"]}"#,
+        ] {
+            let val = parse_json(bad).unwrap();
+            let err = RunConfig::from_json(&val).unwrap_err();
+            assert!(format!("{}", err).contains("valid keys"), "should reject: {}", bad);
+        }
+        // Non-object params are rejected too.
+        let val = parse_json(r#"["fast"]"#).unwrap();
+        assert!(RunConfig::from_json(&val).is_err());
+    }
+
+    #[test]
+    fn run_config_non_object_execution_model_errors() {
+        let val = parse_json(r#"{"execution_model": "parallel"}"#).unwrap();
+        assert!(RunConfig::from_json(&val).is_err());
+    }
+
+    #[test]
+    fn run_config_fractional_timeout_errors() {
+        let val = parse_json(r#"{"timeout_ms": 1.9}"#).unwrap();
+        assert!(RunConfig::from_json(&val).is_err());
+    }
+
+    #[test]
+    fn test_definition_mistyped_tags_and_metadata_error() {
+        assert!(TestDefinition::from_json(
+            &parse_json(r#"{"id": "t", "name": "x", "tags": ["fast", 5]}"#).unwrap()
+        ).is_err());
+        assert!(TestDefinition::from_json(
+            &parse_json(r#"{"id": "t", "name": "x", "metadata": {"k": 5}}"#).unwrap()
+        ).is_err());
+        assert!(TestDefinition::from_json(
+            &parse_json(r#"{"id": "t", "name": "x", "group": 3}"#).unwrap()
+        ).is_err());
     }
 
     #[test]

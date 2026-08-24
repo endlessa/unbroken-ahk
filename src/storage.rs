@@ -113,6 +113,20 @@ pub fn max_existing_run_number(_paths: &StoragePaths) -> u64 {
     0
 }
 
+/// Whether a persisted registry file exists. Typed check instead of
+/// string-matching error text (which breaks on Windows locale messages
+/// and the WASM stub).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn registry_exists(paths: &StoragePaths) -> bool {
+    std::fs::metadata(paths.registry_path()).is_ok()
+}
+
+/// WASM stub: no persisted registry.
+#[cfg(target_arch = "wasm32")]
+pub fn registry_exists(_paths: &StoragePaths) -> bool {
+    false
+}
+
 /// Save the test registry to JSON.
 pub fn save_registry(paths: &StoragePaths, tests: &[&TestDefinition]) -> Result<(), String> {
     let arr = JsonValue::Array(tests.iter().map(|t| t.to_json()).collect());

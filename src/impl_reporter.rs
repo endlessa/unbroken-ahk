@@ -92,13 +92,14 @@ fn format_progress_text(p: &RunProgress) -> String {
         .collect();
 
     format!(
-        "[{}] {:.1}% ({}/{}) | P:{} F:{} S:{} | {}ms elapsed",
+        "[{}] {:.1}% ({}/{}) | P:{} F:{} E:{} S:{} | {}ms elapsed",
         bar,
         p.percent_complete,
         p.completed,
         p.total,
         p.passed,
         p.failed,
+        p.errored,
         p.skipped,
         p.elapsed_ms,
     )
@@ -118,6 +119,7 @@ mod tests {
             completed: 5,
             passed: 4,
             failed: 1,
+            errored: 0,
             skipped: 0,
             running: 1,
             percent_complete: 50.0,

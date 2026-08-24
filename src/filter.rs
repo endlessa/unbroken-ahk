@@ -27,16 +27,11 @@ pub trait TestFilter {
 
 /// Case-insensitive name matching shared by discovery search and run
 /// filtering, so `discover <pattern>` and `run --pattern <pattern>`
-/// always select the same tests.
+/// always select the same tests. Takes an already-lowercased pattern so
+/// callers matching one pattern against many names lowercase it once.
 ///
 /// Supports simple globs: "auth_*" (prefix), "*_ping" (suffix),
 /// otherwise substring match.
-pub fn name_matches(pattern: &str, name: &str) -> bool {
-    name_matches_lower(&pattern.to_lowercase(), name)
-}
-
-/// As name_matches, but takes an already-lowercased pattern so callers
-/// matching one pattern against many names can lowercase it once.
 pub fn name_matches_lower(pattern_lower: &str, name: &str) -> bool {
     let name = name.to_lowercase();
     if let Some(prefix) = pattern_lower.strip_suffix('*') {

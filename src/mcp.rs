@@ -142,7 +142,7 @@ pub fn list_tools() -> Vec<ToolDescriptor> {
             parameters: obj(vec![
                 ("run_all", obj(vec![
                     ("type", str_val("boolean")),
-                    ("description", str_val("Run every registered test (default true if no filters)")),
+                    ("description", str_val("Start from every registered test (exclude_tags still applies; include filters are ignored). Defaults to true only when no filters are given.")),
                     ("required", JsonValue::Bool(false)),
                 ])),
                 ("include_ids", obj(vec![
@@ -384,19 +384,8 @@ mod tests {
         }
     }
 
-    /// Fresh, hermetic storage dir per call: removed at start so no state
-    /// leaks between cargo-test invocations, and unique per call so
-    /// parallel tests never share a run counter.
-    fn temp_dir() -> String {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let dir = format!("/tmp/unbroken-mcp-test-{}", SEQ.fetch_add(1, Ordering::Relaxed));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
     fn setup_manager() -> PlatformManager {
-        let mut mgr = PlatformManager::new(&temp_dir());
+        let mut mgr = PlatformManager::new(&crate::test_util::temp_storage_dir("mcp-test"));
         mgr.register_runnable(
             TestDefinition {
                 id: "t1".into(),
@@ -759,6 +748,27 @@ mod tests {
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
         assert!(val.get_str("error").unwrap().contains("include_ids"));
+    }
+
+    #[test]
+    fn run_unknown_filter_key_errors() {
+        // "tags" is test_discover's field name, not test_run's — an easy
+        // agent mistake that must error, never run the whole suite.
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"tags": ["fast"]}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("valid keys"));
+    }
+
+    #[test]
+    fn run_all_with_exclude_honors_exclusion() {
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"run_all": true, "exclude_tags": ["slow"]}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(true));
+        let data = val.get("data").unwrap();
+        assert_eq!(data.get("total").and_then(|v| v.as_f64()), Some(2.0));
     }
 
     #[test]

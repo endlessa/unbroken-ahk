@@ -245,6 +245,7 @@ pub enum JsonError {
     TrailingData(usize),
     MissingField(String),
     InvalidField(String, String),
+    TooDeep(usize),
 }
 
 impl fmt::Display for JsonError {
@@ -263,13 +264,22 @@ impl fmt::Display for JsonError {
             JsonError::InvalidField(name, expected) => {
                 write!(f, "invalid field '{}': expected {}", name, expected)
             }
+            JsonError::TooDeep(pos) => {
+                write!(f, "nesting deeper than {} levels at position {}", MAX_DEPTH, pos)
+            }
         }
     }
 }
 
+/// Maximum container nesting depth. Recursion in the parser is bounded by
+/// this, so hostile or malformed input returns an error instead of
+/// overflowing the stack and killing the process.
+const MAX_DEPTH: usize = 128;
+
 struct Parser<'a> {
     input: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -277,6 +287,7 @@ impl<'a> Parser<'a> {
         Self {
             input: input.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -311,7 +322,11 @@ impl<'a> Parser<'a> {
 
     fn parse_value(&mut self) -> Result<JsonValue, JsonError> {
         self.skip_whitespace();
-        match self.peek() {
+        if self.depth >= MAX_DEPTH {
+            return Err(JsonError::TooDeep(self.pos));
+        }
+        self.depth += 1;
+        let result = match self.peek() {
             None => Err(JsonError::UnexpectedEnd),
             Some(b'"') => self.parse_string().map(JsonValue::Str),
             Some(b'{') => self.parse_object(),
@@ -321,7 +336,9 @@ impl<'a> Parser<'a> {
             Some(b'n') => self.parse_literal("null", JsonValue::Null),
             Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
             Some(b) => Err(JsonError::UnexpectedChar(self.pos, b as char)),
-        }
+        };
+        self.depth -= 1;
+        result
     }
 
     fn parse_string(&mut self) -> Result<String, JsonError> {
@@ -641,6 +658,19 @@ mod tests {
         let val = JsonValue::Str("a\u{0008}b\u{000C}c".into());
         let s = to_json_compact(&val);
         assert_eq!(parse_json(&s).unwrap(), val);
+    }
+
+    #[test]
+    fn deep_nesting_errors_instead_of_overflowing() {
+        // Hostile/malformed input must return an error, not crash the
+        // process with a stack overflow.
+        let deep = "[".repeat(200_000);
+        assert!(matches!(parse_json(&deep), Err(JsonError::TooDeep(_))));
+        let deep_obj = r#"{"a":"#.repeat(100_000) + "1";
+        assert!(matches!(parse_json(&deep_obj), Err(JsonError::TooDeep(_))));
+        // Reasonable nesting still parses.
+        let ok = "[".repeat(50) + &"]".repeat(50);
+        assert!(parse_json(&ok).is_ok());
     }
 
     #[test]

@@ -18,53 +18,64 @@ impl TestFilter for StandardFilter {
         tests: &[&'a TestDefinition],
         config: &RunConfig,
     ) -> Vec<&'a TestDefinition> {
-        if config.run_all {
-            return tests.to_vec();
-        }
+        let no_includes = config.include_ids.is_empty()
+            && config.include_tags.is_empty()
+            && config.name_pattern.is_none();
 
-        let mut candidates: Vec<&'a TestDefinition> = Vec::new();
-
-        // Step 1: Include by ID
-        if !config.include_ids.is_empty() {
-            for test in tests {
-                if config.include_ids.contains(&test.id) {
-                    candidates.push(test);
-                }
+        let mut candidates: Vec<&'a TestDefinition> = if config.run_all {
+            // run_all: start from every test. Include filters are ignored,
+            // but exclusions below STILL apply — "run everything except the
+            // destructive tag" must honor the exclusion.
+            tests.to_vec()
+        } else if no_includes {
+            if config.exclude_tags.is_empty() {
+                // Explicit run_all=false with no filters at all: the caller
+                // opted out of run-everything and selected nothing — an
+                // empty selection (NoTestsMatched upstream), not the whole
+                // suite.
+                return Vec::new();
             }
-        }
+            // Exclude-only config: start from everything, prune below.
+            tests.to_vec()
+        } else {
+            let mut candidates: Vec<&'a TestDefinition> = Vec::new();
 
-        // Step 2: Include by tags (additive — add tests matching ALL include_tags)
-        if !config.include_tags.is_empty() {
-            for test in tests {
-                if config.include_tags.iter().all(|tag| test.tags.contains(tag)) {
-                    if !candidates.iter().any(|c| c.id == test.id) {
+            // Step 1: Include by ID
+            if !config.include_ids.is_empty() {
+                for test in tests {
+                    if config.include_ids.contains(&test.id) {
                         candidates.push(test);
                     }
                 }
             }
-        }
 
-        // Step 3: Include by name pattern
-        if let Some(ref pattern) = config.name_pattern {
-            let pattern_lower = pattern.to_lowercase();
-            for test in tests {
-                if name_matches_lower(&pattern_lower, &test.name)
-                    && !candidates.iter().any(|c| c.id == test.id)
-                {
-                    candidates.push(test);
+            // Step 2: Include by tags (additive — add tests matching ALL include_tags)
+            if !config.include_tags.is_empty() {
+                for test in tests {
+                    if config.include_tags.iter().all(|tag| test.tags.contains(tag)) {
+                        if !candidates.iter().any(|c| c.id == test.id) {
+                            candidates.push(test);
+                        }
+                    }
                 }
             }
-        }
 
-        // If no include criteria were specified, start with everything
-        if config.include_ids.is_empty()
-            && config.include_tags.is_empty()
-            && config.name_pattern.is_none()
-        {
-            candidates = tests.to_vec();
-        }
+            // Step 3: Include by name pattern
+            if let Some(ref pattern) = config.name_pattern {
+                let pattern_lower = pattern.to_lowercase();
+                for test in tests {
+                    if name_matches_lower(&pattern_lower, &test.name)
+                        && !candidates.iter().any(|c| c.id == test.id)
+                    {
+                        candidates.push(test);
+                    }
+                }
+            }
 
-        // Step 4: Exclude by tags (remove tests matching ANY exclude tag)
+            candidates
+        };
+
+        // Exclude by tags — always applied, including under run_all.
         if !config.exclude_tags.is_empty() {
             candidates.retain(|test| {
                 !config.exclude_tags.iter().any(|tag| test.tags.contains(tag))
@@ -129,6 +140,32 @@ mod tests {
         };
         let result = StandardFilter::new().apply(&refs, &config);
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn run_all_still_honors_exclusions() {
+        let tests = vec![
+            td("a", "a", &["fast"]),
+            td("b", "b", &["slow"]),
+        ];
+        let refs: Vec<&TestDefinition> = tests.iter().collect();
+        let config = RunConfig {
+            run_all: true,
+            exclude_tags: vec!["slow".into()],
+            ..Default::default()
+        };
+        let result = StandardFilter::new().apply(&refs, &config);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "a");
+    }
+
+    #[test]
+    fn explicit_run_all_false_with_no_filters_selects_nothing() {
+        let tests = vec![td("a", "a", &[]), td("b", "b", &[])];
+        let refs: Vec<&TestDefinition> = tests.iter().collect();
+        let config = RunConfig { run_all: false, ..Default::default() };
+        let result = StandardFilter::new().apply(&refs, &config);
+        assert!(result.is_empty());
     }
 
     #[test]

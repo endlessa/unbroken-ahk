@@ -183,7 +183,7 @@
   "params": [],
   "semantics": "cube, sphere, cylinder and polyhedron are the only parametric 3D primitives. import() of STL/OFF/AMF/3MF (OBJ snapshot-only) and surface() heightmaps also act as leaf 3D geometry sources but are covered in the import/export and other-geometry-ops categories. A reimplementation must not add extra solids under unprefixed names, since user scripts may define modules named e.g. 'torus' and rely on the three-namespace/shadowing rules.",
   "edge_cases": [
-   "Long-removed legacy 3D sources import_stl()/import_off() and dxf_linear_extrude()/dxf_rotate_extrude() are ERRORS in 2021.01 (unknown module warning / removal error \u2014 VERIFY which); do not resurrect them.",
+   "dxf_linear_extrude()/dxf_rotate_extrude() are deprecated-but-functional aliases of the extrusions in 2021.01 (see their entry) \u2014 not part of the primitive set, and not errors.",
    "cube/sphere/cylinder/polyhedron can all be shadowed by user module definitions \u2014 VERIFY the precedence of user redefinitions of builtins before relying on it."
   ],
   "example": "cube(1); sphere(1); cylinder(1); polyhedron(points=[[0,0,0],[1,0,0],[0,1,0],[0,0,1]], faces=[[0,2,1],[0,1,3],[1,2,3],[0,3,2]]);",
@@ -1410,7 +1410,7 @@
   ],
   "semantics": "Parses the DXF (through the same limited-entity DXF reader used by import(): lines, polylines, arcs, circles, plus DIMENSION entities; results are cached per file/parameters), finds the DIMENSION entity matching name (and layer), and returns its measured value as a number, scaled by scale. The dimension TYPE matters: linear/aligned dimensions return a length; radius/diameter dimensions return that measure; rotated/ordinate types have their own extraction rules (VERIFY per-type formulas against the oracle \u2014 upstream computes the value from the dimension's definition points for some types rather than reading stored text). This is an expression-level FUNCTION (usable in assignments and arguments), not a module.",
   "edge_cases": [
-   "Still LIVE in 2021.01 with no deprecation warning (VERIFY absence of warning) even though the related dxf_linear_extrude/dxf_rotate_extrude modules are long removed and linear_extrude(file=) is deprecated \u2014 do not lump it in with removed legacy.",
+   "Part of the legacy DXF-era surface, but unlike dxf_linear_extrude()/dxf_rotate_extrude() (deprecated module aliases \u2014 see their entry), dxf_dim()/dxf_cross() are NOT deprecated in 2021.01: they remain the supported way to read dimension/cross values out of DXF files.",
    "Lookup failure (no such dimension/name/layer, or unreadable file): returns undef with a WARNING of approximately 'WARNING: Can't find dimension 'name' in 'file', layer 'layer'' (VERIFY exact text and whether file-open failure has a distinct message).",
    "VERIFY: dimensions with a text override in the DXF (user-typed measurement text) \u2014 believed upstream returns the GEOMETRIC value computed from definition points, ignoring the override text; pin this, it changes results on hand-edited drawings.",
    "VERIFY per-dimension-type behavior (linear, aligned, angular, radius, diameter, ordinate): which types are supported at all, and the returned unit/interpretation for angular dimensions (degrees expected).",
@@ -2088,7 +2088,7 @@
    "User definitions shadow builtins in both callable namespaces \u2014 VERIFY precedence for e.g. 'module cube()' and 'function sin()'; also VERIFY whether ANY builtins are un-shadowable.",
    "Inner-scope definitions shadow outer ones lexically; include<> merges definitions into the including scope (subject to duplicate-warn/last-wins), use<> populates only the two callable namespaces of the using file's top scope.",
    "Hoisting + lexical capture: a hoisted function reading a scope variable sees the slot-reordered final value, even if the call textually precedes the assignment.",
-   "Keywords (module, function, if, else, for, let, each, include, use, true, false, undef) cannot be identifiers in ANY namespace; builtin names (echo, assert, version, intersection_for, ...) are ordinary identifiers and shadowable \u2014 VERIFY the exact reserved list, especially assert/echo which gained expression forms."
+   "Keywords (module, function, if, else, for, let, each, echo, assert, include, use, true, false, undef) cannot be identifiers in ANY namespace \u2014 echo and assert joined the reserved set with their 2019.05 expression forms and are NOT shadowable in 2021.01; other builtin names (version, intersection_for, cube, sin, ...) are ordinary identifiers and shadowable."
   ],
   "example": "x = 1; function x(n) = n * 10; module x() sphere(1); echo(x, x(2)); x();",
   "since": "pre-2015.03",
@@ -2208,9 +2208,9 @@
   "signature": "\"text with \\\" \\\\ \\t \\n \\r escapes\"",
   "summary": "Double-quoted UTF-8 string literals with a small escape set.",
   "params": [],
-  "semantics": "Strings are immutable sequences of Unicode code points stored as UTF-8. Only double quotes delimit strings. Recognized escapes: \\\" \\\\ \\t \\n \\r. Arbitrary UTF-8 (including astral characters) may appear directly in source.",
+  "semantics": "Strings are immutable sequences of Unicode code points stored as UTF-8. Only double quotes delimit strings. Recognized escapes: \\\" \\\\ \\t \\n \\r, plus (since 2015.03) \\x## (two hex digits, one byte), \\u#### (4 hex digits) and \\U###### (6 hex digits) for Unicode code points. Arbitrary UTF-8 (including astral characters) may appear directly in source.",
   "edge_cases": [
-   "No \\u/\\x escapes in 2021.01 (VERIFY: \\u was discussed upstream; confirm 2021.01 lacks it).",
+   "Unicode/hex escapes \\x## (hex byte), \\u#### and \\U###### (code points) are supported since 2015.03. VERIFY: behavior for invalid hex digits and out-of-range \\U values \u2014 pin against oracle.",
    "VERIFY: unrecognized escape like \\q - believed to keep the character (or backslash+char); pin against oracle.",
    "No single-quoted strings; ' is a syntax error.",
    "Unterminated string at EOF is a parse error.",
@@ -2266,7 +2266,7 @@
   "signature": "// line   /* block */",
   "summary": "C-style comments; whitespace-insensitive token stream; identifier and keyword rules.",
   "params": [],
-  "semantics": "// comments run to end of line; /* */ block comments do NOT nest. Identifiers are [A-Za-z0-9_]+ not starting with a digit; the $ prefix creates special (dynamically scoped) variable names. Keywords: module, function, if, else, for, let, each, include, use, true, false, undef. echo, assert, intersection_for, etc. are builtin callables, not keywords.",
+  "semantics": "// comments run to end of line; /* */ block comments do NOT nest. Identifiers are [A-Za-z0-9_]+ not starting with a digit; the $ prefix creates special (dynamically scoped) variable names. Keywords: module, function, if, else, for, let, each, echo, assert, include, use, true, false, undef \u2014 echo and assert are lexer keywords since their 2019.05 expression forms ('echo = 5;' and 'module echo() ...' are parse errors), though both remain callable in statement position via a dedicated module-name grammar production (alongside for/let/each). intersection_for and other builtins are ordinary identifiers, not keywords.",
   "edge_cases": [
    "/* /* */ ends at the FIRST */ - non-nesting block comments.",
    "include <file> and use <file> use angle brackets with a raw path (spaces allowed inside); they are directives, not expressions.",
@@ -2376,11 +2376,11 @@
     "desc": "Number divisor."
    }
   ],
-  "semantics": "num/num is IEEE division. vector/num divides each element (recursive into nested vectors, so matrix/scalar works). Other shapes are undef with WARNING.",
+  "semantics": "num/num is IEEE division. vector/num divides each element, and num/vector divides the scalar by each element (both recursive into nested vectors, so matrix/scalar works and 10/[2,5] yields [5,2]). vector/vector and non-numeric shapes are undef with WARNING.",
   "edge_cases": [
    "1/0 -> inf, -1/0 -> -inf, each with 'WARNING: division by zero' (VERIFY exact text/format).",
    "0/0 -> nan with the same division-by-zero WARNING (VERIFY whether warning fires for 0/0).",
-   "scalar/vector: undef with WARNING (VERIFY - believed NOT supported, unlike vector/scalar).",
+   "scalar/vector IS supported elementwise: 10/[2,5] == [5,2], recursing into nested vectors; only vector/vector division (and non-numeric operands) is undef with WARNING.",
    "vector/vector: undef with WARNING (no elementwise divide).",
    "[1,2]/0 -> [inf, inf] plus warning(s) - VERIFY warning count (per element vs once).",
    "-0 results follow IEEE (1/-0 -> -inf)."
@@ -2767,7 +2767,7 @@
     "desc": "Angle in degrees (any magnitude; reduced mod 360)."
    }
   ],
-  "semantics": "Returns sin of the angle interpreted in degrees. OpenSCAD special-cases angles that reduce to multiples of 90 degrees so results are EXACT: sin(180)==0 (not 1.2e-16), sin(90)==1, sin(30)==0.5? (30 is not special-cased - only quadrant angles are exact; VERIFY whether 30/45 get special handling - believed only multiples of 90, plus 45-multiples for some builds).",
+  "semantics": "Returns sin of the angle interpreted in degrees. OpenSCAD special-cases angles that reduce to multiples of 90 degrees so results are EXACT: sin(180)==0 (not 1.2e-16), sin(90)==1, sin(30)==0.5 exactly \u2014 30, 45 and 60 are special-cased in every quadrant alongside the 0/90/180/270 folding (degree-exact trig, 2019.05+).",
   "edge_cases": [
    "DEGREES, not radians - the single most common porting error.",
    "Exact values not just at quadrants but at 30/45/60 in EVERY quadrant: sin(30)==0.5, sin(45)==sqrt(1/2), sin(60)==sqrt(3)/2 exactly; angle folded/reduced first, so sin(36000)==0 exactly. Present in 2019.05 and 2021.01 (post-dates 2015.03).",
@@ -3558,10 +3558,10 @@
   "signature": "\"...\" literals; UTF-8 storage; code-point semantics for len/[]/ord/iteration",
   "summary": "Strings are immutable UTF-8 sequences whose observable unit everywhere (len, indexing, ord, iteration, search) is the Unicode code point.",
   "params": [],
-  "semantics": "String literals are double-quoted, may contain arbitrary UTF-8 directly in the source file, and support the escapes \\\" \\\\ \\t \\n \\r. At runtime a string is an immutable sequence of Unicode code points: len counts code points, s[i] indexes code points, ord/chr convert code points, iteration and search operate per code point. There is no char type (1-char strings serve), no mutation, no byte-level access.",
+  "semantics": "String literals are double-quoted, may contain arbitrary UTF-8 directly in the source file, and support the escapes \\\" \\\\ \\t \\n \\r plus \\x##, \\u#### and \\U###### (since 2015.03). At runtime a string is an immutable sequence of Unicode code points: len counts code points, s[i] indexes code points, ord/chr convert code points, iteration and search operate per code point. There is no char type (1-char strings serve), no mutation, no byte-level access.",
   "edge_cases": [
    "len(\"h\u00e4x\") == 3 despite 4 UTF-8 bytes; one astral emoji has len 1 despite 4 bytes.",
-   "VERIFY: no \\u escape in 2021.01 (believed absent \u2014 raw UTF-8 in source is the way); pin what an unknown escape like \\q produces (believed the character literally, or lexer error \u2014 must match).",
+   "\\u####/\\U######/\\x## escapes exist since 2015.03 (raw UTF-8 in source also works). VERIFY: what an unknown escape like \\q produces (believed the character literally) \u2014 must match.",
    "Escapes \\t \\n \\r produce real control characters that echo prints literally inside the quoted rendering (a \\n in a string breaks the ECHO line). VERIFY exact console rendering of embedded newlines.",
    "No normalization is ever applied \u2014 comparison, len and indexing see exactly the code points written.",
    "Grapheme clusters are not a unit anywhere in the language.",
@@ -3710,39 +3710,6 @@
   "since": "pre-2015.03"
  },
  {
-  "name": "vector indexing and swizzles",
-  "kind": "syntax",
-  "category": "Vector/list builtins",
-  "signature": "v[i] -> element | undef;  v.x, v.y, v.z -> v[0], v[1], v[2]",
-  "summary": "Zero-based element access with undef (never error) on any bad index; .x/.y/.z member sugar for the first three elements (2019.05+). No slicing, no negative indices.",
-  "params": [
-   {
-    "name": "v",
-    "desc": "A vector (or string \u2014 see string indexing). Any other type yields undef on indexing."
-   },
-   {
-    "name": "i",
-    "desc": "Zero-based integer index; anything negative, >= len(v), fractional, or non-numeric yields undef."
-   }
-  ],
-  "semantics": "v[i] returns the i-th element with no bounds error \u2014 every out-of-domain access is a silent undef, which then propagates. The postfix member accessors .x, .y and .z (2019.05) are pure sugar for [0], [1], [2] on vectors, letting geometry code read point components. Indexing chains compose arbitrarily: m[1][2], pts[i].x.",
-  "edge_cases": [
-   "Out of range or negative -> undef. VERIFY: silent (no console warning) in 2021.01.",
-   "Fractional index -> undef (no rounding); exactly-integral doubles (2.0) index normally.",
-   "Non-numeric index (bool, string, undef, vector, range) -> undef; no multi-index/fancy indexing exists.",
-   "Indexing a non-indexable value (number, boolean, range, undef, function) -> undef. VERIFY silence. Ranges are NOT indexable \u2014 [0:5][2] is undef.",
-   "Swizzles: [7,8,9].x == 7; on a 2-vector, .z -> undef; on strings/scalars/ranges .x -> undef (VERIFY undef-vs-error).",
-   "VERIFY: member names other than x/y/z (v.w, v.foo) \u2014 pin whether the parser accepts any identifier and evaluation yields undef, or it is a parse/eval ERROR; 2021.01 believed limited to x/y/z.",
-   "Swizzles read only \u2014 there is no assignment to elements anywhere in the language.",
-   "Swizzles are 2019.05+: on 2015.03 the .x syntax is a parse error \u2014 relevant if the reimplementation offers legacy version modes.",
-   "Heterogeneous and nested vectors index normally; v[i] can itself be a vector, string, function, etc.",
-   "undef[0] and undef.x -> undef (VERIFY silence)."
-  ],
-  "example": "p = [3,4,5]; echo(p[0], p.z, p[9], p[-1], p[1.5]);",
-  "impl_notes": "Keep every failure a silent undef unless the oracle shows warnings \u2014 scripts index past bounds intentionally as an is-present test. Pin the .w/unknown-member question before freezing the parser grammar.",
-  "since": "pre-2015.03 (v[i]); 2019.05 (.x/.y/.z)"
- },
- {
   "name": "vector addition and subtraction",
   "kind": "operator",
   "category": "Vector/list builtins",
@@ -3784,7 +3751,7 @@
    "VERIFY: [] * [] and M * [] \u2014 believed undef (+ warning); candidate alternative for empty dot is 0; pin against oracle.",
    "Non-numeric element anywhere in a dot/matrix operand -> VERIFY whole-result undef vs nan-propagation; strings/bools/undef as operands -> undef + warning.",
    "Vectors of vectors of vectors (3+ deep) are not tensors: dispatch only distinguishes 'elements are vectors' vs not \u2014 VERIFY exact behavior on depth-3 operands (believed treated as matrices whose 'scalars' are vectors, producing elementwise-recursive adds inside dots \u2014 pin, multmatrix-adjacent code hits it).",
-   "Division: [4,6]/2 == [2,3] (recursive: [[2],[4]]/2 works); 2/[1,2] -> undef + warning (VERIFY); [1,2]/[3,4] -> undef + warning (VERIFY); v % s -> undef (VERIFY \u2014 % is number-number only).",
+   "2/[1,2] is defined: elementwise scalar-by-vector division yields [2, 1]; see the / entry. Only vector/vector division is undef.",
    "Dot/matrix results use IEEE double accumulation in element order \u2014 VERIFY summation order if bit-exact echo parity of large dots is desired.",
    "Same row-major nested-list convention as multmatrix(m); precedence of * over +/- is ordinary."
   ],
@@ -4084,7 +4051,7 @@
   "edge_cases": [
    "$t never reaches 1.0 from the GUI stepper ($t = frame/steps, frames 0..steps-1); scripts written for looping animations rely on [0,1) semantics.",
    "VERIFY: a top-level '$t = 0.25;' in the script overrides the GUI/CLI-provided value for the whole run (last-write-wins over the injected outer value) \u2014 pin precedence via oracle.",
-   "CLI: 2021.01 has no --animate flag (added in later snapshots \u2014 VERIFY exact snapshot); frames are produced by looping -D '$t=...' -o frameN.png externally.",
+   "CLI: --animate N is NEW in 2021.01 (pre-2021 releases required external -D '$t=...' looping); the frame number is appended to the -o output filename, 5-digit zero-padded.",
    "-D '$t=0.5' works like any -D injection and wins over in-file assignment.",
    "Reading $t when nothing set it yields 0, not undef \u2014 the default is a real binding in the outermost scope.",
    "Geometry caching interacts: each distinct $t value forces re-evaluation of $t-dependent subtrees; $t-independent subtrees stay cached (performance surface, not semantics).",
@@ -4371,7 +4338,7 @@
    "dpi < some minimum: VERIFY clamp/warning behavior.",
    "Imported 3D meshes participate in preview un-validated; non-manifold input typically only errors at F6/CSG time (CGAL 'not closed' class errors) \u2014 deferred failure is observable behavior.",
    "$fn/$fa/$fs at the call site affect DXF arc/circle and SVG curve tessellation. VERIFY exact application per entity.",
-   "Legacy import_stl()/import_dxf()/import_off() were removed long before 2021.01 \u2014 calling them is an unknown-module WARNING (they do NOT alias to import). dxf_dim()/dxf_cross() remain live separately.",
+   "Legacy import_stl()/import_dxf()/import_off() still FUNCTION in 2021.01 as deprecated aliases of import(), emitting 'DEPRECATED: The import_stl() module will be removed in future releases. Use import() instead.' (removal came only after 2021.01). dxf_dim()/dxf_cross() remain live separately.",
    "Snapshot-only (2023+): OBJ import, center=true parameter, SVG id=/layer= element selection, 3MF color/material import \u2014 absent in 2021.01; flag as opt-in extensions only.",
    "origin=[x,y] and scale= are honored for DXF import in 2021.01 (the legacy DXF pipeline); VERIFY: snapshot additions center= and id=/layer= selection for SVG import \u2014 pin exact versions before documenting as contract."
   ],
@@ -5043,7 +5010,7 @@
     "desc": "CLI/preferences mode that turns the FIRST warning into a fatal error; CI pipelines rely on it, making the warning set itself part of the contract."
    }
   ],
-  "semantics": "Arithmetic is plain IEEE-754 double arithmetic with these language-level decorations: division by zero warns ('WARNING: division by zero') and yields inf/-inf (0/0 yields nan); modulo is C fmod (result sign follows the dividend; x % 0 is nan); domain errors in sqrt/ln/log/asin/acos produce nan with a WARNING (since 2019.05; silently nan before). Nothing numeric ever throws \u2014 evaluation continues with inf/nan/undef flowing onward. All trigonometry is in degrees, and quadrant angles are special-cased to exact results (sin(180) == 0 exactly, cos(90) == 0), which golden echo-based tests will expose. The observable text surface: echo prints 'ECHO: ' plus arguments joined by ', '; numbers are formatted %g-style with 6 SIGNIFICANT digits \u2014 1/3 prints 0.333333, PI prints 3.14159, 10.0 prints 10 (no decimal point), 1234567 prints 1.23457e+06 (large integers go scientific AND get rounded \u2014 a famous trap), tiny values print like 1.5e-05, inf prints inf, nan prints nan. str() uses the IDENTICAL formatter, so user string-building inherits the 6-digit rounding; 0.1+0.2 both echoes and str()s as 0.3, hiding float error. Diagnostics follow fixed shapes \u2014 'WARNING: <message>, in file <path>, line <N>.', 'ERROR: ...', 'DEPRECATED: ...', and assert failures with 'TRACE: called by ...' stack lines \u2014 and are parsed by users, test suites, and tooling, so the strings must match the oracle verbatim. Because --hardwarnings turns any warning fatal, emitting too many warnings breaks scripts as surely as emitting too few.",
+  "semantics": "Arithmetic is plain IEEE-754 double arithmetic with these language-level decorations: division by zero warns ('WARNING: division by zero') and yields inf/-inf (0/0 yields nan); modulo is C fmod (result sign follows the dividend; x % 0 is nan); domain errors in sqrt/ln/log/asin/acos produce nan with a WARNING (since 2019.05; silently nan before). Nothing numeric ever throws \u2014 evaluation continues with inf/nan/undef flowing onward. All trigonometry is in degrees, and multiples of 30 and 45 degrees are special-cased to exact results in every quadrant (sin(180) == 0 exactly, cos(60) == 0.5; introduced 2019.05), which golden echo-based tests will expose. The observable text surface: echo prints 'ECHO: ' plus arguments joined by ', '; numbers are formatted %g-style with 6 SIGNIFICANT digits \u2014 1/3 prints 0.333333, PI prints 3.14159, 10.0 prints 10 (no decimal point), 1234567 prints 1.23457e+06 (large integers go scientific AND get rounded \u2014 a famous trap), tiny values print like 1.5e-05, inf prints inf, nan prints nan. str() uses the IDENTICAL formatter, so user string-building inherits the 6-digit rounding; 0.1+0.2 both echoes and str()s as 0.3, hiding float error. Diagnostics follow fixed shapes \u2014 'WARNING: <message>, in file <path>, line <N>.', 'ERROR: ...', 'DEPRECATED: ...', and assert failures with 'TRACE: called by ...' stack lines \u2014 and are parsed by users, test suites, and tooling, so the strings must match the oracle verbatim. Because --hardwarnings turns any warning fatal, emitting too many warnings breaks scripts as surely as emitting too few.",
   "edge_cases": [
    "Large integers in echo go scientific and ROUNDED: echo(1234567) prints 1.23457e+06; echo(123456) prints 123456; VERIFY the exact %g cutover (believed standard %g: scientific when exponent >= 6, so 1000000 prints 1e+06 while 999999 prints 999999).",
    "echo hides float error: 0.1+0.2 prints 0.3; 6-significant-digit rounding applies inside vectors too ([1/3] prints [0.333333]).",
@@ -5053,7 +5020,7 @@
    "inf prints 'inf', nan prints 'nan'; VERIFY -inf prints '-inf'. There are no literals; 1/0 (with warning) is the accessible source of inf, 0/0 of nan.",
    "1/0 yields inf with 'WARNING: division by zero'; -1/0 yields -inf; VERIFY whether 0/0 emits the same division-by-zero warning text (result nan); x % 0 yields nan (VERIFY its warning, believed 'WARNING: modulo by zero' or the division text \u2014 pin).",
    "Domain errors yield nan with WARNING since 2019.05: sqrt(-1), ln(-1), log(-1), asin(2), acos(-2). VERIFY per-function warning texts. VERIFY ln(0)/log(0) \u2014 believed -inf (C behavior), possibly with warning.",
-   "Exact quadrant trig: sin(180) == 0 exactly (not 1.22e-16), cos(90) == 0, tan(45) == 1. VERIFY which release introduced the special-casing (believed present well before 2021.01, around 2015.03) and the exact angle set covered (multiples of 90 certainly; VERIFY 30/45/60 exactness, e.g. whether sin(30) == 0.5 exactly).",
+   "Exact trig: sin(180)==0 exactly (not 1.22e-16), cos(90)==0, tan(45)==1 \u2014 and 30/45/60 in every quadrant (sin(30)==0.5, cos(60)==0.5, tan(60)==sqrt(3)) via the degree-trig special cases introduced in 2019.05. Settled; matches the sin/cos/tan entries.",
    "round() is half-away-from-zero: round(2.5) == 3, round(-2.5) == -3 \u2014 VERIFY against the oracle since C round vs rint differ and implementations vary.",
    "% is fmod, sign follows dividend: 5%3 == 2, -5%3 == -2, 5%-3 == 2; fractional moduli work (5.5%2 == 1.5).",
    "^ exponentiation is NEW in 2021.01 (pow() is the older spelling): right-associative (2^3^2 == 512); VERIFY precedence vs unary minus (-2^2 believed -4, i.e. ^ binds tighter than unary minus); VERIFY 0^0 (believed 1, C pow); negative base with non-integer exponent yields nan.",
@@ -5294,13 +5261,13 @@
     "desc": "0-based index of the passed child to instantiate; omitted = first child."
    }
   ],
-  "semantics": "Pre-2014 modules re-instantiated their passed subtree with child(). children() replaced it with range/index support. In 2021.01 calling child() is an error (the module no longer exists), so scripts using it fail to compile.",
+  "semantics": "Pre-2014 modules re-instantiated their passed subtree with child(). children() replaced it with range/index support; child() was removed in 2019.05, so in 2021.01 calling it is an unknown-module condition and the subtree is dropped.",
   "edge_cases": [
    "VERIFY: exact 2021.01 behavior for a child() call \u2014 believed an ordinary unknown-module warning (module ignored) rather than a hard parse error; pin the message text.",
    "Migration is mechanical: child() -> children(0) / children(i)."
   ],
   "example": "// legacy: child(0);  \u2014 modern equivalent:\nmodule pair(){ children(0); translate([10,0,0]) children(0); }\npair() circle(2);",
-  "since": "pre-2015.03 (deprecated 2014.03, later removed)",
+  "since": "pre-2015.03 (deprecated 2014.03, removed in 2019.05)",
   "impl_notes": "Do not implement; recognize the name in diagnostics and suggest children() \u2014 a targeted hint beats the generic unknown-module warning."
  },
  {
@@ -5315,13 +5282,14 @@
     "desc": "Path, resolved like import()."
    }
   ],
-  "semantics": "Each behaved as import() restricted to one format. Long deprecated; scripts in the wild (pre-2014 Thingiverse era) still contain them.",
+  "semantics": "Each behaves as import() restricted to one format. In 2021.01 all three still function as deprecated aliases, emitting the DEPRECATED-removal warning on every use; they were removed only after 2021.01. Scripts in the wild (pre-2014 Thingiverse era) still contain them.",
   "edge_cases": [
-   "VERIFY: whether 2021.01 still executes them with a DEPRECATED warning or errors as unknown modules \u2014 pin per-name; historical releases warned \"DEPRECATED: Support for import_stl() is deprecated. Use import() instead.\""
+   "Functional in 2021.01: each call emits 'DEPRECATED: The import_stl() module will be removed in future releases. Use import() instead.' \u2014 VERIFY the exact per-name message text.",
+   "Among the classic deprecations only child() was actually REMOVED by the 2021.01 baseline; these aliases survived through it."
   ],
   "example": "import_stl(\"part.stl\"); // legacy \u2014 write import(\"part.stl\");",
   "since": "pre-2015.03 (deprecated ~2013)",
-  "impl_notes": "Cheap to accept as aliases emitting the deprecation warning \u2014 old scripts then run unmodified; decide explicitly and document."
+  "impl_notes": "Implement as aliases of import() that emit the deprecation warning \u2014 2021.01 parity requires them to work, and old scripts then run unmodified."
  },
  {
   "name": "textmetrics (snapshot)",
@@ -5421,19 +5389,20 @@
   "impl_notes": "Mirror the mechanism (named opt-in flags) rather than individual flags; implement lazy-union early \u2014 it is cheap and unlocks multi-object export."
  },
  {
-  "name": "dxf_linear_extrude / dxf_rotate_extrude (removed)",
+  "name": "dxf_linear_extrude / dxf_rotate_extrude (deprecated)",
   "kind": "module",
   "category": "import() and export formats",
-  "signature": "dxf_linear_extrude(file, layer, height, ...)  // REMOVED before 2021.01",
-  "summary": "Ancient DXF-extrusion modules, removed from the language before the 2021.01 baseline \u2014 documented here only as an explicit exclusion.",
+  "signature": "dxf_linear_extrude(file, layer, height, ...); dxf_rotate_extrude(file, layer, ...)  // deprecated aliases, functional in 2021.01",
+  "summary": "Ancient DXF-extrusion modules \u2014 still functional in 2021.01 as deprecated aliases of linear_extrude/rotate_extrude with the legacy parameter order.",
   "params": [],
-  "semantics": "Their surviving descendants are the deprecated file=/layer= parameters on linear_extrude/rotate_extrude (still functional in 2021.01 with a deprecation warning) and import(). A 2021.01-compatible implementation must NOT accept these module names.",
+  "semantics": "These are the same modules as linear_extrude/rotate_extrude reached through their legacy file=/layer= parameters \u2014 which is exactly why linear_extrude's true positional order starts (file, layer, height, origin, scale, ...). Calling them works in 2021.01 and emits the DEPRECATED-removal warning; the modern equivalent is an extrusion over a child import().",
   "edge_cases": [
-   "In 2021.01 these names produce the ordinary unknown-module warning (subtree ignored) \u2014 VERIFY the exact text."
+   "Emits 'DEPRECATED: The dxf_linear_extrude() module will be removed in future releases. Use linear_extrude() instead.' (and the rotate twin) \u2014 VERIFY exact wording per name.",
+   "Only child() among the classic deprecations was actually removed by 2021.01 (gone in 2019.05); these five legacy import/dxf names all survived through 2021.01."
   ],
   "example": "// removed: dxf_linear_extrude(file=\"p.dxf\", height=5);\n// modern: linear_extrude(5) import(\"p.dxf\");",
-  "since": "removed pre-baseline",
-  "impl_notes": "Recognize the names in diagnostics with a migration hint; do not implement."
+  "since": "pre-2015.03 (deprecated; removed after 2021.01)",
+  "impl_notes": "Accept as aliases emitting the deprecation warning if strict 2021.01 parity is the goal; recognize-and-hint without executing is a documented divergence."
  },
  {
   "name": "CLI diagnostic switches",
