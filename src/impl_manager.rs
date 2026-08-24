@@ -429,7 +429,7 @@ impl TestManager for PlatformManager {
         // for its callers; programmatic configs must hit the same wall.
         if config.timeout_ms.map_or(false, |t| t > crate::json_types::MAX_SAFE_JSON_INT as u64) {
             return Err(ManagerError::UnsupportedConfig(
-                "timeout_ms exceeds the exact JSON integer range (2^53) \
+                "timeout_ms exceeds the exact JSON integer range (2^53 - 1) \
                  and would not round-trip through the persisted summary"
                     .into(),
             ));
@@ -1487,8 +1487,8 @@ mod tests {
         // test serves the same values as everyone reading from disk —
         // never u64::MAX from memory and 2^53 from the file.
         let in_mem = mgr.get_results(&run_id).unwrap();
-        assert_eq!(in_mem.results[0].duration_ms, 9_007_199_254_740_992);
-        assert_eq!(in_mem.total_duration_ms, 9_007_199_254_740_992);
+        assert_eq!(in_mem.results[0].duration_ms, 9_007_199_254_740_991);
+        assert_eq!(in_mem.total_duration_ms, 9_007_199_254_740_991);
         // A fresh manager reads the run purely from storage.
         let fresh = PlatformManager::new(&dir);
         let summary = fresh.get_results(&run_id).unwrap();

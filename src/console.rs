@@ -424,7 +424,7 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
                 // asked for.
                 if ms > crate::json_types::MAX_SAFE_JSON_INT as u64 {
                     return Err(format!(
-                        "--timeout: '{}' exceeds the exact JSON integer range (2^53)",
+                        "--timeout: '{}' exceeds the exact JSON integer range (2^53 - 1)",
                         v
                     ));
                 }

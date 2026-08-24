@@ -417,6 +417,15 @@ impl<'a> Parser<'a> {
                     }
                     run_start = self.pos;
                 }
+                // RFC 8259 §7: control characters MUST be escaped inside
+                // strings — a raw newline/tab here is input every
+                // conforming parser rejects, and the strict loaders must
+                // not quietly accept what standard tools would refuse.
+                // (Our own serializer escapes all of these, so accepted
+                // documents still round-trip.)
+                Some(b) if b < 0x20 => {
+                    return Err(JsonError::UnexpectedChar(self.pos - 1, b as char));
+                }
                 Some(_) => {}
             }
         }
@@ -887,6 +896,22 @@ mod tests {
         assert!(parse_json(r#""\ud83d""#).is_err());
         assert!(parse_json(r#""\ude00""#).is_err());
         assert!(parse_json(r#""\ud83dA""#).is_err());
+    }
+
+    #[test]
+    fn raw_control_characters_in_strings_are_rejected() {
+        // RFC 8259 §7: control characters must be escaped. A literal
+        // newline/tab inside a string is input every conforming parser
+        // rejects — accepting it would quietly bless damage that other
+        // tools refuse.
+        assert!(parse_json("\"a\nb\"").is_err());
+        assert!(parse_json("\"a\tb\"").is_err());
+        assert!(parse_json("\"a\u{0001}b\"").is_err());
+        // Their escaped spellings are fine and round-trip.
+        assert_eq!(parse_json(r#""a\nb""#).unwrap().as_str(), Some("a\nb"));
+        let val = JsonValue::Str("a\nb\tc\u{0001}d".into());
+        let s = to_json_compact(&val);
+        assert_eq!(parse_json(&s).unwrap().as_str(), Some("a\nb\tc\u{0001}d"));
     }
 
     #[test]

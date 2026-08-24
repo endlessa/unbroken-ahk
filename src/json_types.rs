@@ -5,14 +5,16 @@ use crate::types::*;
 use crate::discovery::{DiscoveryQuery, DiscoveryResult, DiscoverySummary};
 
 
-/// The exact-integer boundary of an f64-backed JSON number (2^53). ONE
-/// constant bounds both sides of the round-trip contract: the writer
-/// clamps u64 fields to it (u64_json) and the strict readers reject
-/// beyond it (strict_opt_u64) — defined once so they cannot drift into
-/// writing values the platform itself cannot reload.
-pub(crate) const MAX_SAFE_JSON_INT: f64 = 9_007_199_254_740_992.0;
+/// The largest integer an f64-backed JSON number represents UNAMBIGUOUSLY:
+/// 2^53 - 1 (JavaScript's MAX_SAFE_INTEGER). 2^53 itself is representable
+/// but 2^53 + 1 rounds onto it, so accepting 2^53 would silently accept a
+/// value the caller may never have sent. ONE constant bounds both sides of
+/// the round-trip contract: the writer clamps u64 fields to it (u64_json)
+/// and the strict readers reject beyond it (strict_opt_u64) — defined once
+/// so they cannot drift into writing values the platform cannot reload.
+pub(crate) const MAX_SAFE_JSON_INT: f64 = 9_007_199_254_740_991.0;
 
-/// Serialize a u64 for JSON, clamped to the exact-integer range (2^53):
+/// Serialize a u64 for JSON, clamped to the exact-integer range (2^53-1):
 /// the strict read side rejects larger values, so the write side must
 /// never produce them — a pathological duration/timestamp is stored as
 /// the clamp rather than a value the platform itself cannot reload.
@@ -698,21 +700,28 @@ fn strict_opt_u64(value: &JsonValue, field: &str) -> Result<Option<u64>, JsonErr
         }
         Some(_) => Err(JsonError::InvalidField(
             field.into(),
-            "a non-negative integer within the exact JSON range (<= 2^53)".into(),
+            "a non-negative integer within the exact JSON range (at most 2^53 - 1)".into(),
         )),
     }
 }
 
 /// Like strict_opt_u64, but for STORED documents: a finite integer above
-/// 2^53 is legacy data from before the writer clamped u64 fields (u64
-/// values were serialized verbatim, so a runnable reporting a duration
-/// near u64::MAX persisted ~1.8e19), not damage — clamp it the way the
-/// writer now does instead of refusing to load previously readable
-/// history as CorruptRun. Everything else (mistyped, negative,
-/// fractional, non-finite) is still an error.
+/// 2^53-1 but within what `u64 as f64` can produce (at most 2^64) is
+/// legacy data from before the writer clamped u64 fields (u64 values were
+/// serialized verbatim, so a runnable reporting a duration near u64::MAX
+/// persisted ~1.8e19), not damage — clamp it the way the writer now does
+/// instead of refusing to load previously readable history as CorruptRun.
+/// Anything ABOVE that bound is provably NOT legacy output (no u64 cast
+/// ever produced it) and stays an error, like every other mistyped,
+/// negative, fractional, or non-finite value.
 fn stored_opt_u64(value: &JsonValue, field: &str) -> Result<Option<u64>, JsonError> {
+    // u64::MAX as f64 rounds up to exactly 2^64 — the largest value the
+    // pre-clamp writer could emit.
+    const MAX_LEGACY_WRITE: f64 = 18_446_744_073_709_551_615u64 as f64;
     match value.get(field) {
-        Some(JsonValue::Number(n)) if n.is_finite() && *n > MAX_SAFE_JSON_INT => {
+        Some(JsonValue::Number(n))
+            if n.is_finite() && *n > MAX_SAFE_JSON_INT && *n <= MAX_LEGACY_WRITE =>
+        {
             Ok(Some(MAX_SAFE_JSON_INT as u64))
         }
         _ => strict_opt_u64(value, field),
@@ -933,16 +942,16 @@ mod tests {
         )
         .unwrap();
         let summary = RunSummary::from_json(&val).unwrap();
-        assert_eq!(summary.results[0].duration_ms, 9_007_199_254_740_992);
-        assert_eq!(summary.total_duration_ms, 9_007_199_254_740_992);
-        assert_eq!(summary.started_at, 9_007_199_254_740_992);
+        assert_eq!(summary.results[0].duration_ms, 9_007_199_254_740_991);
+        assert_eq!(summary.total_duration_ms, 9_007_199_254_740_991);
+        assert_eq!(summary.started_at, 9_007_199_254_740_991);
 
         // Caller input keeps full strictness; only STORED configs clamp.
         let cfg = parse_json(r#"{"run_all": true, "timeout_ms": 18446744073709552000}"#).unwrap();
         assert!(RunConfig::from_json(&cfg).is_err());
         assert_eq!(
             RunConfig::from_json_stored(&cfg).unwrap().timeout_ms,
-            Some(9_007_199_254_740_992)
+            Some(9_007_199_254_740_991)
         );
     }
 
@@ -967,6 +976,37 @@ mod tests {
         );
         let summary_val = parse_json(&summary_raw).unwrap();
         assert!(RunSummary::from_json(&summary_val).is_ok());
+    }
+
+    #[test]
+    fn exact_integer_bound_is_two_to_the_53_minus_one() {
+        // 2^53 + 1 rounds ONTO 2^53 in f64, so accepting 2^53 would
+        // silently accept a value the caller may never have sent — the
+        // unambiguous bound is 2^53 - 1, and both sides of it behave.
+        let ok = parse_json(r#"{"run_all": true, "timeout_ms": 9007199254740991}"#).unwrap();
+        assert_eq!(
+            RunConfig::from_json(&ok).unwrap().timeout_ms,
+            Some(9_007_199_254_740_991)
+        );
+        for bad in [
+            r#"{"run_all": true, "timeout_ms": 9007199254740992}"#,
+            r#"{"run_all": true, "timeout_ms": 9007199254740993}"#,
+        ] {
+            let val = parse_json(bad).unwrap();
+            assert!(RunConfig::from_json(&val).is_err(), "should reject: {}", bad);
+        }
+    }
+
+    #[test]
+    fn stored_leniency_stops_at_what_legacy_could_write() {
+        // The pre-clamp writer serialized `u64 as f64` — at most 2^64.
+        // Anything above that is provably NOT legacy output: damage,
+        // which must stay CorruptRun instead of loading as a clamp.
+        let damaged = parse_json(
+            r#"{"run_id": "run_0001", "results": [], "started_at": 1e300}"#,
+        )
+        .unwrap();
+        assert!(RunSummary::from_json(&damaged).is_err());
     }
 
     #[test]
