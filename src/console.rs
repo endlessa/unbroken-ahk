@@ -245,24 +245,17 @@ fn cmd_run(manager: &mut PlatformManager, args: &[&str], rest: &str) -> ConsoleO
         }
     };
 
-    let config_json = to_json_pretty(&config.to_json());
-
-    match manager.start_run(config) {
-        Ok(run_id) => {
-            match manager.get_results(&run_id) {
-                Ok(summary) => {
-                    let reporter = crate::impl_reporter::StandardReporter::new();
-                    let text = crate::reporter::TestReporter::format_summary(
-                        &reporter, &summary, ReportFormat::Text,
-                    );
-                    let json = to_json_pretty(&summary.to_json());
-                    ConsoleOutput { text, json }
-                }
-                Err(_) => ConsoleOutput {
-                    text: format!("Run started: {}\nUse 'progress {}' to check status.", run_id, run_id),
-                    json: config_json,
-                },
-            }
+    // The summary comes straight from the run — no disk read-back that
+    // could transiently fail and misreport a finished run as merely
+    // "started".
+    match manager.run_to_completion(config) {
+        Ok(summary) => {
+            let reporter = crate::impl_reporter::StandardReporter::new();
+            let text = crate::reporter::TestReporter::format_summary(
+                &reporter, &summary, ReportFormat::Text,
+            );
+            let json = to_json_pretty(&summary.to_json());
+            ConsoleOutput { text, json }
         }
         Err(crate::manager::ManagerError::PersistFailed(run_id, msg)) => error_output(&format!(
             "Run {} EXECUTED but its summary could not be persisted ({}). \
@@ -494,13 +487,46 @@ fn split_args(input: &str) -> Vec<&str> {
 /// actually accepts, so the stated remedy is typeable at this surface —
 /// telling a flag user to edit "exclude_tags" points at a field that
 /// does not exist for them.
+///
+/// Replacement skips QUOTED spans: quoted text is user data echoed back
+/// (tags are unvalidated, so a tag literally named "include_tags" is
+/// legal) and must never be rewritten into a flag name.
 fn console_vocabulary(msg: &str) -> String {
-    msg.replace("include_ids", "--id")
-        .replace("include_tags", "--tag")
-        .replace("exclude_tags", "--exclude")
-        .replace("name_pattern", "--pattern")
-        .replace("run_all: true", "--all")
-        .replace("run_all", "--all")
+    fn replace_fields(s: &str) -> String {
+        s.replace("include_ids", "--id")
+            .replace("include_tags", "--tag")
+            .replace("exclude_tags", "--exclude")
+            .replace("name_pattern", "--pattern")
+            .replace("run_all: true", "--all")
+            .replace("run_all", "--all")
+    }
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    loop {
+        match rest.find('"') {
+            None => {
+                out.push_str(&replace_fields(rest));
+                return out;
+            }
+            Some(open) => {
+                out.push_str(&replace_fields(&rest[..open]));
+                let quoted = &rest[open + 1..];
+                match quoted.find('"') {
+                    Some(close) => {
+                        out.push('"');
+                        out.push_str(&quoted[..=close]);
+                        rest = &quoted[close + 1..];
+                    }
+                    None => {
+                        // Unbalanced quote: copy the tail verbatim.
+                        out.push('"');
+                        out.push_str(quoted);
+                        return out;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Split "--flag=value" into ("--flag", Some("value")). Only tokens that
@@ -864,6 +890,12 @@ mod tests {
             r#"run {"run_all": false, "include_ids": ["nosuch"]}"#,
         );
         assert!(out.text.contains("include_ids"), "got: {}", out.text);
+
+        // Quoted spans are user data echoed back — a tag literally named
+        // "include_tags" must survive the translation verbatim.
+        let out = execute_command(&mut mgr, "run --tag include_tags");
+        assert!(out.text.contains("\"include_tags\""), "got: {}", out.text);
+        assert!(out.text.contains("--tag"), "got: {}", out.text);
     }
 
     #[test]

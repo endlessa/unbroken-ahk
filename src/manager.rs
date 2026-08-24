@@ -67,7 +67,9 @@ pub enum ManagerError {
     ReadFailed(RunId, String),
     /// The run id was claimed by some session but no summary was ever
     /// persisted: still executing in another session, or that session
-    /// died mid-run. If it is known dead, delete runs/<id>.json to clear.
+    /// died mid-run. The empty reservation file is inert and should be
+    /// LEFT IN PLACE — it is what keeps the id from being re-minted for
+    /// an unrelated future run.
     RunNotPersisted(RunId),
     /// The run has not completed yet.
     RunInProgress(RunId),
@@ -117,7 +119,9 @@ impl std::fmt::Display for ManagerError {
                 f,
                 "run '{}' was claimed but no summary was ever persisted: it is \
                  still executing in another session, or that session died \
-                 mid-run; if it is known dead, delete runs/{}.json to clear it",
+                 mid-run; leave runs/{}.json in place — the empty reservation \
+                 is inert, and deleting it would let an unrelated future run \
+                 be minted under this same id",
                 id, id
             ),
             ManagerError::RunInProgress(id) => {

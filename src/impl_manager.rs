@@ -342,62 +342,11 @@ impl PlatformManager {
         storage::save_run_summary(&self.storage, summary)
     }
 
-    fn next_run_id(&mut self) -> Result<RunId, ManagerError> {
-        // Mint an id and CLAIM it by atomically creating its file — two
-        // sessions racing on the same storage dir can never mint the same
-        // id. The directory is scanned only on the first mint of a
-        // session, and re-scanned after a failed claim (someone else got
-        // there first) — never on the hot path once the counter is ahead.
-        loop {
-            if self.run_counter == 0 {
-                self.run_counter = storage::max_existing_run_number(&self.storage);
-            }
-            self.run_counter += 1;
-            let run_id = format!("run_{:04}", self.run_counter);
-            match storage::reserve_run_file(&self.storage, &run_id) {
-                storage::ReserveOutcome::Claimed => return Ok(run_id),
-                // Claimed by another session: resync with disk and retry.
-                storage::ReserveOutcome::Taken => {
-                    self.run_counter = self
-                        .run_counter
-                        .max(storage::max_existing_run_number(&self.storage));
-                }
-                // Storage erroring: an unprotected id could collide with
-                // another session's and silently overwrite its summary —
-                // refuse to start rather than run without a claim.
-                storage::ReserveOutcome::Failed(msg) => {
-                    return Err(ManagerError::RunStartFailed(format!(
-                        "could not claim a run id ({}); no tests were \
-                         executed — retry when storage recovers",
-                        msg
-                    )));
-                }
-            }
-        }
-    }
-}
-
-
-impl TestManager for PlatformManager {
-    fn discover(&self, query: &DiscoveryQuery) -> DiscoveryResult {
-        let disc = RegistryDiscovery::new(&self.registry);
-        disc.discover(query)
-    }
-
-    fn summary(&self) -> DiscoverySummary {
-        let disc = RegistryDiscovery::new(&self.registry);
-        disc.summary()
-    }
-
-    fn register_test(&mut self, definition: TestDefinition) -> Result<(), ManagerError> {
-        let id = self.ensure_definition(definition)?;
-        // Persist unconditionally — see register_runnable.
-        self.persist_registry()
-            .map_err(|e| ManagerError::PersistFailed(id, e))?;
-        Ok(())
-    }
-
-    fn start_run(&mut self, config: RunConfig) -> Result<RunId, ManagerError> {
+    /// Execute a run to completion and return its SUMMARY — the
+    /// authoritative copy the caller should report, so a successful
+    /// run never needs an immediate (and fallible) disk read-back.
+    /// The TestManager::start_run trait method delegates here.
+    pub fn run_to_completion(&mut self, config: RunConfig) -> Result<RunSummary, ManagerError> {
         // The sequential executor is the only implementation so far —
         // reject a parallel request instead of silently running sequentially.
         if let ExecutionModel::Parallel { .. } = config.execution_model {
@@ -676,13 +625,72 @@ impl TestManager for PlatformManager {
         if durable {
             self.progress.remove_run(&run_id);
         } else {
-            self.completed_runs.push(summary);
+            self.completed_runs.push(summary.clone());
         }
         if let Err(e) = persisted {
             return Err(ManagerError::PersistFailed(run_id, e));
         }
 
-        Ok(run_id)
+        Ok(summary)
+    }
+
+    fn next_run_id(&mut self) -> Result<RunId, ManagerError> {
+        // Mint an id and CLAIM it by atomically creating its file — two
+        // sessions racing on the same storage dir can never mint the same
+        // id. The directory is scanned only on the first mint of a
+        // session, and re-scanned after a failed claim (someone else got
+        // there first) — never on the hot path once the counter is ahead.
+        loop {
+            if self.run_counter == 0 {
+                self.run_counter = storage::max_existing_run_number(&self.storage);
+            }
+            self.run_counter += 1;
+            let run_id = format!("run_{:04}", self.run_counter);
+            match storage::reserve_run_file(&self.storage, &run_id) {
+                storage::ReserveOutcome::Claimed => return Ok(run_id),
+                // Claimed by another session: resync with disk and retry.
+                storage::ReserveOutcome::Taken => {
+                    self.run_counter = self
+                        .run_counter
+                        .max(storage::max_existing_run_number(&self.storage));
+                }
+                // Storage erroring: an unprotected id could collide with
+                // another session's and silently overwrite its summary —
+                // refuse to start rather than run without a claim.
+                storage::ReserveOutcome::Failed(msg) => {
+                    return Err(ManagerError::RunStartFailed(format!(
+                        "could not claim a run id ({}); no tests were \
+                         executed — retry when storage recovers",
+                        msg
+                    )));
+                }
+            }
+        }
+    }
+}
+
+
+impl TestManager for PlatformManager {
+    fn discover(&self, query: &DiscoveryQuery) -> DiscoveryResult {
+        let disc = RegistryDiscovery::new(&self.registry);
+        disc.discover(query)
+    }
+
+    fn summary(&self) -> DiscoverySummary {
+        let disc = RegistryDiscovery::new(&self.registry);
+        disc.summary()
+    }
+
+    fn register_test(&mut self, definition: TestDefinition) -> Result<(), ManagerError> {
+        let id = self.ensure_definition(definition)?;
+        // Persist unconditionally — see register_runnable.
+        self.persist_registry()
+            .map_err(|e| ManagerError::PersistFailed(id, e))?;
+        Ok(())
+    }
+
+    fn start_run(&mut self, config: RunConfig) -> Result<RunId, ManagerError> {
+        self.run_to_completion(config).map(|summary| summary.run_id)
     }
 
     fn check_progress(&self, run_id: &str) -> Result<RunProgress, ManagerError> {
@@ -1432,7 +1440,7 @@ mod tests {
                 // guidance, not just the variant name.
                 let text = format!("{}", e);
                 assert!(
-                    text.contains("delete runs/run_0005.json"),
+                    text.contains("leave runs/run_0005.json in place"),
                     "guidance missing: {}",
                     text
                 );

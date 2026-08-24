@@ -302,19 +302,11 @@ fn handle_run(manager: &mut PlatformManager, params: &JsonValue) -> McpResponse 
         Err(e) => return McpResponse::err(&format!("Invalid config: {}", e)),
     };
 
-    match manager.start_run(config) {
-        Ok(run_id) => {
-            match manager.get_results(&run_id) {
-                Ok(summary) => McpResponse::ok(summary.to_json()),
-                Err(_) => {
-                    // Run still in progress (shouldn't happen with sync executor)
-                    McpResponse::ok(obj(vec![
-                        ("run_id", str_val(&run_id)),
-                        ("status", str_val("in_progress")),
-                    ]))
-                }
-            }
-        }
+    // The summary comes straight from the run — no disk read-back that
+    // could transiently fail and misreport a finished run as
+    // "in_progress".
+    match manager.run_to_completion(config) {
+        Ok(summary) => McpResponse::ok(summary.to_json()),
         // The tests EXECUTED — a retry would run everything again. Say so
         // machine-readably so an agent fetches results instead of re-running.
         Err(crate::manager::ManagerError::PersistFailed(run_id, msg)) => McpResponse {
