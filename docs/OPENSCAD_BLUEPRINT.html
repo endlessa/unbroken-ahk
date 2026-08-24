@@ -1,0 +1,601 @@
+<title>OpenSCAD From Scratch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --paper: #F7F9FB;
+    --panel: #FFFFFF;
+    --panel-2: #EFF3F6;
+    --ink: #1D2833;
+    --muted: #56677A;
+    --line: #D9E1E8;
+    --line-strong: #B9C6D0;
+    --gold: #C79A2E;
+    --gold-text: #8A6600;
+    --gold-wash: #FAF3DF;
+    --blue: #2E5E9E;
+    --good: #2E7D4F;
+    --good-wash: #E9F4EC;
+    --risk: #A84432;
+    --risk-wash: #F9ECE8;
+    --code-bg: #EDF1F4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #12181F;
+      --panel: #1A222B;
+      --panel-2: #202A34;
+      --ink: #D9E1E8;
+      --muted: #93A5B5;
+      --line: #2A3540;
+      --line-strong: #3C4B59;
+      --gold: #D8B34A;
+      --gold-text: #E3C25B;
+      --gold-wash: #2A2415;
+      --blue: #85AEDD;
+      --good: #66BB8C;
+      --good-wash: #16281D;
+      --risk: #D98876;
+      --risk-wash: #301B15;
+      --code-bg: #0E141A;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #12181F;
+    --panel: #1A222B;
+    --panel-2: #202A34;
+    --ink: #D9E1E8;
+    --muted: #93A5B5;
+    --line: #2A3540;
+    --line-strong: #3C4B59;
+    --gold: #D8B34A;
+    --gold-text: #E3C25B;
+    --gold-wash: #2A2415;
+    --blue: #85AEDD;
+    --good: #66BB8C;
+    --good-wash: #16281D;
+    --risk: #D98876;
+    --risk-wash: #301B15;
+    --code-bg: #0E141A;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Source Serif 4", Georgia, "Times New Roman", serif;
+    font-size: 17px;
+    line-height: 1.65;
+    margin: 0;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 0 28px 96px;
+  }
+  h1, h2, h3, h4 {
+    font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.15;
+    text-wrap: balance;
+    margin: 0;
+  }
+  a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; border-radius: 2px; }
+  code, pre, .mono {
+    font-family: "IBM Plex Mono", "SF Mono", Consolas, monospace;
+  }
+  code {
+    background: var(--code-bg);
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-size: 0.82em;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 14px 18px;
+    font-size: 13px;
+    line-height: 1.6;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+
+  /* ---------- header ---------- */
+  header { padding: 64px 0 40px; }
+  .dimline {
+    display: flex; align-items: center; gap: 10px;
+    color: var(--gold); margin-bottom: 26px;
+  }
+  .dimline .bar { flex: 1; height: 1px; background: var(--gold); opacity: .55; }
+  .dimline .tick { width: 1px; height: 11px; background: var(--gold); }
+  .dimline .lbl {
+    font-family: "IBM Plex Mono", monospace; font-size: 11.5px;
+    letter-spacing: .14em; text-transform: uppercase; color: var(--gold-text);
+    white-space: nowrap;
+  }
+  header h1 { font-size: clamp(34px, 6vw, 52px); font-weight: 800; letter-spacing: -0.015em; }
+  .subtitle {
+    font-size: 19px; color: var(--muted); max-width: 62ch;
+    margin: 18px 0 0; text-wrap: balance;
+  }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 8px 22px;
+    margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line);
+    font-family: "IBM Plex Mono", monospace; font-size: 12px;
+    letter-spacing: .06em; color: var(--muted);
+  }
+  .meta b { color: var(--ink); font-weight: 500; }
+
+  /* ---------- verdict ---------- */
+  .verdict {
+    border: 1px solid var(--line-strong);
+    border-left: 4px solid var(--gold);
+    background: var(--panel);
+    border-radius: 6px;
+    padding: 22px 26px;
+    margin: 8px 0 0;
+  }
+  .verdict h2 { font-size: 15px; letter-spacing: .1em; text-transform: uppercase; color: var(--gold-text); font-weight: 700; margin-bottom: 12px; }
+  .verdict p { margin: 0 0 10px; }
+  .verdict p:last-child { margin-bottom: 0; }
+
+  /* ---------- TOC ---------- */
+  nav.toc {
+    margin: 40px 0 8px;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 6px 28px;
+  }
+  nav.toc a {
+    display: flex; gap: 12px; align-items: baseline;
+    text-decoration: none; color: var(--ink);
+    padding: 7px 4px; border-bottom: 1px solid var(--line);
+    font-family: Archivo, sans-serif; font-size: 14.5px; font-weight: 500;
+  }
+  nav.toc a:hover { color: var(--blue); }
+  nav.toc .n { font-family: "IBM Plex Mono", monospace; font-size: 11.5px; color: var(--gold-text); }
+
+  /* ---------- sections ---------- */
+  section { margin-top: 72px; }
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace; font-size: 12px;
+    letter-spacing: .16em; text-transform: uppercase; color: var(--gold-text);
+    display: flex; align-items: center; gap: 14px; margin-bottom: 12px;
+  }
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--line-strong); }
+  section > h2 { font-size: 29px; font-weight: 700; letter-spacing: -0.01em; margin-bottom: 18px; }
+  section h3 { font-size: 19px; font-weight: 600; margin: 34px 0 10px; }
+  p { margin: 0 0 16px; max-width: 70ch; }
+  ul, ol { margin: 0 0 16px; padding-left: 24px; max-width: 70ch; }
+  li { margin-bottom: 8px; }
+  li::marker { color: var(--gold); }
+  .lede { font-size: 18.5px; }
+
+  /* ---------- tables ---------- */
+  .tablewrap { overflow-x: auto; margin: 20px 0 26px; border: 1px solid var(--line); border-radius: 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; background: var(--panel); }
+  th {
+    font-family: Archivo, sans-serif; font-size: 12px; font-weight: 600;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+    text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--line-strong);
+    background: var(--panel-2); white-space: nowrap;
+  }
+  td { padding: 11px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.mono, th.mono { font-family: "IBM Plex Mono", monospace; font-size: 13px; white-space: nowrap; }
+  td .sub { display: block; color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* ---------- two-col safe/forbidden ---------- */
+  .cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 20px 0 8px; }
+  @media (max-width: 720px) { .cols2 { grid-template-columns: 1fr; } }
+  .rulecard { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); overflow: hidden; }
+  .rulecard h4 {
+    font-size: 12.5px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 10px 16px; border-bottom: 1px solid var(--line);
+  }
+  .rulecard.ok h4 { color: var(--good); background: var(--good-wash); }
+  .rulecard.no h4 { color: var(--risk); background: var(--risk-wash); }
+  .rulecard ul { padding: 12px 16px 12px 34px; margin: 0; font-size: 14.5px; }
+  .rulecard li { margin-bottom: 7px; }
+  .rulecard.ok li::marker { color: var(--good); }
+  .rulecard.no li::marker { color: var(--risk); }
+
+  /* ---------- crate diagram ---------- */
+  .crates { margin: 24px 0 10px; }
+  .crate-tier { display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch; margin-bottom: 10px; }
+  .crate {
+    background: var(--panel); border: 1px solid var(--line-strong); border-radius: 5px;
+    padding: 9px 13px; flex: 1 1 150px; min-width: 140px;
+  }
+  .crate .cname { font-family: "IBM Plex Mono", monospace; font-size: 13px; font-weight: 600; }
+  .crate .cdesc { font-size: 12.5px; color: var(--muted); line-height: 1.45; margin-top: 3px; font-family: Archivo, sans-serif; }
+  .crate.front { border-left: 3px solid var(--gold); }
+  .tierlbl {
+    font-family: "IBM Plex Mono", monospace; font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--muted); margin: 16px 0 8px;
+  }
+
+  /* ---------- callouts ---------- */
+  .note {
+    border: 1px solid var(--line); border-left: 3px solid var(--gold);
+    background: var(--gold-wash); border-radius: 5px;
+    padding: 14px 18px; margin: 20px 0; font-size: 15px; max-width: none;
+  }
+  .note.risk { border-left-color: var(--risk); background: var(--risk-wash); }
+  .note b { font-family: Archivo, sans-serif; font-weight: 600; }
+  .note p { max-width: none; }
+
+  /* ---------- phases ---------- */
+  .phase { display: grid; grid-template-columns: 118px 1fr; gap: 20px; padding: 20px 0; border-top: 1px solid var(--line); }
+  .phase:last-of-type { border-bottom: 1px solid var(--line); }
+  @media (max-width: 640px) { .phase { grid-template-columns: 1fr; gap: 6px; } }
+  .phase .pn { font-family: "IBM Plex Mono", monospace; font-size: 12px; color: var(--gold-text); letter-spacing: .06em; }
+  .phase .pn .when { display: block; color: var(--muted); margin-top: 4px; }
+  .phase h3 { margin: 0 0 6px; font-size: 17px; }
+  .phase p { margin: 0; font-size: 15px; color: var(--muted); max-width: none; }
+  .phase p b { color: var(--ink); font-weight: 600; }
+
+  footer {
+    margin-top: 88px; padding-top: 22px; border-top: 1px solid var(--line);
+    font-family: "IBM Plex Mono", monospace; font-size: 12px; color: var(--muted); line-height: 1.8;
+  }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+  html { scroll-behavior: smooth; }
+</style>
+
+<div class="wrap">
+<header>
+  <div class="dimline">
+    <span class="tick"></span><span class="bar"></span>
+    <span class="lbl">Architecture blueprint · rev A · 2026-08-23</span>
+    <span class="bar"></span><span class="tick"></span>
+  </div>
+  <h1>OpenSCAD From Scratch</h1>
+  <p class="subtitle">A clean-room reimplementation of the OpenSCAD language in pure Rust — WASM + WebGL2 in the browser, served from a self-contained localhost binary, with MCP tools so an AI companion can design alongside you.</p>
+  <div class="meta">
+    <span>lang <b>Rust, zero third-party crates</b></span>
+    <span>targets <b>wasm32 + native</b></span>
+    <span>license posture <b>proprietary-safe</b></span>
+    <span>repo <b>endlessa/unbroken-ahk</b></span>
+  </div>
+</header>
+
+<div class="verdict">
+  <h2>The verdict</h2>
+  <p><b>This is viable, and it is legally clean.</b> The OpenSCAD <em>language</em> is an uncopyrightable functional interface; a clean-room implementation built from the CC-BY-SA manual and black-box observation of the official binary carries zero GPL obligations. You can keep every line proprietary.</p>
+  <p><b>The language is the tractable 15%. The geometry kernel is the project.</b> A full lexer/parser/evaluator with OpenSCAD's genuinely strange semantics is weeks of careful work. Robust 3D booleans on degenerate-by-design CAD input is months, and it is where reimplementations die. The plan below sequences the work so a useful, interactive tool ships in ~2–3 months while the hard kernel lands incrementally behind it.</p>
+  <p><b>One shared core, two frontends.</b> Every crate that computes stays OS-free and compiles identically to wasm32 (browser) and native (HTTP server, MCP, CLI). The AI never touches WASM; the browser never touches the filesystem. A differential-test harness that runs the real OpenSCAD binary as an oracle is the backbone from week one.</p>
+</div>
+
+<nav class="toc">
+  <a href="#license"><span class="n">01</span> Licensing &amp; clean-room rules</a>
+  <a href="#shape"><span class="n">02</span> Shape of the system</a>
+  <a href="#language"><span class="n">03</span> The language, honestly</a>
+  <a href="#geometry"><span class="n">04</span> Geometry kernel strategy</a>
+  <a href="#platform"><span class="n">05</span> WASM, WebGL &amp; the server</a>
+  <a href="#mcp"><span class="n">06</span> MCP tools for the AI loop</a>
+  <a href="#zerodep"><span class="n">07</span> The zero-dependency bill</a>
+  <a href="#testing"><span class="n">08</span> Testing as the backbone</a>
+  <a href="#roadmap"><span class="n">09</span> Roadmap &amp; estimates</a>
+  <a href="#risks"><span class="n">10</span> Risk register</a>
+</nav>
+
+<!-- ============================================================ -->
+<section id="license">
+  <div class="eyebrow">Part 01</div>
+  <h2>Licensing: a clear yes, with discipline</h2>
+  <p class="lede">The GPL binds code that copies or derives from GPL code — never behavioral compatibility. OpenSCAD the application is GPL-2.0-or-later and its CGAL kernel is GPL, but its <em>language</em> — grammar, keywords, builtin names, semantics, the .scad format — is a functional system, not protectable expression.</p>
+  <p>The controlling authority is <em>SAS Institute v. World Programming</em> (CJEU C-406/10): a company clean-roomed the entire SAS language from manuals and black-box observation and won. The parallel US case ended with SAS losing too. <em>Google v. Oracle</em> left a sliver of US API-copyright uncertainty, but OpenSCAD's few dozen short builtin names are far weaker ground than Oracle's 11,500 lines of declarations. Wine, Mono, and every "X-compatible" interpreter rest on the same footing.</p>
+  <p>One accuracy note worth internalizing: in the US action, World Programming actually lost <em>contract</em> claims (~$79M) because SAS's license forbade reverse engineering. Black-box probing is safe here specifically because GPLv2 §0 says running the program is unrestricted — the method is protected by OpenSCAD's own license terms, not by some general immunity.</p>
+
+  <div class="cols2">
+    <div class="rulecard ok">
+      <h4>Safe to use</h4>
+      <ul>
+        <li>OpenSCAD User Manual on Wikibooks (CC-BY-SA) — read freely; paraphrase, never paste prose into your docs or strings</li>
+        <li>openscad.org cheat sheet — unprotectable functional facts; use as the completeness checklist</li>
+        <li><b>Running the official binary</b> on your own probe files and recording outputs as golden references — the primary semantics oracle</li>
+        <li>Geometry papers &amp; textbooks: Shewchuk predicates, Goldfeather/SCS, Vatti clipping, quickhull, Bernstein–Fussell</li>
+        <li>Permissive reference code <em>if you choose</em>: Manifold (Apache-2.0), Clipper (Boost/BSL), earcut (ISC), csg.js (MIT)</li>
+        <li>Format specs: STL, OFF, 3MF, DXF, SVG, TrueType, RFC 1951, RFC 6455</li>
+        <li>Liberation fonts from upstream Red Hat (SIL OFL) — bundleable in closed source</li>
+      </ul>
+    </div>
+    <div class="rulecard no">
+      <h4>Hard bans</h4>
+      <ul>
+        <li><b>Never open the OpenSCAD source tree</b> — parser.y, lexer.l, evaluator, headers. Reading destroys the clean-room evidentiary posture</li>
+        <li>Never copy their regression tests or examples — the #1 realistic contamination vector; author every test .scad in-house</li>
+        <li>Never read CGAL or OpenCSG source (both GPL) — implement image-space CSG from the papers, not the library</li>
+        <li>Don't vendor MCAD (LGPL) — let users fetch libraries themselves</li>
+        <li>Don't ship the official binary in public artifacts (private CI use is fine)</li>
+        <li>No "OpenSCAD" in your product name, no logo derivatives — unregistered trademark/passing-off risk is real. Distinct name + "compatible with the OpenSCAD language; not affiliated" is the pattern</li>
+        <li>Watch AI-assistant regurgitation — the GPL evaluator is in training corpora; review suspiciously C++-shaped Rust</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Process that makes it stick</h3>
+  <ul>
+    <li><b>Sources policy, committed to the repo:</b> one page listing permitted and forbidden references, before serious coding starts.</li>
+    <li><b>Provenance log:</b> every behavioral question answered by probing gets its probe file and the oracle's output recorded. This is the evidence that wins a hypothetical dispute — and it doubles as your test suite.</li>
+    <li><b>License posture:</b> fully proprietary is available. If you ever open parts, use MIT OR Apache-2.0 (patent grant, no disclosure). A sensible split: keep the engine private, open the thin MCP/HTTP scaffolding for adoption.</li>
+    <li><b>The one flagged exception:</b> the Manifold library (the robust-boolean kernel modern OpenSCAD itself adopted) is Apache-2.0 — legally portable to Rust with attribution only, no disclosure. Your all-our-own-code rule is stricter than the legal requirement here; since the boolean kernel is the single hardest subsystem, keep this option consciously on the table rather than off it by default. Implementing from the papers alone is also fine — just slower.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section id="shape">
+  <div class="eyebrow">Part 02</div>
+  <h2>Shape of the system</h2>
+  <p class="lede">One Cargo workspace. Core crates are pure computation — no filesystem, no clock, no threads, no <code>#[cfg]</code> — so they compile bit-for-bit to both targets and are debugged natively with ordinary <code>cargo test</code>.</p>
+
+  <div class="crates">
+    <div class="tierlbl">Core — compiles to wasm32 and native, zero OS surface</div>
+    <div class="crate-tier">
+      <div class="crate"><div class="cname">scad-lang</div><div class="cdesc">lexer, parser, AST, error-tolerant diagnostics</div></div>
+      <div class="crate"><div class="cname">scad-eval</div><div class="cdesc">tree-walking evaluator → CSG tree; echo/assert capture; budgets</div></div>
+      <div class="crate"><div class="cname">scad-geom-2d</div><div class="cdesc">integer-snapped booleans, triangulation, offset, hull</div></div>
+      <div class="crate"><div class="cname">scad-geom-3d</div><div class="cdesc">tessellation, CSG kernel, hull, minkowski, mesh stats</div></div>
+    </div>
+    <div class="crate-tier">
+      <div class="crate"><div class="cname">scad-formats</div><div class="cdesc">STL·OFF·OBJ·AMF·3MF·DXF·SVG·CSG import/export</div></div>
+      <div class="crate"><div class="cname">scad-font</div><div class="cdesc">TrueType parser, glyph outlines → polygons</div></div>
+      <div class="crate"><div class="cname">scad-raster</div><div class="cdesc">z-buffer CPU rasterizer + PNG writer (headless renders)</div></div>
+      <div class="crate"><div class="cname">scad-json</div><div class="cdesc">JSON + JSON-RPC (seed from the existing json.rs in this repo)</div></div>
+      <div class="crate"><div class="cname">tinyutil</div><div class="cdesc">SHA-1, base64, CRC-32, Adler-32, inflate/deflate, XML, ZIP, MT19937</div></div>
+    </div>
+    <div class="tierlbl">Frontends — own all I/O, threads, and time via a small platform trait</div>
+    <div class="crate-tier">
+      <div class="crate front"><div class="cname">scad-wasm</div><div class="cdesc">cdylib; hand-rolled extern "C" ABI; ~300 lines of JS glue; runs in a Web Worker</div></div>
+      <div class="crate front"><div class="cname">scad-cli</div><div class="cdesc">one native binary: serve (HTTP UI + POST /mcp) · mcp-stdio · check · render · export · stats</div></div>
+    </div>
+  </div>
+
+  <p>The frontends inject a platform trait (file provider, clock, entropy, log). The evaluator resolves <code>include</code>/<code>use</code>/<code>import()</code> through a virtual filesystem: native roots it at the project directory (path-canonicalized, symlink-escape-checked — <em>in the MCP process too</em>, not just the browser), wasm backs it with an in-memory map fed over the server's file API. That one seam gives the MCP server dirty-buffer-aware includes for free and makes the browser and AI see identical worlds.</p>
+  <p>The <code>serve</code> process owns the session: document buffers with monotonic revisions, customizer values, camera pose. The browser editor syncs over a hand-rolled WebSocket; MCP tools mutate the same store. Human keystrokes and AI edits meet through revision-checked writes — reject-and-rebase on conflict, ~50 lines, no CRDT theater.</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="language">
+  <div class="eyebrow">Part 03</div>
+  <h2>The language, honestly</h2>
+  <p class="lede">Pin the baseline to <b>OpenSCAD 2021.01 semantics</b>, report <code>version_num() = 20210100</code>, and add newer features behind explicit flags. (Verify against a live check whether a post-2021 stable has shipped before freezing this — libraries feature-detect on the version you report.)</p>
+  <p>"Full language" spans 22 categories: 3D/2D primitives, transforms, booleans, extrusions, hull/minkowski/offset/projection/surface/render, control flow, list comprehensions, modules/functions/children, function literals, ~60 builtins, all $-variables, modifiers <code>* ! # %</code>, include/use, import/export, the comment-based customizer, and echo/assert formatting. None of it is individually hard. What kills compatibility is the semantics no one expects:</p>
+  <ul>
+    <li><b>Assignment is not imperative.</b> Last textual assignment per scope wins, taking effect at the first assignment's position: <code>a=1; b=a; a=2;</code> yields <code>b==2</code>. Blocks can't mutate outer variables.</li>
+    <li><b>All $-variables are dynamically scoped</b> through the call stack, and <code>children()</code> sees the caller's lexical scope with the instantiating site's $-environment. Get this wrong and BOSL2 breaks.</li>
+    <li><b>undef propagates with warnings, never errors.</b> <code>[1,2]+1</code> is undef; <code>vector*vector</code> is a dot product; there is no elementwise multiply and no string <code>+</code>.</li>
+    <li><b>The ternary is the only lazy construct</b> — an eager ternary infinite-loops every recursive library. Tail-call elimination is required (~1M-frame tail recursion must work); on wasm the evaluator needs an explicit heap stack, not the shadow stack.</li>
+    <li><b>Tessellation is contractual.</b> Fragment formula <code>$fn ? max($fn,3) : ceil(max(min(360/$fa, 2πr/$fs), 5))</code>; circles are inscribed with vertex 0 at +X; spheres stack <code>ceil(frags/2)</code> rings at half-step offsets with no pole vertices. Users build hex nuts out of these exact choices.</li>
+    <li><b>polyhedron faces wind clockwise from outside</b> — the reverse of STL convention. <code>echo</code>/<code>str()</code> format floats %g-style at 6 significant digits (<code>0.1+0.2</code> prints <code>0.3</code>) — golden tests must reuse the exact formatter. <code>search()</code> returns ragged mixed shapes that libraries pattern-match; clone it bug-for-bug.</li>
+    <li><b>Preview ≠ render:</b> <code>%</code> objects show in preview but vanish from export, <code>#</code> the opposite emphasis, <code>$preview</code> flips, <code>convexity</code> only matters to the preview renderer (parse it everywhere, may ignore it). The warning set itself is compatibility surface — serious users run <code>--hardwarnings</code> in CI.</li>
+    <li><b>Geometry caching is compatibility.</b> A for-loop stamping one module 1000× only finishes because identical subtrees hit a cache. Budget a subtree-keyed geometry cache early, not as an optimization.</li>
+  </ul>
+  <div class="note"><b>Design consequence:</b> the parser must be error-tolerant (recover and continue, multiple diagnostics per pass) from the start — the editor squiggles and the MCP <code>scad_check</code> tool both depend on it, and retrofitting recovery into a halt-on-first-error parser is miserable.</div>
+</section>
+
+<!-- ============================================================ -->
+<section id="geometry">
+  <div class="eyebrow">Part 04</div>
+  <h2>Geometry kernel: the make-or-break, phased</h2>
+  <p class="lede">OpenSCAD input is degenerate <em>by construction</em> — mirrored halves, rotated copies, flush faces are the idiom, not the edge case. Strategy: buy time with an image-space preview, build the bulletproof 2D kernel that half the language sits on, then land robust 3D booleans with a declared fallback.</p>
+
+  <div class="tablewrap"><table>
+    <tr><th>Strategy</th><th>What it buys</th><th>Where it breaks</th><th>Role</th></tr>
+    <tr>
+      <td><b>Image-space CSG preview</b><span class="sub">Goldfeather / SCS stencil passes on WebGL2 — from the papers; OpenCSG code is GPL</span></td>
+      <td>Pixel-exact-looking booleans instantly, with only tessellation implemented. Exactly OpenSCAD's F5 design</td>
+      <td>Produces pixels, not geometry; export still needs a real kernel; SOP-normalization term explosion needs the same cap + warning OpenSCAD has</td>
+      <td class="mono">preview, weeks 6–16</td>
+    </tr>
+    <tr>
+      <td><b>BSP CSG (csg.js-style)</b><span class="sub">~1–1.5k lines, MIT references</span></td>
+      <td>A real boolean in 1–2 weeks; stopgap STL export; later a test oracle</td>
+      <td>Coplanar faces (the hello-world case), T-junction cracks, epsilon drift, O(n²) fragmentation on high-$fn spheres</td>
+      <td class="mono">stopgap, time-boxed ≤1 month</td>
+    </tr>
+    <tr>
+      <td><b>Manifold-style robust booleans</b><span class="sub">Shewchuk predicates → BVH → exact tri-tri arrangement → indirect predicates on constructed points → winding classification → manifold output</span></td>
+      <td>Watertight manifold-in/manifold-out by design; parity with modern OpenSCAD (which itself adopted Manifold)</td>
+      <td>8–15k unforgiving lines; the last 20% (coincident geometry) is months of fuzz-fix. The project's variance lives here</td>
+      <td class="mono">end-state, months 4–12</td>
+    </tr>
+    <tr>
+      <td><b>Bernstein–Fussell exact BSP</b><span class="sub">plane-based, fixed-width i256 integer determinants, no epsilons ever</span></td>
+      <td>Provable robustness in 2–4 months; coplanar cases exact by construction; BSP leaves double as the convex decomposition minkowski needs</td>
+      <td>Performance ceiling — 100k near-parallel planes from a smooth sphere hurt it long before Manifold-style does</td>
+      <td class="mono">declared fallback at month ~6</td>
+    </tr>
+  </table></div>
+
+  <h3>The 2D kernel is the quiet workhorse</h3>
+  <p>square/circle/polygon/text/offset/projection/extrude-caps all sit on 2D booleans. Implement Vatti/Clipper-style scanline clipping with <b>integer coordinate snapping</b> (scale by ~1e7, exact i64/i128 intersection math, unscale at the end) — that single decision buys total robustness in 2D. Ear-clipping triangulation with holes, Clipper-style offsetting (round joins consume $fn/$fa/$fs), monotone-chain hull. This is 6–9 weeks and an order of magnitude easier than 3D; it unblocks half the language and both extrusions.</p>
+
+  <h3>Everything else, difficulty-ranked</h3>
+  <ul>
+    <li><b>Easy:</b> primitive tessellation to the exact fragment formula (days — lock with canonicalized-mesh comparison against the oracle, <em>never</em> byte-diffed STL); rotate_extrude; 2D hull; point-in-mesh; BVH.</li>
+    <li><b>Medium:</b> linear_extrude with twist/scale (non-planar side quads need consistent shorter-diagonal splits; scale→0 collapses to a welded apex); quickhull 3D hardened for coplanar input; projection(cut) by exact z=0 slicing; mesh repair/validation (welding, orientation, 2-manifold check — also your honesty layer for the stopgap kernel).</li>
+    <li><b>Hard:</b> text() — TrueType parsing is mechanical but large (see Part 05); projection(cut=false) as a batched union tree over projected triangles.</li>
+    <li><b>Brutal, scope deliberately:</b> nonconvex minkowski (convex path = hull of pairwise vertex sums, days; general path = convex decomposition + giant union — upstream is notoriously slow here too, parity means "similarly slow"); <code>roof()</code> is experimental upstream — skip and document.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section id="platform">
+  <div class="eyebrow">Part 05</div>
+  <h2>WASM, WebGL &amp; the server</h2>
+
+  <h3>wasm32 without wasm-bindgen</h3>
+  <p>Entirely practical — wasm-bindgen automates this boundary; it doesn't enable it. <code>crate-type = ["cdylib"]</code>, <code>#[no_mangle] extern "C"</code> exports, and one ABI rule: <b>only scalars and (ptr, len) pairs cross the boundary</b> — never structs by value. Export <code>wasm_alloc</code>/<code>wasm_free</code>; strings go in via <code>TextEncoder</code> → alloc → memory write; results come back as one <code>#[repr(C)]</code> header struct JS reads with a little-endian <code>DataView</code>.</p>
+  <ul>
+    <li><b>The #1 glue bug:</b> typed-array views detach when linear memory grows. Never cache a view across any call that can allocate — recreate immediately before use.</li>
+    <li><b>Silent std landmines on this target:</b> <code>Instant::now()</code> <em>panics at runtime</em>; <code>println!</code> goes nowhere; no threads. Route time/log/entropy through ~4 imported host functions. <code>panic = "abort"</code> plus a panic hook that ships the message to <code>console.error</code> before the trap; treat any trap as fatal and re-instantiate (keep the compiled <code>Module</code> cached — milliseconds).</li>
+    <li><b>Run the engine in a Web Worker from day one.</b> A 30-second render must never freeze the UI, and <code>Worker.terminate()</code> is your only preemption — that plus a cooperative cancel flag is the interrupt story. Don't plan on SharedArrayBuffer threads; later parallelism is N independent instances in N workers.</li>
+    <li><b>Determinism discipline:</b> HashMap iteration order differs native-vs-wasm — anywhere order can reach output geometry, use BTreeMap/sorted iteration or golden tests rot.</li>
+  </ul>
+
+  <h3>Rust computes, JS renders</h3>
+  <p>WASM has no GPU access, so something crosses to JS regardless — choose the coarse boundary. Rust hands over finished f32 vertex/normal buffers, u32 triangle and edge indices, and a small draw-list (offsets, RGBA, modifier flags). Hand-written JS (~600–900 lines, no npm, no bundler) owns WebGL2: a 120-line mat4/vec3 library, Blinn-Phong with headlight, orbit/pan/zoom camera honoring <code>$vpr/$vpt/$vpd</code>, edge overlay with <code>polygonOffset</code>, adaptive grid. The alternative — extern-importing the GL API into Rust — is hundreds of stateful shim functions with handle tables; reject it. This boundary also makes a future WebGPU backend a contained swap, and the stencil buffer WebGL2 gives you is exactly what the Goldfeather preview needs. Handle <code>webglcontextlost</code>/<code>restored</code> — long-lived tabs will hit it.</p>
+
+  <h3>The localhost server: the easiest component</h3>
+  <p><code>TcpListener</code> on <b>127.0.0.1 only</b>, thread-per-connection, hand-rolled HTTP/1.1 (~300–500 lines: header caps, Content-Length bodies, keep-alive, HEAD). Every asset — HTML, JS, the .wasm blob, the default font — embedded via <code>include_bytes!</code> so the binary is fully self-contained; serve .wasm as <code>application/wasm</code> or streaming instantiation fails. SSE for live-reload and progress push (~30 lines + browser-native reconnection); add the RFC 6455 WebSocket (~250–350 lines; needs your own SHA-1 + base64) when editor sync arrives. Localhost binding is necessary but not sufficient:</p>
+  <ul>
+    <li>Validate <code>Host</code> against <code>{localhost, 127.0.0.1, [::1]}:port</code> — kills DNS rebinding outright.</li>
+    <li>Send no <code>Access-Control-Allow-Origin</code> at all; validate <code>Origin</code> on POSTs and on WebSocket upgrades (upgrades bypass CORS entirely).</li>
+    <li>Require a custom header with a per-launch random token on state-changing endpoints — cross-origin pages can send blind POSTs but can't set custom headers.</li>
+  </ul>
+
+  <h3>text() and the file formats</h3>
+  <p>A minimal-correct TrueType engine is ~1,200–2,000 lines against excellent public specs: cmap formats 4/12, glyf quadratic outlines <em>including composites</em> (every accented Latin glyph is one — not optional) and the implied on-curve midpoint trap, hmtx/hhea metrics, TTC headers (macOS ships .ttc), kern now and a GPOS PairPos subset in v2. Flatten quadratics with $fn-derived tolerance, resolve contour overlap with the 2D winding union you already have. <b>Declare loudly:</b> no CFF/.otf initially, no HarfBuzz-class shaping — Latin with kerning first, registered font files + an embedded OFL Liberation face, and per-codepoint fallback documented as a divergence. Fonts are attacker-shaped input: bounds-check everything, cap composite recursion, fuzz natively.</p>
+  <div class="tablewrap"><table>
+    <tr><th>Format</th><th>Write</th><th>Read</th><th>Notes</th></tr>
+    <tr><td class="mono">STL</td><td class="num">~60 lines</td><td class="num">~150 lines</td><td>Sniff binary by size arithmetic, not the "solid" prefix; weld vertices on import</td></tr>
+    <tr><td class="mono">OFF / OBJ</td><td class="num">~130 lines</td><td class="num">~400 lines</td><td>OBJ: 1-based and negative indices, v//vn forms, triangulate n-gons</td></tr>
+    <tr><td class="mono">3MF</td><td class="num">stored-ZIP, ~250</td><td class="num">~1,500</td><td>Reading others' files needs your inflate; writing needs none (stored entries are legal ZIP)</td></tr>
+    <tr><td class="mono">AMF</td><td class="num">~150</td><td class="num">~250</td><td>Rides the shared ~400-line XML pull parser (no DTD — that's also the XXE defense)</td></tr>
+    <tr><td class="mono">DXF</td><td class="num">~150 (R12 LINE)</td><td class="num">~500</td><td>Pin the exact 2021.01 entity subset against the oracle before speccing; bulge = tan(θ/4)</td></tr>
+    <tr><td class="mono">SVG</td><td class="num">~150</td><td class="num">~2,000</td><td>Path d-parser, arc→bezier, transform stack, fill-rule → polygon-with-holes</td></tr>
+    <tr><td class="mono">CSG dump</td><td class="num">~150</td><td>—</td><td>Pretty-print the evaluated tree — but oracle-diffing it means matching OpenSCAD's group() wrappers and float formatting; budget the emitter deliberately</td></tr>
+    <tr><td class="mono">PNG</td><td class="num">~400–600</td><td class="num">~1,000</td><td>Write with fixed-Huffman deflate from v1 (stored-block PNGs make 512² thumbnails ~1.4MB base64 — too fat for MCP); read needed for surface() heightmaps</td></tr>
+  </table></div>
+
+  <h3>Editor without CodeMirror</h3>
+  <p>v0 is a plain textarea + error list + Ctrl-Enter render — ships in a day. v1 stacks a transparent-text textarea over a <code>&lt;pre&gt;</code> backdrop colored by <b>the same wasm lexer the compiler uses</b> (export <code>tokenize()</code> → one source of truth for highlighting). Squiggles via <code>text-decoration: underline wavy</code> on diagnostic spans; convert Rust's UTF-8 byte offsets to UTF-16 columns on the Rust side. Skip contenteditable entirely. Known cost: programmatic edits (tab insertion, AI edits pushed into the buffer) break native textarea undo — plan to own undo/redo once <code>scad_edit</code> lands, which the revision history conveniently already supports.</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="mcp">
+  <div class="eyebrow">Part 06</div>
+  <h2>MCP: the AI design companion</h2>
+  <p class="lede">One transport-agnostic JSON-RPC dispatcher, exposed two ways: <b>POST /mcp on the same localhost server</b> (primary — zero-IPC access to the live editor session) and a thin <b>stdio mode</b> that bridges to the running instance (Claude Desktop is stdio-only; stdio is also the conformance-test harness). The MCP server links the core crates <em>natively</em> — no WASM in the AI loop, real debuggability, and a headless CPU rasterizer (~400–700 lines) instead of driving a browser.</p>
+  <p>Protocol surface is small: pin revision 2025-06-18, negotiate down; implement <code>initialize</code>, <code>ping</code>, <code>tools/list</code>, <code>tools/call</code>; declare tools only. The one rule that makes or breaks the loop: <b>domain failures (syntax errors, timeouts, non-manifold export) are successful responses with <code>isError:true</code> and diagnostics in content</b> — the model reads them and self-corrects. JSON-RPC error objects are for protocol failures only. Every evaluating tool runs under budgets (step counter, wall clock, triangle cap, recursion depth) that name the limit and the source location when tripped — AI-authored .scad <em>will</em> contain <code>$fn=10000</code> and runaway recursion. Pin and document <code>$preview</code> per tool.</p>
+
+  <div class="tablewrap"><table>
+    <tr><th>Tool</th><th>Job</th></tr>
+    <tr><td class="mono">scad_check</td><td>Syntax + semantic diagnostics, no geometry. <code>file:line:col: severity[CODE]: message</code> + source line + caret, deterministic order, first-20 cap. Sub-100ms; called after every edit</td></tr>
+    <tr><td class="mono">scad_eval</td><td>Run the interpreter, capture echo/assert/warnings + CSG-node stats — the model's printf debugger, no mesh cost</td></tr>
+    <tr><td class="mono">scad_render</td><td>Headless z-buffer render → PNG image block. Multi-view as one tiled grid — pixels are context tokens</td></tr>
+    <tr><td class="mono">scad_stats</td><td>bbox, volume (divergence theorem), surface area, components, manifold/watertight report — numeric ground truth after every render</td></tr>
+    <tr><td class="mono">scad_measure</td><td>Batched raycast / thickness / clearance / slice-area queries — turns "does the lid clear by 0.2mm" into arithmetic</td></tr>
+    <tr><td class="mono">scad_read / scad_edit</td><td>Live-buffer read and revision-checked edit (find/replace or ranges). Stale revision → current content back, model rebases. Edit response includes post-edit check — fusing edit+check saves a round trip per iteration</td></tr>
+    <tr><td class="mono">scad_params</td><td>Customizer schema get/set; presets in OpenSCAD's .json format so files round-trip with upstream</td></tr>
+    <tr><td class="mono">scad_export</td><td>STL/3MF/OFF/OBJ/AMF/DXF/SVG/CSG to project-rooted paths, manifoldness gate before "done"</td></tr>
+    <tr><td class="mono">scad_docs</td><td>Exact builtin signatures generated from the interpreter's own tables — the anti-hallucination tool, and where dialect deviations are documented</td></tr>
+    <tr><td class="mono">scad_undo · scad_render_diff</td><td>Optional polish: revert AI edits; side-by-side render + stats delta for "did my change do what I intended"</td></tr>
+  </table></div>
+
+  <p>The loop the tool set is shaped for — state it in <code>serverInfo.instructions</code>: read → edit (returns diagnostics) → render → stats/measure to verify numerically → export with manifold gate. <code>readOnlyHint</code> annotations keep the read-side prompt-free in Claude Code, and a checked-in project <code>.mcp.json</code> pointing at <code>http://127.0.0.1:PORT/mcp</code> makes the whole thing auto-discover.</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="zerodep">
+  <div class="eyebrow">Part 07</div>
+  <h2>What zero-dependency actually costs</h2>
+  <p class="lede">The rule is fully workable — this repo's test platform already proves the house style — but it silently adds a second project: infrastructure that has nothing to do with CAD. Budget it explicitly (~2–3 months spread across phases) or the geometry schedule absorbs it invisibly.</p>
+  <div class="tablewrap"><table>
+    <tr><th>You give up</th><th>You hand-roll instead</th><th>Size</th></tr>
+    <tr><td class="mono">wasm-bindgen</td><td>extern "C" ABI + JS glue</td><td class="num">~300 lines JS + boundary code</td></tr>
+    <tr><td class="mono">serde</td><td>JSON parser/serializer + JSON-RPC <span class="sub">seed from src/json.rs already in this repo</span></td><td class="num">~1,000–1,300 lines</td></tr>
+    <tr><td class="mono">glam / nalgebra</td><td>vec/mat/quat library</td><td class="num">~120 lines JS + Rust twin</td></tr>
+    <tr><td class="mono">flate2 / zip</td><td>RFC 1951 inflate + deflate(fixed) + ZIP r/w</td><td class="num">~1,200 lines</td></tr>
+    <tr><td class="mono">quick-xml</td><td>XML pull parser, no DTD</td><td class="num">~400–500 lines</td></tr>
+    <tr><td class="mono">ttf-parser + rusttype</td><td>TrueType engine</td><td class="num">~1,200–2,000 lines</td></tr>
+    <tr><td class="mono">png / image</td><td>PNG encode + decode</td><td class="num">~1,400 lines</td></tr>
+    <tr><td class="mono">axum / tokio</td><td>HTTP/1.1 + SSE + WebSocket, thread-per-conn</td><td class="num">~800–1,000 lines</td></tr>
+    <tr><td class="mono">sha1 / base64 / crc32</td><td>tinyutil with RFC test vectors</td><td class="num">~150 lines</td></tr>
+    <tr><td class="mono">rand</td><td>MT19937 (rands() parity — match OpenSCAD-on-Linux mapping, document it)</td><td class="num">~80 lines</td></tr>
+    <tr><td class="mono">earcut / clipper / manifold crates</td><td>the entire geometry kernel</td><td class="num">the project itself</td></tr>
+    <tr><td class="mono">proptest / criterion / insta</td><td>golden-file runner + PRNG fuzz loop on std #[test]</td><td class="num">a few days</td></tr>
+  </table></div>
+  <p>Two consciously-made calls to record: Rust std's float formatting/parsing is already shortest-roundtrip and correctly-rounded — no hand-written Ryū needed, but echo/str() need an ~80-line %g-at-6-digits formatter to match OpenSCAD's observable output. And <code>rustup</code>'s wasm32 target plus <code>cargo</code> are toolchain, not dependencies — the constraint stays intact.</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="testing">
+  <div class="eyebrow">Part 08</div>
+  <h2>Testing is the backbone, not a phase</h2>
+  <ul>
+    <li><b>Differential oracle from week one.</b> CI runs the official OpenSCAD AppImage headlessly on <em>your own</em> probe files (running GPL software is unrestricted; their test files never enter your tree). Compare echo/warning text verbatim, CSG dumps, and mesh-level equivalence.</li>
+    <li><b>Canonicalize before comparing meshes:</b> sorted vertex/triangle sets under tolerance — never byte-diffed STL. OpenSCAD doesn't guarantee triangle order across its own versions; promise mesh equivalence and self-consistency instead.</li>
+    <li><b>Golden native CLI:</b> <code>scad-cli check|render|export|stats</code> makes every pipeline stage scriptable — hashed deterministic renders, blessed fixtures, and the same binary the MCP server uses.</li>
+    <li><b>Fuzz the parsers</b> (fonts, DXF, SVG, JSON, inflate) natively with a 50-line PRNG loop; fuzz the boolean kernel with generated coincident-geometry adversaries — mirrored, rotated, grid-aligned.</li>
+    <li><b>Provenance log doubles as the compat spec:</b> every quirk pinned by a probe file + recorded oracle output is simultaneously legal evidence and a regression test.</li>
+    <li><b>Acceptance corpus, license-checked:</b> BOSL2 (BSD-2, shippable) as the semantic stress test; GPL libraries run privately in CI only, never vendored.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section id="roadmap">
+  <div class="eyebrow">Part 09</div>
+  <h2>Roadmap</h2>
+  <p>Solo, experienced, aggressively AI-assisted. AI assist genuinely compresses the well-specified parts — format parsers, published algorithms, test generation — and deliberately does not shrink the robust-kernel degeneracy tail.</p>
+
+  <div class="phase">
+    <div class="pn">Phase 0<span class="when">months 0–2.5</span></div>
+    <div>
+      <h3>A real tool with no booleans</h3>
+      <p>Full lexer/parser/evaluator with the honest semantics of Part 03 · exact primitive tessellation · WebGL2 viewer with camera + edges · HTTP server with embedded assets · MCP server with <b>check/eval/docs/read/edit</b> (none of these need geometry) · differential harness running the oracle. <b>Ships: a live .scad previewer with an AI copilot for language-level work.</b></p>
+    </div>
+  </div>
+  <div class="phase">
+    <div class="pn">Phase 1<span class="when">months 1.5–5, overlapping</span></div>
+    <div>
+      <h3>Interactive parity + the 2D kernel</h3>
+      <p>Goldfeather stencil preview (F5-equivalent booleans with zero kernel) · integer-snapped 2D booleans, triangulation, offset · linear/rotate_extrude · quickhull + convex minkowski · customizer panel. <b>Ships: most real-world scripts preview interactively.</b></p>
+    </div>
+  </div>
+  <div class="phase">
+    <div class="pn">Phase 2<span class="when">≤1 month, optional</span></div>
+    <div>
+      <h3>Stopgap export, honestly labeled</h3>
+      <p>csg.js-style BSP + vertex welding + a manifold validator that <b>reports</b> when output is broken. Time-boxed hard; every hour hardening it is stolen from Phase 3. Skip if export urgency is low.</p>
+    </div>
+  </div>
+  <div class="phase">
+    <div class="pn">Phase 3<span class="when">months 4–12</span></div>
+    <div>
+      <h3>The real kernel</h3>
+      <p>Shewchuk predicates → BVH → exact arrangement → winding classification → manifold output, fuzzed continuously against the oracle. <b>Decision gate at month ~6:</b> if the degeneracy tail is eating the schedule, pivot F6 to Bernstein–Fussell exact BSP (provably robust, slower) and keep this as the performance track.</p>
+    </div>
+  </div>
+  <div class="phase">
+    <div class="pn">Phase 4<span class="when">months 6–14, parallel</span></div>
+    <div>
+      <h3>The long tail</h3>
+      <p>text() Latin subset · projection · surface + PNG decode · import/export formats · nonconvex minkowski with documented caveats · scad_measure/render_diff · animation runner ($t) · worker-pool parallelism if profiling demands it.</p>
+    </div>
+  </div>
+
+  <div class="tablewrap"><table>
+    <tr><th>Milestone</th><th>Calendar</th></tr>
+    <tr><td>Useful interactive previewer + AI loop (no real booleans)</td><td class="num">~2.5–3 months</td></tr>
+    <tr><td>Interactive parity on most real scripts, 2D correct, stopgap export</td><td class="num">~4–6 months</td></tr>
+    <tr><td>Credible replacement: robust F6 booleans passing the differential suite, text-Latin, main formats</td><td class="num">~12–18 months</td></tr>
+    <tr><td>Hard parity minus declared descopes (complex-script shaping, roof(), nonconvex-minkowski speed)</td><td class="num">~24–36 months</td></tr>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="risks">
+  <div class="eyebrow">Part 10</div>
+  <h2>Risk register</h2>
+  <div class="tablewrap"><table>
+    <tr><th>Risk</th><th>Mitigation</th></tr>
+    <tr><td><b>Robust-boolean tail</b> — 20% happy path, 80% degenerate whack-a-mole on input that is degenerate on purpose</td><td>Exact predicates from day one of Phase 3, continuous coincident-geometry fuzzing, the explicit Bernstein–Fussell fallback gate</td></tr>
+    <tr><td><b>GPL contamination via tests/examples or AI regurgitation</b> — the highest-probability real legal risk</td><td>Committed sources policy, in-house probes only, provenance log, review C++-shaped generated code</td></tr>
+    <tr><td><b>Language-semantics drift</b> — silent incompatibilities reported as "your CAD is wrong"</td><td>The differential oracle from week one; the warning set and echo formatter treated as compatibility surface</td></tr>
+    <tr><td><b>Zero-dep infrastructure absorbing the schedule invisibly</b></td><td>Part 07's bill of materials budgeted as line items, shared across formats (one inflate serves 3MF, AMF, PNG, SVG-in-zip)</td></tr>
+    <tr><td><b>wasm performance vs modern OpenSCAD</b> — single-threaded kernel, no rayon</td><td>Set expectations in order: correctness parity → native single-thread speed → worker-pool parallelism. Native MCP path is full speed already</td></tr>
+    <tr><td><b>Native/wasm render divergence</b> — the AI (native) and the human (browser) disagreeing about the same file</td><td>Same core crates both sides, BTreeMap discipline, epsilon-compared cross-target goldens; bound and document any residual libm ULP differences</td></tr>
+    <tr><td><b>text() scope creep</b> — shaping/CFF/fontconfig is quietly a year</td><td>Latin + kerning + registered TTFs + embedded OFL face; divergences documented in scad_docs</td></tr>
+    <tr><td><b>Solo-dev morale through the kernel grind</b> — months of low-visible progress after the flashy preview ships</td><td>The phasing is the morale plan: shippable value at month 2.5, the stopgap time-boxed, the fallback explicit</td></tr>
+  </table></div>
+</section>
+
+<footer>
+  <div>OpenSCAD From Scratch · architecture blueprint · prepared 2026-08-23</div>
+  <div>Synthesized from a six-agent research workflow: language surface · licensing · geometry strategies · platform mechanics · MCP design · adversarial critique.</div>
+  <div>"OpenSCAD" refers to the language implemented for compatibility; this project is not affiliated with or endorsed by the OpenSCAD project.</div>
+</footer>
+</div>
