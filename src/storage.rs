@@ -166,6 +166,44 @@ pub fn is_valid_run_id(id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a persisted summary exists for this run id.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_summary_exists(paths: &StoragePaths, run_id: &str) -> bool {
+    is_valid_run_id(run_id) && std::fs::metadata(paths.run_path(run_id)).is_ok()
+}
+
+/// WASM stub: no persisted runs.
+#[cfg(target_arch = "wasm32")]
+pub fn run_summary_exists(_paths: &StoragePaths, _run_id: &str) -> bool {
+    false
+}
+
+/// Atomically claim a run id by creating its file with create_new —
+/// fails when another session already claimed it. Returns false ONLY on
+/// already-claimed; other IO errors report true (best effort — the later
+/// save will surface them) so callers can never loop forever.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn reserve_run_file(paths: &StoragePaths, run_id: &str) -> bool {
+    if !is_valid_run_id(run_id) {
+        return false;
+    }
+    let path = paths.run_path(run_id);
+    if let Some((parent, _)) = path.rsplit_once('/') {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => true,
+    }
+}
+
+/// WASM stub: no filesystem, no contention.
+#[cfg(target_arch = "wasm32")]
+pub fn reserve_run_file(_paths: &StoragePaths, _run_id: &str) -> bool {
+    true
+}
+
 /// Save a run summary to JSON.
 pub fn save_run_summary(paths: &StoragePaths, summary: &RunSummary) -> Result<(), String> {
     if !is_valid_run_id(&summary.run_id) {

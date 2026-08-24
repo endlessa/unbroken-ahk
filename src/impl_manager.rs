@@ -164,17 +164,20 @@ impl PlatformManager {
     }
 
     fn next_run_id(&mut self) -> RunId {
-        // Re-scan persisted runs at mint time, not only at construction:
-        // two sessions open concurrently on the same storage dir would
-        // otherwise both seed the same counter and clobber each other's
-        // run files. (A narrow scan-to-write race remains; runs are
-        // infrequent and single-user, so exclusive-create is not worth
-        // the platform surface yet.)
-        self.run_counter = self
-            .run_counter
-            .max(storage::max_existing_run_number(&self.storage));
-        self.run_counter += 1;
-        format!("run_{:04}", self.run_counter)
+        // Re-scan persisted runs at mint time and then CLAIM the id by
+        // atomically creating its file — two sessions racing on the same
+        // storage dir can no longer mint the same id and clobber each
+        // other. On a claimed id, advance and retry.
+        loop {
+            self.run_counter = self
+                .run_counter
+                .max(storage::max_existing_run_number(&self.storage));
+            self.run_counter += 1;
+            let run_id = format!("run_{:04}", self.run_counter);
+            if storage::reserve_run_file(&self.storage, &run_id) {
+                return run_id;
+            }
+        }
     }
 }
 
@@ -364,9 +367,14 @@ impl TestManager for PlatformManager {
         if self.progress.active_runs().contains(&run_id.to_string()) {
             return Err(ManagerError::RunInProgress(run_id.into()));
         }
-        // Try loading from storage
+        // Try loading from storage. A missing file is an unknown run; a
+        // file that exists but fails to parse is CORRUPTION and must say
+        // so — telling the user the run never happened hides real damage.
+        if !storage::run_summary_exists(&self.storage, run_id) {
+            return Err(ManagerError::UnknownRun(run_id.into()));
+        }
         storage::load_run_summary(&self.storage, run_id)
-            .map_err(|_| ManagerError::UnknownRun(run_id.into()))
+            .map_err(|e| ManagerError::CorruptRun(run_id.into(), e))
     }
 }
 
@@ -516,6 +524,24 @@ mod tests {
                 Err(ManagerError::UnknownRun(_)) => {}
                 other => panic!("expected UnknownRun for {:?}, got {:?}", evil, other.map(|_| ())),
             }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_run_file_is_reported_as_corrupt_not_unknown() {
+        let dir = crate::test_util::temp_storage_dir("mgr-corruptrun");
+        std::fs::create_dir_all(format!("{}/runs", dir)).unwrap();
+        std::fs::write(format!("{}/runs/run_0042.json", dir), "{ not json").unwrap();
+        let mgr = PlatformManager::new(&dir);
+        match mgr.get_results("run_0042") {
+            Err(ManagerError::CorruptRun(id, _)) => assert_eq!(id, "run_0042"),
+            other => panic!("expected CorruptRun, got {:?}", other.map(|_| ())),
+        }
+        // A genuinely absent run is still UnknownRun.
+        match mgr.get_results("run_0099") {
+            Err(ManagerError::UnknownRun(_)) => {}
+            other => panic!("expected UnknownRun, got {:?}", other.map(|_| ())),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

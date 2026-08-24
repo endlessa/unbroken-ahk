@@ -73,6 +73,19 @@ pub enum ExecutionModel {
     Parallel { max_concurrency: u32 },
 }
 
+impl RunConfig {
+    /// True when any include-side filter is set. The single source of the
+    /// "no includes selected" predicate — shared by the filter engine and
+    /// the console parser so the layers cannot drift. (The JSON layer
+    /// necessarily tests key PRESENCE instead, before parsing collapses
+    /// an explicitly-empty list and an absent one into the same value.)
+    pub fn has_include_filters(&self) -> bool {
+        !self.include_ids.is_empty()
+            || !self.include_tags.is_empty()
+            || self.name_pattern.is_some()
+    }
+}
+
 impl Default for RunConfig {
     fn default() -> Self {
         Self {

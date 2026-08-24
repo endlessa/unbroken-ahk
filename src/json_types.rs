@@ -193,6 +193,23 @@ impl ToJson for RunConfig {
 
 impl FromJson for RunConfig {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
+        parse_run_config(value, true)
+    }
+}
+
+impl RunConfig {
+    /// Parse a config embedded in a PERSISTED run summary. Same strict
+    /// typing as caller input, but without the bare-run_all:false guard:
+    /// files written before the exclude-under-run_all rework legitimately
+    /// contain {"run_all": false, "exclude_tags": [...]} configs, and
+    /// history must stay readable.
+    pub fn from_json_stored(value: &JsonValue) -> Result<Self, JsonError> {
+        parse_run_config(value, false)
+    }
+}
+
+fn parse_run_config(value: &JsonValue, reject_bare_run_all_false: bool) -> Result<RunConfig, JsonError> {
+    {
         // Every field is strictly typed when present, and unknown keys are
         // rejected: a mistyped filter — wrong type OR wrong name ("tags"
         // instead of "include_tags") — must be an error, never a
@@ -231,8 +248,9 @@ impl FromJson for RunConfig {
         // name the cause and the fix here, where key presence is still
         // visible, instead of a bare no-tests-matched downstream.
         // ({"run_all": false, "include_ids": []} keeps its NoTestsMatched
-        // contract: an include key WAS supplied.)
-        if run_all_explicit == Some(false) && !includes_supplied {
+        // contract: an include key WAS supplied.) Skipped for persisted
+        // configs (from_json_stored), which may predate this rule.
+        if reject_bare_run_all_false && run_all_explicit == Some(false) && !includes_supplied {
             return Err(JsonError::InvalidField(
                 "run_all".into(),
                 "false requires at least one include filter (include_ids, \
@@ -380,7 +398,7 @@ impl FromJson for RunSummary {
             .unwrap_or_default();
         let config = value
             .get("config")
-            .map(|v| RunConfig::from_json(v))
+            .map(RunConfig::from_json_stored)
             .transpose()?
             .unwrap_or_default();
         Ok(RunSummary {
@@ -688,6 +706,27 @@ mod tests {
         assert!(TestDefinition::from_json(
             &parse_json(r#"{"id": "t", "name": "x", "group": 3}"#).unwrap()
         ).is_err());
+    }
+
+    #[test]
+    fn stored_exclude_only_config_stays_readable() {
+        // Files written before the exclude-under-run_all rework contain
+        // {"run_all": false, "exclude_tags": [...]} configs. History must
+        // stay loadable even though caller input now rejects that shape.
+        let old_file = r#"{
+            "run_id": "run_0007",
+            "config": {"run_all": false, "exclude_tags": ["slow"], "fail_fast": false,
+                       "execution_model": {"type": "sequential"}},
+            "results": [], "total": 2, "passed": 2, "failed": 0, "skipped": 0,
+            "errored": 0, "total_duration_ms": 10, "started_at": 5, "completed_at": 15
+        }"#;
+        let val = parse_json(old_file).unwrap();
+        let summary = RunSummary::from_json(&val).unwrap();
+        assert_eq!(summary.run_id, "run_0007");
+        assert!(!summary.config.run_all);
+        // The same config shape as direct caller input still errors.
+        let caller = parse_json(r#"{"run_all": false, "exclude_tags": ["slow"]}"#).unwrap();
+        assert!(RunConfig::from_json(&caller).is_err());
     }
 
     #[test]

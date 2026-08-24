@@ -59,6 +59,9 @@ pub trait TestManager {
 pub enum ManagerError {
     /// No run exists with this ID.
     UnknownRun(RunId),
+    /// A run file exists but could not be parsed — the run happened, its
+    /// record is damaged (or written by an incompatible version).
+    CorruptRun(RunId, String),
     /// The run has not completed yet.
     RunInProgress(RunId),
     /// The run already completed — cannot start again.

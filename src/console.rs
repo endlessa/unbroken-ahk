@@ -395,10 +395,7 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
     // If no include-side filters were set, run everything. Exclusions
     // don't count: they apply under run_all, so 'run --exclude slow'
     // means "everything except slow".
-    if config.include_ids.is_empty()
-        && config.include_tags.is_empty()
-        && config.name_pattern.is_none()
-    {
+    if !config.has_include_filters() {
         config.run_all = true;
     }
 
@@ -570,8 +567,9 @@ mod tests {
         let mut mgr = setup_manager();
         let out = execute_command(&mut mgr, "run --tag smoke");
         assert!(out.text.contains("Passed: 2"));
-        // Should not include the slow test
-        assert!(!out.text.contains("net_ping"));
+        // Should not include the slow test (results list test IDs, so
+        // assert on the id — the name never appears in run output).
+        assert!(!out.text.contains(" t3 "));
     }
 
     #[test]
@@ -652,7 +650,8 @@ mod tests {
         let mut mgr = setup_manager();
         let out = execute_command(&mut mgr, "run --exclude slow");
         assert!(out.text.contains("Total: 2"), "got: {}", out.text);
-        assert!(!out.json.contains("net_ping"));
+        // Run output carries test IDs, not names — assert on the id.
+        assert!(!out.json.contains("\"t3\""));
     }
 
     #[test]

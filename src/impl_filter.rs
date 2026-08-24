@@ -18,9 +18,7 @@ impl TestFilter for StandardFilter {
         tests: &[&'a TestDefinition],
         config: &RunConfig,
     ) -> Vec<&'a TestDefinition> {
-        let no_includes = config.include_ids.is_empty()
-            && config.include_tags.is_empty()
-            && config.name_pattern.is_none();
+        let no_includes = !config.has_include_filters();
 
         let mut candidates: Vec<&'a TestDefinition> = if config.run_all {
             // run_all: start from every test. Include filters are ignored,
