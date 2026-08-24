@@ -21,9 +21,11 @@ impl TestFilter for StandardFilter {
         let no_includes = !config.has_include_filters();
 
         let mut candidates: Vec<&'a TestDefinition> = if config.run_all {
-            // run_all: start from every test. Include filters are ignored,
-            // but exclusions below STILL apply — "run everything except the
-            // destructive tag" must honor the exclusion.
+            // run_all: start from every test; exclusions below STILL apply —
+            // "run everything except the destructive tag" must honor the
+            // exclusion. Include filters are ignored here as defense in
+            // depth, but start_run rejects that contradictory combination
+            // before any config reaches this point.
             tests.to_vec()
         } else if no_includes {
             // run_all=false with no include criteria: the include side

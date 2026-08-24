@@ -142,7 +142,7 @@ pub fn list_tools() -> Vec<ToolDescriptor> {
             parameters: obj(vec![
                 ("run_all", obj(vec![
                     ("type", str_val("boolean")),
-                    ("description", str_val("Start from every registered test (exclude_tags still applies; include filters are ignored). Defaults to true unless include_ids, include_tags, or name_pattern is supplied — exclude_tags alone keeps run_all true, running everything except the excluded tags.")),
+                    ("description", str_val("Start from every registered test (exclude_tags still applies; combining with include filters is rejected as contradictory). Defaults to true unless include_ids, include_tags, or name_pattern is supplied — exclude_tags alone keeps run_all true, running everything except the excluded tags.")),
                     ("required", JsonValue::Bool(false)),
                 ])),
                 ("include_ids", obj(vec![
@@ -795,6 +795,23 @@ mod tests {
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
         assert!(val.get_str("error").unwrap().contains("include_ids"));
+    }
+
+    #[test]
+    fn run_all_with_include_filters_is_rejected() {
+        // Contradictory intent must never silently widen the run past
+        // the includes (the destructive tests a tag was scoping out).
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(
+            &mut mgr,
+            r#"{"tool": "test_run", "params": {"run_all": true, "include_tags": ["smoke"]}}"#,
+        );
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val
+            .get_str("error")
+            .unwrap()
+            .contains("conflicts with include filters"));
     }
 
     #[test]

@@ -632,7 +632,15 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                 }
                 pos += 1;
             }
-            elements.push(input[start..pos].trim());
+            let piece = input[start..pos].trim();
+            if piece.is_empty() {
+                // A zero-length element is damage to the array SKELETON
+                // (a trailing or doubled comma), not a damaged entry —
+                // reporting it per-entry would warn about a nonexistent
+                // entry and back up an intact file as corrupt.
+                return Err(JsonError::UnexpectedChar(pos, bytes[pos] as char));
+            }
+            elements.push(piece);
             let closed = bytes[pos] == b']';
             pos += 1;
             if closed {
@@ -728,6 +736,10 @@ mod tests {
         assert!(matches!(split_top_level_array("{}"), Err(JsonError::UnexpectedChar(_, _))));
         assert!(matches!(split_top_level_array("[1, 2"), Err(JsonError::UnexpectedEnd)));
         assert!(matches!(split_top_level_array("[1] junk"), Err(JsonError::TrailingData(_))));
+        // Comma damage is skeleton damage, never a phantom empty "entry".
+        assert!(matches!(split_top_level_array("[1, 2,]"), Err(JsonError::UnexpectedChar(_, _))));
+        assert!(matches!(split_top_level_array("[1,, 2]"), Err(JsonError::UnexpectedChar(_, _))));
+        assert!(matches!(split_top_level_array("[,]"), Err(JsonError::UnexpectedChar(_, _))));
     }
 
     #[test]

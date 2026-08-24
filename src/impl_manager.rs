@@ -396,6 +396,21 @@ impl TestManager for PlatformManager {
             ));
         }
 
+        // run_all combined with include filters is contradictory caller
+        // intent: honoring run_all would silently WIDEN the run past the
+        // includes (running the destructive tests a tag was scoping out),
+        // honoring the includes would silently ignore run_all. Same rule
+        // as the sequential+max_concurrency contradiction: reject loudly
+        // and name the fix.
+        if config.run_all && config.has_include_filters() {
+            return Err(ManagerError::UnsupportedConfig(
+                "run_all: true conflicts with include filters (include_ids, \
+                 include_tags, name_pattern) — drop run_all (include \
+                 filters imply it is false) or drop the include filters"
+                    .into(),
+            ));
+        }
+
         // A programmatic exclude-only config with run_all=false selects
         // nothing by construction — point at the fix instead of a bare
         // no-tests-matched (the JSON layer already rejects this shape).
@@ -443,8 +458,9 @@ impl TestManager for PlatformManager {
         }
 
         // A misspelled include criterion must error, never silently shrink
-        // the run while other criteria still match something. Skipped under
-        // run_all, where include filters are documented as ignored.
+        // the run while other criteria still match something. (Under
+        // run_all include filters cannot appear at all — the contradiction
+        // guard above rejected them.)
         if !config.run_all {
             // Validate against the SAME snapshot selection will use — a
             // second live-registry query here is both O(ids × registry)
@@ -618,16 +634,26 @@ impl TestManager for PlatformManager {
         // (unknown, reserved-only, unreadable, corrupt) pass through
         // with their own truthful messages.
         let summary = self.get_results(run_id)?;
+        // completed comes from the RESULTS, not from total: a legacy file
+        // (written before ghost-Error reconciliation) can hold fewer
+        // results than selected tests, and claiming completed == total
+        // would contradict the counters shown beside it.
+        let completed = summary.results.len().min(u32::MAX as usize) as u32;
+        let percent_complete = if summary.total > 0 {
+            (completed as f64 / summary.total as f64) * 100.0
+        } else {
+            100.0
+        };
         Ok(RunProgress {
             run_id: summary.run_id.clone(),
             total: summary.total,
-            completed: summary.total,
+            completed,
             passed: summary.passed,
             failed: summary.failed,
             errored: summary.errored,
             skipped: summary.skipped,
             running: 0,
-            percent_complete: 100.0,
+            percent_complete,
             elapsed_ms: summary.completed_at.saturating_sub(summary.started_at),
         })
     }
@@ -757,25 +783,11 @@ mod tests {
         let dir = crate::test_util::temp_storage_dir("mgr-ghost");
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
-            TestDefinition {
-                id: "t1".into(),
-                name: "runnable".into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            },
+            TestDefinition { name: "runnable".into(), ..crate::test_util::def("t1") },
             Box::new(EchoTest { id: "t1".into(), pass: true }),
         ).unwrap();
         // Definition with no runnable attached.
-        mgr.register_test(TestDefinition {
-            id: "t2".into(),
-            name: "definition_only".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        }).unwrap();
+        mgr.register_test(TestDefinition { name: "definition_only".into(), ..crate::test_util::def("t2") }).unwrap();
 
         let run_id = mgr.start_run(RunConfig::default()).unwrap();
         let results = mgr.get_results(&run_id).unwrap();
@@ -801,14 +813,7 @@ mod tests {
         let dir = crate::test_util::temp_storage_dir("mgr-traversal");
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
-            TestDefinition {
-                id: "t1".into(),
-                name: "t".into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            },
+            TestDefinition { name: "t".into(), ..crate::test_util::def("t1") },
             Box::new(EchoTest { id: "t1".into(), pass: true }),
         ).unwrap();
         mgr.start_run(RunConfig::default()).unwrap();
@@ -830,24 +835,10 @@ mod tests {
         // merge-on-persist must not clobber the stored definition-only
         // test in between.
         let dir = crate::test_util::temp_storage_dir("mgr-preserve");
-        let def_t1 = TestDefinition {
-            id: "t1".into(),
-            name: "runnable".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        };
+        let def_t1 = TestDefinition { name: "runnable".into(), ..crate::test_util::def("t1") };
         let mut mgr1 = PlatformManager::new(&dir);
         mgr1.register_runnable(def_t1.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
-        mgr1.register_test(TestDefinition {
-            id: "t2".into(),
-            name: "definition_only".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        }).unwrap();
+        mgr1.register_test(TestDefinition { name: "definition_only".into(), ..crate::test_util::def("t2") }).unwrap();
 
         // Restart in register-first order.
         let mut mgr2 = PlatformManager::new(&dir);
@@ -865,14 +856,7 @@ mod tests {
         // The no-op fast path must still write to disk: a retry after a
         // failed persist lands there and success must mean durable.
         let dir = crate::test_util::temp_storage_dir("mgr-fastpath");
-        let def = TestDefinition {
-            id: "d1".into(),
-            name: "t".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        };
+        let def = TestDefinition { name: "t".into(), ..crate::test_util::def("d1") };
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_test(def.clone()).unwrap();
         // Simulate the definition never having reached disk.
@@ -904,14 +888,7 @@ mod tests {
         // identical definition-only test after load_from_storage is a
         // no-op, and a conflicting one errors.
         let dir = crate::test_util::temp_storage_dir("mgr-regtest-restart");
-        let def = TestDefinition {
-            id: "d1".into(),
-            name: "definition_only".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        };
+        let def = TestDefinition { name: "definition_only".into(), ..crate::test_util::def("d1") };
         let mut mgr1 = PlatformManager::new(&dir);
         mgr1.register_test(def.clone()).unwrap();
 
@@ -1119,6 +1096,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_short_results_progress_stays_consistent() {
+        // A pre-ghost-reconciliation run file can hold fewer results
+        // than selected tests; the synthetic snapshot must not claim
+        // they all completed while the counters beside it say otherwise.
+        let dir = crate::test_util::temp_storage_dir("mgr-legacy-progress");
+        std::fs::create_dir_all(format!("{}/runs", dir)).unwrap();
+        std::fs::write(
+            format!("{}/runs/run_0001.json", dir),
+            r#"{"run_id": "run_0001", "total": 5, "passed": 3,
+                "results": [
+                    {"test_id": "a", "status": "passed", "duration_ms": 1},
+                    {"test_id": "b", "status": "passed", "duration_ms": 1},
+                    {"test_id": "c", "status": "passed", "duration_ms": 1}
+                ],
+                "started_at": 1000, "completed_at": 4000}"#,
+        )
+        .unwrap();
+        let mgr = PlatformManager::new(&dir);
+        let progress = mgr.check_progress("run_0001").unwrap();
+        assert_eq!(progress.total, 5);
+        assert_eq!(progress.completed, 3);
+        assert!((progress.percent_complete - 60.0).abs() < 1e-9);
+        assert_eq!(progress.elapsed_ms, 3000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn parse_defect_in_one_registry_entry_spares_the_rest() {
         // A duplicate object key INSIDE one entry is that entry's damage:
         // the healthy definitions around it must load, and the next
@@ -1147,14 +1151,7 @@ mod tests {
             .collect();
         assert_eq!(loaded, vec!["good1", "good2"]);
 
-        mgr.register_test(TestDefinition {
-            id: "new1".into(),
-            name: "new1".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        })
+        mgr.register_test(crate::test_util::def("new1"))
         .unwrap();
         let rewritten = std::fs::read_to_string(format!("{}/registry.json", dir)).unwrap();
         for id in ["good1", "good2", "new1"] {
@@ -1178,14 +1175,7 @@ mod tests {
 
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
-            TestDefinition {
-                id: "t1".into(),
-                name: "t".into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            },
+            TestDefinition { name: "t".into(), ..crate::test_util::def("t1") },
             Box::new(EchoTest { id: "t1".into(), pass: true }),
         ).unwrap();
         // Evidence preserved under a unique .corrupt-* name, and the live
@@ -1246,14 +1236,7 @@ mod tests {
         ).unwrap();
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
-            TestDefinition {
-                id: "t1".into(),
-                name: "t".into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            },
+            TestDefinition { name: "t".into(), ..crate::test_util::def("t1") },
             Box::new(EchoTest { id: "t1".into(), pass: true }),
         ).unwrap();
         let run_id = mgr.start_run(RunConfig::default()).unwrap();
@@ -1266,14 +1249,7 @@ mod tests {
         // Redeploying a fixed implementation under the same definition
         // must execute the NEW code, never silently keep the stale one.
         let dir = crate::test_util::temp_storage_dir("mgr-replace");
-        let def = TestDefinition {
-            id: "t1".into(),
-            name: "t".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        };
+        let def = TestDefinition { name: "t".into(), ..crate::test_util::def("t1") };
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: false })).unwrap();
         mgr.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
@@ -1289,14 +1265,7 @@ mod tests {
         // A rejected replacement must leave the previously-valid
         // definition in place, not drop it.
         let dir = crate::test_util::temp_storage_dir("mgr-upgradefail");
-        let good = TestDefinition {
-            id: "t1".into(),
-            name: "good".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        };
+        let good = TestDefinition { name: "good".into(), ..crate::test_util::def("t1") };
         let mut mgr1 = PlatformManager::new(&dir);
         mgr1.register_test(good.clone()).unwrap();
 
@@ -1386,14 +1355,7 @@ mod tests {
         let dir = crate::test_util::temp_storage_dir("mgr-bigdur");
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
-            TestDefinition {
-                id: "t1".into(),
-                name: "t".into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            },
+            TestDefinition { name: "t".into(), ..crate::test_util::def("t1") },
             Box::new(SlowLiar),
         ).unwrap();
         let run_id = mgr.start_run(RunConfig::default()).unwrap();
@@ -1447,14 +1409,7 @@ mod tests {
             ]"#,
         ).unwrap();
         let mut mgr = PlatformManager::new(&dir);
-        mgr.register_test(TestDefinition {
-            id: "t2".into(),
-            name: "session".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        }).unwrap();
+        mgr.register_test(TestDefinition { name: "session".into(), ..crate::test_util::def("t2") }).unwrap();
         let content = std::fs::read_to_string(format!("{}/registry.json", dir)).unwrap();
         assert_eq!(content.matches("\"t1\"").count(), 1, "duplicate must collapse");
         assert!(content.contains("first"));
@@ -1529,14 +1484,7 @@ mod tests {
     #[test]
     fn concurrent_managers_do_not_reuse_run_ids() {
         let dir = crate::test_util::temp_storage_dir("mgr-concurrent");
-        let def = TestDefinition {
-            id: "t1".into(),
-            name: "t".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        };
+        let def = TestDefinition { name: "t".into(), ..crate::test_util::def("t1") };
         // Both managers open BEFORE either has run — both seed counter 0.
         let mut a = PlatformManager::new(&dir);
         let mut b = PlatformManager::new(&dir);
@@ -1556,14 +1504,7 @@ mod tests {
         let dir = crate::test_util::temp_storage_dir("mgr-barefalse");
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
-            TestDefinition {
-                id: "t1".into(),
-                name: "t".into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            },
+            TestDefinition { name: "t".into(), ..crate::test_util::def("t1") },
             Box::new(EchoTest { id: "t1".into(), pass: true }),
         ).unwrap();
         let config = RunConfig { run_all: false, ..Default::default() };
@@ -1599,14 +1540,7 @@ mod tests {
         let dir = crate::test_util::temp_storage_dir("mgr-lying");
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
-            TestDefinition {
-                id: "t1".into(),
-                name: "t".into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            },
+            TestDefinition { name: "t".into(), ..crate::test_util::def("t1") },
             Box::new(LyingTest),
         ).unwrap();
         let run_id = mgr.start_run(RunConfig::default()).unwrap();
@@ -1627,14 +1561,7 @@ mod tests {
         // FIRST, then attach runnables — must not fail as a duplicate,
         // and the runnable must actually attach (no ghost Errors).
         let dir = crate::test_util::temp_storage_dir("mgr-loadfirst");
-        let def = TestDefinition {
-            id: "t1".into(),
-            name: "t".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        };
+        let def = TestDefinition { name: "t".into(), ..crate::test_util::def("t1") };
         let mut mgr1 = PlatformManager::new(&dir);
         mgr1.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
 
@@ -1659,14 +1586,7 @@ mod tests {
         // The idempotent path must still write to disk so a retry after a
         // failed persist actually recovers durability.
         let dir = crate::test_util::temp_storage_dir("mgr-runfastpath");
-        let def = TestDefinition {
-            id: "t1".into(),
-            name: "t".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        };
+        let def = TestDefinition { name: "t".into(), ..crate::test_util::def("t1") };
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
         // Simulate the definition never having reached disk.
@@ -1678,29 +1598,28 @@ mod tests {
     }
 
     #[test]
-    fn run_all_ignores_stale_include_ids() {
-        // Documented contract: include filters are ignored under run_all —
-        // a stale id must not error the run.
-        let dir = crate::test_util::temp_storage_dir("mgr-staleids");
+    fn run_all_with_include_filters_is_rejected() {
+        // Contradictory intent: run_all would silently widen the run past
+        // the includes, dropping the includes would silently ignore
+        // run_all. Same rule as the sequential+max_concurrency
+        // contradiction — reject, never half-honor.
+        let dir = crate::test_util::temp_storage_dir("mgr-allplusinc");
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
-            TestDefinition {
-                id: "t1".into(),
-                name: "t".into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            },
+            crate::test_util::def("t1"),
             Box::new(EchoTest { id: "t1".into(), pass: true }),
         ).unwrap();
         let config = RunConfig {
             run_all: true,
-            include_ids: vec!["removed_test".into()],
+            include_ids: vec!["t1".into()],
             ..Default::default()
         };
-        let run_id = mgr.start_run(config).unwrap();
-        assert_eq!(mgr.get_results(&run_id).unwrap().total, 1);
+        match mgr.start_run(config) {
+            Err(ManagerError::UnsupportedConfig(msg)) => {
+                assert!(msg.contains("conflicts with include filters"), "got: {}", msg);
+            }
+            other => panic!("expected UnsupportedConfig, got {:?}", other),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1711,14 +1630,7 @@ mod tests {
         // must be skipped silently, not reported as failures.
         let dir = crate::test_util::temp_storage_dir("mgr-restart");
 
-        let def = TestDefinition {
-            id: "t1".into(),
-            name: "t".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        };
+        let def = TestDefinition { name: "t".into(), ..crate::test_util::def("t1") };
 
         // Session 1 persists the definition.
         let mut mgr1 = PlatformManager::new(&dir);
@@ -1787,14 +1699,7 @@ mod tests {
     fn run_counter_survives_restart() {
         let dir = crate::test_util::temp_storage_dir("mgr-counter");
 
-        let def = TestDefinition {
-            id: "t1".into(),
-            name: "t".into(),
-            tags: vec![],
-            group: None,
-            description: None,
-            metadata: vec![],
-        };
+        let def = TestDefinition { name: "t".into(), ..crate::test_util::def("t1") };
 
         let mut mgr1 = PlatformManager::new(&dir);
         mgr1.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
@@ -1818,14 +1723,7 @@ mod tests {
         let dir = crate::test_util::temp_storage_dir("mgr-clock");
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
-            TestDefinition {
-                id: "t1".into(),
-                name: "t".into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            },
+            TestDefinition { name: "t".into(), ..crate::test_util::def("t1") },
             Box::new(EchoTest { id: "t1".into(), pass: true }),
         ).unwrap();
         let run_id = mgr.start_run(RunConfig::default()).unwrap();
@@ -1841,14 +1739,7 @@ mod tests {
         let dir = crate::test_util::temp_storage_dir("mgr-parallel");
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(
-            TestDefinition {
-                id: "t1".into(),
-                name: "t".into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            },
+            TestDefinition { name: "t".into(), ..crate::test_util::def("t1") },
             Box::new(EchoTest { id: "t1".into(), pass: true }),
         ).unwrap();
         let config = RunConfig {

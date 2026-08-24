@@ -44,9 +44,11 @@ pub struct TestDefinition {
 /// What the caller sends to request a test run.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    /// If true, start from every registered test. Include filters are
-    /// ignored, but exclude_tags still applies — "run everything except
-    /// the slow tag" honors the exclusion.
+    /// If true, start from every registered test. exclude_tags still
+    /// applies — "run everything except the slow tag" honors the
+    /// exclusion. Combining run_all with include filters is contradictory
+    /// intent and rejected by start_run; the filter layer itself would
+    /// ignore the includes, but callers never get that far.
     pub run_all: bool,
     /// Run only these specific test IDs.
     pub include_ids: Vec<TestId>,
