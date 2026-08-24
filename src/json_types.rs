@@ -5,12 +5,19 @@ use crate::types::*;
 use crate::discovery::{DiscoveryQuery, DiscoveryResult, DiscoverySummary};
 
 
+/// The exact-integer boundary of an f64-backed JSON number (2^53). ONE
+/// constant bounds both sides of the round-trip contract: the writer
+/// clamps u64 fields to it (u64_json) and the strict readers reject
+/// beyond it (strict_opt_u64) — defined once so they cannot drift into
+/// writing values the platform itself cannot reload.
+const MAX_SAFE_JSON_INT: f64 = 9_007_199_254_740_992.0;
+
 /// Serialize a u64 for JSON, clamped to the exact-integer range (2^53):
 /// the strict read side rejects larger values, so the write side must
 /// never produce them — a pathological duration/timestamp is stored as
 /// the clamp rather than a value the platform itself cannot reload.
 fn u64_json(n: u64) -> JsonValue {
-    JsonValue::Number(n.min(9_007_199_254_740_992) as f64)
+    JsonValue::Number(n.min(MAX_SAFE_JSON_INT as u64) as f64)
 }
 
 // ---------------------------------------------------------------------------
@@ -670,11 +677,6 @@ fn strict_opt_bool(value: &JsonValue, field: &str) -> Result<Option<bool>, JsonE
         Some(_) => Err(JsonError::InvalidField(field.into(), "a boolean".into())),
     }
 }
-
-/// Largest integer a JSON double represents exactly (2^53). Values above
-/// it have already lost integer precision in transit, so the strict
-/// loaders reject them rather than fabricating a number.
-const MAX_SAFE_JSON_INT: f64 = 9_007_199_254_740_992.0;
 
 fn strict_opt_u64(value: &JsonValue, field: &str) -> Result<Option<u64>, JsonError> {
     match value.get(field) {

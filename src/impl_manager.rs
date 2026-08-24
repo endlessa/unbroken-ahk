@@ -1163,7 +1163,16 @@ mod tests {
         std::fs::write(format!("{}/runs/run_0005.json", dir), "").unwrap();
         let mgr = PlatformManager::new(&dir);
         match mgr.get_results("run_0005") {
-            Err(ManagerError::RunNotPersisted(_)) => {}
+            Err(e @ ManagerError::RunNotPersisted(_)) => {
+                // The user-facing rendering must carry the recovery
+                // guidance, not just the variant name.
+                let text = format!("{}", e);
+                assert!(
+                    text.contains("delete runs/run_0005.json"),
+                    "guidance missing: {}",
+                    text
+                );
+            }
             other => panic!("expected RunNotPersisted, got {:?}", other.map(|_| ())),
         }
         let _ = std::fs::remove_dir_all(&dir);

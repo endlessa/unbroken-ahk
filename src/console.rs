@@ -118,39 +118,34 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
 
     let mut i = 0;
     while i < args.len() {
-        match args[i] {
-            "--tag" | "-t" => {
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    query.tags.push(args[i + 1].to_string());
-                    i += 2;
-                } else {
-                    return error_output("--tag requires a value");
+        let (flag, inline) = split_flag(args[i]);
+        match flag {
+            "--tag" | "-t" => match take_value(inline, args, i, "--tag") {
+                Ok((v, used)) => {
+                    query.tags.push(v.to_string());
+                    i += used;
                 }
-            }
-            "--group" | "-g" => {
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    query.group = Some(args[i + 1].to_string());
-                    i += 2;
-                } else {
-                    return error_output("--group requires a value");
+                Err(e) => return error_output(&e),
+            },
+            "--group" | "-g" => match take_value(inline, args, i, "--group") {
+                Ok((v, used)) => {
+                    query.group = Some(v.to_string());
+                    i += used;
                 }
-            }
-            "--limit" | "-l" => {
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    match args[i + 1].parse() {
-                        Ok(n) => query.limit = Some(n),
-                        Err(_) => {
-                            return error_output(&format!(
-                                "--limit: '{}' is not a number",
-                                args[i + 1]
-                            ))
-                        }
+                Err(e) => return error_output(&e),
+            },
+            "--limit" | "-l" => match take_value(inline, args, i, "--limit") {
+                Ok((v, used)) => match v.parse() {
+                    Ok(n) => {
+                        query.limit = Some(n);
+                        i += used;
                     }
-                    i += 2;
-                } else {
-                    return error_output("--limit requires a value");
-                }
-            }
+                    Err(_) => {
+                        return error_output(&format!("--limit: '{}' is not a number", v))
+                    }
+                },
+                Err(e) => return error_output(&e),
+            },
             // A misspelled flag must error, not silently become a name
             // pattern that searches for the wrong thing.
             other if other.starts_with('-') => {
@@ -243,7 +238,7 @@ fn cmd_run(manager: &mut PlatformManager, args: &[&str], rest: &str) -> ConsoleO
              Use 'results {}' to see the outcome — do not re-run.",
             run_id, msg, run_id
         )),
-        Err(e) => error_output(&format!("Run failed: {:?}", e)),
+        Err(e) => error_output(&format!("Run failed: {}", e)),
     }
 }
 
@@ -270,7 +265,7 @@ fn cmd_progress(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
             let json = to_json_pretty(&progress.to_json());
             ConsoleOutput { text, json }
         }
-        Err(e) => error_output(&format!("{:?}", e)),
+        Err(e) => error_output(&format!("{}", e)),
     }
 }
 
@@ -288,7 +283,7 @@ fn cmd_results(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
             let json = to_json_pretty(&summary.to_json());
             ConsoleOutput { text, json }
         }
-        Err(e) => error_output(&format!("{:?}", e)),
+        Err(e) => error_output(&format!("{}", e)),
     }
 }
 
@@ -330,61 +325,65 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
 
     let mut i = 0;
     while i < args.len() {
-        match args[i] {
+        let (flag, inline) = split_flag(args[i]);
+        match flag {
             "--all" | "-a" => {
+                if inline.is_some() {
+                    return Err("--all takes no value".into());
+                }
                 config.run_all = true;
                 i += 1;
             }
             "--tag" | "-t" => {
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    config.include_tags.push(args[i + 1].to_string());
-                    i += 2;
-                } else {
-                    return Err("--tag requires a value".into());
-                }
+                let (v, used) = take_value(inline, args, i, "--tag")?;
+                config.include_tags.push(v.to_string());
+                i += used;
             }
             "--exclude" | "-e" => {
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    config.exclude_tags.push(args[i + 1].to_string());
-                    i += 2;
-                } else {
-                    return Err("--exclude requires a value".into());
-                }
+                let (v, used) = take_value(inline, args, i, "--exclude")?;
+                config.exclude_tags.push(v.to_string());
+                i += used;
             }
             "--id" => {
+                let mut got = false;
+                if let Some(v) = inline {
+                    if v.is_empty() {
+                        return Err("--id requires at least one test ID".into());
+                    }
+                    config.include_ids.push(v.to_string());
+                    got = true;
+                }
                 i += 1;
-                let start = i;
                 while i < args.len() && !args[i].starts_with('-') {
                     config.include_ids.push(args[i].to_string());
+                    got = true;
                     i += 1;
                 }
-                if i == start {
-                    return Err("--id requires at least one test ID".into());
+                if !got {
+                    return Err("--id requires at least one test ID; use \
+                                --id=<id> for an ID that begins with '-'"
+                        .into());
                 }
             }
             "--pattern" | "-p" => {
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    config.name_pattern = Some(args[i + 1].to_string());
-                    i += 2;
-                } else {
-                    return Err("--pattern requires a value".into());
-                }
+                let (v, used) = take_value(inline, args, i, "--pattern")?;
+                config.name_pattern = Some(v.to_string());
+                i += used;
             }
             "--fail-fast" | "-f" => {
+                if inline.is_some() {
+                    return Err("--fail-fast takes no value".into());
+                }
                 config.fail_fast = true;
                 i += 1;
             }
             "--timeout" => {
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    config.timeout_ms = Some(
-                        args[i + 1]
-                            .parse()
-                            .map_err(|_| format!("--timeout: '{}' is not a number", args[i + 1]))?,
-                    );
-                    i += 2;
-                } else {
-                    return Err("--timeout requires a value in milliseconds".into());
-                }
+                let (v, used) = take_value(inline, args, i, "--timeout")?;
+                config.timeout_ms = Some(
+                    v.parse()
+                        .map_err(|_| format!("--timeout: '{}' is not a number", v))?,
+                );
+                i += used;
             }
             other if other.starts_with('-') => {
                 return Err(format!("unknown flag '{}'", other));
@@ -409,6 +408,48 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
 
 fn split_args(input: &str) -> Vec<&str> {
     input.split_whitespace().collect()
+}
+
+/// Split "--flag=value" into ("--flag", Some("value")). Only tokens that
+/// look like flags are split — a bare value containing '=' is untouched.
+fn split_flag(arg: &str) -> (&str, Option<&str>) {
+    if arg.starts_with('-') {
+        if let Some((flag, value)) = arg.split_once('=') {
+            return (flag, Some(value));
+        }
+    }
+    (arg, None)
+}
+
+/// The value for a value-taking flag, in either spelling:
+///   --flag value  — the next argument, rejected when it looks like a
+///                   flag (silently consuming a typo'd flag would change
+///                   the run's meaning);
+///   --flag=value  — inline, where the value may be ANYTHING — the
+///                   escape hatch for legitimately registered tags,
+///                   patterns, and ids that begin with '-'.
+/// Returns the value and how many argument tokens were consumed.
+fn take_value<'a>(
+    inline: Option<&'a str>,
+    args: &[&'a str],
+    i: usize,
+    flag: &str,
+) -> Result<(&'a str, usize), String> {
+    if let Some(v) = inline {
+        if v.is_empty() {
+            return Err(format!("{} requires a value", flag));
+        }
+        return Ok((v, 1));
+    }
+    match args.get(i + 1) {
+        Some(&next) if !next.starts_with('-') => Ok((next, 2)),
+        Some(next) => Err(format!(
+            "{} requires a value; '{}' looks like a flag — use {}=<value> \
+             to pass a value that begins with '-'",
+            flag, next, flag
+        )),
+        None => Err(format!("{} requires a value", flag)),
+    }
 }
 
 fn error_output(message: &str) -> ConsoleOutput {
@@ -642,11 +683,47 @@ mod tests {
         assert!(out.text.contains("unknown flag"));
 
         // A flag as the "value" of a value-taking flag means the value was
-        // forgotten — must error, never consume the flag.
+        // forgotten — must error, never consume the flag — and the error
+        // must name the =<value> escape hatch.
         let out = execute_command(&mut mgr, "run --tag --fail-fast");
         assert!(out.text.contains("--tag requires a value"));
+        assert!(out.text.contains("--tag=<value>"), "got: {}", out.text);
         let out = execute_command(&mut mgr, "discover --tag --group auth");
         assert!(out.text.contains("--tag requires a value"));
+    }
+
+    #[test]
+    fn dash_prefixed_values_pass_via_equals_form() {
+        // Tags are unvalidated at registration, so a tag beginning with
+        // '-' is legal — the =<value> spelling must be able to address it
+        // even though the space-separated spelling rejects flag-alikes.
+        let mut mgr = setup_manager();
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t9".into(),
+                name: "weird_tag_test".into(),
+                tags: vec!["-net".into()],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(StubTest { id: "t9".into(), pass: true }),
+        )
+        .unwrap();
+
+        let out = execute_command(&mut mgr, "discover --tag=-net");
+        assert!(out.text.contains("weird_tag_test"), "got: {}", out.text);
+
+        let out = execute_command(&mut mgr, "run --exclude=-net");
+        assert!(out.text.contains("Total: 3"), "got: {}", out.text);
+        assert!(!out.json.contains("\"t9\""));
+
+        // Inline values reach the same validation as spaced ones.
+        let out = execute_command(&mut mgr, "discover --limit=-3");
+        assert!(out.text.contains("not a number"), "got: {}", out.text);
+        // Boolean flags take no value in either spelling.
+        let out = execute_command(&mut mgr, "run --fail-fast=yes");
+        assert!(out.text.contains("takes no value"), "got: {}", out.text);
     }
 
     #[test]

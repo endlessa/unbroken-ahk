@@ -88,3 +88,57 @@ pub enum ManagerError {
     /// a test id, or a registration-batch descriptor.
     PersistFailed(String, String),
 }
+
+/// Human/agent-facing rendering: every variant states what happened AND
+/// the recovery it implies, so the generic presentation sites (console,
+/// MCP) surface the guidance from the doc comments above instead of a
+/// bare Debug dump like 'RunNotPersisted("run_0005")'.
+impl std::fmt::Display for ManagerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ManagerError::UnknownRun(id) => write!(f, "no run named '{}' exists", id),
+            ManagerError::CorruptRun(id, msg) => write!(
+                f,
+                "run '{}' happened but its record is damaged or written by an \
+                 incompatible version: {}",
+                id, msg
+            ),
+            ManagerError::ReadFailed(id, msg) => write!(
+                f,
+                "run '{}' exists but could not be read ({}); this says nothing \
+                 about the data — a retry may succeed",
+                id, msg
+            ),
+            ManagerError::RunNotPersisted(id) => write!(
+                f,
+                "run '{}' was claimed but no summary was ever persisted: it is \
+                 still executing in another session, or that session died \
+                 mid-run; if it is known dead, delete runs/{}.json to clear it",
+                id, id
+            ),
+            ManagerError::RunInProgress(id) => {
+                write!(f, "run '{}' has not completed yet", id)
+            }
+            ManagerError::RunAlreadyComplete(id) => {
+                write!(f, "run '{}' already completed and cannot be started again", id)
+            }
+            ManagerError::NoTestsMatched => {
+                write!(f, "no tests matched the given configuration")
+            }
+            ManagerError::UnknownTestIds(ids) => {
+                write!(f, "include_ids named tests that are not registered: {:?}", ids)
+            }
+            ManagerError::RegistrationFailed(msg) => {
+                write!(f, "test registration failed: {}", msg)
+            }
+            ManagerError::UnsupportedConfig(msg) => {
+                write!(f, "unsupported configuration: {}", msg)
+            }
+            ManagerError::PersistFailed(what, msg) => write!(
+                f,
+                "'{}' succeeded in memory but could not be written to storage: {}",
+                what, msg
+            ),
+        }
+    }
+}

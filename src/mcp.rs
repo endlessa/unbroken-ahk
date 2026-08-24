@@ -323,7 +323,7 @@ fn handle_run(manager: &mut PlatformManager, params: &JsonValue) -> McpResponse 
                 run_id, msg
             )),
         },
-        Err(e) => McpResponse::err(&format!("{:?}", e)),
+        Err(e) => McpResponse::err(&format!("{}", e)),
     }
 }
 
@@ -354,7 +354,7 @@ fn handle_progress(manager: &PlatformManager, params: &JsonValue) -> McpResponse
     match run_id_param(params) {
         Ok(Some(run_id)) => match manager.check_progress(run_id) {
             Ok(progress) => McpResponse::ok(progress.to_json()),
-            Err(e) => McpResponse::err(&format!("{:?}", e)),
+            Err(e) => McpResponse::err(&format!("{}", e)),
         },
         // No run_id means "list the active runs".
         Ok(None) => McpResponse::ok(str_array(&manager.active_runs())),
@@ -366,7 +366,7 @@ fn handle_results(manager: &PlatformManager, params: &JsonValue) -> McpResponse 
     match run_id_param(params) {
         Ok(Some(run_id)) => match manager.get_results(run_id) {
             Ok(summary) => McpResponse::ok(summary.to_json()),
-            Err(e) => McpResponse::err(&format!("{:?}", e)),
+            Err(e) => McpResponse::err(&format!("{}", e)),
         },
         Ok(None) => McpResponse::err("Missing required parameter: 'run_id'"),
         Err(e) => McpResponse::err(&e),
@@ -610,7 +610,7 @@ mod tests {
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
         let err = val.get_str("error").unwrap();
-        assert!(err.contains("UnknownTestIds") && err.contains("nonexistent"));
+        assert!(err.contains("not registered") && err.contains("nonexistent"));
 
         // Even when another include criterion matches, the typo still errors.
         let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"include_ids": ["t1", "tpyo3"]}}"#);
@@ -856,7 +856,7 @@ mod tests {
         let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"include_ids": []}}"#);
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
-        assert!(val.get_str("error").unwrap().contains("NoTestsMatched"));
+        assert!(val.get_str("error").unwrap().contains("no tests matched"));
     }
 
     #[test]
@@ -887,7 +887,7 @@ mod tests {
             r#"{"tool": "test_run", "params": {"execution_model": {"type": "parallel", "max_concurrency": 8}}}"#);
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
-        assert!(val.get_str("error").unwrap().contains("UnsupportedConfig"));
+        assert!(val.get_str("error").unwrap().contains("parallel execution is not supported"));
     }
 
     // -- Full workflow (AI perspective) --
