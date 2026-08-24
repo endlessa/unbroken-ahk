@@ -105,17 +105,16 @@ impl PlatformManager {
         // BEFORE this load is the normal embedder-re-registered overlap
         // (skip silently); a second occurrence of an id WITHIN the file
         // is corruption whose data would silently vanish — report it.
-        let mut seen_in_file: Vec<String> = Vec::new();
+        let mut seen_in_file: std::collections::HashSet<String> = std::collections::HashSet::new();
         for test in tests {
             let id = test.id.clone();
-            if seen_in_file.iter().any(|s| *s == id) {
+            if !seen_in_file.insert(id.clone()) {
                 failures.push(format!(
                     "{}: duplicate id within registry.json (later definition ignored)",
                     id
                 ));
                 continue;
             }
-            seen_in_file.push(id.clone());
             if self.registry.get(&id).is_some() {
                 continue;
             }
@@ -150,9 +149,27 @@ impl PlatformManager {
     }
 
     fn next_run_id(&mut self) -> RunId {
+        // Re-scan persisted runs at mint time, not only at construction:
+        // two sessions open concurrently on the same storage dir would
+        // otherwise both seed the same counter and clobber each other's
+        // run files. (A narrow scan-to-write race remains; runs are
+        // infrequent and single-user, so exclusive-create is not worth
+        // the platform surface yet.)
+        self.run_counter = self
+            .run_counter
+            .max(storage::max_existing_run_number(&self.storage));
         self.run_counter += 1;
         format!("run_{:04}", self.run_counter)
     }
+}
+
+/// Run IDs are always minted as run_<digits>. Anything else cannot name a
+/// real run — and must never reach the filesystem, where a crafted id
+/// like "../registry" would escape the runs directory.
+fn is_valid_run_id(id: &str) -> bool {
+    id.strip_prefix("run_")
+        .map(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false)
 }
 
 impl TestManager for PlatformManager {
@@ -201,10 +218,12 @@ impl TestManager for PlatformManager {
 
         self.progress.start_run(run_id.clone(), total);
 
+        let selected_set: std::collections::HashSet<&str> =
+            selected_ids.iter().map(|s| s.as_str()).collect();
         let runnables: Vec<&dyn RunnableTest> = self
             .runnables
             .iter()
-            .filter(|r| selected_ids.contains(&r.id().to_string()))
+            .filter(|r| selected_set.contains(r.id()))
             .map(|r| r.as_ref())
             .collect();
 
@@ -227,10 +246,11 @@ impl TestManager for PlatformManager {
         // Surface each as an explicit Error result instead of silently
         // shrinking the run (the classic case: definitions restored from
         // storage after a restart, with no runnables re-attached).
-        let executed: Vec<&str> = results.iter().map(|r| r.test_id.as_str()).collect();
+        let executed: std::collections::HashSet<&str> =
+            results.iter().map(|r| r.test_id.as_str()).collect();
         let missing: Vec<String> = selected_ids
             .iter()
-            .filter(|id| !executed.contains(&id.as_str()))
+            .filter(|id| !executed.contains(id.as_str()))
             .cloned()
             .collect();
         for id in missing {
@@ -306,6 +326,12 @@ impl TestManager for PlatformManager {
     }
 
     fn get_results(&self, run_id: &str) -> Result<RunSummary, ManagerError> {
+        // Reject non-run-shaped ids before anything else — the storage
+        // fallback below builds a file path from this string, and a
+        // crafted id ("../registry") must never escape the runs dir.
+        if !is_valid_run_id(run_id) {
+            return Err(ManagerError::UnknownRun(run_id.into()));
+        }
         // Check completed runs in memory first
         if let Some(summary) = self.completed_runs.iter().find(|s| s.run_id == run_id) {
             return Ok(summary.clone());
@@ -440,6 +466,81 @@ mod tests {
         assert_eq!(prog.percent_complete, 100.0);
         assert!(mgr.active_runs().is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_id_path_traversal_is_rejected() {
+        let dir = crate::test_util::temp_storage_dir("mgr-traversal");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "t".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        ).unwrap();
+        mgr.start_run(RunConfig::default()).unwrap();
+        // registry.json now exists next to runs/ — a crafted id must not
+        // be able to read it (or any other file) through the runs path.
+        for evil in ["../registry", "run_0001/../../registry", "..", "run_", "run_1x"] {
+            match mgr.get_results(evil) {
+                Err(ManagerError::UnknownRun(_)) => {}
+                other => panic!("expected UnknownRun for {:?}, got {:?}", evil, other.map(|_| ())),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_managers_do_not_reuse_run_ids() {
+        let dir = crate::test_util::temp_storage_dir("mgr-concurrent");
+        let def = TestDefinition {
+            id: "t1".into(),
+            name: "t".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+        // Both managers open BEFORE either has run — both seed counter 0.
+        let mut a = PlatformManager::new(&dir);
+        let mut b = PlatformManager::new(&dir);
+        a.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        b.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        let first = a.start_run(RunConfig::default()).unwrap();
+        let second = b.start_run(RunConfig::default()).unwrap();
+        assert_ne!(first, second, "concurrent sessions minted the same run id");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bare_run_all_false_is_no_tests_matched() {
+        // Programmatic callers constructing RunConfig directly get the
+        // plain empty-selection error; the friendly explanation lives at
+        // the JSON parse layer where key presence is visible.
+        let dir = crate::test_util::temp_storage_dir("mgr-barefalse");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "t".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        ).unwrap();
+        let config = RunConfig { run_all: false, ..Default::default() };
+        match mgr.start_run(config) {
+            Err(ManagerError::NoTestsMatched) => {}
+            other => panic!("expected NoTestsMatched, got {:?}", other.map(|_| ())),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

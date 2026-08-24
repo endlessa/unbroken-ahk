@@ -119,7 +119,11 @@ pub fn to_json_compact(value: &JsonValue) -> String {
 
 /// Serialize a JsonValue to a pretty-printed JSON string.
 pub fn to_json_pretty(value: &JsonValue) -> String {
-    format!("{}", value)
+    // Write straight into the result buffer — going through Display would
+    // build the whole output twice for large values.
+    let mut out = String::new();
+    write_value_to_string(&mut out, value, 0, true);
+    out
 }
 
 fn write_value_to_string(out: &mut String, val: &JsonValue, indent: usize, pretty: bool) {

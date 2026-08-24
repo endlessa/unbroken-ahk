@@ -142,7 +142,7 @@ pub fn list_tools() -> Vec<ToolDescriptor> {
             parameters: obj(vec![
                 ("run_all", obj(vec![
                     ("type", str_val("boolean")),
-                    ("description", str_val("Start from every registered test (exclude_tags still applies; include filters are ignored). Defaults to true only when no filters are given.")),
+                    ("description", str_val("Start from every registered test (exclude_tags still applies; include filters are ignored). Defaults to true unless include_ids, include_tags, or name_pattern is supplied — exclude_tags alone keeps run_all true, running everything except the excluded tags.")),
                     ("required", JsonValue::Bool(false)),
                 ])),
                 ("include_ids", obj(vec![
@@ -839,6 +839,17 @@ mod tests {
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
         assert!(val.get_str("error").unwrap().contains("NoTestsMatched"));
+    }
+
+    #[test]
+    fn bare_run_all_false_gets_explanatory_error() {
+        // {"run_all": false} with no filter keys must name the cause and
+        // the fix, not just report NoTestsMatched.
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"run_all": false}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("nothing is selected"));
     }
 
     #[test]

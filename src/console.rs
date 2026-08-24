@@ -151,7 +151,17 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
                     return error_output("--limit requires a value");
                 }
             }
+            // A misspelled flag must error, not silently become a name
+            // pattern that searches for the wrong thing.
+            other if other.starts_with('-') => {
+                return error_output(&format!("unknown flag '{}'", other));
+            }
             other => {
+                if query.name_pattern.is_some() {
+                    return error_output(
+                        "multiple name patterns given — discover takes at most one",
+                    );
+                }
                 query.name_pattern = Some(other.to_string());
                 i += 1;
             }
@@ -643,6 +653,15 @@ mod tests {
         let out = execute_command(&mut mgr, "run --exclude slow");
         assert!(out.text.contains("Total: 2"), "got: {}", out.text);
         assert!(!out.json.contains("net_ping"));
+    }
+
+    #[test]
+    fn discover_unknown_flag_errors() {
+        let mut mgr = setup_manager();
+        let out = execute_command(&mut mgr, "discover --tga slow");
+        assert!(out.text.contains("unknown flag"));
+        let out = execute_command(&mut mgr, "discover auth_basic net_ping");
+        assert!(out.text.contains("multiple name patterns"));
     }
 
     #[test]

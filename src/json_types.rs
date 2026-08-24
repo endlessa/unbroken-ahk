@@ -219,7 +219,22 @@ impl FromJson for RunConfig {
         let includes_supplied = ["include_ids", "include_tags", "name_pattern"]
             .iter()
             .any(|k| matches!(value.get(k), Some(v) if !matches!(v, JsonValue::Null)));
-        let run_all = strict_opt_bool(value, "run_all")?.unwrap_or(!includes_supplied);
+        let run_all_explicit = strict_opt_bool(value, "run_all")?;
+        let run_all = run_all_explicit.unwrap_or(!includes_supplied);
+        // An explicit run_all=false with no include keys and no exclusions
+        // selects nothing by definition — name the cause and the fix here,
+        // where key presence is still visible, instead of a bare
+        // no-tests-matched downstream. ({"run_all": false, "include_ids": []}
+        // keeps its NoTestsMatched contract: an include key WAS supplied.)
+        if run_all_explicit == Some(false) && !includes_supplied && exclude_tags.is_empty() {
+            return Err(JsonError::InvalidField(
+                "run_all".into(),
+                "false requires at least one filter (include_ids, include_tags, \
+                 name_pattern, or exclude_tags) — with run_all false and no \
+                 filters nothing is selected; drop run_all or add filters"
+                    .into(),
+            ));
+        }
         let fail_fast = strict_opt_bool(value, "fail_fast")?.unwrap_or(false);
         let timeout_ms = strict_opt_u64(value, "timeout_ms")?;
         let execution_model = match value.get("execution_model") {

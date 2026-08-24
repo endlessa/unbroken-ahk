@@ -3126,10 +3126,11 @@
    "Mixed/mismatched element types in the vector: undef with WARNING (VERIFY).",
    "nan among arguments: result order-dependent under C comparisons - pin min(nan,1) and min(1,nan) against oracle (VERIFY).",
    "Nested vectors as elements: VERIFY (believed undef - no deep min).",
-   "min(vector, scalar) two-arg mix: undef with WARNING (VERIFY)."
+   "min(vector, scalar) two-arg mix: undef with WARNING (VERIFY).",
+   "The single-vector form (min([a,b,c])) was added in 2015.03; earlier releases warn/return undef for a vector argument. It compares with the generic relational less-than, so a vector of strings returns the lexicographic extreme (see string comparison)."
   ],
   "example": "echo(min(3,1,2), min([5,4,6])); // ECHO: 1, 4",
-  "since": "pre-2015.03",
+  "since": "pre-2015.03 (single-vector-argument form: 2015.03)",
   "impl_notes": "The 1-vector vs n-scalar dispatch and every degenerate case need oracle pinning; libraries call both forms."
  },
  {
@@ -3153,10 +3154,11 @@
    "max([]) -> WARNING + undef.",
    "max(5) single scalar: VERIFY (believed WARNING + undef).",
    "nan handling, string handling, mixed types: same VERIFY set as min - keep the two functions exactly symmetric.",
-   "Used pervasively in fragment sizing (cylinder uses max(r1,r2)) - numeric behavior must be exact."
+   "Used pervasively in fragment sizing (cylinder uses max(r1,r2)) - numeric behavior must be exact.",
+   "The single-vector form (max([a,b,c])) was added in 2015.03; earlier releases warn/return undef for a vector argument. It compares with the generic relational less-than, so a vector of strings returns the lexicographic extreme (see string comparison)."
   ],
   "example": "echo(max(3,1,2), max([5,4,6])); // ECHO: 3, 6",
-  "since": "pre-2015.03"
+  "since": "pre-2015.03 (single-vector-argument form: 2015.03)"
  },
  {
   "name": "norm",
@@ -3191,7 +3193,7 @@
   "params": [
    {
     "name": "a",
-    "desc": "Numeric vector of length 3 (or 2, since 2019.05)."
+    "desc": "Numeric vector of length 3 (or 2, since 2015.03)."
    },
    {
     "name": "b",
@@ -3524,7 +3526,7 @@
    "No Unicode normalization: NFC and NFD spellings of the same visual text are DIFFERENT, unequal strings.",
    "Implementation shortcut that is exactly conformant: byte-wise comparison of UTF-8 encodings yields the same order as code-point comparison (UTF-8 is order-preserving) \u2014 safe to use.",
    "Sorting user-space (there is no builtin sort) is built on these operators; nan-style partiality does not apply to strings, but comparing a string against undef relationally is undef.",
-   "min()/max() do NOT accept strings \u2014 numeric only (undef/warning; see math category)."
+   "min/max: the n-ary form min(a,b,...) is numbers-only (a non-number argument yields the conversion WARNING + undef), but the single-vector form uses the generic relational less-than, so min([\"b\",\"a\"]) returns \"a\" (lexicographic) in 2021.01; mixed-type element vectors give unwarned, comparator-dependent results."
   ],
   "example": "echo(\"Zoo\" < \"apple\", \"ab\" == \"ab\", \"1\" == 1);",
   "impl_notes": "Use memcmp-style byte comparison over UTF-8. Pin the warning-vs-silent behavior of mixed-type relational comparisons via oracle (matters under --hardwarnings).",
@@ -3801,7 +3803,7 @@
   "params": [
    {
     "name": "condition",
-    "desc": "Any value, tested with standard truthiness: false, 0, \"\", [], undef, and nan FAIL; everything else (including \"false\", [0], -1) passes."
+    "desc": "Any value, tested with standard truthiness: exactly the five falsy values \u2014 false, 0 (and -0), \"\", [], undef \u2014 FAIL; everything else passes, including nan (assert(0/0) passes), \"false\", [0], and -1; everything else (including \"false\", [0], -1) passes."
    },
    {
     "name": "message",
@@ -4178,7 +4180,7 @@
    "Range guard idiom 'if ($children > 1)' is common in libraries (e.g. conditional union wrappers) \u2014 must be exact."
   ],
   "example": "module pair() { children(0); translate([20, 0, 0]) children($children - 1); }\npair() { cube(5); sphere(3); } // echo($children) inside would print 2",
-  "since": "2014.03",
+  "since": "pre-2015.03 (predates 2014.03 \u2014 existed with legacy child(); 2014.03 fixed a dynamic-scoping bug and added children()/parent_module()/$parent_modules)",
   "impl_notes": "Bind it in the module-call frame alongside the children list; ensure for/if children count as single group nodes. Oracle-probe top-level read and the for-as-one-child case."
  },
  {
@@ -5291,7 +5293,7 @@
    "None of the classic deprecations (child(), assign(), import_stl/import_dxf/import_off, dxf_linear_extrude/dxf_rotate_extrude, triangles=) was removed by the 2021.01 baseline \u2014 all remain deprecated-but-functional; removals came only after 2021.01."
   ],
   "example": "import_stl(\"part.stl\"); // legacy \u2014 write import(\"part.stl\");",
-  "since": "pre-2015.03 (deprecated ~2013)",
+  "since": "pre-2015.03 (deprecated 2011.12, alongside the introduction of unified import())",
   "impl_notes": "Implement as aliases of import() that emit the deprecation warning \u2014 2021.01 parity requires them to work, and old scripts then run unmodified."
  },
  {

@@ -74,7 +74,7 @@ footer{margin-top:70px;padding-top:18px;border-top:1px solid var(--line);font-fa
 <div class="topbar">
   <h1>OpenSCAD Language Reference</h1>
   <input id="q" type="search" placeholder="filter: name, parameter, behavior&hellip;" aria-label="Filter entries">
-  <span class="stats">183 entries &middot; 1574 edge cases &middot; <span id="shown">183</span> shown</span>
+  <span class="stats">183 entries &middot; 1576 edge cases &middot; <span id="shown">183</span> shown</span>
 </div>
 <div class="layout">
 <nav class="sidenav"><a href="#s-semantic-model" data-sec="s-semantic-model"><span>Semantic model</span><span class="ncount" data-count="s-semantic-model">47</span></a>
@@ -576,7 +576,7 @@ assert(fact(3) == 6, &quot;factorial broken&quot;);</pre>
 </div>
 <p class="esum">Equality is total deep equality; relational operators are defined for string-string only and compare lexicographically by Unicode code point.</p>
 <p class="esem">== and != work across all types: two strings are equal iff they have identical code-point sequences; a string compared to any non-string is unequal (false, not undef). The relational operators &lt; &lt;= &gt; &gt;= are defined only between two strings (or two numbers): they compare lexicographically by code point, case-sensitively, with no locale, collation, or normalization. A relational comparison where either side is not the right type yields undef.</p>
-<div class="edges"><div class="elbl">Edge cases &amp; oddities</div><ul><li>&quot;a&quot; == &quot;a&quot; -&gt; true; &quot;a&quot; == 97 -&gt; false (mismatched types compare unequal under ==, never undef).</li><li>&quot;abc&quot; &lt; &quot;abd&quot; -&gt; true; &quot;ab&quot; &lt; &quot;abc&quot; -&gt; true (proper prefix sorts first); &quot;&quot; &lt; &quot;a&quot; -&gt; true.</li><li>Case-sensitive code-point order: &quot;Z&quot; &lt; &quot;a&quot; is true (90 &lt; 97); digits sort before uppercase before lowercase.</li><li>&quot;a&quot; &lt; 5 -&gt; undef (relational across types is undef, not false). VERIFY: whether a WARNING like &quot;undefined operation (string &lt; number)&quot; accompanies it in 2021.01.</li><li>No Unicode normalization: NFC and NFD spellings of the same visual text are DIFFERENT, unequal strings.</li><li>Implementation shortcut that is exactly conformant: byte-wise comparison of UTF-8 encodings yields the same order as code-point comparison (UTF-8 is order-preserving) — safe to use.</li><li>Sorting user-space (there is no builtin sort) is built on these operators; nan-style partiality does not apply to strings, but comparing a string against undef relationally is undef.</li><li>min()/max() do NOT accept strings — numeric only (undef/warning; see math category).</li></ul></div>
+<div class="edges"><div class="elbl">Edge cases &amp; oddities</div><ul><li>&quot;a&quot; == &quot;a&quot; -&gt; true; &quot;a&quot; == 97 -&gt; false (mismatched types compare unequal under ==, never undef).</li><li>&quot;abc&quot; &lt; &quot;abd&quot; -&gt; true; &quot;ab&quot; &lt; &quot;abc&quot; -&gt; true (proper prefix sorts first); &quot;&quot; &lt; &quot;a&quot; -&gt; true.</li><li>Case-sensitive code-point order: &quot;Z&quot; &lt; &quot;a&quot; is true (90 &lt; 97); digits sort before uppercase before lowercase.</li><li>&quot;a&quot; &lt; 5 -&gt; undef (relational across types is undef, not false). VERIFY: whether a WARNING like &quot;undefined operation (string &lt; number)&quot; accompanies it in 2021.01.</li><li>No Unicode normalization: NFC and NFD spellings of the same visual text are DIFFERENT, unequal strings.</li><li>Implementation shortcut that is exactly conformant: byte-wise comparison of UTF-8 encodings yields the same order as code-point comparison (UTF-8 is order-preserving) — safe to use.</li><li>Sorting user-space (there is no builtin sort) is built on these operators; nan-style partiality does not apply to strings, but comparing a string against undef relationally is undef.</li><li>min/max: the n-ary form min(a,b,...) is numbers-only (a non-number argument yields the conversion WARNING + undef), but the single-vector form uses the generic relational less-than, so min([&quot;b&quot;,&quot;a&quot;]) returns &quot;a&quot; (lexicographic) in 2021.01; mixed-type element vectors give unwarned, comparator-dependent results.</li></ul></div>
 <pre class="ex">echo(&quot;Zoo&quot; &lt; &quot;apple&quot;, &quot;ab&quot; == &quot;ab&quot;, &quot;1&quot; == 1);</pre>
 <div class="impl"><b>Implementer:</b> Use memcmp-style byte comparison over UTF-8. Pin the warning-vs-silent behavior of mixed-type relational comparisons via oracle (matters under --hardwarnings).</div>
 </article>
@@ -1923,7 +1923,7 @@ pair() circle(2);</pre>
 </div>
 <pre class="sig">cross(a, b)</pre>
 <p class="esum">Vector cross product: 3-vectors give a 3-vector; 2-vectors give the scalar z-component (2019.05+).</p>
-<div class="ptable"><table><tr><td class="pname">a</td><td>Numeric vector of length 3 (or 2, since 2019.05).</td></tr><tr><td class="pname">b</td><td>Numeric vector of the SAME length as a.</td></tr></table></div>
+<div class="ptable"><table><tr><td class="pname">a</td><td>Numeric vector of length 3 (or 2, since 2015.03).</td></tr><tr><td class="pname">b</td><td>Numeric vector of the SAME length as a.</td></tr></table></div>
 <p class="esem">For 3-vectors returns [a1*b2-a2*b1, a2*b0-a0*b2, a0*b1-a1*b0]. For two 2-vectors returns the scalar a0*b1-a1*b0. Both arguments must have the same length, 2 or 3.</p>
 <div class="edges"><div class="elbl">Edge cases &amp; oddities</div><ul><li>Length mismatch (3 with 2) or lengths other than 2/3: undef with WARNING (approx &#x27;Invalid parameters for cross()&#x27; - VERIFY text).</li><li>2D form since 2015.03 (returns the scalar v0[0]*v1[1] - v0[1]*v1[0]); only 2014.03-era releases warned/returned undef for 2-vectors.</li><li>Non-numeric elements: undef with WARNING (VERIFY vs nan propagation).</li><li>Missing second argument: undef with WARNING.</li><li>No n-ary or chained form; exactly two arguments.</li></ul></div>
 <pre class="ex">echo(cross([1,0,0],[0,1,0]), cross([1,0],[0,1])); // ECHO: [0, 0, 1], 1</pre>
@@ -1985,26 +1985,26 @@ pair() circle(2);</pre>
 <div class="ehead">
 <h4 class="ename">max</h4>
 <span class="chip k-function">function</span>
-<span class="chip since">pre-2015.03</span>
+<span class="chip since">pre-2015.03 (single-vector-argument form: 2015.03)</span>
 </div>
 <pre class="sig">max(a, b, ...) | max(vector)</pre>
 <p class="esum">Maximum of two-or-more arguments, or of a single vector&#x27;s elements.</p>
 <div class="ptable"><table><tr><td class="pname">a, b, ...</td><td>Two or more numbers.</td></tr><tr><td class="pname">vector</td><td>Alternative single vector argument.</td></tr></table></div>
 <p class="esem">Mirror of min with &gt; ordering; identical dispatch rules.</p>
-<div class="edges"><div class="elbl">Edge cases &amp; oddities</div><ul><li>max([]) -&gt; WARNING + undef.</li><li>max(5) single scalar: VERIFY (believed WARNING + undef).</li><li>nan handling, string handling, mixed types: same VERIFY set as min - keep the two functions exactly symmetric.</li><li>Used pervasively in fragment sizing (cylinder uses max(r1,r2)) - numeric behavior must be exact.</li></ul></div>
+<div class="edges"><div class="elbl">Edge cases &amp; oddities</div><ul><li>max([]) -&gt; WARNING + undef.</li><li>max(5) single scalar: VERIFY (believed WARNING + undef).</li><li>nan handling, string handling, mixed types: same VERIFY set as min - keep the two functions exactly symmetric.</li><li>Used pervasively in fragment sizing (cylinder uses max(r1,r2)) - numeric behavior must be exact.</li><li>The single-vector form (max([a,b,c])) was added in 2015.03; earlier releases warn/return undef for a vector argument. It compares with the generic relational less-than, so a vector of strings returns the lexicographic extreme (see string comparison).</li></ul></div>
 <pre class="ex">echo(max(3,1,2), max([5,4,6])); // ECHO: 3, 6</pre>
 </article>
 <article class="entry" id="e-math-builtins-min" data-kind="function">
 <div class="ehead">
 <h4 class="ename">min</h4>
 <span class="chip k-function">function</span>
-<span class="chip since">pre-2015.03</span>
+<span class="chip since">pre-2015.03 (single-vector-argument form: 2015.03)</span>
 </div>
 <pre class="sig">min(a, b, ...) | min(vector)</pre>
 <p class="esum">Minimum of two-or-more arguments, or of a single vector&#x27;s elements.</p>
 <div class="ptable"><table><tr><td class="pname">a, b, ...</td><td>Two or more numbers (VERIFY: strings also comparable - see edge cases).</td></tr><tr><td class="pname">vector</td><td>Alternative single argument: a vector whose elements are compared.</td></tr></table></div>
 <p class="esem">With &gt;=2 arguments, returns the smallest; with exactly one vector argument, returns the smallest element. Comparison is the relational &lt; ordering.</p>
-<div class="edges"><div class="elbl">Edge cases &amp; oddities</div><ul><li>min([]) (empty vector): WARNING + undef (approx &#x27;min() parameter could not be converted&#x27; or &#x27;empty vector&#x27; - VERIFY text).</li><li>min(5) with a single scalar: VERIFY - believed WARNING + undef (one argument must be a vector).</li><li>Strings: VERIFY whether min(&quot;a&quot;,&quot;b&quot;) works lexicographically or is undef - pin against oracle.</li><li>Mixed/mismatched element types in the vector: undef with WARNING (VERIFY).</li><li>nan among arguments: result order-dependent under C comparisons - pin min(nan,1) and min(1,nan) against oracle (VERIFY).</li><li>Nested vectors as elements: VERIFY (believed undef - no deep min).</li><li>min(vector, scalar) two-arg mix: undef with WARNING (VERIFY).</li></ul></div>
+<div class="edges"><div class="elbl">Edge cases &amp; oddities</div><ul><li>min([]) (empty vector): WARNING + undef (approx &#x27;min() parameter could not be converted&#x27; or &#x27;empty vector&#x27; - VERIFY text).</li><li>min(5) with a single scalar: VERIFY - believed WARNING + undef (one argument must be a vector).</li><li>Strings: VERIFY whether min(&quot;a&quot;,&quot;b&quot;) works lexicographically or is undef - pin against oracle.</li><li>Mixed/mismatched element types in the vector: undef with WARNING (VERIFY).</li><li>nan among arguments: result order-dependent under C comparisons - pin min(nan,1) and min(1,nan) against oracle (VERIFY).</li><li>Nested vectors as elements: VERIFY (believed undef - no deep min).</li><li>min(vector, scalar) two-arg mix: undef with WARNING (VERIFY).</li><li>The single-vector form (min([a,b,c])) was added in 2015.03; earlier releases warn/return undef for a vector argument. It compares with the generic relational less-than, so a vector of strings returns the lexicographic extreme (see string comparison).</li></ul></div>
 <pre class="ex">echo(min(3,1,2), min([5,4,6])); // ECHO: 1, 4</pre>
 <div class="impl"><b>Implementer:</b> The 1-vector vs n-scalar dispatch and every degenerate case need oracle pinning; libraries call both forms.</div>
 </article>
@@ -2340,7 +2340,7 @@ tm = textmetrics(&quot;hi&quot;); echo(is_object(tm)); // ECHO: true</pre>
 </div>
 <pre class="sig">assert(condition);  assert(condition, message);   |   assert(condition, message) expression   (expression form 2019.05+)</pre>
 <p class="esum">Halts evaluation with a formatted ERROR plus TRACE stack when the condition is falsy; the expression form otherwise yields its trailing expression. The only throwing construct in the language.</p>
-<div class="ptable"><table><tr><td class="pname">condition</td><td>Any value, tested with standard truthiness: false, 0, &quot;&quot;, [], undef, and nan FAIL; everything else (including &quot;false&quot;, [0], -1) passes.</td></tr><tr><td class="pname">message</td><td>Optional; any value, rendered with the echo value formatter and appended to the error line after &#x27;: &#x27;. VERIFY: evaluated eagerly with the call (believed) rather than only on failure.</td></tr></table></div>
+<div class="ptable"><table><tr><td class="pname">condition</td><td>Any value, tested with standard truthiness: exactly the five falsy values — false, 0 (and -0), &quot;&quot;, [], undef — FAIL; everything else passes, including nan (assert(0/0) passes), &quot;false&quot;, [0], and -1; everything else (including &quot;false&quot;, [0], -1) passes.</td></tr><tr><td class="pname">message</td><td>Optional; any value, rendered with the echo value formatter and appended to the error line after &#x27;: &#x27;. VERIFY: evaluated eagerly with the call (believed) rather than only on failure.</td></tr></table></div>
 <p class="esem">On a truthy condition, the statement form does nothing (its children, if any, instantiate normally — VERIFY) and the expression form evaluates to its trailing expression. On a falsy condition, evaluation HALTS immediately with an ERROR line naming the re-serialized SOURCE TEXT of the condition expression, the optional message, and the file and line, followed by one &#x27;TRACE:&#x27; line per frame of the module instantiation stack. Nothing renders; the CLI exits nonzero. Expression asserts chain: assert(a) assert(b) expr. Introduced 2019.05; the canonical argument-validation tool for libraries.</p>
 <div class="edges"><div class="elbl">Edge cases &amp; oddities</div><ul><li>Failure output shape: ERROR: Assertion &#x27;(cond-source-text)&#x27; failed: &quot;message&quot; in file &lt;path&gt;, line &lt;N&gt; — then TRACE: called by &#x27;&lt;module&gt;&#x27;, in file &lt;path&gt;, line &lt;N&gt; lines unwinding the module stack innermost-first. VERIFY every punctuation detail verbatim (quoting of the condition, parentheses, message quoting, comma placement) — users and CI parse it.</li><li>The condition text is the AST re-serialization, not verbatim source: normalized whitespace and possibly added parentheses (assert(1+1==3) may render as &#x27;((1 + 1) == 3)&#x27;) — VERIFY exact serializer output on a probe battery.</li><li>Message rendered like an echo VALUE: string messages believed printed WITH quotes; non-string messages (numbers, vectors) render in display form; omitted message omits the &#x27;: msg&#x27; segment entirely.</li><li>Truthiness traps: assert([]) FAILS (empty vector falsy); assert(&quot;false&quot;) PASSES; assert(0/0) PASSES (nan is truthy — toBool is a plain != 0 test); assert(undef) fails.</li><li>Expression form: assert(cond, msg) expr — lazy only in the sense that expr is unreached on failure; chains and mixes with let/echo expressions; inside functions a failure reports the assert&#x27;s own file/line with the MODULE instantiation TRACE (VERIFY whether intermediate function call sites appear — believed not, modules only).</li><li class="verify"><span class="vbadge">verify vs oracle</span> statement-form assert with a child (assert(x) cube();) — believed the child instantiates normally on success; pin.</li><li class="verify"><span class="vbadge">verify vs oracle</span> assert() with no arguments and assert(a, b, extra) — pin the too-few/too-many argument warnings/errors.</li><li>Halting is total: no further echoes, warnings, or geometry from anywhere in the tree after the failure (VERIFY whether top-level statements after the failing one are reached — believed not).</li><li>Pre-2019.05 compatibility: on 2015.03 assert is an unknown module (warned, ignored) / unknown function — version-gate via version_num.</li><li>Not affected by --hardwarnings (already fatal); assert is the ONLY user-reachable hard stop besides syntax/recursion errors.</li></ul></div>
 <pre class="ex">module ring(r) { assert(r &gt; 0, &quot;radius must be positive&quot;); circle(r); } ring(5);</pre>
@@ -2431,7 +2431,7 @@ tm = textmetrics(&quot;hi&quot;); echo(is_object(tm)); // ECHO: true</pre>
 <div class="ehead">
 <h4 class="ename">$children</h4>
 <span class="chip k-special-variable">$ var</span>
-<span class="chip since">2014.03</span>
+<span class="chip since">pre-2015.03 (predates 2014.03 — existed with legacy child(); 2014.03 fixed a dynamic-scoping bug and added children()/parent_module()/$parent_modules)</span>
 </div>
 <pre class="sig">$children  // integer, set by the module-call mechanism</pre>
 <p class="esum">Number of child instantiations passed to the currently executing module; 0 at top level and for childless calls.</p>
@@ -2649,7 +2649,7 @@ linear_extrude(5) import(&quot;p.dxf&quot;);</pre>
 <div class="ehead">
 <h4 class="ename">import_stl / import_dxf / import_off (deprecated)</h4>
 <span class="chip k-module">module</span>
-<span class="chip since">pre-2015.03 (deprecated ~2013)</span>
+<span class="chip since">pre-2015.03 (deprecated 2011.12, alongside the introduction of unified import())</span>
 </div>
 <pre class="sig">import_stl(&quot;file.stl&quot;); import_dxf(&quot;file.dxf&quot;); import_off(&quot;file.off&quot;);</pre>
 <p class="esum">Deprecated per-format aliases of import(), from before the unified importer.</p>
