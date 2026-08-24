@@ -94,8 +94,13 @@ fn format_progress_text(p: &RunProgress) -> String {
         .chain(core::iter::repeat('-').take(empty))
         .collect();
 
+    // The finished marker is what stops a human from polling forever: a
+    // finished legacy run can truthfully sit below 100% (fewer results
+    // than selected tests), and percent alone would read as "still
+    // running".
+    let state = if p.finished { "finished" } else { "running" };
     format!(
-        "[{}] {:.1}% ({}/{}) | P:{} F:{} E:{} S:{} | {}ms elapsed",
+        "[{}] {:.1}% ({}/{}) | P:{} F:{} E:{} S:{} | {}ms elapsed | {}",
         bar,
         p.percent_complete,
         p.completed,
@@ -105,6 +110,7 @@ fn format_progress_text(p: &RunProgress) -> String {
         p.errored,
         p.skipped,
         p.elapsed_ms,
+        state,
     )
 }
 

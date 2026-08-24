@@ -230,10 +230,18 @@ pub fn parse_request(json_input: &str) -> Result<McpRequest, String> {
     // the whole suite run instead.
     crate::json_types::reject_unknown_keys(&value, "request", &["tool", "params"])
         .map_err(|e| format!("{}", e))?;
-    let tool = value
-        .get_str("tool")
-        .ok_or("Missing 'tool' field")?
-        .to_string();
+    // Present-but-mistyped must not be reported as "missing" — the same
+    // precision run_id_param gives one layer down.
+    let tool = match value.get("tool") {
+        Some(JsonValue::Str(s)) => s.clone(),
+        Some(other) => {
+            return Err(format!(
+                "Field 'tool' must be a string, got: {}",
+                crate::json::to_json_compact(other)
+            ))
+        }
+        None => return Err("Missing 'tool' field".into()),
+    };
     // Absent params — or explicit null, the JSON convention for "not set" —
     // means an empty parameter object.
     let params = match value.get("params") {
@@ -817,6 +825,17 @@ mod tests {
             .get_str("error")
             .unwrap()
             .contains("conflicts with include filters"));
+    }
+
+    #[test]
+    fn mistyped_tool_field_is_not_reported_missing() {
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": 42, "params": {}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        let err = val.get_str("error").unwrap();
+        assert!(err.contains("must be a string"), "got: {}", err);
+        assert!(!err.contains("Missing"), "got: {}", err);
     }
 
     #[test]

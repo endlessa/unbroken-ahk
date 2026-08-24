@@ -51,6 +51,16 @@ pub fn execute_command(manager: &mut PlatformManager, input: &str) -> ConsoleOut
     // inside string values.
     let rest = input[parts[0].len()..].trim_start();
 
+    // Argument-less commands reject surplus tokens like every other part
+    // of this surface: 'tags smoke' silently printing the UNFILTERED
+    // list reads as a filtered result.
+    if matches!(command.as_str(), "help" | "summary" | "tags" | "groups") && !args.is_empty() {
+        return error_output(&format!(
+            "'{}' takes no arguments (try 'discover --tag <tag>' to filter tests)",
+            command
+        ));
+    }
+
     match command.as_str() {
         "help" => cmd_help(),
         "summary" => cmd_summary(manager),
@@ -871,6 +881,30 @@ mod tests {
         assert!(out.text.contains("exactly one run_id"), "got: {}", out.text);
         let out = execute_command(&mut mgr, "progress run_0001 run_9999");
         assert!(out.text.contains("exactly one run_id"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn argumentless_commands_reject_surplus_tokens() {
+        // 'tags smoke' silently printing the UNFILTERED list reads as a
+        // filtered result — reject like the rest of the surface.
+        let mut mgr = setup_manager();
+        for cmd in ["tags smoke", "groups auth", "summary all", "help run"] {
+            let out = execute_command(&mut mgr, cmd);
+            assert!(out.text.contains("takes no arguments"), "{}: got: {}", cmd, out.text);
+        }
+    }
+
+    #[test]
+    fn text_progress_shows_finished_state() {
+        // The text surface needs the same poll-until signal JSON carries:
+        // a finished legacy run can truthfully sit below 100%.
+        let mut mgr = setup_manager();
+        let out = execute_command(&mut mgr, "run --id t1");
+        assert!(out.text.contains("Passed"), "got: {}", out.text);
+        let run_id_json = parse_json(&out.json).unwrap();
+        let run_id = run_id_json.get_str("run_id").unwrap().to_string();
+        let out = execute_command(&mut mgr, &format!("progress {}", run_id));
+        assert!(out.text.contains("| finished"), "got: {}", out.text);
     }
 
     #[test]
