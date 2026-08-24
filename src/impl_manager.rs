@@ -40,9 +40,9 @@ pub struct PlatformManager {
 impl PlatformManager {
     pub fn new(storage_dir: &str) -> Self {
         let storage = StoragePaths::new(storage_dir);
-        // Resume the run counter from persisted runs so a new session never
-        // reuses — and overwrites — a previous session's run IDs.
-        let run_counter = storage::max_existing_run_number(&storage);
+        // Run-counter continuity across sessions is handled entirely by
+        // next_run_id's rescan at mint time — no seeding needed here.
+        let run_counter = 0;
         Self {
             registry: InMemoryRegistry::new(),
             filter: StandardFilter::new(),
@@ -93,12 +93,16 @@ impl PlatformManager {
     /// normal restart flow (register_runnable persists every definition,
     /// so stored and live definitions overlap by design). Every valid
     /// stored definition is registered even when some entries are
-    /// malformed; an Err reports what was skipped or corrupt, after
-    /// loading everything that could be loaded.
-    pub fn load_from_storage(&mut self) -> Result<(), String> {
+    /// malformed.
+    ///
+    /// Returns Ok with per-entry warnings (empty when the load was clean) —
+    /// a partially-dirty registry is still a successful load. Err is
+    /// reserved for file-level failure (unreadable file, invalid JSON),
+    /// where nothing was loaded.
+    pub fn load_from_storage(&mut self) -> Result<Vec<String>, String> {
         // No file yet (first launch, or WASM) is not an error.
         if !storage::registry_exists(&self.storage) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let (tests, mut failures) = storage::load_registry(&self.storage)?;
         // Distinguish two kinds of duplicate: an id already in memory
@@ -122,16 +126,7 @@ impl PlatformManager {
                 failures.push(format!("{}: {:?}", id, e));
             }
         }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "loaded registry with {} problem entr{}: {}",
-                failures.len(),
-                if failures.len() == 1 { "y" } else { "ies" },
-                failures.join("; ")
-            ))
-        }
+        Ok(failures)
     }
 
     /// Get the storage paths for external use.
@@ -200,6 +195,18 @@ impl TestManager for PlatformManager {
                  use \"execution_model\": {\"type\": \"sequential\"}"
                     .into(),
             ));
+        }
+
+        // A misspelled include id must error, never silently shrink the
+        // run while other criteria still match something.
+        let unknown_ids: Vec<String> = config
+            .include_ids
+            .iter()
+            .filter(|id| self.registry.get(id).is_none())
+            .cloned()
+            .collect();
+        if !unknown_ids.is_empty() {
+            return Err(ManagerError::UnknownTestIds(unknown_ids));
         }
 
         // Collect selected test IDs upfront to avoid borrow conflicts
@@ -567,7 +574,7 @@ mod tests {
         // Session 2 re-registers, then loads — must succeed.
         let mut mgr2 = PlatformManager::new(&dir);
         mgr2.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
-        assert!(mgr2.load_from_storage().is_ok());
+        assert!(mgr2.load_from_storage().unwrap().is_empty());
         assert_eq!(mgr2.summary().total_tests, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -586,10 +593,11 @@ mod tests {
         ).unwrap();
 
         let mut mgr = PlatformManager::new(&dir);
-        let result = mgr.load_from_storage();
-        // The in-file duplicate is reported, the first definition wins.
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("duplicate id within registry.json"));
+        // The load succeeds (usable registry), the in-file duplicate is
+        // reported as a warning, and the first definition wins.
+        let warnings = mgr.load_from_storage().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("duplicate id within registry.json"));
         assert_eq!(mgr.summary().total_tests, 1);
         let found = mgr.discover(&DiscoveryQuery::default());
         assert_eq!(found.tests[0].name, "first_definition");
@@ -612,11 +620,11 @@ mod tests {
         ).unwrap();
 
         let mut mgr = PlatformManager::new(&dir);
-        let result = mgr.load_from_storage();
-        // The corrupt entry is reported...
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("entry 1"));
-        // ...but both valid definitions loaded.
+        // The load succeeds; the corrupt entry is reported as a warning...
+        let warnings = mgr.load_from_storage().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("entry 1"));
+        // ...and both valid definitions loaded.
         assert_eq!(mgr.summary().total_tests, 2);
 
         let _ = std::fs::remove_dir_all(&dir);

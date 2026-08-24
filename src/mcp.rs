@@ -594,11 +594,20 @@ mod tests {
 
     #[test]
     fn run_no_match_returns_error() {
+        // A misspelled/unknown id errors and NAMES the id — it must never
+        // silently shrink the run.
         let mut mgr = setup_manager();
         let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"run_all": false, "include_ids": ["nonexistent"]}}"#);
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
-        assert!(val.get_str("error").unwrap().contains("NoTestsMatched"));
+        let err = val.get_str("error").unwrap();
+        assert!(err.contains("UnknownTestIds") && err.contains("nonexistent"));
+
+        // Even when another include criterion matches, the typo still errors.
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"include_ids": ["t1", "tpyo3"]}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("tpyo3"));
     }
 
     // -- test_progress --

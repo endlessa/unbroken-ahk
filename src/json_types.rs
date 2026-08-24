@@ -91,7 +91,12 @@ impl FromJson for TestStatus {
             Some("failed") => Ok(TestStatus::Failed),
             Some("error") => Ok(TestStatus::Error),
             Some("skipped") => Ok(TestStatus::Skipped),
-            _ => Ok(TestStatus::Error),
+            // A corrupted status must be a load error, not a silent Error
+            // status that skews the counts.
+            _ => Err(JsonError::InvalidField(
+                "status".into(),
+                "one of \"passed\", \"failed\", \"error\", \"skipped\"".into(),
+            )),
         }
     }
 }
@@ -495,9 +500,10 @@ fn reject_unknown_keys(
         JsonValue::Object(pairs) => {
             for (key, _) in pairs {
                 if !known.contains(&key.as_str()) {
-                    return Err(JsonError::InvalidField(
+                    return Err(JsonError::UnknownField(
+                        what.into(),
                         key.clone(),
-                        format!("no such {} parameter; valid keys: {}", what, known.join(", ")),
+                        known.join(", "),
                     ));
                 }
             }

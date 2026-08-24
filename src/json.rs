@@ -254,6 +254,7 @@ pub enum JsonError {
     TrailingData(usize),
     MissingField(String),
     InvalidField(String, String),
+    UnknownField(String, String, String),
     TooDeep(usize),
 }
 
@@ -272,6 +273,9 @@ impl fmt::Display for JsonError {
             }
             JsonError::InvalidField(name, expected) => {
                 write!(f, "invalid field '{}': expected {}", name, expected)
+            }
+            JsonError::UnknownField(what, name, valid) => {
+                write!(f, "unknown {} field '{}'; valid keys: {}", what, name, valid)
             }
             JsonError::TooDeep(pos) => {
                 write!(f, "nesting deeper than {} levels at position {}", MAX_DEPTH, pos)

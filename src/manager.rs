@@ -10,6 +10,7 @@ use crate::discovery::DiscoveryResult;
 use crate::discovery::DiscoverySummary;
 use crate::types::RunConfig;
 use crate::types::RunId;
+use crate::types::TestId;
 use crate::types::RunProgress;
 use crate::types::RunSummary;
 use crate::types::TestDefinition;
@@ -64,6 +65,9 @@ pub enum ManagerError {
     RunAlreadyComplete(RunId),
     /// No tests matched the given configuration.
     NoTestsMatched,
+    /// include_ids named tests that are not registered — a typo must
+    /// error, never silently shrink the run.
+    UnknownTestIds(Vec<TestId>),
     /// A test registration failed.
     RegistrationFailed(String),
     /// The configuration requests something this build cannot do.
