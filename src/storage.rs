@@ -260,7 +260,12 @@ pub fn reserve_run_file(paths: &StoragePaths, run_id: &str) -> bool {
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(_) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(_) => true,
+        // Some other IO error: if the file turns out to exist, someone
+        // else claimed it — treat as taken so the caller retries the next
+        // id; only when it genuinely does not exist do we proceed
+        // best-effort (uniqueness degrades while storage itself errors,
+        // and the later save will surface the underlying problem).
+        Err(_) => std::fs::metadata(&path).is_err(),
     }
 }
 

@@ -29,6 +29,13 @@ pub trait TestFilter {
     ) -> Vec<&'a TestDefinition>;
 }
 
+/// The include_tags predicate: a test matches when it carries ALL of the
+/// requested tags. Shared by the filter engine and the manager's
+/// zero-match validation so what is validated is exactly what selects.
+pub fn matches_all_tags(tags: &[String], test: &TestDefinition) -> bool {
+    tags.iter().all(|tag| test.tags.contains(tag))
+}
+
 /// Case-insensitive name matching shared by discovery search and run
 /// filtering, so `discover <pattern>` and `run --pattern <pattern>`
 /// always select the same tests. Takes an already-lowercased pattern so

@@ -4,6 +4,15 @@ use crate::json::*;
 use crate::types::*;
 use crate::discovery::{DiscoveryQuery, DiscoveryResult, DiscoverySummary};
 
+
+/// Serialize a u64 for JSON, clamped to the exact-integer range (2^53):
+/// the strict read side rejects larger values, so the write side must
+/// never produce them — a pathological duration/timestamp is stored as
+/// the clamp rather than a value the platform itself cannot reload.
+fn u64_json(n: u64) -> JsonValue {
+    JsonValue::Number(n.min(9_007_199_254_740_992) as f64)
+}
+
 // ---------------------------------------------------------------------------
 // TestDefinition
 // ---------------------------------------------------------------------------
@@ -194,7 +203,7 @@ impl ToJson for RunConfig {
         }
         pairs.push(("fail_fast", JsonValue::Bool(self.fail_fast)));
         if let Some(t) = self.timeout_ms {
-            pairs.push(("timeout_ms", JsonValue::Number(t as f64)));
+            pairs.push(("timeout_ms", u64_json(t)));
         }
         pairs.push(("execution_model", self.execution_model.to_json()));
         obj(pairs)
@@ -314,7 +323,7 @@ impl ToJson for TestResult {
         let mut pairs: Vec<(&str, JsonValue)> = vec![
             ("test_id", str_val(&self.test_id)),
             ("status", self.status.to_json()),
-            ("duration_ms", JsonValue::Number(self.duration_ms as f64)),
+            ("duration_ms", u64_json(self.duration_ms)),
         ];
         if let Some(ref m) = self.message {
             pairs.push(("message", str_val(m)));
@@ -369,7 +378,7 @@ impl ToJson for RunProgress {
             ("skipped", JsonValue::Number(self.skipped as f64)),
             ("running", JsonValue::Number(self.running as f64)),
             ("percent_complete", JsonValue::Number(self.percent_complete)),
-            ("elapsed_ms", JsonValue::Number(self.elapsed_ms as f64)),
+            ("elapsed_ms", u64_json(self.elapsed_ms)),
         ])
     }
 }
@@ -406,9 +415,9 @@ impl ToJson for RunSummary {
             ("failed", JsonValue::Number(self.failed as f64)),
             ("skipped", JsonValue::Number(self.skipped as f64)),
             ("errored", JsonValue::Number(self.errored as f64)),
-            ("total_duration_ms", JsonValue::Number(self.total_duration_ms as f64)),
-            ("started_at", JsonValue::Number(self.started_at as f64)),
-            ("completed_at", JsonValue::Number(self.completed_at as f64)),
+            ("total_duration_ms", u64_json(self.total_duration_ms)),
+            ("started_at", u64_json(self.started_at)),
+            ("completed_at", u64_json(self.completed_at)),
         ])
     }
 }

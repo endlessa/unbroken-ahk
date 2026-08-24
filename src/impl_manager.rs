@@ -35,6 +35,12 @@ pub struct PlatformManager {
     completed_runs: Vec<RunSummary>,
     /// Counter for generating unique run IDs
     run_counter: u64,
+    /// Ids whose definitions were supplied by THIS session's code (via
+    /// register_runnable/register_test), as opposed to restored from
+    /// storage — decides whether a differing re-registration is a
+    /// definition upgrade (storage-sourced) or a programming error
+    /// (session-sourced).
+    session_defined: std::collections::HashSet<TestId>,
 }
 
 impl PlatformManager {
@@ -53,30 +59,59 @@ impl PlatformManager {
             runnables: Vec::new(),
             completed_runs: Vec::new(),
             run_counter,
+            session_defined: std::collections::HashSet::new(),
         }
     }
 
-    /// Ensure a definition is registered in memory: a brand-new id is
-    /// inserted; an identical already-registered definition is a no-op
-    /// (the load-then-register restart flow, and retries after
-    /// PersistFailed); a conflicting definition is an error. The single
-    /// shared implementation behind register_runnable and register_test —
+    /// Ensure a definition is registered in memory. The single shared
+    /// implementation behind register_runnable and register_test —
     /// persistence is the caller's next step, ALWAYS attempted so that
     /// success means durable.
+    ///
+    /// - brand-new id: inserted
+    /// - identical to the existing definition: no-op (restart flows and
+    ///   retries after PersistFailed)
+    /// - differs from a definition RESTORED FROM STORAGE: updated — the
+    ///   embedder's code is the source of truth, and this is the normal
+    ///   definition-evolved-between-versions upgrade path
+    /// - differs from one registered EARLIER THIS SESSION: error — two
+    ///   parts of one program disagreeing about a test is a bug
     fn ensure_definition(&mut self, definition: TestDefinition) -> Result<TestId, ManagerError> {
-        let id = definition.id.clone();
-        if let Some(existing) = self.registry.get(&id) {
-            if *existing != definition {
+        // A definition the registry accepts must survive its own
+        // persistence round-trip: duplicate metadata keys would serialize
+        // to a JSON object the strict parser rejects.
+        let mut meta_keys = std::collections::HashSet::new();
+        for (k, _) in &definition.metadata {
+            if !meta_keys.insert(k.as_str()) {
                 return Err(ManagerError::RegistrationFailed(format!(
-                    "definition for '{}' conflicts with the already-registered one",
+                    "duplicate metadata key '{}' in definition '{}'",
+                    k, definition.id
+                )));
+            }
+        }
+        let id = definition.id.clone();
+        match self.registry.get(&id) {
+            Some(existing) if *existing == definition => {}
+            Some(_) if self.session_defined.contains(&id) => {
+                return Err(ManagerError::RegistrationFailed(format!(
+                    "definition for '{}' conflicts with the one registered earlier this session",
                     id
                 )));
             }
-        } else {
-            self.registry
-                .register(definition)
-                .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
+            Some(_) => {
+                // Restored from storage with an older shape — update.
+                self.registry.deregister(&id);
+                self.registry
+                    .register(definition)
+                    .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
+            }
+            None => {
+                self.registry
+                    .register(definition)
+                    .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
+            }
         }
+        self.session_defined.insert(id.clone());
         Ok(id)
     }
 
@@ -212,12 +247,16 @@ impl PlatformManager {
         };
         let mut all: Vec<TestDefinition> =
             self.registry.list_all().into_iter().cloned().collect();
-        let in_memory: std::collections::HashSet<String> =
+        // One set covers both filters: skip stored entries shadowed by
+        // memory AND collapse in-file duplicate ids (first wins, matching
+        // load_from_storage) so the corruption converges instead of being
+        // written back verbatim forever.
+        let mut written: std::collections::HashSet<String> =
             all.iter().map(|t| t.id.clone()).collect();
         all.extend(
             stored
                 .into_iter()
-                .filter(|t| !in_memory.contains(t.id.as_str())),
+                .filter(|t| written.insert(t.id.clone())),
         );
         let refs: Vec<&TestDefinition> = all.iter().collect();
         storage::save_registry(&self.storage, &refs)
@@ -316,7 +355,7 @@ impl TestManager for PlatformManager {
             if !config.include_tags.is_empty()
                 && !all_defs
                     .iter()
-                    .any(|t| config.include_tags.iter().all(|tag| t.tags.contains(tag)))
+                    .any(|t| crate::filter::matches_all_tags(&config.include_tags, t))
             {
                 return Err(ManagerError::UnsupportedConfig(format!(
                     "include_tags {:?} match no registered test",
@@ -897,6 +936,128 @@ mod tests {
         let summary = mgr.get_results(&run_id).unwrap();
         assert_eq!(summary.passed, 1, "replacement runnable must execute");
         assert_eq!(summary.total, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_metadata_keys_rejected_at_registration() {
+        // A definition must survive its own persistence round-trip; the
+        // strict parser rejects duplicate JSON keys, so registration must
+        // reject them first.
+        let dir = crate::test_util::temp_storage_dir("mgr-dupmeta");
+        let mut mgr = PlatformManager::new(&dir);
+        let def = TestDefinition {
+            id: "t1".into(),
+            name: "t".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![("env".into(), "a".into()), ("env".into(), "b".into())],
+        };
+        match mgr.register_test(def) {
+            Err(ManagerError::RegistrationFailed(msg)) => assert!(msg.contains("duplicate metadata key")),
+            other => panic!("expected RegistrationFailed, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct SlowLiar;
+    impl RunnableTest for SlowLiar {
+        fn id(&self) -> &str {
+            "t1"
+        }
+        fn run(&self, _timeout: Option<DurationMs>) -> TestResult {
+            TestResult {
+                test_id: "t1".into(),
+                status: TestStatus::Passed,
+                duration_ms: u64::MAX, // pathological reported duration
+                message: None,
+                stdout: None,
+                stderr: None,
+            }
+        }
+    }
+
+    #[test]
+    fn pathological_duration_round_trips_through_storage() {
+        // The platform must be able to reload every file it writes: a
+        // u64::MAX duration is clamped on write and loads back cleanly.
+        let dir = crate::test_util::temp_storage_dir("mgr-bigdur");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "t".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(SlowLiar),
+        ).unwrap();
+        let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        // A fresh manager reads the run purely from storage.
+        let fresh = PlatformManager::new(&dir);
+        let summary = fresh.get_results(&run_id).unwrap();
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.results[0].duration_ms, 9_007_199_254_740_992);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changed_definition_from_storage_is_upgraded() {
+        // The normal evolution flow: the embedder's code changed a test's
+        // definition between versions. load-then-register must update the
+        // stored shape, attach the runnable, and run.
+        let dir = crate::test_util::temp_storage_dir("mgr-evolve");
+        let old_def = TestDefinition {
+            id: "t1".into(),
+            name: "t".into(),
+            tags: vec!["a".into()],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+        let mut mgr1 = PlatformManager::new(&dir);
+        mgr1.register_runnable(old_def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+
+        let new_def = TestDefinition { tags: vec!["a".into(), "b".into()], ..old_def };
+        let mut mgr2 = PlatformManager::new(&dir);
+        assert!(mgr2.load_from_storage().unwrap().is_empty());
+        mgr2.register_runnable(new_def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        let found = mgr2.discover(&DiscoveryQuery::default());
+        assert_eq!(found.tests[0].tags, vec!["a".to_string(), "b".to_string()]);
+        let run_id = mgr2.start_run(RunConfig::default()).unwrap();
+        assert_eq!(mgr2.get_results(&run_id).unwrap().passed, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_file_duplicate_ids_converge_on_persist() {
+        // A register-first session must collapse hand-edit duplicates
+        // (first wins) instead of writing them back forever.
+        let dir = crate::test_util::temp_storage_dir("mgr-dupconverge");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            format!("{}/registry.json", dir),
+            r#"[
+              {"id": "t1", "name": "first", "tags": []},
+              {"id": "t1", "name": "second", "tags": []}
+            ]"#,
+        ).unwrap();
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_test(TestDefinition {
+            id: "t2".into(),
+            name: "session".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        }).unwrap();
+        let content = std::fs::read_to_string(format!("{}/registry.json", dir)).unwrap();
+        assert_eq!(content.matches("\"t1\"").count(), 1, "duplicate must collapse");
+        assert!(content.contains("first"));
+        assert!(content.contains("\"t2\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

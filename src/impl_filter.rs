@@ -52,7 +52,7 @@ impl TestFilter for StandardFilter {
             // Step 2: Include by tags (additive — add tests matching ALL include_tags)
             if !config.include_tags.is_empty() {
                 for test in tests {
-                    if config.include_tags.iter().all(|tag| test.tags.contains(tag))
+                    if crate::filter::matches_all_tags(&config.include_tags, test)
                         && seen.insert(test.id.as_str())
                     {
                         candidates.push(test);
