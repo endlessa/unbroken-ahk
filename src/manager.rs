@@ -75,4 +75,7 @@ pub enum ManagerError {
     RegistrationFailed(String),
     /// The configuration requests something this build cannot do.
     UnsupportedConfig(String),
+    /// The run EXECUTED (results are queryable in memory via get_results)
+    /// but its summary could not be written to storage.
+    PersistFailed(RunId, String),
 }

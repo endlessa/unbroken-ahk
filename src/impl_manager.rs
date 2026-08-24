@@ -154,13 +154,33 @@ impl PlatformManager {
         &self.storage
     }
 
+    /// Persist the registry, MERGED with what the file already holds:
+    /// stored definitions not present in memory are preserved, so a
+    /// register-before-load restart cannot clobber definition-only tests
+    /// that a previous session persisted. In-memory definitions win on id
+    /// conflict. (If a manager-level deregister is ever added, it must
+    /// delete from the file explicitly — this merge would resurrect
+    /// otherwise.)
     fn persist_registry(&self) {
-        let all = self.registry.list_all();
-        let _ = storage::save_registry(&self.storage, &all);
+        let mut all: Vec<TestDefinition> =
+            self.registry.list_all().into_iter().cloned().collect();
+        if storage::registry_exists(&self.storage) {
+            if let Ok((stored, _)) = storage::load_registry(&self.storage) {
+                let in_memory: std::collections::HashSet<&str> =
+                    all.iter().map(|t| t.id.as_str()).collect();
+                let preserved: Vec<TestDefinition> = stored
+                    .into_iter()
+                    .filter(|t| !in_memory.contains(t.id.as_str()))
+                    .collect();
+                all.extend(preserved);
+            }
+        }
+        let refs: Vec<&TestDefinition> = all.iter().collect();
+        let _ = storage::save_registry(&self.storage, &refs);
     }
 
-    fn persist_run(&self, summary: &RunSummary) {
-        let _ = storage::save_run_summary(&self.storage, summary);
+    fn persist_run(&self, summary: &RunSummary) -> Result<(), String> {
+        storage::save_run_summary(&self.storage, summary)
     }
 
     fn next_run_id(&mut self) -> RunId {
@@ -336,8 +356,13 @@ impl TestManager for PlatformManager {
             },
         };
 
-        self.persist_run(&summary);
+        // Surface a failed write instead of letting the user believe the
+        // run persisted — the results stay queryable in memory either way.
+        let persisted = self.persist_run(&summary);
         self.completed_runs.push(summary);
+        if let Err(e) = persisted {
+            return Err(ManagerError::PersistFailed(run_id, e));
+        }
 
         Ok(run_id)
     }
@@ -367,11 +392,16 @@ impl TestManager for PlatformManager {
         if self.progress.active_runs().contains(&run_id.to_string()) {
             return Err(ManagerError::RunInProgress(run_id.into()));
         }
-        // Try loading from storage. A missing file is an unknown run; a
-        // file that exists but fails to parse is CORRUPTION and must say
-        // so — telling the user the run never happened hides real damage.
+        // Try loading from storage. A missing file is an unknown run; an
+        // empty file is another session's reservation (running, or died
+        // before persisting) — no results yet, not corruption; a file with
+        // content that fails to parse is CORRUPTION and must say so —
+        // telling the user the run never happened hides real damage.
         if !storage::run_summary_exists(&self.storage, run_id) {
             return Err(ManagerError::UnknownRun(run_id.into()));
+        }
+        if storage::run_summary_is_reserved_only(&self.storage, run_id) {
+            return Err(ManagerError::RunInProgress(run_id.into()));
         }
         storage::load_run_summary(&self.storage, run_id)
             .map_err(|e| ManagerError::CorruptRun(run_id.into(), e))
@@ -524,6 +554,59 @@ mod tests {
                 Err(ManagerError::UnknownRun(_)) => {}
                 other => panic!("expected UnknownRun for {:?}, got {:?}", evil, other.map(|_| ())),
             }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_then_load_preserves_definition_only_tests() {
+        // Session 1 persists a runnable-backed test AND a definition-only
+        // test. Session 2 registers its runnable BEFORE loading — the
+        // merge-on-persist must not clobber the stored definition-only
+        // test in between.
+        let dir = crate::test_util::temp_storage_dir("mgr-preserve");
+        let def_t1 = TestDefinition {
+            id: "t1".into(),
+            name: "runnable".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+        let mut mgr1 = PlatformManager::new(&dir);
+        mgr1.register_runnable(def_t1.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        mgr1.register_test(TestDefinition {
+            id: "t2".into(),
+            name: "definition_only".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        }).unwrap();
+
+        // Restart in register-first order.
+        let mut mgr2 = PlatformManager::new(&dir);
+        mgr2.register_runnable(def_t1, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        assert!(mgr2.load_from_storage().unwrap().is_empty());
+        // t2 survived the register-first persist.
+        assert_eq!(mgr2.summary().total_tests, 2);
+        let run_id = mgr2.start_run(RunConfig::default()).unwrap();
+        assert_eq!(mgr2.get_results(&run_id).unwrap().total, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reserved_only_run_file_reports_in_progress_not_corrupt() {
+        // Another session claimed the id (empty reservation file) but has
+        // not persisted a summary — that is "no results yet", never
+        // corruption.
+        let dir = crate::test_util::temp_storage_dir("mgr-reserved");
+        std::fs::create_dir_all(format!("{}/runs", dir)).unwrap();
+        std::fs::write(format!("{}/runs/run_0005.json", dir), "").unwrap();
+        let mgr = PlatformManager::new(&dir);
+        match mgr.get_results("run_0005") {
+            Err(ManagerError::RunInProgress(_)) => {}
+            other => panic!("expected RunInProgress, got {:?}", other.map(|_| ())),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

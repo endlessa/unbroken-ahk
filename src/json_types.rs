@@ -209,82 +209,80 @@ impl RunConfig {
 }
 
 fn parse_run_config(value: &JsonValue, reject_bare_run_all_false: bool) -> Result<RunConfig, JsonError> {
-    {
-        // Every field is strictly typed when present, and unknown keys are
-        // rejected: a mistyped filter — wrong type OR wrong name ("tags"
-        // instead of "include_tags") — must be an error, never a
-        // silently-empty filter that runs the whole suite.
-        reject_unknown_keys(
-            value,
-            "run config",
-            &[
-                "run_all",
-                "include_ids",
-                "include_tags",
-                "exclude_tags",
-                "name_pattern",
-                "fail_fast",
-                "timeout_ms",
-                "execution_model",
-            ],
-        )?;
-        let include_ids = strict_string_array(value, "include_ids")?;
-        let include_tags = strict_string_array(value, "include_tags")?;
-        let exclude_tags = strict_string_array(value, "exclude_tags")?;
-        let name_pattern = strict_opt_string(value, "name_pattern")?;
-        // run_all defaults to true unless an INCLUDE-side key was supplied.
-        // Key PRESENCE decides, not emptiness: {"include_ids": []} selected
-        // zero tests — that must become NoTestsMatched, never run-everything.
-        // exclude_tags does not flip the default: exclusions apply under
-        // run_all anyway, so {"exclude_tags": [...]} means "everything
-        // except these" and {"exclude_tags": []} means "everything".
-        let includes_supplied = ["include_ids", "include_tags", "name_pattern"]
-            .iter()
-            .any(|k| matches!(value.get(k), Some(v) if !matches!(v, JsonValue::Null)));
-        let run_all_explicit = strict_opt_bool(value, "run_all")?;
-        let run_all = run_all_explicit.unwrap_or(!includes_supplied);
-        // An explicit run_all=false without include keys selects nothing by
-        // definition — exclusions never resurrect an empty selection — so
-        // name the cause and the fix here, where key presence is still
-        // visible, instead of a bare no-tests-matched downstream.
-        // ({"run_all": false, "include_ids": []} keeps its NoTestsMatched
-        // contract: an include key WAS supplied.) Skipped for persisted
-        // configs (from_json_stored), which may predate this rule.
-        if reject_bare_run_all_false && run_all_explicit == Some(false) && !includes_supplied {
-            return Err(JsonError::InvalidField(
-                "run_all".into(),
-                "false requires at least one include filter (include_ids, \
-                 include_tags, or name_pattern) — exclusions cannot resurrect \
-                 an empty selection, so with run_all false nothing is selected; \
-                 drop run_all or add include filters"
-                    .into(),
-            ));
-        }
-        let fail_fast = strict_opt_bool(value, "fail_fast")?.unwrap_or(false);
-        let timeout_ms = strict_opt_u64(value, "timeout_ms")?;
-        let execution_model = match value.get("execution_model") {
-            None | Some(JsonValue::Null) => ExecutionModel::Sequential,
-            Some(obj @ JsonValue::Object(_)) => ExecutionModel::from_json(obj)?,
-            // A bare string like "parallel" must not silently become
-            // Sequential — the caller's intent would be ignored.
-            Some(_) => {
-                return Err(JsonError::InvalidField(
-                    "execution_model".into(),
-                    "an object like {\"type\": \"sequential\"}".into(),
-                ))
-            }
-        };
-        Ok(RunConfig {
-            run_all,
-            include_ids,
-            include_tags,
-            exclude_tags,
-            name_pattern,
-            fail_fast,
-            timeout_ms,
-            execution_model,
-        })
+    // Every field is strictly typed when present, and unknown keys are
+    // rejected: a mistyped filter — wrong type OR wrong name ("tags"
+    // instead of "include_tags") — must be an error, never a
+    // silently-empty filter that runs the whole suite.
+    reject_unknown_keys(
+        value,
+        "run config",
+        &[
+            "run_all",
+            "include_ids",
+            "include_tags",
+            "exclude_tags",
+            "name_pattern",
+            "fail_fast",
+            "timeout_ms",
+            "execution_model",
+        ],
+    )?;
+    let include_ids = strict_string_array(value, "include_ids")?;
+    let include_tags = strict_string_array(value, "include_tags")?;
+    let exclude_tags = strict_string_array(value, "exclude_tags")?;
+    let name_pattern = strict_opt_string(value, "name_pattern")?;
+    // run_all defaults to true unless an INCLUDE-side key was supplied.
+    // Key PRESENCE decides, not emptiness: {"include_ids": []} selected
+    // zero tests — that must become NoTestsMatched, never run-everything.
+    // exclude_tags does not flip the default: exclusions apply under
+    // run_all anyway, so {"exclude_tags": [...]} means "everything
+    // except these" and {"exclude_tags": []} means "everything".
+    let includes_supplied = ["include_ids", "include_tags", "name_pattern"]
+        .iter()
+        .any(|k| matches!(value.get(k), Some(v) if !matches!(v, JsonValue::Null)));
+    let run_all_explicit = strict_opt_bool(value, "run_all")?;
+    let run_all = run_all_explicit.unwrap_or(!includes_supplied);
+    // An explicit run_all=false without include keys selects nothing by
+    // definition — exclusions never resurrect an empty selection — so
+    // name the cause and the fix here, where key presence is still
+    // visible, instead of a bare no-tests-matched downstream.
+    // ({"run_all": false, "include_ids": []} keeps its NoTestsMatched
+    // contract: an include key WAS supplied.) Skipped for persisted
+    // configs (from_json_stored), which may predate this rule.
+    if reject_bare_run_all_false && run_all_explicit == Some(false) && !includes_supplied {
+        return Err(JsonError::InvalidField(
+            "run_all".into(),
+            "false requires at least one include filter (include_ids, \
+             include_tags, or name_pattern) — exclusions cannot resurrect \
+             an empty selection, so with run_all false nothing is selected; \
+             drop run_all or add include filters"
+                .into(),
+        ));
     }
+    let fail_fast = strict_opt_bool(value, "fail_fast")?.unwrap_or(false);
+    let timeout_ms = strict_opt_u64(value, "timeout_ms")?;
+    let execution_model = match value.get("execution_model") {
+        None | Some(JsonValue::Null) => ExecutionModel::Sequential,
+        Some(obj @ JsonValue::Object(_)) => ExecutionModel::from_json(obj)?,
+        // A bare string like "parallel" must not silently become
+        // Sequential — the caller's intent would be ignored.
+        Some(_) => {
+            return Err(JsonError::InvalidField(
+                "execution_model".into(),
+                "an object like {\"type\": \"sequential\"}".into(),
+            ))
+        }
+    };
+    Ok(RunConfig {
+        run_all,
+        include_ids,
+        include_tags,
+        exclude_tags,
+        name_pattern,
+        fail_fast,
+        timeout_ms,
+        execution_model,
+    })
 }
 
 // ---------------------------------------------------------------------------

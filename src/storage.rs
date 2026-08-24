@@ -178,6 +178,24 @@ pub fn run_summary_exists(_paths: &StoragePaths, _run_id: &str) -> bool {
     false
 }
 
+/// Whether a run file is a reservation placeholder only (exists, empty):
+/// the run was claimed by some session but its summary has not been
+/// written — still executing, or that session died mid-run. Either way
+/// it is "no results yet", never corruption.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_summary_is_reserved_only(paths: &StoragePaths, run_id: &str) -> bool {
+    is_valid_run_id(run_id)
+        && std::fs::metadata(paths.run_path(run_id))
+            .map(|m| m.len() == 0)
+            .unwrap_or(false)
+}
+
+/// WASM stub: no filesystem, no reservations.
+#[cfg(target_arch = "wasm32")]
+pub fn run_summary_is_reserved_only(_paths: &StoragePaths, _run_id: &str) -> bool {
+    false
+}
+
 /// Atomically claim a run id by creating its file with create_new —
 /// fails when another session already claimed it. Returns false ONLY on
 /// already-claimed; other IO errors report true (best effort — the later

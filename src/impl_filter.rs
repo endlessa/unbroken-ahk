@@ -35,10 +35,13 @@ impl TestFilter for StandardFilter {
         } else {
             let mut candidates: Vec<&'a TestDefinition> = Vec::new();
 
+            // Set-based dedup so a large registry stays O(n) per step.
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
             // Step 1: Include by ID
             if !config.include_ids.is_empty() {
                 for test in tests {
-                    if config.include_ids.contains(&test.id) {
+                    if config.include_ids.contains(&test.id) && seen.insert(test.id.as_str()) {
                         candidates.push(test);
                     }
                 }
@@ -47,10 +50,10 @@ impl TestFilter for StandardFilter {
             // Step 2: Include by tags (additive — add tests matching ALL include_tags)
             if !config.include_tags.is_empty() {
                 for test in tests {
-                    if config.include_tags.iter().all(|tag| test.tags.contains(tag)) {
-                        if !candidates.iter().any(|c| c.id == test.id) {
-                            candidates.push(test);
-                        }
+                    if config.include_tags.iter().all(|tag| test.tags.contains(tag))
+                        && seen.insert(test.id.as_str())
+                    {
+                        candidates.push(test);
                     }
                 }
             }
@@ -60,7 +63,7 @@ impl TestFilter for StandardFilter {
                 let pattern_lower = pattern.to_lowercase();
                 for test in tests {
                     if name_matches_lower(&pattern_lower, &test.name)
-                        && !candidates.iter().any(|c| c.id == test.id)
+                        && seen.insert(test.id.as_str())
                     {
                         candidates.push(test);
                     }
