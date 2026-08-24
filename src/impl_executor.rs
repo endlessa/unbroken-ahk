@@ -27,7 +27,15 @@ impl TestExecutor for SequentialExecutor {
         let mut results = Vec::with_capacity(tests.len());
 
         for test in tests {
-            let result = test.run(timeout_ms);
+            let mut result = test.run(timeout_ms);
+            // The REGISTERED id is authoritative. A buggy runnable
+            // reporting a wrong test_id would mis-attribute the record;
+            // an empty one would persist a run file the strict loader
+            // cannot reload (MissingField -> CorruptRun) — the platform
+            // must never write what it cannot read back.
+            if result.test_id != test.id() {
+                result.test_id = test.id().to_string();
+            }
             on_result(&result);
 
             let should_stop = fail_fast

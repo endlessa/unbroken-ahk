@@ -501,6 +501,13 @@ impl<'a> Parser<'a> {
         let slice = core::str::from_utf8(&self.input[start..self.pos])
             .map_err(|_| JsonError::InvalidNumber(start))?;
         let num: f64 = slice.parse().map_err(|_| JsonError::InvalidNumber(start))?;
+        // f64's FromStr saturates overflow to infinity (1e999 -> inf), a
+        // value the serializer can only emit as null — accepting it would
+        // make parse-then-reserialize silently change the value. Reject,
+        // like strict parsers do ("number out of range").
+        if !num.is_finite() {
+            return Err(JsonError::InvalidNumber(start));
+        }
         Ok(JsonValue::Number(num))
     }
 
@@ -896,6 +903,17 @@ mod tests {
         assert!(parse_json(r#""\ud83d""#).is_err());
         assert!(parse_json(r#""\ude00""#).is_err());
         assert!(parse_json(r#""\ud83dA""#).is_err());
+    }
+
+    #[test]
+    fn overflowing_numbers_are_rejected_not_infinity() {
+        // f64 FromStr saturates 1e999 to infinity — a value the
+        // serializer can only emit as null. Reject like strict parsers.
+        assert!(matches!(parse_json("1e999"), Err(JsonError::InvalidNumber(_))));
+        assert!(matches!(parse_json("-1e999"), Err(JsonError::InvalidNumber(_))));
+        // The extremes of the finite range still parse.
+        assert!(parse_json("1e308").is_ok());
+        assert!(parse_json("-1.7976931348623157e308").is_ok());
     }
 
     #[test]

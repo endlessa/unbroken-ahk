@@ -26,9 +26,11 @@ impl<'a, R: TestRegistry> TestDiscovery for RegistryDiscovery<'a, R> {
             matches.retain(|t| found.iter().any(|f| f.id == t.id));
         }
 
-        // Filter by tags (ALL must match)
+        // Filter by tags — the SAME predicate run selection and its
+        // zero-match validation use, so 'discover --tag X' can never
+        // disagree with 'run --tag X'.
         if !query.tags.is_empty() {
-            matches.retain(|t| query.tags.iter().all(|tag| t.tags.contains(tag)));
+            matches.retain(|t| crate::filter::matches_all_tags(&query.tags, t));
         }
 
         // Filter by group

@@ -584,6 +584,9 @@ impl TestManager for PlatformManager {
         // Keyed on the runnables' REGISTERED ids, not the test_id inside
         // their results — a buggy runnable returning a mismatched test_id
         // must not double-count the run (phantom result + spurious ghost).
+        // (The executor now normalizes result ids to the registered id,
+        // so mismatches cannot reach here; this keying stays as the
+        // definition-only detection and as defense in depth.)
         let ran: std::collections::HashSet<&str> = runnables.iter().map(|r| r.id()).collect();
         let missing: Vec<String> = selected_ids
             .iter()
@@ -697,10 +700,13 @@ impl TestManager for PlatformManager {
             run_id: summary.run_id.clone(),
             total: summary.total,
             completed,
-            passed: summary.passed,
-            failed: summary.failed,
-            errored: summary.errored,
-            skipped: summary.skipped,
+            // Same reconciliation as completed: a damaged file must not
+            // yield a snapshot claiming more tests passed than completed.
+            // get_results remains the diagnostic channel for the file.
+            passed: summary.passed.min(completed),
+            failed: summary.failed.min(completed),
+            errored: summary.errored.min(completed),
+            skipped: summary.skipped.min(completed),
             running: 0,
             percent_complete,
             elapsed_ms: summary.completed_at.saturating_sub(summary.started_at),
@@ -1251,6 +1257,9 @@ mod tests {
         let progress = mgr.check_progress("run_0001").unwrap();
         assert_eq!(progress.completed, 2);
         assert!((progress.percent_complete - 100.0).abs() < 1e-9);
+        // Counters reconcile the same way: never more passed than
+        // completed in one snapshot.
+        assert_eq!(progress.passed, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1710,11 +1719,52 @@ mod tests {
         let summary = mgr.get_results(&run_id).unwrap();
         assert_eq!(summary.total, 1);
         assert_eq!(summary.results.len(), 1);
+        // The executor normalizes the lie: the record carries the
+        // REGISTERED id, so the run stays attributable and reloadable.
+        assert_eq!(summary.results[0].test_id, "t1");
         let prog = mgr.check_progress(&run_id).unwrap();
         assert_eq!(prog.completed, 1);
         assert_eq!(prog.total, 1);
         // The progress bar renderer must not panic on any counts.
         let _ = mgr.format_progress(&run_id, ReportFormat::Text).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_reported_test_id_still_persists_a_reloadable_run() {
+        // The platform must never write a file its own strict loader
+        // rejects: an empty self-reported test_id is normalized to the
+        // registered id at the executor, so the persisted run reloads.
+        struct AnonTest;
+        impl RunnableTest for AnonTest {
+            fn id(&self) -> &str {
+                "t1"
+            }
+            fn run(&self, _timeout: Option<DurationMs>) -> TestResult {
+                TestResult {
+                    test_id: String::new(), // pathological
+                    status: TestStatus::Passed,
+                    duration_ms: 1,
+                    message: None,
+                    stdout: None,
+                    stderr: None,
+                }
+            }
+        }
+        let dir = crate::test_util::temp_storage_dir("mgr-anon");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition { name: "t".into(), ..crate::test_util::def("t1") },
+            Box::new(AnonTest),
+        )
+        .unwrap();
+        let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        // A fresh session reads the run purely from storage — this is
+        // exactly the path that reported CorruptRun before the fix.
+        let fresh = PlatformManager::new(&dir);
+        let summary = fresh.get_results(&run_id).unwrap();
+        assert_eq!(summary.results[0].test_id, "t1");
+        assert_eq!(summary.passed, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
