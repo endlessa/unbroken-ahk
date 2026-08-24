@@ -673,7 +673,7 @@ pub fn counts_json(key: &str, items: &[(String, usize)]) -> JsonValue {
 /// Reject caller-supplied input that is not an object, or that carries
 /// keys outside the known set — a misspelled key ("tags" for
 /// "include_tags") must error, never act as "no filter".
-fn reject_unknown_keys(
+pub(crate) fn reject_unknown_keys(
     value: &JsonValue,
     what: &str,
     known: &[&str],

@@ -5,7 +5,6 @@
 //! into isolated containers.
 
 use crate::types::DurationMs;
-use crate::types::TestId;
 use crate::types::TestResult;
 
 /// A callable test. Implementations wrap the actual test logic.
@@ -37,6 +36,12 @@ pub trait TestExecutor {
     ///
     /// Returns all results when the batch is complete, or stops early
     /// if `fail_fast` is true and a test fails.
+    ///
+    /// There is deliberately no error channel: every outcome — including
+    /// a fail_fast stop (remaining tests emitted as Skipped) — is a
+    /// TestResult, and timeout enforcement is delegated entirely to the
+    /// RunnableTest via `timeout_ms` (best effort; the executor does not
+    /// preempt).
     fn execute(
         &self,
         tests: &[&dyn RunnableTest],
@@ -44,15 +49,4 @@ pub trait TestExecutor {
         fail_fast: bool,
         on_result: &mut dyn FnMut(&TestResult),
     ) -> Vec<TestResult>;
-}
-
-/// Errors that can occur during test execution.
-#[derive(Debug, Clone)]
-pub enum ExecutionError {
-    /// The test exceeded its timeout.
-    Timeout { test_id: TestId, limit_ms: DurationMs },
-    /// The test panicked or crashed.
-    Crash { test_id: TestId, message: String },
-    /// The run was aborted (e.g. fail_fast triggered).
-    Aborted { completed: u32, remaining: u32 },
 }

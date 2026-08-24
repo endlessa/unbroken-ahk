@@ -78,11 +78,15 @@ Commands:
   discover --pattern <pattern>   Same; use --pattern=<p> if it starts with '-'
   discover --tag <tag>           Filter tests by tag
   discover --group <group>       Filter tests by group
+  discover --limit <n>           Show at most n matches
   tags                           List all available tags
   groups                         List all available groups
   run                            Run all tests
   run --tag <tag>                Run tests matching a tag
   run --id <id1> <id2> ...       Run specific tests by ID
+  run --exclude <tag>            Skip tests with a tag (combines with above)
+  run --pattern <pattern>        Run tests matching a name pattern
+  run --timeout <ms>             Per-test timeout in milliseconds
   run --fail-fast                Stop on first failure
   run <json>                     Run with JSON configuration
   progress <run_id>              Check progress of a running suite
@@ -289,6 +293,12 @@ fn cmd_progress(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
         return ConsoleOutput { text, json };
     }
 
+    // Surplus tokens are dropped nowhere else at this surface — a second
+    // run_id (or one split by a stray space) must not silently vanish.
+    if args.len() > 1 {
+        return error_output("progress takes exactly one run_id");
+    }
+
     match manager.check_progress(args[0]) {
         Ok(progress) => {
             let reporter = crate::impl_reporter::StandardReporter::new();
@@ -305,6 +315,9 @@ fn cmd_progress(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
 fn cmd_results(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
     if args.is_empty() {
         return error_output("Usage: results <run_id>");
+    }
+    if args.len() > 1 {
+        return error_output("results takes exactly one run_id");
     }
 
     match manager.get_results(args[0]) {
@@ -823,6 +836,15 @@ mod tests {
             assert!(out.text.contains("--all conflicts"), "got: {}", out.text);
             assert!(!out.text.contains("run_all"), "got: {}", out.text);
         }
+    }
+
+    #[test]
+    fn surplus_run_ids_error_instead_of_silently_dropping() {
+        let mut mgr = setup_manager();
+        let out = execute_command(&mut mgr, "results run_0001 run_9999");
+        assert!(out.text.contains("exactly one run_id"), "got: {}", out.text);
+        let out = execute_command(&mut mgr, "progress run_0001 run_9999");
+        assert!(out.text.contains("exactly one run_id"), "got: {}", out.text);
     }
 
     #[test]

@@ -43,13 +43,10 @@ impl JsonValue {
         }
     }
 
-    pub fn as_u64(&self) -> Option<u64> {
-        self.as_f64().map(|n| n as u64)
-    }
-
-    pub fn as_u32(&self) -> Option<u32> {
-        self.as_f64().map(|n| n as u32)
-    }
+    // There are deliberately NO as_u64/as_u32 helpers: `n as u64` on an
+    // f64 silently saturates negative, fractional, and overflowing
+    // values — every integer read goes through json_types' strict
+    // helpers, which reject those instead.
 
     pub fn as_array(&self) -> Option<&Vec<JsonValue>> {
         match self {
@@ -83,16 +80,6 @@ impl JsonValue {
     /// Convenience: get a bool field from an object.
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         self.get(key).and_then(|v| v.as_bool())
-    }
-
-    /// Convenience: get a u64 field from an object.
-    pub fn get_u64(&self, key: &str) -> Option<u64> {
-        self.get(key).and_then(|v| v.as_u64())
-    }
-
-    /// Convenience: get a u32 field from an object.
-    pub fn get_u32(&self, key: &str) -> Option<u32> {
-        self.get(key).and_then(|v| v.as_u32())
     }
 }
 

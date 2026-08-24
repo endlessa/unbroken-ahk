@@ -662,9 +662,22 @@ impl TestManager for PlatformManager {
         };
 
         // Surface a failed write instead of letting the user believe the
-        // run persisted — the results stay queryable in memory either way.
+        // run persisted — the results stay queryable either way.
         let persisted = self.persist_run(&summary);
-        self.completed_runs.push(summary);
+        // Keep the summary (and its tracker state) in memory ONLY while
+        // the file cannot serve it: a failed persist, or a platform
+        // without real storage (WASM's write stub succeeds with no file,
+        // so run_summary_exists stays false there). Otherwise get_results
+        // and check_progress fall back to disk, and retaining every
+        // summary — stdout/stderr included — would grow a long-lived
+        // session's memory without bound.
+        let durable = persisted.is_ok()
+            && matches!(storage::run_summary_exists(&self.storage, &run_id), Ok(true));
+        if durable {
+            self.progress.remove_run(&run_id);
+        } else {
+            self.completed_runs.push(summary);
+        }
         if let Err(e) = persisted {
             return Err(ManagerError::PersistFailed(run_id, e));
         }
@@ -1273,6 +1286,27 @@ mod tests {
         // Counters reconcile the same way: never more passed than
         // completed in one snapshot.
         assert_eq!(progress.passed, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_runs_are_evicted_from_memory() {
+        // Once the summary is safely on disk, memory holds nothing —
+        // get_results and check_progress serve it from storage; only a
+        // failed persist keeps its summary resident (and queryable).
+        use crate::test_util::def;
+        let dir = crate::test_util::temp_storage_dir("mgr-evict");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(def("t1"), Box::new(EchoTest { id: "t1".into(), pass: true }))
+            .unwrap();
+        let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        assert!(mgr.completed_runs.is_empty());
+        assert!(mgr.progress.get_progress(&run_id).is_none());
+        // ...and both query paths still serve the run, marked finished.
+        assert_eq!(mgr.get_results(&run_id).unwrap().passed, 1);
+        let progress = mgr.check_progress(&run_id).unwrap();
+        assert!(progress.finished);
+        assert_eq!(progress.completed, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -87,6 +87,14 @@ impl InMemoryProgressTracker {
         }
     }
 
+    /// Drop a run's tracked state. Called once its summary is durable on
+    /// disk — the manager's storage fallback then serves progress for it,
+    /// so keeping the state would only grow memory for the session's
+    /// lifetime.
+    pub fn remove_run(&mut self, run_id: &str) {
+        self.runs.retain(|r| r.run_id != run_id);
+    }
+
     /// Serialize all tracked runs to JSON for debugging.
     pub fn to_json_string(&self) -> String {
         let runs: Vec<JsonValue> =

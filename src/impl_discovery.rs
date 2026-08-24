@@ -20,10 +20,13 @@ impl<'a, R: TestRegistry> TestDiscovery for RegistryDiscovery<'a, R> {
         // Start with all tests, then narrow down
         let mut matches: Vec<&TestDefinition> = self.registry.list_all();
 
-        // Filter by name pattern
+        // Filter by name pattern — the same predicate the run filter and
+        // its zero-match validation use, applied in one pass (fetching
+        // search_by_name's full set and re-matching by id walked the
+        // registry twice for the same answer).
         if let Some(ref pattern) = query.name_pattern {
-            let found = self.registry.search_by_name(pattern);
-            matches.retain(|t| found.iter().any(|f| f.id == t.id));
+            let pattern_lower = pattern.to_lowercase();
+            matches.retain(|t| crate::filter::name_matches_lower(&pattern_lower, &t.name));
         }
 
         // Filter by tags — the SAME predicate run selection and its

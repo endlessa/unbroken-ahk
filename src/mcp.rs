@@ -224,6 +224,12 @@ pub fn list_tools() -> Vec<ToolDescriptor> {
 /// Parse a JSON string into an MCP request.
 pub fn parse_request(json_input: &str) -> Result<McpRequest, String> {
     let value = parse_json(json_input).map_err(|e| format!("Invalid JSON: {}", e))?;
+    // The envelope gets the same strictness as every inner parser: a
+    // client sending {"arguments": {...}} (the MCP-spec spelling) must
+    // hear "unknown field", never have its filters silently dropped and
+    // the whole suite run instead.
+    crate::json_types::reject_unknown_keys(&value, "request", &["tool", "params"])
+        .map_err(|e| format!("{}", e))?;
     let tool = value
         .get_str("tool")
         .ok_or("Missing 'tool' field")?
@@ -340,6 +346,11 @@ fn run_id_param(params: &JsonValue) -> Result<Option<&str>, String> {
             crate::json::to_json_compact(params)
         ));
     }
+    // A misspelled key ("runId") must error — silently treating it as
+    // "no run_id" switches test_progress to the list-active-runs
+    // semantics and the caller reads [] as "the run vanished".
+    crate::json_types::reject_unknown_keys(params, "params", &["run_id"])
+        .map_err(|e| format!("{}", e))?;
     match params.get("run_id") {
         Some(JsonValue::Str(run_id)) => Ok(Some(run_id)),
         None | Some(JsonValue::Null) => Ok(None),
@@ -814,6 +825,35 @@ mod tests {
             .get_str("error")
             .unwrap()
             .contains("conflicts with include filters"));
+    }
+
+    #[test]
+    fn envelope_unknown_keys_error() {
+        // "arguments" is the MCP-spec spelling — an easy client mistake
+        // that must error, never silently drop the filters and run the
+        // whole suite as {"params": {}}.
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(
+            &mut mgr,
+            r#"{"tool": "test_run", "arguments": {"include_ids": ["t1"]}}"#,
+        );
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("arguments"));
+    }
+
+    #[test]
+    fn run_id_param_unknown_keys_error() {
+        // A misspelled run_id key must not silently switch test_progress
+        // to "list active runs" — [] would read as "the run vanished".
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(
+            &mut mgr,
+            r#"{"tool": "test_progress", "params": {"runId": "run_0001"}}"#,
+        );
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("runId"));
     }
 
     #[test]
