@@ -36,15 +36,38 @@ impl StoragePaths {
     }
 }
 
-/// Writes a JSON string to a file path.
-/// Creates parent directories as needed.
+/// Writes a JSON string to a file path, atomically: the content lands in
+/// a temp file first and is renamed into place, so a crash mid-write can
+/// never leave a truncated JSON file behind. Creates parent directories
+/// as needed.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_json_file(path: &str, content: &str) -> Result<(), String> {
     // Ensure parent directory exists
     if let Some(parent) = path.rsplit_once('/') {
         std::fs::create_dir_all(parent.0).map_err(|e| format!("create dir: {}", e))?;
     }
-    std::fs::write(path, content).map_err(|e| format!("write file: {}", e))
+    let tmp = format!("{}.tmp{}", path, std::process::id());
+    std::fs::write(&tmp, content).map_err(|e| format!("write file: {}", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename into place: {}", e)
+    })
+}
+
+/// Preserve a corrupt registry file as evidence before it would be
+/// overwritten. Best effort — returns the backup path when the copy
+/// succeeded.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn backup_corrupt_registry(paths: &StoragePaths) -> Option<String> {
+    let src = paths.registry_path();
+    let dst = format!("{}.corrupt", src);
+    std::fs::copy(&src, &dst).ok().map(|_| dst)
+}
+
+/// WASM stub: nothing to back up.
+#[cfg(target_arch = "wasm32")]
+pub fn backup_corrupt_registry(_paths: &StoragePaths) -> Option<String> {
+    None
 }
 
 /// Reads a JSON string from a file path.

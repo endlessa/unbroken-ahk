@@ -2588,7 +2588,7 @@
   "kind": "operator",
   "category": "Operators, literals, lexical structure",
   "signature": "a < b, a <= b, a >= b, a > b",
-  "summary": "Partial ordering defined ONLY for number-number and string-string; everything else yields undef.",
+  "summary": "Ordering is defined for any SAME-TYPE pair except function values and undef: numbers (IEEE), strings (code-point lexicographic), booleans (false < true), vectors (lexicographic, elementwise-recursive), ranges (begin, then step, then element count). Mixed-type pairs yield undef with a WARNING.",
   "params": [
    {
     "name": "a",
@@ -2599,16 +2599,16 @@
     "desc": "Same type as a."
    }
   ],
-  "semantics": "Numbers compare by IEEE ordering. Strings compare lexicographically by Unicode code point (no locale, no normalization). Any other combination - vectors, booleans, undef, ranges, functions, or mixed number/string - yields undef, with a WARNING (VERIFY: warning presence/text for each mismatch).",
+  "semantics": "Numbers compare by IEEE ordering. Strings compare lexicographically by Unicode code point (no locale, no normalization). Booleans order false < true. Vectors compare lexicographically, elementwise-recursively: the first unequal element pair decides; a strict prefix sorts before the longer vector; an incomparable element pair propagates undef (tagged 'in vector comparison at index i'). Ranges compare by begin, then step, then element count. MIXED-type operands, function-function, and undef-undef yield undef with a WARNING like 'undefined operation (number < string)' (VERIFY exact texts per pair). This generic same-type ordering is 2021.01 behavior \u2014 earlier releases restricted ordering to numbers and strings, so library code often still avoids vector comparison.",
   "edge_cases": [
    "Comparisons involving nan are false (IEEE), not undef: nan<1, nan>=1 both false - VERIFY OpenSCAD matches C here rather than returning undef.",
    "\"Z\" < \"a\" is true (code points 90 < 97); \"abc\" < \"abd\"; prefix < longer (\"ab\" < \"abc\").",
-   "[1] < [2] is undef - vectors are NOT ordered; a ternary on it takes the else branch.",
-   "true < false: undef (booleans unordered) - VERIFY.",
+   "[1] < [2] is true; [1,2] < [1,3] is true; [1] < [1,0] is true (strict prefix sorts first) \u2014 vectors ARE ordered lexicographically in 2021.01. VERIFY: pre-2021 releases yielded undef for vector ordering, so portable library code avoids it.",
+   "false < true is true and true < false is false \u2014 booleans ARE ordered in 2021.01.",
    "undef in a comparison propagates undef; combined with ?: this silently takes else branches - a classic silent-bug source to reproduce faithfully.",
    "-0 < 0 is false (they are equal)."
   ],
-  "example": "echo(2<3, \"abc\"<\"abd\", [1]<[2]); // ECHO: true, true, undef",
+  "example": "echo(2<3, \"abc\"<\"abd\", [1]<[2]); // ECHO: true, true, true",
   "since": "pre-2015.03"
  },
  {
@@ -2631,7 +2631,7 @@
   "edge_cases": [
    "No negative indexing (v[-1] is undef, not last element) and no slicing.",
    "Non-integer index (v[1.5]) -> undef; integral doubles (v[1.0], v[2/2]) work.",
-   "Out of range -> undef; VERIFY whether a warning accompanies out-of-range string/vector indexing (believed silent undef in expressions).",
+   "range[0]/range[1]/range[2] return begin/step/end (2021.01; parallel to .begin/.step/.end member access); other range indices, and any number, boolean, or undef receiver -> undef.",
    "Indexing a range, number, boolean, or undef -> undef (VERIFY warning).",
    "String indexing is by code point over UTF-8 - byte indexing corrupts non-ASCII.",
    "v[true] -> undef (no bool-to-number coercion) - VERIFY.",
@@ -3515,9 +3515,9 @@
   "kind": "concept",
   "category": "String builtins and string semantics",
   "signature": "s1 == s2, s1 != s2, s1 < s2, s1 <= s2, s1 > s2, s1 >= s2",
-  "summary": "Equality is total deep equality; relational operators are defined for string-string only and compare lexicographically by Unicode code point.",
+  "summary": "Equality is total deep equality; string-string relationals compare lexicographically by Unicode code point; a string compared against any non-string yields undef under the mixed-type rule.",
   "params": [],
-  "semantics": "== and != work across all types: two strings are equal iff they have identical code-point sequences; a string compared to any non-string is unequal (false, not undef). The relational operators < <= > >= are defined only between two strings (or two numbers): they compare lexicographically by code point, case-sensitively, with no locale, collation, or normalization. A relational comparison where either side is not the right type yields undef.",
+  "semantics": "== and != work across all types: two strings are equal iff they have identical code-point sequences; a string compared to any non-string is unequal (false, not undef). Between two strings, the relational operators < <= > >= compare lexicographically by code point, case-sensitively, with no locale, collation, or normalization. A relational comparison where either side is not the right type yields undef. A string compared relationally against any NON-string yields undef under the mixed-type rule; other same-type pairs (numbers, booleans, vectors, ranges) have their own orderings \u2014 see the relational entry.",
   "edge_cases": [
    "\"a\" == \"a\" -> true; \"a\" == 97 -> false (mismatched types compare unequal under ==, never undef).",
    "\"abc\" < \"abd\" -> true; \"ab\" < \"abc\" -> true (proper prefix sorts first); \"\" < \"a\" -> true.",
@@ -3621,7 +3621,7 @@
    "len([1,2,3]) == 3; len([]) == 0; len([[1,2],[3]]) == 2 (top level only).",
    "len(\"h\u00e4x\") == 3 (code points, not bytes); len(\"\") == 0; a single astral emoji has len 1.",
    "len(5), len(true), len(undef), len(function(x) x) -> undef. VERIFY: whether 2021.01 emits a WARNING of the \"len() parameter could not be converted\" conversion-failure family or returns undef silently \u2014 pin exact text; --hardwarnings users depend on the set of warnings.",
-   "len([0:10]) -> undef \u2014 ranges are not lists (is_list false); the only way to size a range is to expand it or compute from begin/step/end (which are themselves not extractable in 2021.01 \u2014 no accessors).",
+   "len([0:10]) -> undef \u2014 ranges are not lists (is_list false). begin/step/end ARE extractable in 2021.01 (r.begin/r.step/r.end, or r[0]/r[1]/r[2]), so the element count is computable as floor((end-begin)/step)+1 for a non-empty range.",
    "len is the standard guard in recursive list processing (i >= len(v) base case); it must be O(1).",
    "len of the result of search/concat/comprehensions behaves as for any vector.",
    "No arguments or multiple arguments: VERIFY error/warning behavior (believed too-many/too-few argument warning with undef)."
@@ -3834,11 +3834,11 @@
   "signature": "version() -> [year, month] (release builds) | [year, month, day] (date-versioned snapshots)",
   "summary": "Returns the OpenSCAD version as a numeric vector, e.g. [2021, 1]; the vector-shaped twin of version_num().",
   "params": [],
-  "semantics": "Returns a vector of numbers identifying the running interpreter (two elements on release builds, three on date-versioned snapshot builds): [2021, 1] for release 2021.01. Libraries use it (usually via version_num instead, since vectors don't compare with <) to feature-gate code paths.",
+  "semantics": "Returns a vector of numbers identifying the running interpreter (two elements on release builds, three on date-versioned snapshot builds): [2021, 1] for release 2021.01. Libraries use it (usually via version_num, the portable spelling: vector ordering only became defined in 2021.01 and yielded undef on earlier interpreters) to feature-gate code paths.",
   "edge_cases": [
    "Release mapping: 2021.01 -> [2021, 1]; 2019.05 -> [2019, 5]; 2015.03 -> [2015, 3]. VERIFY: point releases like 2015.03-3 -> believed [2015, 3, 3].",
    "Dev snapshots report their snapshot date: believed [YYYY, M, D] (e.g. a 2025-02-19 nightly -> [2025, 2, 19]) \u2014 VERIFY mapping.",
-   "Elements are plain numbers; the vector itself cannot be relationally compared (version() > [2019,5,0] is undef!) \u2014 code must index elements or use version_num; a reimplementation must NOT make vector comparison work to 'help'.",
+   "In 2021.01 vector ordering IS defined, so version() > [2019,5,0] evaluates to true ([2021,1] vs [2019,5,0] decides at element 0). version_num() remains the conventional, PORTABLE feature-gate because the comparison yielded undef on pre-2021 interpreters \u2014 but a 2021.01-conformant reimplementation must implement vector comparison.",
    "VERIFY: arguments passed to version() \u2014 believed ignored, possibly with an unused-argument warning; pin.",
    "What a reimplementation reports is a policy decision with real consequences: report [2021, 1] to unlock 2021.01 codepaths in BOSL2 etc.; reporting a fake future date may enable snapshot-only paths that then fail.",
    "Release versions are two-element vectors: version() == [2021, 1] on the 2021.01 release, so version()[2] is undef and len(version()) == 2. A third (day) element appears only on date-versioned snapshot builds. version_num() is unaffected: the missing day fills as 0, giving 20210100."
@@ -4917,8 +4917,8 @@
   "name": "Type system & truthiness",
   "kind": "concept",
   "category": "Semantic model",
-  "signature": "echo(is_num(0/0), 1 == [1], undef == undef, \"a\" < \"b\", [1,2] < [1,3]);\n// ECHO: false, false, true, true, undef\nif ([0]) echo(\"[0] is truthy\");\nif (!(\"\" || 0 || [] || undef)) echo(\"all falsy\");",
-  "summary": "OpenSCAD values are: number (f64), boolean, string, vector, range, and undef \u2014 plus first-class function values since 2021.01 (and an experimental object type in snapshots only). Type mismatches never throw: they produce undef plus a console WARNING and evaluation continues. Equality (==/!=) is total deep structural comparison; ordering (< <= > >=) is partial (numbers and strings only, else undef). Truthiness: false, 0, \"\", [], and undef are falsy (exactly five values); everything else \u2014 including \"false\", [0], -1, and nan \u2014 is truthy.",
+  "signature": "echo(is_num(0/0), 1 == [1], true == undef, \"a\" < \"b\", [1,2] < [1,3]);\n// ECHO: false, false, false, true, true\nif ([0]) echo(\"[0] is truthy\");\nif (!(\"\" || 0 || [] || undef)) echo(\"all falsy\");",
+  "summary": "OpenSCAD values are: number (f64), boolean, string, vector, range, and undef \u2014 plus first-class function values since 2021.01 (and an experimental object type in snapshots only). Type mismatches never throw: they produce undef plus a console WARNING and evaluation continues. Equality (==/!=) is total deep structural comparison; ordering (< <= > >=) is defined for same-type pairs \u2014 numbers, strings, booleans, vectors (lexicographic), ranges \u2014 and undef for mixed types, function values, and undef. Truthiness: false, 0, \"\", [], and undef are falsy (exactly five values); everything else \u2014 including \"false\", [0], -1, and nan \u2014 is truthy.",
   "params": [
    {
     "name": "number",
@@ -4938,7 +4938,7 @@
    },
    {
     "name": "range",
-    "desc": "[begin:end] / [begin:step:end]; a distinct lazy type \u2014 is_list false, len undef, indexing undef. See the Ranges chapter."
+    "desc": "[begin:end] / [begin:step:end]; a distinct lazy type \u2014 is_list false, len undef; indexing defined only for [0]/[1]/[2] = begin/step/end (mirroring .begin/.step/.end), other indices undef. See the Ranges chapter."
    },
    {
     "name": "undef",
@@ -4953,7 +4953,7 @@
     "desc": "SNAPSHOT-ONLY experimental dict-like type (textmetrics results), with dot access and is_object(); absent from 2021.01."
    }
   ],
-  "semantics": "The language is dynamically typed with no coercions of any kind: arithmetic on non-numbers, '+' on strings, comparisons across categories, and similar mismatches yield undef accompanied by a console WARNING (approximately 'WARNING: undefined operation ...' naming the operand types \u2014 the warning text and count are observable surface), and evaluation always continues; nothing throws except assert(). undef then propagates silently through further operations (each new mismatched operation warns again). Equality == and inequality != are TOTAL: defined for every pair of values, comparing deeply and structurally \u2014 vectors elementwise with length equality required, mismatched types simply unequal (false, never undef), undef == undef true, and nan unequal to everything including itself. Relational operators < <= > >= are PARTIAL: defined only for number-number (IEEE semantics) and string-string (lexicographic by Unicode code point); every other combination evaluates to undef. These are two deliberately different comparison regimes in one language and both must be cloned. Truthiness (used by if, the ternary, !, &&, ||, and comprehension filters): exactly false, 0, the empty string \"\", the empty vector [], and undef are falsy (five values); every other value is truthy \u2014 including the strings \"false\" and \"0\", the vectors [0], [[]] and [false], negative numbers, inf, and nan (truthiness is a plain != 0 test with no isnan carve-out). The logical operators && and || short-circuit (throughout the reference window; verified back to 2015.03 \u2014 only pre-2014 releases evaluated both sides) and return boolean true/false rather than the operand (VERIFY); ! returns a boolean. Type-test builtins (all 2019.05 except is_function, 2021.01): is_undef, is_num (false for nan), is_bool, is_string, is_list (true for [] and any vector, false for ranges and strings), is_function. There is no typeof() and no is_range \u2014 a range is detectable only by elimination.",
+  "semantics": "The language is dynamically typed with no coercions of any kind: arithmetic on non-numbers, '+' on strings, comparisons across categories, and similar mismatches yield undef accompanied by a console WARNING (approximately 'WARNING: undefined operation ...' naming the operand types \u2014 the warning text and count are observable surface), and evaluation always continues; nothing throws except assert(). undef then propagates silently through further operations (each new mismatched operation warns again). Equality == and inequality != are TOTAL: defined for every pair of values, comparing deeply and structurally \u2014 vectors elementwise with length equality required, mismatched types simply unequal (false, never undef), undef == undef true, and nan unequal to everything including itself. Relational operators are defined for any same-type pair except function values and undef \u2014 numbers (IEEE), strings (code-point lexicographic), booleans (false < true), vectors (lexicographic, elementwise-recursive), ranges (begin, then step, then element count); every mixed-type combination evaluates to undef with a WARNING. These are two deliberately different comparison regimes in one language and both must be cloned. Truthiness (used by if, the ternary, !, &&, ||, and comprehension filters): exactly false, 0, the empty string \"\", the empty vector [], and undef are falsy (five values); every other value is truthy \u2014 including the strings \"false\" and \"0\", the vectors [0], [[]] and [false], negative numbers, inf, and nan (truthiness is a plain != 0 test with no isnan carve-out). The logical operators && and || short-circuit (throughout the reference window; verified back to 2015.03 \u2014 only pre-2014 releases evaluated both sides) and return boolean true/false rather than the operand (VERIFY); ! returns a boolean. Type-test builtins (all 2019.05 except is_function, 2021.01): is_undef, is_num (false for nan), is_bool, is_string, is_list (true for [] and any vector, false for ranges and strings), is_function. There is no typeof() and no is_range \u2014 a range is detectable only by elimination.",
   "edge_cases": [
    "Truthiness table, falsy side exactly five values: false, 0 (and -0), \"\" (empty string), [] (empty vector), undef. Everything else truthy: \"false\", \"0\", \" \", [0], [[]], [false], -1, inf, and nan (the toBool test is a plain != 0; nan != 0 is true). VERIFY: range values and function values as conditions \u2014 believed truthy; pin.",
    "Type-mismatch arithmetic yields undef + WARNING and continues: \"a\"+1, [1]+2, true+1, \"a\"+\"b\" (no string concatenation via + \u2014 str() is the only concatenation). VERIFY exact warning format, believed like 'WARNING: undefined operation (string + number)' with file/line.",
@@ -4963,7 +4963,7 @@
    "VERIFY: [nan] == [nan] \u2014 believed false (elementwise comparison hits nan != nan); pin, libraries occasionally depend on vector equality.",
    "VERIFY: range equality \u2014 [0:1:5] == [0:1:5] believed true (component compare of begin/step/end); a range never equals its expanded vector (different types, so false).",
    "VERIFY: equality between function values \u2014 behavior unpinned (identity? always false? undef?); probe before promising anything.",
-   "Relational operators on anything but number-number or string-string yield undef: [1,2] < [1,3] is undef; undef < 1 is undef; mixed \"1\" < 2 is undef. VERIFY: whether a WARNING accompanies relational-mismatch undef, and specifically whether bool < bool is defined or undef (believed undef).",
+   "Relational operators on anything but number-number or string-string yield undef: [1,2] < [1,3] is true (lexicographic vector ordering, 2021.01); undef < 1 is undef; mixed \"1\" < 2 is undef. VERIFY: whether a WARNING accompanies relational-mismatch undef, and specifically whether bool < bool is defined or undef (believed undef).",
    "String ordering is lexicographic by Unicode code point (not locale, not bytes): \"Z\" < \"a\" is true (90 < 97).",
    "is_num(inf) \u2014 VERIFY, believed true (inf is a number; only nan is excluded).",
    "is_list: true for [] and any vector regardless of content; FALSE for strings, ranges, undef.",
@@ -4979,7 +4979,7 @@
    "undef propagation is per-operation: each mismatched operation emits its own WARNING; the GUI console may rate-limit duplicate lines (app behavior, not language semantics).",
    "Snapshot-only: object values (from textmetrics()/fontmetrics(), behind --enable=textmetrics) with dot access and is_object(); absent in 2021.01 \u2014 is_object is an unknown function there (warning + undef)."
   ],
-  "example": "echo(is_num(0/0));            // false  (nan; also emits division warning)\necho(1 == \"1\", 1 == true);  // false, false\necho(undef == undef);         // true\necho([1,2] < [1,3]);          // undef\necho([1,2] + 1);              // undef (WARNING: no broadcasting)\necho([1,2] * [3,4]);          // 11 (dot product)\nif (\"false\") echo(\"non-empty strings are truthy\");\nif (!([] || 0)) echo(\"[] and 0 are falsy\");",
+  "example": "echo(is_num(0/0));            // false  (nan; also emits division warning)\necho(1 == \"1\", 1 == true);  // false, false\necho(true == undef);         // false (mismatched types are unequal)\necho([1,2] < [1,3]);          // true (lexicographic vector ordering, 2021.01)\necho([1,2] + 1);              // undef (WARNING: no broadcasting)\necho([1,2] * [3,4]);          // 11 (dot product)\nif (\"false\") echo(\"non-empty strings are truthy\");\nif (!([] || 0)) echo(\"[] and 0 are falsy\");",
   "since": "2019.05",
   "impl_notes": "Implement Value as a tagged union with exactly these variants; resist normalizing (no int fast-path leaking into semantics, no bool-number coercion). Two comparison code paths: total structural == and partial IEEE/lexicographic ordering. Route every mismatch through a single warn-and-return-undef helper so warning text/count is centralized and --hardwarnings can hook it. Oracle probes: warning text for each mismatch class, relational-mismatch warning presence, bool ordering, range/function equality, [nan]==[nan], is_num(inf), out-of-range index warning silence, &&/|| return type. The truthiness set and == totality are frozen contracts \u2014 test each listed literal."
  },
@@ -5114,7 +5114,7 @@
   "kind": "concept",
   "category": "Semantic model",
   "signature": "r = [0:2:10];          // begin : step : end \u2014 a range VALUE, not a vector\necho(r);               // ECHO: [0 : 2 : 10]\nfor (i = r) echo(i);   // 0, 2, 4, 6, 8, 10\necho([ each [3:-1:1] ]);   // [3, 2, 1]\nfor (i = [4:1]) echo(i);   // DEPRECATED reversed range: still iterates 1..4",
-  "summary": "[begin:end] (implicit step 1) and [begin:step:end] construct a range \u2014 a distinct lazy value type (is_list false, len undef, indexing undef) consumed by for, intersection_for, each, list comprehensions, and children(); iteration runs begin, begin+step, ... while within end; negative steps descend; and the legacy quirk that [begin:end] with begin>end is silently swapped (with a deprecation warning) must be cloned.",
+  "summary": "[begin:end] (implicit step 1) and [begin:step:end] construct a range \u2014 a distinct lazy value type (is_list false, len undef; subscripts r[0]/r[1]/r[2] yield begin/step/end, other indices undef) consumed by for, intersection_for, each, list comprehensions, and children(); iteration runs begin, begin+step, ... while within end; negative steps descend; and the legacy quirk that [begin:end] with begin>end is silently swapped (with a deprecation warning) must be cloned.",
   "params": [
    {
     "name": "begin",
@@ -5129,9 +5129,9 @@
     "desc": "Inclusive bound: values are produced while they have not passed end in the direction of step; whether a float-accumulated endpoint is included depends on the exact count formula \u2014 pin via oracle."
    }
   ],
-  "semantics": "A range literal uses colon syntax inside square brackets and produces a value of the distinct range type: it is NOT a vector \u2014 is_list returns false, len returns undef, indexing returns undef \u2014 and no builtin converts it to a list except iteration ([each r] or [for (i=r) i]). Ranges are consumed lazily by the for module, intersection_for, list-comprehension for, each, and children(): a huge range like [0:1e9] iterates without materializing a billion-element vector (memory is only committed when a comprehension or each collects results). Iteration semantics: values begin, begin+step, begin+2*step, ... are produced while they do not pass end (ascending for positive step, descending for negative); end is inclusive when landed on exactly, but with fractional steps floating-point error decides whether the endpoint is reached \u2014 the element-count rule must be pinned bit-for-bit against the oracle (e.g. whether [0:0.1:1] produces 10 or 11 values). The two-part form [b:e] has implicit step 1, and carries the notorious legacy rule: when begin > end, 2021.01 SWAPS the bounds, emits 'DEPRECATED: Using ranges of the form [begin:end] with begin value greater than the end value is deprecated.', and iterates ascending anyway. Echo prints ranges with spaced colons in three-part form, e.g. [0 : 2 : 10].",
+  "semantics": "A range literal uses colon syntax inside square brackets and produces a value of the distinct range type: it is NOT a vector \u2014 is_list returns false, len returns undef; subscripts r[0]/r[1]/r[2] return begin/step/end (any other index is undef with the range-subscript message), and r.begin/r.step/r.end member access returns the same components \u2014 and no builtin converts it to a list except iteration ([each r] or [for (i=r) i]). Ranges are consumed lazily by the for module, intersection_for, list-comprehension for, each, and children(): a huge range like [0:1e9] iterates without materializing a billion-element vector (memory is only committed when a comprehension or each collects results). Iteration semantics: values begin, begin+step, begin+2*step, ... are produced while they do not pass end (ascending for positive step, descending for negative); end is inclusive when landed on exactly, but with fractional steps floating-point error decides whether the endpoint is reached \u2014 the element-count rule must be pinned bit-for-bit against the oracle (e.g. whether [0:0.1:1] produces 10 or 11 values). The two-part form [b:e] has implicit step 1, and carries the notorious legacy rule: when begin > end, 2021.01 SWAPS the bounds, emits 'DEPRECATED: Using ranges of the form [begin:end] with begin value greater than the end value is deprecated.', and iterates ascending anyway. Echo prints ranges with spaced colons in three-part form, e.g. [0 : 2 : 10].",
   "edge_cases": [
-   "Range is a distinct type: is_list(r) false, is_num(r) false, len(r) undef (VERIFY accompanying warning), r[0] undef, .x undef. Detection is only by elimination \u2014 there is no is_range.",
+   "Range is a distinct type: is_list(r) false, is_num(r) false, len(r) undef (VERIFY accompanying warning). Components ARE reachable: r[0]/r[1]/r[2] = begin/step/end and r.begin/r.step/r.end (2021.01); r[3] and r.x are undef. Detection is only by elimination \u2014 there is no is_range.",
    "echo/str rendering: [0:2:10] prints as '[0 : 2 : 10]' (spaces around colons). VERIFY: whether the two-part form [0:5] prints its implicit step (believed yes, as '[0 : 1 : 5]') \u2014 pin exact text.",
    "Legacy reversed range: [10:1] emits 'DEPRECATED: Using ranges of the form [begin:end] with begin value greater than the end value is deprecated.' and iterates 1..10 ASCENDING (bounds swapped) in 2021.01. VERIFY: newer snapshots have discussed treating it as empty \u2014 pin per targeted version.",
    "VERIFY: whether the swap applies to the explicit-step form \u2014 believed NOT: [10:1:0] (positive step, begin>end) yields ZERO iterations with no deprecation message; only the two-part form swaps. Pin.",

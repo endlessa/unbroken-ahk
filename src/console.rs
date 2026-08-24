@@ -120,7 +120,7 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
     while i < args.len() {
         match args[i] {
             "--tag" | "-t" => {
-                if i + 1 < args.len() {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     query.tags.push(args[i + 1].to_string());
                     i += 2;
                 } else {
@@ -128,7 +128,7 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
                 }
             }
             "--group" | "-g" => {
-                if i + 1 < args.len() {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     query.group = Some(args[i + 1].to_string());
                     i += 2;
                 } else {
@@ -136,7 +136,7 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
                 }
             }
             "--limit" | "-l" => {
-                if i + 1 < args.len() {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     match args[i + 1].parse() {
                         Ok(n) => query.limit = Some(n),
                         Err(_) => {
@@ -238,6 +238,11 @@ fn cmd_run(manager: &mut PlatformManager, args: &[&str], rest: &str) -> ConsoleO
                 },
             }
         }
+        Err(crate::manager::ManagerError::PersistFailed(run_id, msg)) => error_output(&format!(
+            "Run {} EXECUTED but its summary could not be persisted ({}). \
+             Use 'results {}' to see the outcome — do not re-run.",
+            run_id, msg, run_id
+        )),
         Err(e) => error_output(&format!("Run failed: {:?}", e)),
     }
 }
@@ -331,7 +336,7 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
                 i += 1;
             }
             "--tag" | "-t" => {
-                if i + 1 < args.len() {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     config.include_tags.push(args[i + 1].to_string());
                     i += 2;
                 } else {
@@ -339,7 +344,7 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
                 }
             }
             "--exclude" | "-e" => {
-                if i + 1 < args.len() {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     config.exclude_tags.push(args[i + 1].to_string());
                     i += 2;
                 } else {
@@ -358,7 +363,7 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
                 }
             }
             "--pattern" | "-p" => {
-                if i + 1 < args.len() {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     config.name_pattern = Some(args[i + 1].to_string());
                     i += 2;
                 } else {
@@ -370,7 +375,7 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
                 i += 1;
             }
             "--timeout" => {
-                if i + 1 < args.len() {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     config.timeout_ms = Some(
                         args[i + 1]
                             .parse()
@@ -635,6 +640,13 @@ mod tests {
 
         let out = execute_command(&mut mgr, "run --bogus-flag");
         assert!(out.text.contains("unknown flag"));
+
+        // A flag as the "value" of a value-taking flag means the value was
+        // forgotten — must error, never consume the flag.
+        let out = execute_command(&mut mgr, "run --tag --fail-fast");
+        assert!(out.text.contains("--tag requires a value"));
+        let out = execute_command(&mut mgr, "discover --tag --group auth");
+        assert!(out.text.contains("--tag requires a value"));
     }
 
     #[test]

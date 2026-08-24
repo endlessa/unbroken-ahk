@@ -388,29 +388,47 @@ impl ToJson for RunSummary {
 
 impl FromJson for RunSummary {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
-        let results = value
-            .get("results")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().map(|v| TestResult::from_json(v)).collect::<Result<Vec<_>, _>>())
-            .transpose()?
-            .unwrap_or_default();
+        // Strictly typed when present: a summary whose results field or
+        // counters are mistyped is a damaged record and must load as an
+        // error (surfaced upstream as CorruptRun), never as a summary
+        // silently claiming zero results.
+        let run_id = match value.get_str("run_id") {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return Err(JsonError::MissingField("run_id".into())),
+        };
+        let results = match value.get("results") {
+            None | Some(JsonValue::Null) => Vec::new(),
+            Some(JsonValue::Array(arr)) => arr
+                .iter()
+                .map(TestResult::from_json)
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(JsonError::InvalidField(
+                    "results".into(),
+                    "an array of test results".into(),
+                ))
+            }
+        };
         let config = value
             .get("config")
             .map(RunConfig::from_json_stored)
             .transpose()?
             .unwrap_or_default();
+        let count = |field: &str| -> Result<u32, JsonError> {
+            Ok(strict_opt_u64(value, field)?.unwrap_or(0) as u32)
+        };
         Ok(RunSummary {
-            run_id: value.get_str("run_id").unwrap_or("").to_string(),
+            run_id,
             config,
             results,
-            total: value.get_u32("total").unwrap_or(0),
-            passed: value.get_u32("passed").unwrap_or(0),
-            failed: value.get_u32("failed").unwrap_or(0),
-            skipped: value.get_u32("skipped").unwrap_or(0),
-            errored: value.get_u32("errored").unwrap_or(0),
-            total_duration_ms: value.get_u64("total_duration_ms").unwrap_or(0),
-            started_at: value.get_u64("started_at").unwrap_or(0),
-            completed_at: value.get_u64("completed_at").unwrap_or(0),
+            total: count("total")?,
+            passed: count("passed")?,
+            failed: count("failed")?,
+            skipped: count("skipped")?,
+            errored: count("errored")?,
+            total_duration_ms: strict_opt_u64(value, "total_duration_ms")?.unwrap_or(0),
+            started_at: strict_opt_u64(value, "started_at")?.unwrap_or(0),
+            completed_at: strict_opt_u64(value, "completed_at")?.unwrap_or(0),
         })
     }
 }
@@ -725,6 +743,20 @@ mod tests {
         // The same config shape as direct caller input still errors.
         let caller = parse_json(r#"{"run_all": false, "exclude_tags": ["slow"]}"#).unwrap();
         assert!(RunConfig::from_json(&caller).is_err());
+    }
+
+    #[test]
+    fn run_summary_mistyped_fields_error() {
+        // A damaged summary must load as an error (CorruptRun upstream),
+        // never as a summary silently claiming zero results.
+        for bad in [
+            r#"{"run_id": "run_0001", "results": "oops", "total": 5}"#,
+            r#"{"run_id": "run_0001", "results": [], "total": "five"}"#,
+            r#"{"results": [], "total": 1}"#,
+        ] {
+            let val = parse_json(bad).unwrap();
+            assert!(RunSummary::from_json(&val).is_err(), "should reject: {}", bad);
+        }
     }
 
     #[test]

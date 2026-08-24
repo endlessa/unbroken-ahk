@@ -75,7 +75,8 @@ pub enum ManagerError {
     RegistrationFailed(String),
     /// The configuration requests something this build cannot do.
     UnsupportedConfig(String),
-    /// The run EXECUTED (results are queryable in memory via get_results)
-    /// but its summary could not be written to storage.
-    PersistFailed(RunId, String),
+    /// The operation SUCCEEDED in memory (a run executed and is queryable
+    /// via get_results, or a test registered) but could not be written to
+    /// storage. The id names the run or test involved.
+    PersistFailed(String, String),
 }

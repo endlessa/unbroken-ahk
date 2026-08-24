@@ -309,6 +309,20 @@ fn handle_run(manager: &mut PlatformManager, params: &JsonValue) -> McpResponse 
                 }
             }
         }
+        // The tests EXECUTED — a retry would run everything again. Say so
+        // machine-readably so an agent fetches results instead of re-running.
+        Err(crate::manager::ManagerError::PersistFailed(run_id, msg)) => McpResponse {
+            success: false,
+            data: obj(vec![
+                ("run_id", str_val(&run_id)),
+                ("executed", JsonValue::Bool(true)),
+            ]),
+            error: Some(format!(
+                "Run {} EXECUTED but its summary could not be persisted ({}). \
+                 Results are queryable via test_results with this run_id — do NOT re-run.",
+                run_id, msg
+            )),
+        },
         Err(e) => McpResponse::err(&format!("{:?}", e)),
     }
 }

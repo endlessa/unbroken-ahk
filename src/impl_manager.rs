@@ -35,6 +35,11 @@ pub struct PlatformManager {
     completed_runs: Vec<RunSummary>,
     /// Counter for generating unique run IDs
     run_counter: u64,
+    /// Stored-registry definitions not registered in memory, read at most
+    /// once per session (None = file not read yet) and re-preserved on
+    /// every persist so a register-before-load restart cannot clobber
+    /// definition-only tests a previous session persisted.
+    preserved_from_file: Option<Vec<TestDefinition>>,
 }
 
 impl PlatformManager {
@@ -53,6 +58,7 @@ impl PlatformManager {
             runnables: Vec::new(),
             completed_runs: Vec::new(),
             run_counter,
+            preserved_from_file: None,
         }
     }
 
@@ -87,11 +93,14 @@ impl PlatformManager {
             self.runnables.push(runnable);
             return Ok(());
         }
+        let id = definition.id.clone();
         self.registry
             .register(definition)
             .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
         self.runnables.push(runnable);
-        self.persist_registry();
+        // Registered in memory either way; a failed write must be loud.
+        self.persist_registry()
+            .map_err(|e| ManagerError::PersistFailed(id, e))?;
         Ok(())
     }
 
@@ -158,25 +167,55 @@ impl PlatformManager {
     /// stored definitions not present in memory are preserved, so a
     /// register-before-load restart cannot clobber definition-only tests
     /// that a previous session persisted. In-memory definitions win on id
-    /// conflict. (If a manager-level deregister is ever added, it must
-    /// delete from the file explicitly — this merge would resurrect
-    /// otherwise.)
-    fn persist_registry(&self) {
+    /// conflict. The file is read at most once per session (cached in
+    /// preserved_from_file) so bulk registration stays O(N). A corrupt
+    /// file — whole-file or individual entries — is backed up to
+    /// registry.json.corrupt before the rewrite would destroy the
+    /// evidence. Write errors are returned, never swallowed. (If a
+    /// manager-level deregister is ever added, it must delete from the
+    /// file explicitly — this merge would resurrect otherwise.)
+    fn persist_registry(&mut self) -> Result<(), String> {
+        if self.preserved_from_file.is_none() {
+            let stored = if storage::registry_exists(&self.storage) {
+                match storage::load_registry(&self.storage) {
+                    Ok((stored, entry_errors)) => {
+                        if !entry_errors.is_empty() {
+                            // Malformed entries would be dropped by the
+                            // rewrite — keep the original as evidence.
+                            let _ = storage::backup_corrupt_registry(&self.storage);
+                        }
+                        stored
+                    }
+                    Err(_) => {
+                        // File-level corruption: preserve the evidence
+                        // instead of silently overwriting it.
+                        let _ = storage::backup_corrupt_registry(&self.storage);
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            self.preserved_from_file = Some(stored);
+        }
+        let in_memory: std::collections::HashSet<String> = self
+            .registry
+            .list_all()
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
         let mut all: Vec<TestDefinition> =
             self.registry.list_all().into_iter().cloned().collect();
-        if storage::registry_exists(&self.storage) {
-            if let Ok((stored, _)) = storage::load_registry(&self.storage) {
-                let in_memory: std::collections::HashSet<&str> =
-                    all.iter().map(|t| t.id.as_str()).collect();
-                let preserved: Vec<TestDefinition> = stored
-                    .into_iter()
-                    .filter(|t| !in_memory.contains(t.id.as_str()))
-                    .collect();
-                all.extend(preserved);
-            }
-        }
+        all.extend(
+            self.preserved_from_file
+                .as_ref()
+                .expect("populated above")
+                .iter()
+                .filter(|t| !in_memory.contains(t.id.as_str()))
+                .cloned(),
+        );
         let refs: Vec<&TestDefinition> = all.iter().collect();
-        let _ = storage::save_registry(&self.storage, &refs);
+        storage::save_registry(&self.storage, &refs)
     }
 
     fn persist_run(&self, summary: &RunSummary) -> Result<(), String> {
@@ -214,10 +253,13 @@ impl TestManager for PlatformManager {
     }
 
     fn register_test(&mut self, definition: TestDefinition) -> Result<(), ManagerError> {
+        let id = definition.id.clone();
         self.registry
             .register(definition)
             .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
-        self.persist_registry();
+        // Registered in memory either way; a failed write must be loud.
+        self.persist_registry()
+            .map_err(|e| ManagerError::PersistFailed(id, e))?;
         Ok(())
     }
 
@@ -592,6 +634,41 @@ mod tests {
         assert_eq!(mgr2.summary().total_tests, 2);
         let run_id = mgr2.start_run(RunConfig::default()).unwrap();
         assert_eq!(mgr2.get_results(&run_id).unwrap().total, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_registry_is_backed_up_not_silently_overwritten() {
+        // Register-first restart over a file-level-corrupt registry must
+        // preserve the corrupt file as evidence before rewriting.
+        let dir = crate::test_util::temp_storage_dir("mgr-corruptreg");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(format!("{}/registry.json", dir), "{ truncated garb").unwrap();
+
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "t".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        ).unwrap();
+        // Evidence preserved, and the live file is clean again.
+        let backup = std::fs::read_to_string(format!("{}/registry.json.corrupt", dir)).unwrap();
+        assert_eq!(backup, "{ truncated garb");
+        assert!(crate::json::parse_json(
+            &std::fs::read_to_string(format!("{}/registry.json", dir)).unwrap()
+        ).is_ok());
+        // No temp files left behind by the atomic writer.
+        let stray: Vec<_> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(stray.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
