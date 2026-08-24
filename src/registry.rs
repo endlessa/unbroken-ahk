@@ -8,7 +8,9 @@ use crate::types::TestId;
 /// The registry holds every known test definition and supports
 /// registration and lookup operations.
 pub trait TestRegistry {
-    /// Register a new test. Returns an error if the ID is already taken.
+    /// Register a new test. Returns an error if the ID is already taken
+    /// or the definition is invalid (empty id or name) — what the
+    /// registry accepts must survive its own persistence round-trip.
     fn register(&mut self, test: TestDefinition) -> Result<(), RegistryError>;
 
     /// Remove a test by ID. Returns the definition if it existed.
@@ -44,4 +46,6 @@ pub trait TestRegistry {
 pub enum RegistryError {
     /// A test with this ID is already registered.
     DuplicateId(TestId),
+    /// The definition is not acceptable (e.g. empty id or name).
+    InvalidDefinition(String),
 }

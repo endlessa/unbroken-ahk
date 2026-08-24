@@ -279,9 +279,14 @@ impl TestManager for PlatformManager {
             errored,
             total_duration_ms: total_duration,
             started_at,
-            // Real clock when available; on WASM (now_ms() == 0) fall back
-            // to started_at + duration so the pair still encodes elapsed time.
-            completed_at: storage::now_ms().max(started_at.saturating_add(total_duration)),
+            // Real clock when available. Only on WASM (no clock, now_ms()==0)
+            // fall back to started_at + duration so the pair still encodes
+            // elapsed time — never on native, where self-reported per-test
+            // durations could fabricate a completion time in the future.
+            completed_at: match storage::now_ms() {
+                0 => started_at.saturating_add(total_duration),
+                now => now.max(started_at),
+            },
         };
 
         self.persist_run(&summary);

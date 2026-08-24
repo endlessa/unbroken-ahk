@@ -29,6 +29,15 @@ impl InMemoryRegistry {
 
 impl TestRegistry for InMemoryRegistry {
     fn register(&mut self, test: TestDefinition) -> Result<(), RegistryError> {
+        // Mirror the load-side strictness: a definition the registry
+        // accepts must survive its own persistence round-trip, and
+        // TestDefinition::from_json rejects empty id/name.
+        if test.id.is_empty() {
+            return Err(RegistryError::InvalidDefinition("empty id".into()));
+        }
+        if test.name.is_empty() {
+            return Err(RegistryError::InvalidDefinition("empty name".into()));
+        }
         if self.tests.iter().any(|t| t.id == test.id) {
             return Err(RegistryError::DuplicateId(test.id));
         }
@@ -131,6 +140,23 @@ mod tests {
         let mut reg = InMemoryRegistry::new();
         reg.register(make_test("t1", "test", &[], None)).unwrap();
         assert!(reg.register(make_test("t1", "test2", &[], None)).is_err());
+    }
+
+    #[test]
+    fn empty_id_or_name_rejected_at_registration() {
+        // What the registry accepts must survive its own persistence
+        // round-trip — the load side rejects empty id/name, so the
+        // write side must too.
+        let mut reg = InMemoryRegistry::new();
+        assert!(matches!(
+            reg.register(make_test("", "named", &[], None)),
+            Err(RegistryError::InvalidDefinition(_))
+        ));
+        assert!(matches!(
+            reg.register(make_test("t1", "", &[], None)),
+            Err(RegistryError::InvalidDefinition(_))
+        ));
+        assert_eq!(reg.count(), 0);
     }
 
     #[test]

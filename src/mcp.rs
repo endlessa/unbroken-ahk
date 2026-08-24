@@ -175,6 +175,11 @@ pub fn list_tools() -> Vec<ToolDescriptor> {
                     ("description", str_val("Per-test timeout in milliseconds")),
                     ("required", JsonValue::Bool(false)),
                 ])),
+                ("execution_model", obj(vec![
+                    ("type", str_val("object")),
+                    ("description", str_val("Execution strategy, e.g. {\"type\": \"sequential\"}. Only \"sequential\" is currently supported; \"parallel\" is accepted syntax but rejected at run time.")),
+                    ("required", JsonValue::Bool(false)),
+                ])),
             ]),
         },
         ToolDescriptor {
@@ -556,12 +561,20 @@ mod tests {
 
     #[test]
     fn run_with_exclude() {
+        // Exclude-only means "everything except these" — run_all defaults
+        // true and the exclusion still applies.
         let mut mgr = setup_manager();
-        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"run_all": false, "exclude_tags": ["slow"]}}"#);
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"exclude_tags": ["slow"]}}"#);
         let val = parse_json(&resp).unwrap();
         let data = val.get("data").unwrap();
         assert_eq!(data.get("total").and_then(|v| v.as_f64()), Some(2.0));
         assert_eq!(data.get("passed").and_then(|v| v.as_f64()), Some(2.0));
+
+        // An explicit run_all=false with only exclusions selects nothing.
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"run_all": false, "exclude_tags": ["slow"]}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("NoTestsMatched"));
     }
 
     #[test]
@@ -807,6 +820,16 @@ mod tests {
         let resp = execute_mcp(&mut mgr, r#"{"tool": "test_results", "params": "run_0001"}"#);
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
+    }
+
+    #[test]
+    fn empty_exclude_tags_runs_everything() {
+        // "Exclude nothing" is a full run, not NoTestsMatched.
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"exclude_tags": []}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(true));
+        assert_eq!(val.get("data").unwrap().get("total").and_then(|v| v.as_f64()), Some(3.0));
     }
 
     #[test]

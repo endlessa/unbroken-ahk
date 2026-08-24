@@ -210,14 +210,16 @@ impl FromJson for RunConfig {
         let include_tags = strict_string_array(value, "include_tags")?;
         let exclude_tags = strict_string_array(value, "exclude_tags")?;
         let name_pattern = strict_opt_string(value, "name_pattern")?;
-        // run_all defaults to true only when NO filter key was supplied.
-        // Key PRESENCE decides, not emptiness: a caller passing
-        // {"include_ids": []} selected zero tests — that must become
-        // NoTestsMatched, never run-everything.
-        let filters_supplied = ["include_ids", "include_tags", "exclude_tags", "name_pattern"]
+        // run_all defaults to true unless an INCLUDE-side key was supplied.
+        // Key PRESENCE decides, not emptiness: {"include_ids": []} selected
+        // zero tests — that must become NoTestsMatched, never run-everything.
+        // exclude_tags does not flip the default: exclusions apply under
+        // run_all anyway, so {"exclude_tags": [...]} means "everything
+        // except these" and {"exclude_tags": []} means "everything".
+        let includes_supplied = ["include_ids", "include_tags", "name_pattern"]
             .iter()
             .any(|k| matches!(value.get(k), Some(v) if !matches!(v, JsonValue::Null)));
-        let run_all = strict_opt_bool(value, "run_all")?.unwrap_or(!filters_supplied);
+        let run_all = strict_opt_bool(value, "run_all")?.unwrap_or(!includes_supplied);
         let fail_fast = strict_opt_bool(value, "fail_fast")?.unwrap_or(false);
         let timeout_ms = strict_opt_u64(value, "timeout_ms")?;
         let execution_model = match value.get("execution_model") {
@@ -550,19 +552,27 @@ mod tests {
 
     #[test]
     fn run_config_filters_imply_run_all_false() {
-        // Filters without an explicit run_all must NOT default to run-everything.
+        // Include-side filters without an explicit run_all must NOT default
+        // to run-everything.
         let val = parse_json(r#"{"include_tags": ["fast"]}"#).unwrap();
         let config = RunConfig::from_json(&val).unwrap();
         assert!(!config.run_all);
         assert_eq!(config.include_tags, vec!["fast".to_string()]);
 
-        let val = parse_json(r#"{"exclude_tags": ["slow"]}"#).unwrap();
-        let config = RunConfig::from_json(&val).unwrap();
-        assert!(!config.run_all);
-
         let val = parse_json(r#"{"name_pattern": "auth_*"}"#).unwrap();
         let config = RunConfig::from_json(&val).unwrap();
         assert!(!config.run_all);
+
+        // exclude_tags alone keeps run_all true — exclusions apply under
+        // run_all, so this means "everything except slow".
+        let val = parse_json(r#"{"exclude_tags": ["slow"]}"#).unwrap();
+        let config = RunConfig::from_json(&val).unwrap();
+        assert!(config.run_all);
+        assert_eq!(config.exclude_tags, vec!["slow".to_string()]);
+
+        // "Exclude nothing" runs everything, not NoTestsMatched.
+        let val = parse_json(r#"{"exclude_tags": []}"#).unwrap();
+        assert!(RunConfig::from_json(&val).unwrap().run_all);
     }
 
     #[test]

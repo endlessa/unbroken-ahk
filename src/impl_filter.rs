@@ -28,15 +28,12 @@ impl TestFilter for StandardFilter {
             // destructive tag" must honor the exclusion.
             tests.to_vec()
         } else if no_includes {
-            if config.exclude_tags.is_empty() {
-                // Explicit run_all=false with no filters at all: the caller
-                // opted out of run-everything and selected nothing — an
-                // empty selection (NoTestsMatched upstream), not the whole
-                // suite.
-                return Vec::new();
-            }
-            // Exclude-only config: start from everything, prune below.
-            tests.to_vec()
+            // run_all=false with no include criteria: the include side
+            // selected nothing, so nothing runs (NoTestsMatched upstream) —
+            // exclusions alone never resurrect the whole suite. Exclude-only
+            // configs run everything-minus via run_all (its default stays
+            // true when only exclude_tags is supplied).
+            return Vec::new();
         } else {
             let mut candidates: Vec<&'a TestDefinition> = Vec::new();
 
@@ -133,8 +130,10 @@ mod tests {
             td("c", "c", &["fast"]),
         ];
         let refs: Vec<&TestDefinition> = tests.iter().collect();
+        // Exclude-only selection rides on run_all (the parse-side default
+        // when only exclude_tags is supplied).
         let config = RunConfig {
-            run_all: false,
+            run_all: true,
             exclude_tags: vec!["slow".into()],
             ..Default::default()
         };
@@ -166,6 +165,24 @@ mod tests {
         let config = RunConfig { run_all: false, ..Default::default() };
         let result = StandardFilter::new().apply(&refs, &config);
         assert!(result.is_empty());
+        // Exclusions alone never resurrect the suite when run_all is false.
+        let config = RunConfig {
+            run_all: false,
+            exclude_tags: vec!["x".into()],
+            ..Default::default()
+        };
+        let result = StandardFilter::new().apply(&refs, &config);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn contains_glob_matches() {
+        use crate::filter::name_matches_lower;
+        assert!(name_matches_lower("*auth*", "basic_auth_test"));
+        assert!(name_matches_lower("*auth*", "auth_basic"));
+        assert!(!name_matches_lower("*auth*", "network_ping"));
+        // Bare "*" matches everything.
+        assert!(name_matches_lower("*", "anything"));
     }
 
     #[test]

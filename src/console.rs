@@ -137,7 +137,15 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
             }
             "--limit" | "-l" => {
                 if i + 1 < args.len() {
-                    query.limit = args[i + 1].parse().ok();
+                    match args[i + 1].parse() {
+                        Ok(n) => query.limit = Some(n),
+                        Err(_) => {
+                            return error_output(&format!(
+                                "--limit: '{}' is not a number",
+                                args[i + 1]
+                            ))
+                        }
+                    }
                     i += 2;
                 } else {
                     return error_output("--limit requires a value");
@@ -374,10 +382,11 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
         }
     }
 
-    // If no specific filters set, run all
+    // If no include-side filters were set, run everything. Exclusions
+    // don't count: they apply under run_all, so 'run --exclude slow'
+    // means "everything except slow".
     if config.include_ids.is_empty()
         && config.include_tags.is_empty()
-        && config.exclude_tags.is_empty()
         && config.name_pattern.is_none()
     {
         config.run_all = true;
@@ -618,6 +627,22 @@ mod tests {
 
         let out = execute_command(&mut mgr, "run --bogus-flag");
         assert!(out.text.contains("unknown flag"));
+    }
+
+    #[test]
+    fn discover_bad_limit_errors() {
+        let mut mgr = setup_manager();
+        let out = execute_command(&mut mgr, "discover --limit abc");
+        assert!(out.text.contains("Error"));
+        assert!(out.text.contains("not a number"));
+    }
+
+    #[test]
+    fn run_exclude_only_runs_the_rest() {
+        let mut mgr = setup_manager();
+        let out = execute_command(&mut mgr, "run --exclude slow");
+        assert!(out.text.contains("Total: 2"), "got: {}", out.text);
+        assert!(!out.json.contains("net_ping"));
     }
 
     #[test]

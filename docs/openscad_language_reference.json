@@ -1016,7 +1016,7 @@
   "name": "linear_extrude",
   "kind": "module",
   "category": "Extrusions",
-  "since": "pre-2015.03 (core); slice-count heuristics/segments as of 2021.01 (VERIFY segments intro); v=/h= snapshot-only",
+  "since": "pre-2015.03 (core); geometry-aware default-slices heuristics new in 2021.01; segments=, v=, h= snapshot-only (post-2021.01)",
   "signature": "linear_extrude(height = 100, center = false, convexity = 1, twist = 0, slices = <computed>, scale = 1)  //  true positional order (legacy): (file, layer, height, origin, scale, center, twist, slices); snapshot-only: v = [x,y,z], h (alias for height), segments",
   "summary": "Extrudes its (implicitly unioned) 2D children along +Z into a 3D solid, optionally twisting about the Z axis and linearly scaling the cross-section from bottom to top. One of only three 2D<->3D bridges in the language (with rotate_extrude and projection).",
   "params": [
@@ -3829,19 +3829,20 @@
   "name": "version",
   "kind": "function",
   "category": "Other builtins: echo, assert, version, introspection",
-  "signature": "version() -> [year, month, patch]",
-  "summary": "Returns the OpenSCAD version as a numeric vector, e.g. [2021, 1, 0]; the vector-shaped twin of version_num().",
+  "signature": "version() -> [year, month] (release builds) | [year, month, day] (date-versioned snapshots)",
+  "summary": "Returns the OpenSCAD version as a numeric vector, e.g. [2021, 1]; the vector-shaped twin of version_num().",
   "params": [],
-  "semantics": "Returns a three-element vector of numbers identifying the running interpreter: [2021, 1, 0] for release 2021.01. Libraries use it (usually via version_num instead, since vectors don't compare with <) to feature-gate code paths.",
+  "semantics": "Returns a three-element vector of numbers identifying the running interpreter: [2021, 1] for release 2021.01. Libraries use it (usually via version_num instead, since vectors don't compare with <) to feature-gate code paths.",
   "edge_cases": [
-   "Release mapping: 2021.01 -> [2021, 1, 0]; 2019.05 -> [2019, 5, 0]; 2015.03 -> [2015, 3, 0]. VERIFY: point releases like 2015.03-3 -> believed [2015, 3, 3].",
+   "Release mapping: 2021.01 -> [2021, 1]; 2019.05 -> [2019, 5]; 2015.03 -> [2015, 3]. VERIFY: point releases like 2015.03-3 -> believed [2015, 3, 3].",
    "Dev snapshots report their snapshot date: believed [YYYY, M, D] (e.g. a 2025-02-19 nightly -> [2025, 2, 19]) \u2014 VERIFY mapping.",
    "Elements are plain numbers; the vector itself cannot be relationally compared (version() > [2019,5,0] is undef!) \u2014 code must index elements or use version_num; a reimplementation must NOT make vector comparison work to 'help'.",
    "VERIFY: arguments passed to version() \u2014 believed ignored, possibly with an unused-argument warning; pin.",
-   "What a reimplementation reports is a policy decision with real consequences: report [2021, 1, 0] to unlock 2021.01 codepaths in BOSL2 etc.; reporting a fake future date may enable snapshot-only paths that then fail."
+   "What a reimplementation reports is a policy decision with real consequences: report [2021, 1] to unlock 2021.01 codepaths in BOSL2 etc.; reporting a fake future date may enable snapshot-only paths that then fail.",
+   "Release versions are two-element vectors: version() == [2021, 1] on the 2021.01 release, so version()[2] is undef and len(version()) == 2. A third (day) element appears only on date-versioned snapshot builds. version_num() is unaffected: the missing day fills as 0, giving 20210100."
   ],
   "example": "echo(version(), version()[0] >= 2021);",
-  "impl_notes": "Report [2021, 1, 0] for a 2021.01-compat mode; if the app exposes opt-in snapshot features, still consider keeping version() at the compat baseline and documenting the choice \u2014 libraries key behavior off it.",
+  "impl_notes": "Report [2021, 1] for a 2021.01-compat mode; if the app exposes opt-in snapshot features, still consider keeping version() at the compat baseline and documenting the choice \u2014 libraries key behavior off it.",
   "since": "pre-2015.03"
  },
  {
@@ -4365,10 +4366,11 @@
    "AMF unit attribute: VERIFY honored (scaling) vs ignored in 2021.01.",
    "3MF (2019.05+ read): geometry only in 2021.01 \u2014 colors/materials dropped; multiple build items: VERIFY unioned; build transforms: VERIFY applied; units: 3MF is mm-based, VERIFY conversion of other unit declarations.",
    "All four: non-manifold input previews fine, fails at F6/CSG with CGAL-era errors \u2014 timing is observable.",
-   "OBJ is snapshot-only (2023+); in 2021.01 '.obj' hits the unsupported-format error."
+   "OBJ is snapshot-only (2023+); in 2021.01 '.obj' hits the unsupported-format error.",
+   "Version asymmetry: AMF EXPORT is 2015.03, but AMF IMPORT only arrived in 2019.05 alongside SVG and 3MF import."
   ],
   "example": "import(\"widget.3mf\");\ntranslate([40, 0, 0]) import(\"widget.stl\");",
-  "since": "STL/OFF pre-2015.03; AMF 2015.03; 3MF 2019.05",
+  "since": "STL/OFF pre-2015.03; AMF 2019.05; 3MF 2019.05",
   "impl_notes": "STL sniffing and mesh stitching are the highest-risk items \u2014 build a corpus (ASCII, binary, binary-starting-with-'solid', degenerate triangles, unreferenced vertices) and pin behavior. For AMF/3MF pin multi-object and unit handling via oracle before writing the XML/ZIP parsers."
  },
  {
@@ -4457,7 +4459,7 @@
   "kind": "concept",
   "category": "import() and export formats",
   "signature": "openscad -o out.dxf|svg|pdf file.scad",
-  "summary": "2D geometry export surface of 2021.01: DXF and SVG (2019.05+), plus PDF (new in 2021.01). Requires the top-level result to be 2D.",
+  "summary": "2D geometry export surface of 2021.01: DXF (pre-2015.03) and SVG (2015.03+), plus PDF (new in 2021.01), plus PDF (new in 2021.01). Requires the top-level result to be 2D.",
   "params": [],
   "semantics": "The rendered 2D polygon set (outer boundaries plus holes) is written in millimeter units. DXF writes polyline entities; SVG writes a single document with path data (holes via fill-rule); PDF writes a one-page vector document.",
   "edge_cases": [
@@ -4468,10 +4470,11 @@
    "All curves are already tessellated \u2014 2D exports contain line segments only, never true arcs/beziers.",
    "% subtrees excluded; # included \u2014 same as 3D.",
    "Coordinates: full precision vs %g? VERIFY float formatting per format.",
-   "Empty 2D result: VERIFY error vs empty document."
+   "Empty 2D result: VERIFY error vs empty document.",
+   "Upstream's 2019.05 release note 'New export file formats: SVG, 3MF, AMF' is sloppy \u2014 SVG export shipped in 2015.03; what 2019.05 added on the SVG side was IMPORT."
   ],
   "example": "// shell: openscad -o plate.svg plate.scad\nprojection(cut = true) translate([0, 0, -1]) cube(10, center = true);",
-  "since": "DXF pre-2015.03; SVG 2019.05; PDF 2021.01",
+  "since": "DXF pre-2015.03; SVG 2015.03; PDF 2021.01",
   "impl_notes": "Pin DXF entity types and SVG attribute boilerplate with tiny fixtures (one square with one hole). PDF is a from-scratch writer in a zero-dependency build \u2014 keep it minimal (one content stream, no compression is legal PDF) and only match OpenSCAD geometrically."
  },
  {
@@ -5033,7 +5036,7 @@
    "The warning SET is surface (compatibility-critical under --hardwarnings): variable reassignment, unknown variable, undefined operation/type mismatch, unequal-length vector +/-, scalar+vector, division by zero, deprecated reversed range, $fa/$fs clamp, unknown named parameter, empty min/max, range step problems, deprecations (assign, triangles=), unknown module/function call. VERIFY completeness by diffing against oracle runs of a warning-torture script.",
    "Warning/echo emission order is depth-first instantiation order, before/independent of geometry evaluation; duplicate-warning rate limiting in the GUI console is app behavior, not language.",
    "Dev snapshots have been moving echo toward full-precision shortest-roundtrip number output \u2014 2021.01 is firmly 6-significant-digit %g; VERIFY per-snapshot before chasing snapshot parity.",
-   "version() returns [2021, 1, 0] style vectors and version_num() returns 20210100-style numbers \u2014 these numbers flow through the same formatter rules when echoed (20210100 prints as 2.02101e+07!)."
+   "version() returns [2021, 1] style vectors (two elements on release builds; a third day element only on date-versioned snapshots) and version_num() returns 20210100-style numbers \u2014 these numbers flow through the same formatter rules when echoed (20210100 prints as 2.02101e+07!)."
   ],
   "example": "echo(1/3, PI, 10.0, 1234567);   // ECHO: 0.333333, 3.14159, 10, 1.23457e+06\necho(0.1 + 0.2);                 // ECHO: 0.3\necho(sin(180), cos(90));         // ECHO: 0, 0\necho(-5 % 3, 5 % -3);            // ECHO: -2, 2\necho(2^3^2, -2^2);               // ECHO: 512, -4\necho(str(1/3), len(str(1/3)));   // ECHO: \"0.333333\", 8\ncube(1);",
   "since": "2015.03",
@@ -5204,12 +5207,12 @@
   "name": "Determinism & compatibility posture",
   "kind": "concept",
   "category": "Semantic model",
-  "signature": "// Same script + same implementation version => same console text, same solid.\n// Never promised: byte-identical STL versus OpenSCAD or across versions.\necho(version(), version_num());   // ECHO: [2021, 1, 0], 2.02101e+07\nif (version_num() >= 20190500) echo(\"2019.05+ features available\");",
+  "signature": "// Same script + same implementation version => same console text, same solid.\n// Never promised: byte-identical STL versus OpenSCAD or across versions.\necho(version(), version_num());   // ECHO: [2021, 1], 2.02101e+07\nif (version_num() >= 20190500) echo(\"2019.05+ features available\");",
   "summary": "The compatibility contract for a 2021.01 reimplementation: PROMISE full determinism (identical script and inputs give identical console output, warning set/order, and geometry), exact tessellation/fragment-formula parity, and mesh-level (solid) equivalence with OpenSCAD 2021.01; NEVER promise byte-identical STL/vertex ordering versus the official binary or across versions, cloned CGAL error strings, or bit-compatible seeded rands(); report version()=[2021,1,0]/version_num()=20210100 so libraries feature-detect correctly, and pin every uncertainty by differential testing against the official AppImage as an oracle.",
   "params": [
    {
     "name": "version()",
-    "desc": "Returns [year, month, patch], e.g. [2021, 1, 0]; libraries (BOSL2 etc.) feature-test on it, so the reported value gates which library code paths run."
+    "desc": "Returns [year, month, patch], e.g. [2021, 1]; libraries (BOSL2 etc.) feature-test on it, so the reported value gates which library code paths run."
    },
    {
     "name": "version_num()",
@@ -5234,7 +5237,7 @@
    "NEVER promise: cloned CGAL error/assertion strings on invalid geometry \u2014 promise the detection TIMING (failures surface at exact-evaluation/render, not instantiation) and a documented error of your own.",
    "NEVER promise near-degenerate CSG parity: exactly-coincident faces, zero-thickness results, and epsilon-scale 2D features may legitimately differ from CGAL/Clipper outcomes; document as unspecified rather than chasing.",
    "rands(): with a seed, reproducible WITHIN your implementation forever (freeze your PRNG); bit-matching OpenSCAD requires cloning std::mt19937 AND its uniform_real_distribution mapping \u2014 VERIFY: std::uniform_real_distribution output is not pinned by the C++ standard, so the official binary itself may differ across platform stdlibs; recommended posture is to NOT promise cross-implementation rands() equality. Unseeded rands() is nondeterministic by definition \u2014 the only sanctioned nondeterminism in the language.",
-   "version()/version_num() gate real library code paths (BOSL2 feature-detects): report [2021,1,0]/20210100 for baseline claims. VERIFY: what official snapshots report (snapshot date forms like [2025,x,y]) before emulating one. Note the echo trap: version_num() echoes as 2.02101e+07 under %g \u2014 comparisons work, display looks odd; clone as-is.",
+   "version()/version_num() gate real library code paths (BOSL2 feature-detects): report [2021,1]/20210100 for baseline claims. VERIFY: what official snapshots report (snapshot date forms like [2025,x,y]) before emulating one. Note the echo trap: version_num() echoes as 2.02101e+07 under %g \u2014 comparisons work, display looks odd; clone as-is.",
    "Echo number formatting is part of determinism surface: the 6-significant-digit %g formatter must be frozen and shared by echo/str; snapshots moving to shortest-roundtrip output are a DIFFERENT contract \u2014 never mix behind the 2021.01 flag.",
    "--hardwarnings parity: the exact SET of emitted warnings is a compatibility gate \u2014 an extra warning your implementation adds turns green CI runs red; a missing one hides bugs. Diff warning inventories against the oracle on a torture script and freeze.",
    "$t and camera ($vpr/$vpt/$vpd/$vpf) are INPUTS: per-frame determinism given their values; animation runs are deterministic frame-by-frame.",
@@ -5245,7 +5248,7 @@
    "Performance posture (expectation, not semantics): subtree geometry caching, O(1) amortized list building, and fast recursive functions are required for real scripts to complete; document that timing is never part of the compatibility promise.",
    "Licensing constraint on methodology: the reference implementation is GPLv2+ and CGAL is GPL \u2014 a cleanroom reimplementation pins behavior via the CC BY-SA manual and BLACK-BOX oracle observation only; never port OpenSCAD/CGAL source. Manifold (Apache-2.0) and Clipper2 (BSL-1.0) algorithms/papers are safe references."
   ],
-  "example": "echo(version(), version_num());   // ECHO: [2021, 1, 0], 2.02101e+07\nassert(version_num() >= 20210100);\nr = rands(0, 1, 3, 42);            // seeded: reproducible per implementation\necho(r);                            // freeze YOUR values; don't promise OpenSCAD's\nsphere(5, $fn=24);                  // vertex positions: promised; STL bytes: not",
+  "example": "echo(version(), version_num());   // ECHO: [2021, 1], 2.02101e+07\nassert(version_num() >= 20210100);\nr = rands(0, 1, 3, 42);            // seeded: reproducible per implementation\necho(r);                            // freeze YOUR values; don't promise OpenSCAD's\nsphere(5, $fn=24);                  // vertex positions: promised; STL bytes: not",
   "since": "2021.01",
   "impl_notes": "Engineer determinism structurally: ordered maps everywhere results can leak, a single frozen number formatter, deterministic ID/ordering for generated vertices, and cache designs proven invisible by cache-on/cache-off byte-diff tests in CI. Build the oracle harness first \u2014 script corpus, run official 2021.01 headless, capture ECHO/.csg/meshes, diff on every commit; promote each VERIFY item from this reference into that corpus. Freeze your seeded rands() stream as YOUR contract with a documented note that it diverges from OpenSCAD. Publish the compatibility statement in these exact tiers (self-consistency: byte-exact; OpenSCAD parity: console-verbatim + solid-equivalent; explicitly excluded: STL bytes, triangulation, CGAL errors, rands bits, timing) so users and downstream tests target the right guarantees."
  },
@@ -5400,7 +5403,7 @@
    "Emits 'DEPRECATED: The dxf_linear_extrude() module will be removed in future releases. Use linear_extrude() instead.' (and the rotate twin) \u2014 VERIFY exact wording per name.",
    "Only child() among the classic deprecations was actually removed by 2021.01 (gone in 2019.05); these five legacy import/dxf names all survived through 2021.01."
   ],
-  "example": "// removed: dxf_linear_extrude(file=\"p.dxf\", height=5);\n// modern: linear_extrude(5) import(\"p.dxf\");",
+  "example": "// deprecated, still works in 2021.01:\n// dxf_linear_extrude(file=\"p.dxf\", height=5);\n// modern equivalent:\nlinear_extrude(5) import(\"p.dxf\");",
   "since": "pre-2015.03 (deprecated; removed after 2021.01)",
   "impl_notes": "Accept as aliases emitting the deprecation warning if strict 2021.01 parity is the goal; recognize-and-hint without executing is a documented divergence."
  },
