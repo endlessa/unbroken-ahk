@@ -182,18 +182,30 @@ pub fn save_registry(paths: &StoragePaths, tests: &[&TestDefinition]) -> Result<
     write_json_file(&paths.registry_path(), &to_json_pretty(&arr))
 }
 
+/// Why a registry file failed to load — I/O trouble (typed Io) says
+/// nothing about the data and must never be treated as corruption.
+#[derive(Debug)]
+pub enum RegistryLoadError {
+    /// The file could not be read (permissions, transient I/O).
+    Io(String),
+    /// The file was read but is not a valid registry document.
+    Parse(String),
+}
+
 /// Load the test registry from JSON.
 ///
 /// Returns every definition that parsed cleanly plus a description of each
 /// entry that did not — one malformed entry must not discard the rest of
-/// the registry. The outer error is reserved for file-level problems
-/// (missing file, unparseable JSON, not an array).
+/// the registry. The outer error is reserved for file-level problems,
+/// split into Io (retryable, data intact) and Parse (corruption).
 pub fn load_registry(
     paths: &StoragePaths,
-) -> Result<(Vec<TestDefinition>, Vec<String>), String> {
-    let content = read_json_file(&paths.registry_path())?;
-    let value = parse_json(&content).map_err(|e| format!("{}", e))?;
-    let arr = value.as_array().ok_or("expected JSON array")?;
+) -> Result<(Vec<TestDefinition>, Vec<String>), RegistryLoadError> {
+    let content = read_json_file(&paths.registry_path()).map_err(RegistryLoadError::Io)?;
+    let value = parse_json(&content).map_err(|e| RegistryLoadError::Parse(format!("{}", e)))?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| RegistryLoadError::Parse("expected JSON array".into()))?;
     let mut tests = Vec::new();
     let mut entry_errors = Vec::new();
     for (i, v) in arr.iter().enumerate() {

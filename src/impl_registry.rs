@@ -38,6 +38,17 @@ impl TestRegistry for InMemoryRegistry {
         if test.name.is_empty() {
             return Err(RegistryError::InvalidDefinition("empty name".into()));
         }
+        // Duplicate metadata keys would serialize to a JSON object the
+        // strict parser rejects — same round-trip invariant as above.
+        let mut meta_keys = std::collections::HashSet::new();
+        for (k, _) in &test.metadata {
+            if !meta_keys.insert(k.as_str()) {
+                return Err(RegistryError::InvalidDefinition(format!(
+                    "duplicate metadata key '{}'",
+                    k
+                )));
+            }
+        }
         if self.tests.iter().any(|t| t.id == test.id) {
             return Err(RegistryError::DuplicateId(test.id));
         }

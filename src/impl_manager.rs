@@ -77,18 +77,9 @@ impl PlatformManager {
     /// - differs from one registered EARLIER THIS SESSION: error — two
     ///   parts of one program disagreeing about a test is a bug
     fn ensure_definition(&mut self, definition: TestDefinition) -> Result<TestId, ManagerError> {
-        // A definition the registry accepts must survive its own
-        // persistence round-trip: duplicate metadata keys would serialize
-        // to a JSON object the strict parser rejects.
-        let mut meta_keys = std::collections::HashSet::new();
-        for (k, _) in &definition.metadata {
-            if !meta_keys.insert(k.as_str()) {
-                return Err(ManagerError::RegistrationFailed(format!(
-                    "duplicate metadata key '{}' in definition '{}'",
-                    k, definition.id
-                )));
-            }
-        }
+        // Round-trip validity (empty id/name, duplicate metadata keys) is
+        // enforced by InMemoryRegistry::register itself — the invariant
+        // lives at the registry layer so direct registry users get it too.
         let id = definition.id.clone();
         match self.registry.get(&id) {
             Some(existing) if *existing == definition => {}
@@ -138,20 +129,50 @@ impl PlatformManager {
             ));
         }
         let id = self.ensure_definition(definition)?;
-        // REPLACE any already-attached runnable for this id: on a retry
-        // or a redeploy with a fixed implementation, the freshly supplied
-        // code must win — silently keeping stale code behind an Ok would
-        // be worse than either erroring or replacing.
-        if let Some(slot) = self.runnables.iter().position(|r| r.id() == id) {
-            self.runnables[slot] = runnable;
-        } else {
-            self.runnables.push(runnable);
-        }
+        self.attach_runnable(&id, runnable);
         // Persist unconditionally — "already in memory" does not mean
         // "already durable"; a retry after PersistFailed must reach disk
         // before reporting success.
         self.persist_registry()
             .map_err(|e| ManagerError::PersistFailed(id, e))?;
+        Ok(())
+    }
+
+    /// REPLACE any already-attached runnable for this id: on a retry or a
+    /// redeploy with a fixed implementation, the freshly supplied code
+    /// must win — silently keeping stale code behind an Ok would be worse
+    /// than either erroring or replacing.
+    fn attach_runnable(&mut self, id: &str, runnable: Box<dyn RunnableTest>) {
+        if let Some(slot) = self.runnables.iter().position(|r| r.id() == id) {
+            self.runnables[slot] = runnable;
+        } else {
+            self.runnables.push(runnable);
+        }
+    }
+
+    /// Register many runnable tests with a SINGLE registry persist.
+    ///
+    /// The per-call re-read/merge/write that keeps persistence lossless
+    /// makes one-at-a-time registration cost one file read each; bulk
+    /// startup registration should come through here instead — same
+    /// semantics as register_runnable per item, one merge+write total.
+    pub fn register_runnables(
+        &mut self,
+        items: Vec<(TestDefinition, Box<dyn RunnableTest>)>,
+    ) -> Result<(), ManagerError> {
+        let mut last_id = String::new();
+        for (definition, runnable) in items {
+            if runnable.id() != definition.id {
+                return Err(ManagerError::RegistrationFailed(
+                    "runnable ID does not match definition ID".into(),
+                ));
+            }
+            let id = self.ensure_definition(definition)?;
+            self.attach_runnable(&id, runnable);
+            last_id = id;
+        }
+        self.persist_registry()
+            .map_err(|e| ManagerError::PersistFailed(last_id, e))?;
         Ok(())
     }
 
@@ -184,7 +205,10 @@ impl PlatformManager {
         if !storage::registry_exists(&self.storage) {
             return Ok(Vec::new());
         }
-        let (tests, mut failures) = storage::load_registry(&self.storage)?;
+        let (tests, mut failures) = storage::load_registry(&self.storage).map_err(|e| match e {
+            storage::RegistryLoadError::Io(msg) => format!("registry read failed (retryable): {}", msg),
+            storage::RegistryLoadError::Parse(msg) => format!("registry file is corrupt: {}", msg),
+        })?;
         // Distinguish two kinds of duplicate: an id already in memory
         // BEFORE this load is the normal embedder-re-registered overlap
         // (skip silently); a second occurrence of an id WITHIN the file
@@ -243,8 +267,15 @@ impl PlatformManager {
                     }
                     stored
                 }
-                Err(_) => {
-                    // File-level corruption: preserve the evidence
+                // A transient READ failure says nothing about the data —
+                // rewriting from an empty stored set would erase intact
+                // definitions. Abort the persist instead; the caller sees
+                // PersistFailed and can retry.
+                Err(storage::RegistryLoadError::Io(msg)) => {
+                    return Err(format!("registry read failed before merge: {}", msg));
+                }
+                Err(storage::RegistryLoadError::Parse(_)) => {
+                    // Genuine file-level corruption: preserve the evidence
                     // instead of silently overwriting it.
                     let _ = storage::backup_corrupt_registry(&self.storage);
                     Vec::new()
@@ -347,6 +378,12 @@ impl TestManager for PlatformManager {
         // matches nothing and the tests it meant to skip execute) — the
         // mirror image of the include-typo checks below, and validated
         // even under run_all, where exclusions still apply.
+        //
+        // Deliberate tradeoff: this also fails a standing exclusion whose
+        // tag was legitimately drained (last such test removed). For a
+        // platform whose callers are AI agents and whose tags gate
+        // destructive tests, a loud no-op beats a silent widening; the
+        // error names the recovery for the drained-tag case.
         if !config.exclude_tags.is_empty() {
             let all_defs = self.registry.list_all();
             let unmatched: Vec<&String> = config
@@ -357,7 +394,8 @@ impl TestManager for PlatformManager {
             if !unmatched.is_empty() {
                 return Err(ManagerError::UnsupportedConfig(format!(
                     "exclude_tags {:?} match no registered test — a typo here \
-                     would silently run the tests it meant to exclude",
+                     would silently run the tests it meant to exclude; if the \
+                     tag was intentionally retired, remove it from exclude_tags",
                     unmatched
                 )));
             }
@@ -857,6 +895,102 @@ mod tests {
             v
         };
         assert_eq!(ids, vec!["a1", "a2", "b1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_read_failure_aborts_persist_instead_of_clobbering() {
+        let dir = crate::test_util::temp_storage_dir("mgr-io-abort");
+        fn def(id: &str) -> TestDefinition {
+            TestDefinition {
+                id: id.into(),
+                name: id.into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            }
+        }
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(def("t1"), Box::new(EchoTest { id: "t1".into(), pass: true }))
+            .unwrap();
+        // Swap the registry file for a directory: metadata() still
+        // succeeds but reading fails — an I/O error, not corruption.
+        let reg_path = format!("{}/registry.json", dir);
+        std::fs::remove_file(&reg_path).unwrap();
+        std::fs::create_dir(&reg_path).unwrap();
+        match mgr.register_runnable(def("t2"), Box::new(EchoTest { id: "t2".into(), pass: true })) {
+            Err(ManagerError::PersistFailed(id, msg)) => {
+                assert_eq!(id, "t2");
+                assert!(
+                    msg.contains("registry read failed before merge"),
+                    "unexpected persist error: {}",
+                    msg
+                );
+            }
+            other => panic!("expected PersistFailed, got {:?}", other),
+        }
+        // The unreadable path was left untouched: not overwritten, and
+        // not backed up as "corrupt" (an I/O failure is not evidence).
+        assert!(std::fs::metadata(&reg_path).unwrap().is_dir());
+        let no_backups = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e.file_name().to_string_lossy().contains("corrupt"));
+        assert!(no_backups);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_runnables_batch_persists_all() {
+        let dir = crate::test_util::temp_storage_dir("mgr-batch");
+        fn def(id: &str) -> TestDefinition {
+            TestDefinition {
+                id: id.into(),
+                name: id.into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            }
+        }
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnables(vec![
+            (def("b1"), Box::new(EchoTest { id: "b1".into(), pass: true }) as Box<dyn RunnableTest>),
+            (def("b2"), Box::new(EchoTest { id: "b2".into(), pass: true })),
+        ])
+        .unwrap();
+        // Both runnables are attached: the whole batch executes.
+        let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        assert_eq!(mgr.get_results(&run_id).unwrap().total, 2);
+        // And both definitions reached disk in the single persist.
+        let mut fresh = PlatformManager::new(&dir);
+        assert!(fresh.load_from_storage().unwrap().is_empty());
+        assert_eq!(fresh.discover(&DiscoveryQuery::default()).tests.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_runnables_batch_id_mismatch_persists_nothing() {
+        let dir = crate::test_util::temp_storage_dir("mgr-batch-mismatch");
+        fn def(id: &str) -> TestDefinition {
+            TestDefinition {
+                id: id.into(),
+                name: id.into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            }
+        }
+        let mut mgr = PlatformManager::new(&dir);
+        let err = mgr.register_runnables(vec![(
+            def("b1"),
+            Box::new(EchoTest { id: "WRONG".into(), pass: true }) as Box<dyn RunnableTest>,
+        )]);
+        assert!(matches!(err, Err(ManagerError::RegistrationFailed(_))));
+        // The batch failed before its single persist — nothing on disk.
+        assert!(std::fs::metadata(format!("{}/registry.json", dir)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
