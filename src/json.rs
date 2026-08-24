@@ -608,6 +608,13 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
             let mut depth = 0usize;
             let mut in_string = false;
             let mut escaped = false;
+            // Once the element's string or bracketed value has closed at
+            // depth 0, only whitespace may follow before the ',' or ']'.
+            // Anything else means the comma BETWEEN elements is missing —
+            // skeleton damage, which must not merge two healthy entries
+            // into one unparseable "entry" that gets dropped.
+            let mut value_closed = false;
+            let end;
             loop {
                 let b = match bytes.get(pos) {
                     Some(&b) => b,
@@ -620,29 +627,49 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                         escaped = true;
                     } else if b == b'"' {
                         in_string = false;
+                        if depth == 0 {
+                            value_closed = true;
+                        }
+                    }
+                } else if value_closed {
+                    match b {
+                        b',' | b']' => {
+                            end = pos;
+                            break;
+                        }
+                        _ if b.is_ascii_whitespace() => {}
+                        _ => return Err(JsonError::UnexpectedChar(pos, b as char)),
                     }
                 } else {
                     match b {
                         b'"' => in_string = true,
                         b'[' | b'{' => depth += 1,
-                        b']' | b'}' if depth > 0 => depth -= 1,
-                        b',' | b']' if depth == 0 => break,
+                        b']' | b'}' if depth > 0 => {
+                            depth -= 1;
+                            if depth == 0 {
+                                value_closed = true;
+                            }
+                        }
+                        b',' | b']' if depth == 0 => {
+                            end = pos;
+                            break;
+                        }
                         _ => {}
                     }
                 }
                 pos += 1;
             }
-            let piece = input[start..pos].trim();
+            let piece = input[start..end].trim();
             if piece.is_empty() {
                 // A zero-length element is damage to the array SKELETON
                 // (a trailing or doubled comma), not a damaged entry —
                 // reporting it per-entry would warn about a nonexistent
                 // entry and back up an intact file as corrupt.
-                return Err(JsonError::UnexpectedChar(pos, bytes[pos] as char));
+                return Err(JsonError::UnexpectedChar(end, bytes[end] as char));
             }
             elements.push(piece);
-            let closed = bytes[pos] == b']';
-            pos += 1;
+            let closed = bytes[end] == b']';
+            pos = end + 1;
             if closed {
                 break;
             }
@@ -740,6 +767,17 @@ mod tests {
         assert!(matches!(split_top_level_array("[1, 2,]"), Err(JsonError::UnexpectedChar(_, _))));
         assert!(matches!(split_top_level_array("[1,, 2]"), Err(JsonError::UnexpectedChar(_, _))));
         assert!(matches!(split_top_level_array("[,]"), Err(JsonError::UnexpectedChar(_, _))));
+        // A MISSING comma between two elements is the same class: it must
+        // error file-level, never merge two healthy entries into one
+        // unparseable slice that both get dropped.
+        assert!(matches!(
+            split_top_level_array(r#"[{"id": "a"} {"id": "b"}]"#),
+            Err(JsonError::UnexpectedChar(_, _))
+        ));
+        assert!(matches!(
+            split_top_level_array(r#"["a" "b"]"#),
+            Err(JsonError::UnexpectedChar(_, _))
+        ));
     }
 
     #[test]

@@ -342,7 +342,7 @@ impl PlatformManager {
         storage::save_run_summary(&self.storage, summary)
     }
 
-    fn next_run_id(&mut self) -> RunId {
+    fn next_run_id(&mut self) -> Result<RunId, ManagerError> {
         // Mint an id and CLAIM it by atomically creating its file — two
         // sessions racing on the same storage dir can never mint the same
         // id. The directory is scanned only on the first mint of a
@@ -354,13 +354,25 @@ impl PlatformManager {
             }
             self.run_counter += 1;
             let run_id = format!("run_{:04}", self.run_counter);
-            if storage::reserve_run_file(&self.storage, &run_id) {
-                return run_id;
+            match storage::reserve_run_file(&self.storage, &run_id) {
+                storage::ReserveOutcome::Claimed => return Ok(run_id),
+                // Claimed by another session: resync with disk and retry.
+                storage::ReserveOutcome::Taken => {
+                    self.run_counter = self
+                        .run_counter
+                        .max(storage::max_existing_run_number(&self.storage));
+                }
+                // Storage erroring: an unprotected id could collide with
+                // another session's and silently overwrite its summary —
+                // refuse to start rather than run without a claim.
+                storage::ReserveOutcome::Failed(msg) => {
+                    return Err(ManagerError::RunStartFailed(format!(
+                        "could not claim a run id ({}); no tests were \
+                         executed — retry when storage recovers",
+                        msg
+                    )));
+                }
             }
-            // Claimed by another session: resync with disk, then retry.
-            self.run_counter = self
-                .run_counter
-                .max(storage::max_existing_run_number(&self.storage));
         }
     }
 }
@@ -407,6 +419,18 @@ impl TestManager for PlatformManager {
                 "run_all: true conflicts with include filters (include_ids, \
                  include_tags, name_pattern) — drop run_all (include \
                  filters imply it is false) or drop the include filters"
+                    .into(),
+            ));
+        }
+
+        // An empty name_pattern substring-matches EVERY test. The JSON
+        // layer rejects this for its callers; a programmatic RunConfig
+        // (say, built from an empty UI field) must hit the same wall
+        // instead of silently running the whole suite.
+        if config.name_pattern.as_deref() == Some("") {
+            return Err(ManagerError::UnsupportedConfig(
+                "name_pattern is empty — an empty pattern would match \
+                 every test; drop name_pattern or supply a real pattern"
                     .into(),
             ));
         }
@@ -512,7 +536,7 @@ impl TestManager for PlatformManager {
             selected.iter().map(|t| t.id.clone()).collect()
         };
 
-        let run_id = self.next_run_id();
+        let run_id = self.next_run_id()?;
         let total = selected_ids.len() as u32;
 
         self.progress.start_run(run_id.clone(), total);
@@ -637,8 +661,11 @@ impl TestManager for PlatformManager {
         // completed comes from the RESULTS, not from total: a legacy file
         // (written before ghost-Error reconciliation) can hold fewer
         // results than selected tests, and claiming completed == total
-        // would contradict the counters shown beside it.
-        let completed = summary.results.len().min(u32::MAX as usize) as u32;
+        // would contradict the counters shown beside it. The inverse
+        // damage (MORE results than total) is capped at total so the
+        // snapshot never reports 150% — get_results is the diagnostic
+        // channel for such a file, progress just must not lie.
+        let completed = summary.results.len().min(summary.total as usize) as u32;
         let percent_complete = if summary.total > 0 {
             (completed as f64 / summary.total as f64) * 100.0
         } else {
@@ -1119,6 +1146,81 @@ mod tests {
         assert_eq!(progress.completed, 3);
         assert!((progress.percent_complete - 60.0).abs() < 1e-9);
         assert_eq!(progress.elapsed_ms, 3000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn programmatic_empty_pattern_is_rejected() {
+        // The JSON layer rejects an empty name_pattern; a programmatic
+        // RunConfig must hit the same wall instead of silently running
+        // the whole suite.
+        let dir = crate::test_util::temp_storage_dir("mgr-empty-pattern");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            crate::test_util::def("t1"),
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        )
+        .unwrap();
+        let config = RunConfig {
+            run_all: false,
+            name_pattern: Some(String::new()),
+            ..Default::default()
+        };
+        match mgr.start_run(config) {
+            Err(ManagerError::UnsupportedConfig(msg)) => {
+                assert!(msg.contains("name_pattern is empty"), "got: {}", msg);
+            }
+            other => panic!("expected UnsupportedConfig, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reservation_failure_refuses_to_start_instead_of_colliding() {
+        // While storage errors, an id claimed "best effort" is protected
+        // by nothing — two sessions could mint the same id and silently
+        // overwrite each other's summaries. Refuse to start instead.
+        let dir = crate::test_util::temp_storage_dir("mgr-reserve-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        // runs as a FILE: reservation create_new fails NotADirectory and
+        // the file provably does not exist — a storage failure.
+        std::fs::write(format!("{}/runs", dir), "file").unwrap();
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            crate::test_util::def("t1"),
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        )
+        .unwrap();
+        match mgr.start_run(RunConfig::default()) {
+            Err(ManagerError::RunStartFailed(msg)) => {
+                assert!(msg.contains("no tests were executed"), "got: {}", msg);
+            }
+            other => panic!("expected RunStartFailed, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn over_total_results_snapshot_caps_at_total() {
+        // The inverse of the legacy short-results case: a damaged file
+        // holding MORE results than its total must not yield 150%.
+        let dir = crate::test_util::temp_storage_dir("mgr-over-progress");
+        std::fs::create_dir_all(format!("{}/runs", dir)).unwrap();
+        std::fs::write(
+            format!("{}/runs/run_0001.json", dir),
+            r#"{"run_id": "run_0001", "total": 2, "passed": 3,
+                "results": [
+                    {"test_id": "a", "status": "passed", "duration_ms": 1},
+                    {"test_id": "b", "status": "passed", "duration_ms": 1},
+                    {"test_id": "c", "status": "passed", "duration_ms": 1}
+                ],
+                "started_at": 1000, "completed_at": 2000}"#,
+        )
+        .unwrap();
+        let mgr = PlatformManager::new(&dir);
+        let progress = mgr.check_progress("run_0001").unwrap();
+        assert_eq!(progress.completed, 2);
+        assert!((progress.percent_complete - 100.0).abs() < 1e-9);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

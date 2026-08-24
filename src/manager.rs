@@ -87,6 +87,10 @@ pub enum ManagerError {
     /// storage. The first field names what was being persisted: a run id,
     /// a test id, or a registration-batch descriptor.
     PersistFailed(String, String),
+    /// The run could NOT start — storage failed while claiming a run id,
+    /// so NO tests were executed. Distinct from PersistFailed, where the
+    /// run did execute; here a retry is safe and expected.
+    RunStartFailed(String),
 }
 
 /// Human/agent-facing rendering: every variant states what happened AND
@@ -139,6 +143,9 @@ impl std::fmt::Display for ManagerError {
                 "'{}' succeeded in memory but could not be written to storage: {}",
                 what, msg
             ),
+            ManagerError::RunStartFailed(msg) => {
+                write!(f, "the run did not start: {}", msg)
+            }
         }
     }
 }

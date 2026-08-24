@@ -276,34 +276,52 @@ pub fn run_summary_is_reserved_only(_paths: &StoragePaths, _run_id: &str) -> boo
     false
 }
 
+/// Outcome of attempting to claim a run id.
+#[derive(Debug)]
+pub enum ReserveOutcome {
+    /// The reservation file was atomically created — the id is ours.
+    Claimed,
+    /// Another session already holds this id — try the next number.
+    Taken,
+    /// Storage itself is erroring: the id is neither claimed nor
+    /// known-taken. Proceeding anyway would let two sessions mint the
+    /// SAME id during a transient error and silently overwrite each
+    /// other's summaries later — the caller must surface this, not run.
+    Failed(String),
+}
+
 /// Atomically claim a run id by creating its file with create_new —
-/// fails when another session already claimed it. Returns false ONLY on
-/// already-claimed; other IO errors report true (best effort — the later
-/// save will surface them) so callers can never loop forever.
+/// Taken when another session already claimed it, Failed when storage
+/// errors without proving either way.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn reserve_run_file(paths: &StoragePaths, run_id: &str) -> bool {
+pub fn reserve_run_file(paths: &StoragePaths, run_id: &str) -> ReserveOutcome {
     if !is_valid_run_id(run_id) {
-        return false;
+        return ReserveOutcome::Failed(format!("invalid run id '{}'", run_id));
     }
     let path = paths.run_path(run_id);
-    // Best effort — a create_dir failure surfaces via the open below.
+    // A create_dir failure surfaces via the open below.
     let _ = ensure_parent_dir(&path);
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        // Some other IO error: if the file turns out to exist, someone
-        // else claimed it — treat as taken so the caller retries the next
-        // id; only when it genuinely does not exist do we proceed
-        // best-effort (uniqueness degrades while storage itself errors,
-        // and the later save will surface the underlying problem).
-        Err(_) => std::fs::metadata(&path).is_err(),
+        Ok(_) => ReserveOutcome::Claimed,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => ReserveOutcome::Taken,
+        // Some other IO error: if the file demonstrably exists, someone
+        // else claimed it between the attempts — advance to the next id.
+        // Otherwise NOTHING is known; report the failure rather than
+        // "claim" an id no reservation actually protects.
+        Err(e) => {
+            if std::fs::metadata(&path).is_ok() {
+                ReserveOutcome::Taken
+            } else {
+                ReserveOutcome::Failed(format!("{}", e))
+            }
+        }
     }
 }
 
 /// WASM stub: no filesystem, no contention.
 #[cfg(target_arch = "wasm32")]
-pub fn reserve_run_file(_paths: &StoragePaths, _run_id: &str) -> bool {
-    true
+pub fn reserve_run_file(_paths: &StoragePaths, _run_id: &str) -> ReserveOutcome {
+    ReserveOutcome::Claimed
 }
 
 /// Save a run summary to JSON.
