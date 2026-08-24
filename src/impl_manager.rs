@@ -85,6 +85,11 @@ impl PlatformManager {
                 )));
             }
             self.runnables.push(runnable);
+            // Persist even on the attach path: "already in memory" does not
+            // mean "already durable" — a retry after PersistFailed lands
+            // here and must actually reach disk before reporting success.
+            self.persist_registry()
+                .map_err(|e| ManagerError::PersistFailed(definition.id, e))?;
             return Ok(());
         }
         let id = definition.id.clone();
@@ -256,6 +261,11 @@ impl TestManager for PlatformManager {
                     definition.id
                 )));
             }
+            // Persist even on the no-op path: "already in memory" does not
+            // mean "already durable" — a retry after PersistFailed lands
+            // here and must actually reach disk before reporting success.
+            self.persist_registry()
+                .map_err(|e| ManagerError::PersistFailed(definition.id, e))?;
             return Ok(());
         }
         let id = definition.id.clone();
@@ -441,17 +451,20 @@ impl TestManager for PlatformManager {
         }
         // Try loading from storage. A missing file is an unknown run; an
         // empty file is another session's reservation (running, or died
-        // before persisting) — no results yet, not corruption; a file with
-        // content that fails to parse is CORRUPTION and must say so —
-        // telling the user the run never happened hides real damage.
+        // before persisting) — no results yet, not corruption; a read
+        // failure is an access problem, not damage; only content that
+        // fails to PARSE is corruption — telling the user the run never
+        // happened, or that intact data is damaged, hides the real state.
         if !storage::run_summary_exists(&self.storage, run_id) {
             return Err(ManagerError::UnknownRun(run_id.into()));
         }
         if storage::run_summary_is_reserved_only(&self.storage, run_id) {
             return Err(ManagerError::RunInProgress(run_id.into()));
         }
-        storage::load_run_summary(&self.storage, run_id)
-            .map_err(|e| ManagerError::CorruptRun(run_id.into(), e))
+        storage::load_run_summary(&self.storage, run_id).map_err(|e| match e {
+            storage::RunLoadError::Io(msg) => ManagerError::ReadFailed(run_id.into(), msg),
+            storage::RunLoadError::Parse(msg) => ManagerError::CorruptRun(run_id.into(), msg),
+        })
     }
 }
 
@@ -639,6 +652,44 @@ mod tests {
         assert_eq!(mgr2.summary().total_tests, 2);
         let run_id = mgr2.start_run(RunConfig::default()).unwrap();
         assert_eq!(mgr2.get_results(&run_id).unwrap().total, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identical_reregistration_still_persists() {
+        // The no-op fast path must still write to disk: a retry after a
+        // failed persist lands there and success must mean durable.
+        let dir = crate::test_util::temp_storage_dir("mgr-fastpath");
+        let def = TestDefinition {
+            id: "d1".into(),
+            name: "t".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_test(def.clone()).unwrap();
+        // Simulate the definition never having reached disk.
+        std::fs::remove_file(format!("{}/registry.json", dir)).unwrap();
+        // Identical re-registration takes the fast path — and must persist.
+        mgr.register_test(def).unwrap();
+        let content = std::fs::read_to_string(format!("{}/registry.json", dir)).unwrap();
+        assert!(content.contains("\"d1\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_run_file_reports_read_failed_not_corrupt() {
+        // A directory in place of the run file makes the read fail with
+        // an I/O error — an access problem, not evidence of damage.
+        let dir = crate::test_util::temp_storage_dir("mgr-readfail");
+        std::fs::create_dir_all(format!("{}/runs/run_0042.json", dir)).unwrap();
+        let mgr = PlatformManager::new(&dir);
+        match mgr.get_results("run_0042") {
+            Err(ManagerError::ReadFailed(id, _)) => assert_eq!(id, "run_0042"),
+            other => panic!("expected ReadFailed, got {:?}", other.map(|_| ())),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

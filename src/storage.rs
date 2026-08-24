@@ -270,14 +270,26 @@ pub fn save_run_summary(paths: &StoragePaths, summary: &RunSummary) -> Result<()
     write_json_file(&paths.run_path(&summary.run_id), &json)
 }
 
+/// Why a run summary failed to load — I/O trouble is NOT evidence of a
+/// damaged record and callers must not report it as corruption.
+#[derive(Debug)]
+pub enum RunLoadError {
+    /// The file could not be read (permissions, transient I/O, deleted
+    /// between checks). Says nothing about the data.
+    Io(String),
+    /// The file was read but its content does not parse as a valid
+    /// summary — the record is damaged or version-incompatible.
+    Parse(String),
+}
+
 /// Load a run summary from JSON.
-pub fn load_run_summary(paths: &StoragePaths, run_id: &str) -> Result<RunSummary, String> {
+pub fn load_run_summary(paths: &StoragePaths, run_id: &str) -> Result<RunSummary, RunLoadError> {
     if !is_valid_run_id(run_id) {
-        return Err(format!("invalid run id '{}'", run_id));
+        return Err(RunLoadError::Io(format!("invalid run id '{}'", run_id)));
     }
-    let content = read_json_file(&paths.run_path(run_id))?;
-    let value = parse_json(&content).map_err(|e| format!("{}", e))?;
-    RunSummary::from_json(&value).map_err(|e| format!("{}", e))
+    let content = read_json_file(&paths.run_path(run_id)).map_err(RunLoadError::Io)?;
+    let value = parse_json(&content).map_err(|e| RunLoadError::Parse(format!("{}", e)))?;
+    RunSummary::from_json(&value).map_err(|e| RunLoadError::Parse(format!("{}", e)))
 }
 
 #[cfg(test)]

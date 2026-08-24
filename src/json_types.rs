@@ -235,6 +235,14 @@ fn parse_run_config(value: &JsonValue, reject_bare_run_all_false: bool) -> Resul
     let include_tags = strict_string_array(value, "include_tags")?;
     let exclude_tags = strict_string_array(value, "exclude_tags")?;
     let name_pattern = strict_opt_string(value, "name_pattern")?;
+    // An empty pattern substring-matches EVERY test — a config meant
+    // to narrow the run must never silently widen to the whole suite.
+    if name_pattern.as_deref() == Some("") {
+        return Err(JsonError::InvalidField(
+            "name_pattern".into(),
+            "a non-empty string (an empty pattern would match every test)".into(),
+        ));
+    }
     // run_all defaults to true unless an INCLUDE-side key was supplied.
     // Key PRESENCE decides, not emptiness: {"include_ids": []} selected
     // zero tests — that must become NoTestsMatched, never run-everything.
@@ -687,6 +695,8 @@ mod tests {
             r#"{"timeout_ms": "5s"}"#,
             // Beyond exact-JSON-integer range: reject, never saturate.
             r#"{"timeout_ms": 1e300}"#,
+            // An empty pattern would match every test — reject.
+            r#"{"name_pattern": ""}"#,
         ] {
             let val = parse_json(bad).unwrap();
             assert!(RunConfig::from_json(&val).is_err(), "should reject: {}", bad);

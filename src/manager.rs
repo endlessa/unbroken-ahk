@@ -62,6 +62,9 @@ pub enum ManagerError {
     /// A run file exists but could not be parsed — the run happened, its
     /// record is damaged (or written by an incompatible version).
     CorruptRun(RunId, String),
+    /// A run file exists but could not be READ (permissions, transient
+    /// I/O) — says nothing about the data; retry may succeed.
+    ReadFailed(RunId, String),
     /// The run has not completed yet.
     RunInProgress(RunId),
     /// The run already completed — cannot start again.
