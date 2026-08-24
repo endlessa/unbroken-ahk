@@ -387,8 +387,13 @@ impl FromJson for TestResult {
             "test result",
             &["test_id", "status", "duration_ms", "message", "stdout", "stderr"],
         )?;
-        let test_id = match value.get_str("test_id") {
-            Some(s) if !s.is_empty() => s.to_string(),
+        // The key must be present and a string, but an EMPTY id is
+        // accepted verbatim: pre-normalization writers persisted a buggy
+        // runnable's empty test_id as-is, and that history must stay
+        // readable (current writers cannot produce it — the executor
+        // normalizes ids). A missing/mistyped key is still damage.
+        let test_id = match value.get("test_id") {
+            Some(JsonValue::Str(s)) => s.to_string(),
             _ => return Err(JsonError::MissingField("test_id".into())),
         };
         let status = match value.get("status") {

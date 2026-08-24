@@ -510,6 +510,24 @@ fn console_vocabulary(msg: &str) -> String {
             .replace("run_all: true", "--all")
             .replace("run_all", "--all")
     }
+    // The values are echoed in Debug form, where an interior quote
+    // appears as \" — the span-close scan must skip escaped quotes or a
+    // value containing '"' would spill field names into the "unquoted"
+    // region and get rewritten.
+    fn find_close(s: &str) -> Option<usize> {
+        let bytes = s.as_bytes();
+        let mut escaped = false;
+        for (i, &b) in bytes.iter().enumerate() {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                return Some(i);
+            }
+        }
+        None
+    }
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
     loop {
@@ -521,7 +539,7 @@ fn console_vocabulary(msg: &str) -> String {
             Some(open) => {
                 out.push_str(&replace_fields(&rest[..open]));
                 let quoted = &rest[open + 1..];
-                match quoted.find('"') {
+                match find_close(quoted) {
                     Some(close) => {
                         out.push('"');
                         out.push_str(&quoted[..=close]);
@@ -930,6 +948,13 @@ mod tests {
         let out = execute_command(&mut mgr, "run --tag include_tags");
         assert!(out.text.contains("\"include_tags\""), "got: {}", out.text);
         assert!(out.text.contains("--tag"), "got: {}", out.text);
+
+        // Even when the echoed value CONTAINS a double quote (Debug
+        // escapes it as \"): the escaped quote must not end the span and
+        // expose the value's tail to field replacement.
+        let out = execute_command(&mut mgr, "run --tag=x\"include_tags");
+        assert!(out.text.contains("x\\\"include_tags"), "got: {}", out.text);
+        assert!(!out.text.contains("x\\\"--tag"), "got: {}", out.text);
     }
 
     #[test]

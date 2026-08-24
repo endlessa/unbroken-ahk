@@ -253,6 +253,20 @@ pub fn parse_request(json_input: &str) -> Result<McpRequest, String> {
 
 /// Dispatch an MCP request to the appropriate handler.
 pub fn handle_request(manager: &mut PlatformManager, request: &McpRequest) -> McpResponse {
+    // Parameter-less tools reject supplied params like every other
+    // handler rejects unknown keys: {"tool": "test_list_tags",
+    // "params": {"group": "auth"}} answered with the FULL unfiltered
+    // list reads as a filtered result.
+    if matches!(
+        request.tool.as_str(),
+        "tool_list" | "test_summary" | "test_list_tags" | "test_list_groups"
+    ) && !matches!(&request.params, JsonValue::Object(pairs) if pairs.is_empty())
+    {
+        return McpResponse::err(&format!(
+            "'{}' takes no parameters (use test_discover to filter tests)",
+            request.tool
+        ));
+    }
     match request.tool.as_str() {
         "tool_list" => handle_tool_list(),
         "test_summary" => handle_summary(manager),
@@ -825,6 +839,24 @@ mod tests {
             .get_str("error")
             .unwrap()
             .contains("conflicts with include filters"));
+    }
+
+    #[test]
+    fn parameterless_tools_reject_supplied_params() {
+        // A "filtered" request answered with the full unfiltered list
+        // reads as a filtered result — reject loudly instead.
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(
+            &mut mgr,
+            r#"{"tool": "test_list_tags", "params": {"group": "auth"}}"#,
+        );
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("takes no parameters"));
+        // Absent and null params still work.
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_list_tags", "params": null}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(true));
     }
 
     #[test]

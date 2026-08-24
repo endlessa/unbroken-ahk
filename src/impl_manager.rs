@@ -504,10 +504,30 @@ impl PlatformManager {
 
         let selected_set: std::collections::HashSet<&str> =
             selected_ids.iter().map(|s| s.as_str()).collect();
+        let attached: std::collections::HashSet<&str> = self
+            .runnables
+            .iter()
+            .map(|r| r.id())
+            .filter(|id| selected_set.contains(id))
+            .collect();
+
+        // Under fail_fast, a selected definition with no runnable is a
+        // KNOWN Error before anything executes — the run must stop at its
+        // position in selection order, not execute the whole suite and
+        // append the Error at the end.
+        let first_ghost = if config.fail_fast {
+            selected_ids.iter().position(|id| !attached.contains(id.as_str()))
+        } else {
+            None
+        };
+        let execute_ids: std::collections::HashSet<&str> = match first_ghost {
+            Some(i) => selected_ids[..i].iter().map(|s| s.as_str()).collect(),
+            None => selected_set,
+        };
         let runnables: Vec<&dyn RunnableTest> = self
             .runnables
             .iter()
-            .filter(|r| selected_set.contains(r.id()))
+            .filter(|r| execute_ids.contains(r.id()))
             .map(|r| r.as_ref())
             .collect();
 
@@ -536,26 +556,63 @@ impl PlatformManager {
         // (The executor now normalizes result ids to the registered id,
         // so mismatches cannot reach here; this keying stays as the
         // definition-only detection and as defense in depth.)
-        let ran: std::collections::HashSet<&str> = runnables.iter().map(|r| r.id()).collect();
-        let missing: Vec<String> = selected_ids
-            .iter()
-            .filter(|id| !ran.contains(id.as_str()))
-            .cloned()
-            .collect();
-        for id in missing {
-            let result = TestResult {
-                test_id: id.clone(),
-                status: TestStatus::Error,
-                duration_ms: 0,
-                message: Some(format!(
-                    "no runnable registered for test '{}' (definition only)",
-                    id
-                )),
-                stdout: None,
-                stderr: None,
-            };
-            self.progress.test_completed(&run_id, &result);
-            results.push(result);
+        if let Some(i) = first_ghost {
+            // fail_fast, and selected_ids[i] is the first definition-only
+            // test: it stops the run at its own position — unless the
+            // executor already stopped on a real failure before that
+            // point, in which case its turn (like everything after it)
+            // never came and it is Skipped, not Errored.
+            let executor_failed = results
+                .iter()
+                .any(|r| matches!(r.status, TestStatus::Failed | TestStatus::Error));
+            for (offset, id) in selected_ids[i..].iter().enumerate() {
+                let result = if offset == 0 && !executor_failed {
+                    TestResult {
+                        test_id: id.clone(),
+                        status: TestStatus::Error,
+                        duration_ms: 0,
+                        message: Some(format!(
+                            "no runnable registered for test '{}' (definition only)",
+                            id
+                        )),
+                        stdout: None,
+                        stderr: None,
+                    }
+                } else {
+                    TestResult {
+                        test_id: id.clone(),
+                        status: TestStatus::Skipped,
+                        duration_ms: 0,
+                        message: Some("Skipped due to fail_fast".into()),
+                        stdout: None,
+                        stderr: None,
+                    }
+                };
+                self.progress.test_completed(&run_id, &result);
+                results.push(result);
+            }
+        } else {
+            let ran: std::collections::HashSet<&str> = runnables.iter().map(|r| r.id()).collect();
+            let missing: Vec<String> = selected_ids
+                .iter()
+                .filter(|id| !ran.contains(id.as_str()))
+                .cloned()
+                .collect();
+            for id in missing {
+                let result = TestResult {
+                    test_id: id.clone(),
+                    status: TestStatus::Error,
+                    duration_ms: 0,
+                    message: Some(format!(
+                        "no runnable registered for test '{}' (definition only)",
+                        id
+                    )),
+                    stdout: None,
+                    stderr: None,
+                };
+                self.progress.test_completed(&run_id, &result);
+                results.push(result);
+            }
         }
 
         self.progress.finish_run(&run_id);
@@ -1315,6 +1372,76 @@ mod tests {
         let progress = mgr.check_progress(&run_id).unwrap();
         assert!(progress.finished);
         assert_eq!(progress.completed, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fail_fast_stops_at_definition_only_tests_in_order() {
+        use crate::test_util::def;
+        let dir = crate::test_util::temp_storage_dir("mgr-ff-ghost");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(def("t1"), Box::new(EchoTest { id: "t1".into(), pass: true }))
+            .unwrap();
+        mgr.register_test(def("t2")).unwrap(); // definition only
+        mgr.register_runnable(def("t3"), Box::new(EchoTest { id: "t3".into(), pass: true }))
+            .unwrap();
+        let config = RunConfig {
+            fail_fast: true,
+            ..Default::default()
+        };
+        let summary = mgr.run_to_completion(config).unwrap();
+        // The run stops AT the definition-only test's position: t1 ran,
+        // t2 errored, t3 was never executed.
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.errored, 1);
+        assert_eq!(summary.skipped, 1);
+        let by_id = |id: &str| summary.results.iter().find(|r| r.test_id == id).unwrap();
+        assert!(matches!(by_id("t1").status, TestStatus::Passed));
+        assert!(matches!(by_id("t2").status, TestStatus::Error));
+        assert!(matches!(by_id("t3").status, TestStatus::Skipped));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fail_fast_real_failure_before_ghost_skips_the_ghost() {
+        use crate::test_util::def;
+        let dir = crate::test_util::temp_storage_dir("mgr-ff-ghost2");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(def("t1"), Box::new(EchoTest { id: "t1".into(), pass: false }))
+            .unwrap();
+        mgr.register_test(def("t2")).unwrap(); // definition only
+        let config = RunConfig {
+            fail_fast: true,
+            ..Default::default()
+        };
+        let summary = mgr.run_to_completion(config).unwrap();
+        // The executor stopped on t1's failure — t2's turn never came,
+        // so it is Skipped, not a definition-only Error.
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.errored, 0);
+        assert_eq!(summary.skipped, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_empty_test_id_in_stored_results_still_loads() {
+        // Pre-normalization writers persisted a buggy runnable's empty
+        // test_id verbatim; that history must stay readable, not become
+        // CorruptRun after the upgrade.
+        let dir = crate::test_util::temp_storage_dir("mgr-legacy-emptyid");
+        std::fs::create_dir_all(format!("{}/runs", dir)).unwrap();
+        std::fs::write(
+            format!("{}/runs/run_0001.json", dir),
+            r#"{"run_id": "run_0001", "total": 1, "passed": 1,
+                "results": [{"test_id": "", "status": "passed", "duration_ms": 1}],
+                "started_at": 1000, "completed_at": 2000}"#,
+        )
+        .unwrap();
+        let mgr = PlatformManager::new(&dir);
+        let summary = mgr.get_results("run_0001").unwrap();
+        assert_eq!(summary.results[0].test_id, "");
+        assert_eq!(summary.passed, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
