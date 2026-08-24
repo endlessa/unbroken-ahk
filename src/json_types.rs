@@ -35,8 +35,14 @@ impl FromJson for TestDefinition {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
         // id and name are the test's identity — a missing, mistyped, or empty
         // value must be a load error, not a silent ghost entry. The remaining
-        // fields are equally strict when present: silently-dropped tags or
-        // metadata are invisible corruption.
+        // fields are equally strict when present, and unknown keys are
+        // rejected (registry.json is hand-editable; a misspelled field
+        // silently dropped is invisible corruption).
+        reject_unknown_keys(
+            value,
+            "test definition",
+            &["id", "name", "tags", "group", "description", "metadata"],
+        )?;
         let id = match value.get_str("id") {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return Err(JsonError::MissingField("id".into())),
@@ -235,9 +241,11 @@ fn parse_run_config(value: &JsonValue, reject_bare_run_all_false: bool) -> Resul
     let include_tags = strict_string_array(value, "include_tags")?;
     let exclude_tags = strict_string_array(value, "exclude_tags")?;
     let name_pattern = strict_opt_string(value, "name_pattern")?;
-    // An empty pattern substring-matches EVERY test — a config meant
+    // An empty pattern substring-matches EVERY test — CALLER input meant
     // to narrow the run must never silently widen to the whole suite.
-    if name_pattern.as_deref() == Some("") {
+    // Stored configs are exempt (same gate as the run_all guard below):
+    // history persisted by older, lenient versions must stay readable.
+    if reject_bare_run_all_false && name_pattern.as_deref() == Some("") {
         return Err(JsonError::InvalidField(
             "name_pattern".into(),
             "a non-empty string (an empty pattern would match every test)".into(),
@@ -781,6 +789,26 @@ mod tests {
         // The same config shape as direct caller input still errors.
         let caller = parse_json(r#"{"run_all": false, "exclude_tags": ["slow"]}"#).unwrap();
         assert!(RunConfig::from_json(&caller).is_err());
+
+        // Old lenient versions also accepted an empty name_pattern from
+        // callers — stored history with it must stay readable, while
+        // fresh caller input rejects it.
+        let old_pattern = parse_json(r#"{
+            "run_id": "run_0008",
+            "config": {"run_all": false, "name_pattern": "", "fail_fast": false},
+            "results": [], "total": 3, "passed": 3, "failed": 0, "skipped": 0,
+            "errored": 0, "total_duration_ms": 9, "started_at": 1, "completed_at": 10
+        }"#).unwrap();
+        assert!(RunSummary::from_json(&old_pattern).is_ok());
+    }
+
+    #[test]
+    fn test_definition_unknown_keys_error() {
+        // registry.json is hand-editable — a misspelled field must error,
+        // never silently drop.
+        let val = parse_json(r#"{"id": "t1", "name": "x", "tag": ["smoke"]}"#).unwrap();
+        let err = TestDefinition::from_json(&val).unwrap_err();
+        assert!(format!("{}", err).contains("valid keys"));
     }
 
     #[test]

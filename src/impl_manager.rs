@@ -56,7 +56,37 @@ impl PlatformManager {
         }
     }
 
+    /// Ensure a definition is registered in memory: a brand-new id is
+    /// inserted; an identical already-registered definition is a no-op
+    /// (the load-then-register restart flow, and retries after
+    /// PersistFailed); a conflicting definition is an error. The single
+    /// shared implementation behind register_runnable and register_test —
+    /// persistence is the caller's next step, ALWAYS attempted so that
+    /// success means durable.
+    fn ensure_definition(&mut self, definition: TestDefinition) -> Result<TestId, ManagerError> {
+        let id = definition.id.clone();
+        if let Some(existing) = self.registry.get(&id) {
+            if *existing != definition {
+                return Err(ManagerError::RegistrationFailed(format!(
+                    "definition for '{}' conflicts with the already-registered one",
+                    id
+                )));
+            }
+        } else {
+            self.registry
+                .register(definition)
+                .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
+        }
+        Ok(id)
+    }
+
     /// Register a runnable test implementation alongside its definition.
+    ///
+    /// Idempotent for an identical definition: re-registering (a restart
+    /// after load_from_storage, or a retry after PersistFailed) keeps the
+    /// already-attached runnable, re-attempts persistence, and reports
+    /// success only when the definition is durable. A conflicting
+    /// definition is an error.
     pub fn register_runnable(
         &mut self,
         definition: TestDefinition,
@@ -67,37 +97,13 @@ impl PlatformManager {
                 "runnable ID does not match definition ID".into(),
             ));
         }
-        // Load-then-register restart flow: if an identical definition was
-        // already restored from storage, just attach the runnable to it.
-        // A conflicting definition, or a second runnable for the same id,
-        // is still an error.
-        if let Some(existing) = self.registry.get(&definition.id) {
-            if *existing != definition {
-                return Err(ManagerError::RegistrationFailed(format!(
-                    "definition for '{}' conflicts with the already-registered one",
-                    definition.id
-                )));
-            }
-            if self.runnables.iter().any(|r| r.id() == definition.id) {
-                return Err(ManagerError::RegistrationFailed(format!(
-                    "a runnable is already registered for '{}'",
-                    definition.id
-                )));
-            }
+        let id = self.ensure_definition(definition)?;
+        if !self.runnables.iter().any(|r| r.id() == id) {
             self.runnables.push(runnable);
-            // Persist even on the attach path: "already in memory" does not
-            // mean "already durable" — a retry after PersistFailed lands
-            // here and must actually reach disk before reporting success.
-            self.persist_registry()
-                .map_err(|e| ManagerError::PersistFailed(definition.id, e))?;
-            return Ok(());
         }
-        let id = definition.id.clone();
-        self.registry
-            .register(definition)
-            .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
-        self.runnables.push(runnable);
-        // Registered in memory either way; a failed write must be loud.
+        // Persist unconditionally — "already in memory" does not mean
+        // "already durable"; a retry after PersistFailed must reach disk
+        // before reporting success.
         self.persist_registry()
             .map_err(|e| ManagerError::PersistFailed(id, e))?;
         Ok(())
@@ -251,28 +257,8 @@ impl TestManager for PlatformManager {
     }
 
     fn register_test(&mut self, definition: TestDefinition) -> Result<(), ManagerError> {
-        // Same load-then-register restart tolerance as register_runnable:
-        // an identical definition already restored from storage is a
-        // no-op; a conflicting one is an error.
-        if let Some(existing) = self.registry.get(&definition.id) {
-            if *existing != definition {
-                return Err(ManagerError::RegistrationFailed(format!(
-                    "definition for '{}' conflicts with the already-registered one",
-                    definition.id
-                )));
-            }
-            // Persist even on the no-op path: "already in memory" does not
-            // mean "already durable" — a retry after PersistFailed lands
-            // here and must actually reach disk before reporting success.
-            self.persist_registry()
-                .map_err(|e| ManagerError::PersistFailed(definition.id, e))?;
-            return Ok(());
-        }
-        let id = definition.id.clone();
-        self.registry
-            .register(definition)
-            .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
-        // Registered in memory either way; a failed write must be loud.
+        let id = self.ensure_definition(definition)?;
+        // Persist unconditionally — see register_runnable.
         self.persist_registry()
             .map_err(|e| ManagerError::PersistFailed(id, e))?;
         Ok(())
@@ -383,7 +369,9 @@ impl TestManager for PlatformManager {
         let mut total_duration = 0u64;
 
         for r in &results {
-            total_duration += r.duration_ms;
+            // Saturate — a runnable reporting a pathological duration must
+            // not panic (debug) or wrap (release) after tests already ran.
+            total_duration = total_duration.saturating_add(r.duration_ms);
             match r.status {
                 TestStatus::Passed => passed += 1,
                 TestStatus::Failed => failed += 1,
@@ -953,9 +941,34 @@ mod tests {
         assert_eq!(summary.passed, 1);
         assert_eq!(summary.errored, 0);
 
-        // A second runnable for the same id is still rejected, as is a
-        // conflicting definition.
-        assert!(mgr2.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).is_err());
+        // Re-registering the identical definition is idempotent (the
+        // existing runnable is kept); a conflicting definition errors.
+        assert!(mgr2.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).is_ok());
+        let conflicting = TestDefinition { name: "renamed".into(), ..def };
+        assert!(mgr2.register_runnable(conflicting, Box::new(EchoTest { id: "t1".into(), pass: true })).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runnable_reregistration_still_persists() {
+        // The idempotent path must still write to disk so a retry after a
+        // failed persist actually recovers durability.
+        let dir = crate::test_util::temp_storage_dir("mgr-runfastpath");
+        let def = TestDefinition {
+            id: "t1".into(),
+            name: "t".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        // Simulate the definition never having reached disk.
+        std::fs::remove_file(format!("{}/registry.json", dir)).unwrap();
+        mgr.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        let content = std::fs::read_to_string(format!("{}/registry.json", dir)).unwrap();
+        assert!(content.contains("\"t1\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
