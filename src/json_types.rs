@@ -226,17 +226,19 @@ impl FromJson for RunConfig {
             .any(|k| matches!(value.get(k), Some(v) if !matches!(v, JsonValue::Null)));
         let run_all_explicit = strict_opt_bool(value, "run_all")?;
         let run_all = run_all_explicit.unwrap_or(!includes_supplied);
-        // An explicit run_all=false with no include keys and no exclusions
-        // selects nothing by definition — name the cause and the fix here,
-        // where key presence is still visible, instead of a bare
-        // no-tests-matched downstream. ({"run_all": false, "include_ids": []}
-        // keeps its NoTestsMatched contract: an include key WAS supplied.)
-        if run_all_explicit == Some(false) && !includes_supplied && exclude_tags.is_empty() {
+        // An explicit run_all=false without include keys selects nothing by
+        // definition — exclusions never resurrect an empty selection — so
+        // name the cause and the fix here, where key presence is still
+        // visible, instead of a bare no-tests-matched downstream.
+        // ({"run_all": false, "include_ids": []} keeps its NoTestsMatched
+        // contract: an include key WAS supplied.)
+        if run_all_explicit == Some(false) && !includes_supplied {
             return Err(JsonError::InvalidField(
                 "run_all".into(),
-                "false requires at least one filter (include_ids, include_tags, \
-                 name_pattern, or exclude_tags) — with run_all false and no \
-                 filters nothing is selected; drop run_all or add filters"
+                "false requires at least one include filter (include_ids, \
+                 include_tags, or name_pattern) — exclusions cannot resurrect \
+                 an empty selection, so with run_all false nothing is selected; \
+                 drop run_all or add include filters"
                     .into(),
             ));
         }

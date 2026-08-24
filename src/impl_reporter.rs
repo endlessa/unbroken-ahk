@@ -79,8 +79,10 @@ fn format_summary_text(s: &RunSummary) -> String {
 
 fn format_progress_text(p: &RunProgress) -> String {
     let bar_width = 30;
+    // Clamp: completed > total should be impossible, but a rendering
+    // function must never underflow/OOM on inconsistent counts.
     let filled = if p.total > 0 {
-        (p.completed as usize * bar_width) / p.total as usize
+        ((p.completed as usize * bar_width) / p.total as usize).min(bar_width)
     } else {
         0
     };

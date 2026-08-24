@@ -156,14 +156,30 @@ pub fn load_registry(
     Ok((tests, entry_errors))
 }
 
+/// Run IDs are always minted as run_<digits>. Anything else cannot name a
+/// real run — and must never reach the filesystem, where a crafted id
+/// like "../registry" would escape the runs directory. Enforced HERE, at
+/// the layer that builds the path, so every caller is covered.
+pub fn is_valid_run_id(id: &str) -> bool {
+    id.strip_prefix("run_")
+        .map(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
 /// Save a run summary to JSON.
 pub fn save_run_summary(paths: &StoragePaths, summary: &RunSummary) -> Result<(), String> {
+    if !is_valid_run_id(&summary.run_id) {
+        return Err(format!("invalid run id '{}'", summary.run_id));
+    }
     let json = to_json_pretty(&summary.to_json());
     write_json_file(&paths.run_path(&summary.run_id), &json)
 }
 
 /// Load a run summary from JSON.
 pub fn load_run_summary(paths: &StoragePaths, run_id: &str) -> Result<RunSummary, String> {
+    if !is_valid_run_id(run_id) {
+        return Err(format!("invalid run id '{}'", run_id));
+    }
     let content = read_json_file(&paths.run_path(run_id))?;
     let value = parse_json(&content).map_err(|e| format!("{}", e))?;
     RunSummary::from_json(&value).map_err(|e| format!("{}", e))

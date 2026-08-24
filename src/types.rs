@@ -21,7 +21,7 @@ pub type DurationMs = u64;
 
 /// A single test's identity and metadata as known to the registry.
 /// This is what discovery produces and what callers see when they search.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestDefinition {
     /// Unique identifier for this test.
     pub id: TestId,

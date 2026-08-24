@@ -313,56 +313,49 @@ fn handle_run(manager: &mut PlatformManager, params: &JsonValue) -> McpResponse 
     }
 }
 
-fn handle_progress(manager: &PlatformManager, params: &JsonValue) -> McpResponse {
-    // A non-object params (e.g. a bare run-id string) is a caller mistake;
-    // get("run_id") on it would return None and silently list active runs.
+/// Shared extraction of the optional run_id parameter.
+///
+/// Ok(Some(id)): a string run_id was supplied. Ok(None): absent, or
+/// explicit null (the JSON convention for "not set"). Err: non-object
+/// params or a non-string run_id — caller mistakes that must error rather
+/// than silently act like "not set".
+fn run_id_param(params: &JsonValue) -> Result<Option<&str>, String> {
     if !matches!(params, JsonValue::Object(_)) {
-        return McpResponse::err(&format!(
+        return Err(format!(
             "Parameters must be an object like {{\"run_id\": \"...\"}}, got: {}",
             crate::json::to_json_compact(params)
         ));
     }
     match params.get("run_id") {
-        Some(JsonValue::Str(run_id)) => {
-            match manager.check_progress(run_id) {
-                Ok(progress) => McpResponse::ok(progress.to_json()),
-                Err(e) => McpResponse::err(&format!("{:?}", e)),
-            }
-        }
-        // Absent — or explicit null, the JSON convention for "not set" —
-        // means "list the active runs".
-        None | Some(JsonValue::Null) => {
-            let active = manager.active_runs();
-            McpResponse::ok(str_array(&active))
-        }
-        // Present with a non-string, non-null type: a caller mistake, not
-        // a request to list active runs — error so the caller can correct it.
-        Some(other) => McpResponse::err(&format!(
+        Some(JsonValue::Str(run_id)) => Ok(Some(run_id)),
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(other) => Err(format!(
             "Parameter 'run_id' must be a string, got: {}",
             crate::json::to_json_compact(other)
         )),
     }
 }
 
-fn handle_results(manager: &PlatformManager, params: &JsonValue) -> McpResponse {
-    if !matches!(params, JsonValue::Object(_)) {
-        return McpResponse::err(&format!(
-            "Parameters must be an object like {{\"run_id\": \"...\"}}, got: {}",
-            crate::json::to_json_compact(params)
-        ));
+fn handle_progress(manager: &PlatformManager, params: &JsonValue) -> McpResponse {
+    match run_id_param(params) {
+        Ok(Some(run_id)) => match manager.check_progress(run_id) {
+            Ok(progress) => McpResponse::ok(progress.to_json()),
+            Err(e) => McpResponse::err(&format!("{:?}", e)),
+        },
+        // No run_id means "list the active runs".
+        Ok(None) => McpResponse::ok(str_array(&manager.active_runs())),
+        Err(e) => McpResponse::err(&e),
     }
-    match params.get("run_id") {
-        Some(JsonValue::Str(run_id)) => {
-            match manager.get_results(run_id) {
-                Ok(summary) => McpResponse::ok(summary.to_json()),
-                Err(e) => McpResponse::err(&format!("{:?}", e)),
-            }
-        }
-        None | Some(JsonValue::Null) => McpResponse::err("Missing required parameter: 'run_id'"),
-        Some(other) => McpResponse::err(&format!(
-            "Parameter 'run_id' must be a string, got: {}",
-            crate::json::to_json_compact(other)
-        )),
+}
+
+fn handle_results(manager: &PlatformManager, params: &JsonValue) -> McpResponse {
+    match run_id_param(params) {
+        Ok(Some(run_id)) => match manager.get_results(run_id) {
+            Ok(summary) => McpResponse::ok(summary.to_json()),
+            Err(e) => McpResponse::err(&format!("{:?}", e)),
+        },
+        Ok(None) => McpResponse::err("Missing required parameter: 'run_id'"),
+        Err(e) => McpResponse::err(&e),
     }
 }
 
@@ -570,11 +563,13 @@ mod tests {
         assert_eq!(data.get("total").and_then(|v| v.as_f64()), Some(2.0));
         assert_eq!(data.get("passed").and_then(|v| v.as_f64()), Some(2.0));
 
-        // An explicit run_all=false with only exclusions selects nothing.
+        // An explicit run_all=false with only exclusions selects nothing —
+        // and says so with the explanatory parse error (exclusions cannot
+        // resurrect an empty selection).
         let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"run_all": false, "exclude_tags": ["slow"]}}"#);
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
-        assert!(val.get_str("error").unwrap().contains("NoTestsMatched"));
+        assert!(val.get_str("error").unwrap().contains("nothing is selected"));
     }
 
     #[test]

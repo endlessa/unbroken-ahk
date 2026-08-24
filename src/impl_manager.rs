@@ -67,6 +67,26 @@ impl PlatformManager {
                 "runnable ID does not match definition ID".into(),
             ));
         }
+        // Load-then-register restart flow: if an identical definition was
+        // already restored from storage, just attach the runnable to it.
+        // A conflicting definition, or a second runnable for the same id,
+        // is still an error.
+        if let Some(existing) = self.registry.get(&definition.id) {
+            if *existing != definition {
+                return Err(ManagerError::RegistrationFailed(format!(
+                    "definition for '{}' conflicts with the already-registered one",
+                    definition.id
+                )));
+            }
+            if self.runnables.iter().any(|r| r.id() == definition.id) {
+                return Err(ManagerError::RegistrationFailed(format!(
+                    "a runnable is already registered for '{}'",
+                    definition.id
+                )));
+            }
+            self.runnables.push(runnable);
+            return Ok(());
+        }
         self.registry
             .register(definition)
             .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
@@ -158,14 +178,6 @@ impl PlatformManager {
     }
 }
 
-/// Run IDs are always minted as run_<digits>. Anything else cannot name a
-/// real run — and must never reach the filesystem, where a crafted id
-/// like "../registry" would escape the runs directory.
-fn is_valid_run_id(id: &str) -> bool {
-    id.strip_prefix("run_")
-        .map(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-        .unwrap_or(false)
-}
 
 impl TestManager for PlatformManager {
     fn discover(&self, query: &DiscoveryQuery) -> DiscoveryResult {
@@ -198,15 +210,18 @@ impl TestManager for PlatformManager {
         }
 
         // A misspelled include id must error, never silently shrink the
-        // run while other criteria still match something.
-        let unknown_ids: Vec<String> = config
-            .include_ids
-            .iter()
-            .filter(|id| self.registry.get(id).is_none())
-            .cloned()
-            .collect();
-        if !unknown_ids.is_empty() {
-            return Err(ManagerError::UnknownTestIds(unknown_ids));
+        // run while other criteria still match something. Skipped under
+        // run_all, where include filters are documented as ignored.
+        if !config.run_all {
+            let unknown_ids: Vec<String> = config
+                .include_ids
+                .iter()
+                .filter(|id| self.registry.get(id).is_none())
+                .cloned()
+                .collect();
+            if !unknown_ids.is_empty() {
+                return Err(ManagerError::UnknownTestIds(unknown_ids));
+            }
         }
 
         // Collect selected test IDs upfront to avoid borrow conflicts
@@ -253,11 +268,13 @@ impl TestManager for PlatformManager {
         // Surface each as an explicit Error result instead of silently
         // shrinking the run (the classic case: definitions restored from
         // storage after a restart, with no runnables re-attached).
-        let executed: std::collections::HashSet<&str> =
-            results.iter().map(|r| r.test_id.as_str()).collect();
+        // Keyed on the runnables' REGISTERED ids, not the test_id inside
+        // their results — a buggy runnable returning a mismatched test_id
+        // must not double-count the run (phantom result + spurious ghost).
+        let ran: std::collections::HashSet<&str> = runnables.iter().map(|r| r.id()).collect();
         let missing: Vec<String> = selected_ids
             .iter()
-            .filter(|id| !executed.contains(id.as_str()))
+            .filter(|id| !ran.contains(id.as_str()))
             .cloned()
             .collect();
         for id in missing {
@@ -334,9 +351,9 @@ impl TestManager for PlatformManager {
 
     fn get_results(&self, run_id: &str) -> Result<RunSummary, ManagerError> {
         // Reject non-run-shaped ids before anything else — the storage
-        // fallback below builds a file path from this string, and a
-        // crafted id ("../registry") must never escape the runs dir.
-        if !is_valid_run_id(run_id) {
+        // layer validates too, but rejecting here gives the typed
+        // UnknownRun error without touching disk.
+        if !storage::is_valid_run_id(run_id) {
             return Err(ManagerError::UnknownRun(run_id.into()));
         }
         // Check completed runs in memory first
@@ -548,6 +565,111 @@ mod tests {
             Err(ManagerError::NoTestsMatched) => {}
             other => panic!("expected NoTestsMatched, got {:?}", other.map(|_| ())),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct LyingTest;
+    impl RunnableTest for LyingTest {
+        fn id(&self) -> &str {
+            "t1"
+        }
+        fn run(&self, _timeout: Option<DurationMs>) -> TestResult {
+            TestResult {
+                test_id: "other".into(), // deliberately mismatched
+                status: TestStatus::Passed,
+                duration_ms: 1,
+                message: None,
+                stdout: None,
+                stderr: None,
+            }
+        }
+    }
+
+    #[test]
+    fn mismatched_result_test_id_does_not_double_count() {
+        // A runnable whose run() returns the wrong test_id must not
+        // produce a phantom result + spurious ghost Error, or drive
+        // progress completed above total.
+        let dir = crate::test_util::temp_storage_dir("mgr-lying");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "t".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(LyingTest),
+        ).unwrap();
+        let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        let summary = mgr.get_results(&run_id).unwrap();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.results.len(), 1);
+        let prog = mgr.check_progress(&run_id).unwrap();
+        assert_eq!(prog.completed, 1);
+        assert_eq!(prog.total, 1);
+        // The progress bar renderer must not panic on any counts.
+        let _ = mgr.format_progress(&run_id, ReportFormat::Text).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_then_register_order_works() {
+        // The reverse restart order: restore definitions from storage
+        // FIRST, then attach runnables — must not fail as a duplicate,
+        // and the runnable must actually attach (no ghost Errors).
+        let dir = crate::test_util::temp_storage_dir("mgr-loadfirst");
+        let def = TestDefinition {
+            id: "t1".into(),
+            name: "t".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+        let mut mgr1 = PlatformManager::new(&dir);
+        mgr1.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+
+        let mut mgr2 = PlatformManager::new(&dir);
+        assert!(mgr2.load_from_storage().unwrap().is_empty());
+        mgr2.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        let run_id = mgr2.start_run(RunConfig::default()).unwrap();
+        let summary = mgr2.get_results(&run_id).unwrap();
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.errored, 0);
+
+        // A second runnable for the same id is still rejected, as is a
+        // conflicting definition.
+        assert!(mgr2.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_all_ignores_stale_include_ids() {
+        // Documented contract: include filters are ignored under run_all —
+        // a stale id must not error the run.
+        let dir = crate::test_util::temp_storage_dir("mgr-staleids");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "t".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        ).unwrap();
+        let config = RunConfig {
+            run_all: true,
+            include_ids: vec!["removed_test".into()],
+            ..Default::default()
+        };
+        let run_id = mgr.start_run(config).unwrap();
+        assert_eq!(mgr.get_results(&run_id).unwrap().total, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

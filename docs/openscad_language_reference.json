@@ -509,7 +509,7 @@
   "edge_cases": [
    "Note the direction of min(): with defaults and r=1, min(30, 3.14)=3.14 then max(...,5)=5 \u2014 small circles get 5 fragments; large radii are governed by $fa's 360/12=30 until 2*PI*r/$fs falls below it \u2014 never blindly 'increase quality', the coarser bound wins by design.",
    "VERIFY: $fn is truncated toward zero (int cast), so $fn=5.999 \u2192 5; pin truncation vs round/ceil via oracle.",
-   "$fn negative or NaN: treated as not->0, falls through to the $fa/$fs path (VERIFY NaN handling).",
+   "Negative (finite) $fn fails the > 0 test and falls through to the $fa/$fs path; NaN or +/-inf $fn instead returns exactly 3 fragments (guarded BEFORE the $fn > 0 test \u2014 see the canonical formula).",
    "$fa or $fs <= 0 or < 0.01: clamped to 0.01 with WARNING approx '$fa too small - clamping to 0.01' / '$fs too small - clamping to 0.01' \u2014 VERIFY exact text and whether the warning fires once per consumer or once per assignment.",
    "The floor of 5 applies ONLY in the $fa/$fs path; $fn=3 and $fn=4 legitimately produce triangles/squares.",
    "The 3-fragment tiny-radius branch applies before $fn \u2014 VERIFY: whether $fn overrides for r < 2^-20 or the tiny branch wins (believed the tiny branch wins; pin).",
@@ -1965,8 +1965,8 @@
    "Calling an undefined function: warning approx 'WARNING: Ignoring unknown function 'foo'' and the call yields undef; evaluation continues \u2014 VERIFY text.",
    "Duplicate definition in one scope warns, last wins \u2014 VERIFY text.",
    "User definitions shadow builtin functions (function sin(x) = 0;) \u2014 VERIFY precedence and whether any builtins are protected.",
-   "Ternary laziness is the recursion terminator; both && and || short-circuit only since 2019.05 \u2014 pre-2019.05-style guards relied solely on ?:.",
-   "Tail-call elimination since 2019.05: self- and mutual tail calls in ternary branches (and through let \u2014 VERIFY let-tail coverage) run to millions of iterations; non-tail recursion is depth-bounded with 'ERROR: Recursion detected calling function 'name'' \u2014 see recursion entry.",
+   "Ternary laziness is the recursion terminator; && and || short-circuit throughout the reference window (verified back to 2015.03) \u2014 pre-2019.05-style guards relied solely on ?:.",
+   "Tail-call elimination since 2015.03 for the core self-recursive-ternary pattern (2019.05 at most generalized it): self- and mutual tail calls in ternary branches (and through let \u2014 VERIFY let-tail coverage) run to millions of iterations; non-tail recursion is depth-bounded with 'ERROR: Recursion detected calling function 'name'' \u2014 see recursion entry.",
    "Arguments are evaluated eagerly, exactly once, left to right at the call site \u2014 VERIFY order observability via echo-expression arguments.",
    "A function call in statement position is a syntax error (no expression statements); results must feed assignments, arguments, or conditions.",
    "Function parameters and body form a child scope; body cannot see call-site locals (lexical capture of the DEFINITION site + dynamic $-env only).",
@@ -2066,12 +2066,12 @@
    "TCE coverage: plain ternary tail calls definitely eliminated; VERIFY elimination through let(...) tail bodies, through echo()/assert() expression wrappers, and for mutual recursion between two functions.",
    "A call under an operator (n * f(n-1)) is NOT a tail call \u2014 bounded; the same function rewritten with an accumulator is unbounded. Both behaviors are compatibility surface.",
    "Function literals: VERIFY that TCE applies equally to recursive calls through variables holding function values.",
-   "Pre-2019.05: no TCE and no short-circuit &&/|| \u2014 only ?: laziness guarded recursion; irrelevant unless emulating old versions.",
+   "Pre-2015.03: no TCE and (&&/|| already short-circuited) \u2014 only ?: laziness guarded recursion; irrelevant unless emulating old versions.",
    "C-style comprehension for is iterative, not recursive \u2014 it does not consume recursion depth.",
    "Errors here HALT evaluation (unlike warnings); under --hardwarnings nothing changes (already fatal)."
   ],
   "example": "function count(n, acc = 0) = n <= 0 ? acc : count(n - 1, acc + 1); echo(count(500000)); // needs TCE",
-  "since": "2019.05",
+  "since": "2015.03 (core TCE); scope broadened later",
   "impl_notes": "Implement the evaluator iteratively (explicit heap stack / trampoline): wasm32 shadow stacks trap far below OpenSCAD's limits otherwise. Pin both depth limits and error texts via bisection probes; libraries genuinely rely on ~1M tail frames."
  },
  {
@@ -2498,7 +2498,7 @@
   "kind": "operator",
   "category": "Operators, literals, lexical structure",
   "signature": "a && b, a || b",
-  "summary": "Short-circuiting (since 2019.05) logical operators returning booleans, not operands.",
+  "summary": "Short-circuiting logical operators returning booleans, not operands.",
   "params": [
    {
     "name": "a",
@@ -2511,7 +2511,7 @@
   ],
   "semantics": "a && b: if a is falsy, result is false WITHOUT evaluating b; else result is the truthiness of b as a boolean. a || b: if a is truthy, result is true without evaluating b; else truthiness of b. Both return true/false, never the operand value (unlike JS/Python).",
   "edge_cases": [
-   "Short-circuit only since 2019.05; in 2015.03 both sides were always evaluated - recursion guards like 'i<len(v) && v[i]>0' rely on the 2019.05 behavior.",
+   "Short-circuiting holds throughout this document's reference window: verified in the 2015.03 source (C++ bool && / || on the evaluated left operand), and the 2014.03 release notes record if()-condition short-circuiting as fixed. Any non-short-circuit behavior is pre-2014 ancient history.",
    "Return value is boolean: (5 && 7) == true, not 7 (VERIFY per seed).",
    "undef && anything == false, no warning from the && itself.",
    "Side effects in the skipped operand (echo-expression, assert-expression) do not fire - observable laziness.",
@@ -2519,7 +2519,7 @@
    "No 'and'/'or' keywords; no xor operator."
   ],
   "example": "echo(true || assert(false) 1); // ECHO: true (assert never evaluated)",
-  "since": "2019.05",
+  "since": "pre-2015.03",
   "impl_notes": "Laziness must extend through assert/echo expression operands; pin the boolean-not-operand return with echo(1&&2)."
  },
  {
@@ -2547,7 +2547,7 @@
    "An eager implementation infinite-loops every recursive library function - laziness is non-negotiable.",
    "A cond of undef takes the else branch (falsy); a cond of nan takes the THEN branch (nan is truthy in 2021.01); no warning for either.",
    "Nesting chains right: a?b:c?d:e == a?b:(c?d:e); there is no 'elif'.",
-   "A ternary in tail position is eligible for tail-call elimination (2019.05+) - both branches are tail contexts.",
+   "A ternary in tail position is eligible for tail-call elimination (core pattern since 2015.03) - both branches are tail contexts.",
    "No warning ever originates from ?: itself; warnings come from the evaluated branch only."
   ],
   "example": "function fact(n) = n<=1 ? 1 : n*fact(n-1); echo(fact(10)); // ECHO: 3.6288e+6",
@@ -2645,7 +2645,7 @@
   "kind": "operator",
   "category": "Operators, literals, lexical structure",
   "signature": "vector.x, vector.y, vector.z",
-  "summary": "Swizzle sugar for the first three vector elements; 2019.05+.",
+  "summary": "Swizzle sugar for the first three vector elements; pre-2015.03.",
   "params": [
    {
     "name": "vector",
@@ -2654,14 +2654,13 @@
   ],
   "semantics": "v.x == v[0], v.y == v[1], v.z == v[2]. Works on any vector, including nested access like m[1].z. Read-only (no assignment targets).",
   "edge_cases": [
-   "Only x, y, z are supported in 2021.01; v.w or v.foo - VERIFY: believed a parse-time or eval-time error rather than undef; pin exact behavior/message.",
+   "In 2021.01 member access supports .x/.y/.z on vectors AND .begin/.step/.end on RANGE values (returning the range components); every other member name \u2014 or any non-vector/non-range receiver \u2014 yields undef silently, with no warning or error.",
    "Short vector: [1].y -> undef (out of range).",
    "On non-vectors (string, number, range, undef): undef, VERIFY warning.",
-   "Snapshot 'object' values (textmetrics) extend dot access to arbitrary keys - snapshot-only.",
-   "Pre-2019.05 scripts cannot use it; feature-test via version_num()>=20190500."
+   "Snapshot 'object' values (textmetrics) extend dot access to arbitrary keys - snapshot-only."
   ],
   "example": "p=[3,4,5]; echo(p.x+p.y, p.z); // ECHO: 7, 5",
-  "since": "2019.05"
+  "since": "pre-2015.03"
  },
  {
   "name": "function call operator",
@@ -2684,7 +2683,7 @@
    "Calling an undefined function name: WARNING ('WARNING: Ignoring unknown function ...' - VERIFY text) and undef.",
    "Calling a non-function value ((5)(1)): WARNING + undef (VERIFY text).",
    "Named-argument shadowing a positional already bound: VERIFY behavior (warning + which wins).",
-   "Tail calls are eliminated since 2019.05 - millions of frames deep must work; non-tail recursion hits a bounded stack with a 'Recursion detected' style error (pin depth + message).",
+   "Tail calls are eliminated since 2015.03 (core self-recursive-ternary pattern; 2019.05 at most generalized it) - millions of frames deep must work; non-tail recursion hits a bounded stack with a 'Recursion detected' style error (pin depth + message).",
    "$-arguments propagate dynamically to everything the callee evaluates.",
    "Functions/modules/variables are three namespaces: f=5; function f(x)=x; both coexist."
   ],
@@ -3189,7 +3188,7 @@
   "kind": "function",
   "category": "Math builtins",
   "signature": "cross(a, b)",
-  "summary": "Vector cross product: 3-vectors give a 3-vector; 2-vectors give the scalar z-component (2019.05+).",
+  "summary": "Vector cross product: 3-vectors give a 3-vector; 2-vectors give the scalar z-component (2015.03+).",
   "params": [
    {
     "name": "a",
@@ -3504,11 +3503,12 @@
    "VERIFY: 'each' applied to a string splices characters ([each \"ab\"] believed [\"a\", \"b\"]) \u2014 pin, since each on a non-list normally yields the value itself and strings sit ambiguously between 'iterable' and 'scalar'.",
    "Characters come back as strings, so nested iteration over an iterated character iterates that 1-char string once.",
    "Reversal/mapping idioms rely on this: str-join of a comprehension is the canonical map: str([for(c=s) ...]) does NOT join (it renders a vector) \u2014 joining requires recursion or a fold via str(acc, c). Reimplementation must keep these idioms fast.",
-   "search() with a string match_value iterates its characters as independent search terms \u2014 same per-character model (see search entry)."
+   "search() with a string match_value iterates its characters as independent search terms \u2014 same per-character model (see search entry).",
+   "On 2015.03 a string used as a comprehension iterable is a single scalar (ONE iteration binding the whole string: [for (c=\"ab\") c] == [\"ab\"]); per-code-point iteration arrived in 2019.05."
   ],
   "example": "echo([for (c = \"abc\") ord(c)]);",
   "impl_notes": "Iterator over UTF-8 code points shared by comprehensions, the for module, each, and search's per-character term expansion. Pin the for-module and each cases against the oracle before freezing (two VERIFY items above).",
-  "since": "2015.03"
+  "since": "2019.05"
  },
  {
   "name": "string comparison",
@@ -3803,7 +3803,7 @@
   "params": [
    {
     "name": "condition",
-    "desc": "Any value, tested with standard truthiness: exactly the five falsy values \u2014 false, 0 (and -0), \"\", [], undef \u2014 FAIL; everything else passes, including nan (assert(0/0) passes), \"false\", [0], and -1; everything else (including \"false\", [0], -1) passes."
+    "desc": "Any value, tested with standard truthiness: exactly the five falsy values \u2014 false, 0 (and -0), \"\", [], undef \u2014 FAIL; everything else passes, including nan (assert(0/0) passes), \"false\", [0], and -1."
    },
    {
     "name": "message",
@@ -4971,9 +4971,9 @@
    "No is_range and no typeof: detecting a range requires elimination (not num/bool/string/list/undef/function). Keep this gap \u2014 do not add helpfully.",
    "Indexing: v[i] with negative, non-integer, or out-of-range i yields undef (no Python negative indexing, no wrap). VERIFY: believed silent undef (no warning) for out-of-range \u2014 pin, and VERIFY that integer-valued doubles index correctly (v[1.0] works, v[1.5] undef).",
    "String indexing s[i] yields a ONE-CHARACTER STRING (there is no character type); out-of-range undef. len(s) counts Unicode code points, not bytes.",
-   "Swizzles v.x/v.y/v.z (2019.05+) read elements 0/1/2 of a vector; on a too-short vector the missing component is undef; on non-vectors undef (VERIFY warning). Only x/y/z exist \u2014 no .w, no compound swizzles.",
+   "Swizzles v.x/v.y/v.z (pre-2015.03; ranges also expose .begin/.step/.end) read elements 0/1/2 of a vector; on a too-short vector the missing component is undef; on non-vectors undef (VERIFY warning). Only x/y/z exist \u2014 no .w, no compound swizzles.",
    "len() on non-list/non-string (numbers, booleans, ranges, undef) yields undef. VERIFY whether a warning accompanies it.",
-   "&& and || short-circuit only since 2019.05 (earlier releases evaluated both sides \u2014 old code has guard idioms shaped by that); they return boolean true/false, not the last operand (VERIFY \u2014 seed flags this). The ternary is lazy on the untaken branch and is THE recursion terminator.",
+   "&& and || short-circuit throughout the reference window \u2014 verified in the 2015.03 source; only pre-2014 releases evaluated both sides ( \u2014 old code has guard idioms shaped by that); they return boolean true/false, not the last operand (VERIFY \u2014 seed flags this). The ternary is lazy on the untaken branch and is THE recursion terminator.",
    "Strings are iterable despite not being lists: [for (c=\"abc\") c] gives [\"a\",\"b\",\"c\"]; each \"ab\" splices characters. VERIFY version coverage of string iteration in the statement-level for module.",
    "Vectors are heterogeneous and nested arbitrarily: [1, \"a\", [true, [0:2]]] is legal; deep equality recurses through all of it.",
    "undef propagation is per-operation: each mismatched operation emits its own WARNING; the GUI console may rate-limit duplicate lines (app behavior, not language semantics).",
@@ -5157,8 +5157,8 @@
   "name": "Recursion & evaluation limits",
   "kind": "concept",
   "category": "Semantic model",
-  "signature": "function fact(n, acc=1) = n <= 1 ? acc : fact(n-1, acc*n);  // tail call\necho(fact(10000));            // deep tail recursion works (TCO, 2019.05+)\nfunction sum(n) = n <= 0 ? 0 : n + sum(n-1);  // NOT tail \u2014 stack-bounded\nmodule steps(n) { if (n > 0) { cube([n,1,1]); translate([0,1,0]) steps(n-1); } }\nsteps(50);                    // module recursion: fixed 'Recursion detected' limit",
-  "summary": "With no loops-with-state, recursion is the language's only general computation mechanism: the lazy ternary is the sole terminator; functions get tail-call elimination since 2019.05 (deep tail recursion into the millions must work because libraries rely on it) while non-tail recursion is stack-bounded; modules hit a fixed 'Recursion detected' error at a set depth; and assert() is the only construct that halts evaluation.",
+  "signature": "function fact(n, acc=1) = n <= 1 ? acc : fact(n-1, acc*n);  // tail call\necho(fact(10000));            // deep tail recursion works (core TCO since 2015.03)\nfunction sum(n) = n <= 0 ? 0 : n + sum(n-1);  // NOT tail \u2014 stack-bounded\nmodule steps(n) { if (n > 0) { cube([n,1,1]); translate([0,1,0]) steps(n-1); } }\nsteps(50);                    // module recursion: fixed 'Recursion detected' limit",
+  "summary": "With no loops-with-state, recursion is the language's only general computation mechanism: the lazy ternary is the sole terminator; functions get tail-call elimination (core self-recursive-ternary pattern since 2015.03; 2019.05 at most broadened tail positions \u2014 deep tail recursion into the millions must work because libraries rely on it) while non-tail recursion is stack-bounded; modules hit a fixed 'Recursion detected' error at a set depth; and assert() is the only construct that halts evaluation.",
   "params": [
    {
     "name": "cond ? a : b",
@@ -5166,11 +5166,11 @@
    },
    {
     "name": "&& / ||",
-    "desc": "Short-circuit since 2019.05 (both sides were evaluated before that \u2014 old code's guard idioms reflect it); usable as auxiliary recursion guards but the ternary is the primary one."
+    "desc": "Short-circuiting holds throughout the reference window (verified back to 2015.03; if-condition short-circuiting fixed by 2014.03); usable as auxiliary recursion guards but the ternary is the primary one."
    },
    {
     "name": "tail-call elimination",
-    "desc": "Since 2019.05, a function whose recursive call is in tail position reuses the frame; recursion depth on the order of 1,000,000 is expected to work."
+    "desc": "A function whose recursive call is in tail position reuses the frame (core pattern since 2015.03); recursion depth on the order of 1,000,000 is expected to work."
    },
    {
     "name": "module recursion limit",
@@ -5181,10 +5181,10 @@
     "desc": "The only halting construct: on failure, evaluation stops with an ERROR naming the condition's source text (plus optional message) and TRACE: lines unwinding the module call stack."
    }
   ],
-  "semantics": "OpenSCAD has no while, break, continue, return, or mutation; every algorithm is a single-expression function using the ternary for termination and recursion for iteration, or a data-driven for/comprehension. Laziness rules make this viable: the ternary evaluates only the taken branch, and && / || short-circuit (2019.05+). Function recursion comes in two regimes. Calls in TAIL position are eliminated (2019.05+): 'f(n, acc) = n<=0 ? acc : f(n-1, acc+n)' runs at depths around a million \u2014 the BOSL2-class libraries build sort/map/fold on this and an implementation without TCO (or an equivalent trampoline) fails them immediately. Non-tail recursion ('n + sum(n-1)') consumes real evaluator stack and is bounded; exceeding the bound produces a recursion error naming the function rather than a crash. Module recursion (a module instantiating itself, usually guarded by if) is legal and idiomatic for fractals/trees, but is bounded by a fixed depth check with an explicit error approx \"ERROR: Recursion detected calling module 'name'\". Errors and limits are observable surface: the recursion error texts, the assert() failure format with its TRACE stack unwind, and the practical depth thresholds all get exercised by real scripts and test suites. Nothing else halts: warnings (including under-recursion type mismatches) let evaluation continue; only assert() failure \u2014 and fatal errors like recursion detection \u2014 stop the run.",
+  "semantics": "OpenSCAD has no while, break, continue, return, or mutation; every algorithm is a single-expression function using the ternary for termination and recursion for iteration, or a data-driven for/comprehension. Laziness rules make this viable: the ternary evaluates only the taken branch, and && / || short-circuit (verified back to 2015.03). Function recursion comes in two regimes. Calls in TAIL position are eliminated (core pattern since 2015.03): 'f(n, acc) = n<=0 ? acc : f(n-1, acc+n)' runs at depths around a million \u2014 the BOSL2-class libraries build sort/map/fold on this and an implementation without TCO (or an equivalent trampoline) fails them immediately. Non-tail recursion ('n + sum(n-1)') consumes real evaluator stack and is bounded; exceeding the bound produces a recursion error naming the function rather than a crash. Module recursion (a module instantiating itself, usually guarded by if) is legal and idiomatic for fractals/trees, but is bounded by a fixed depth check with an explicit error approx \"ERROR: Recursion detected calling module 'name'\". Errors and limits are observable surface: the recursion error texts, the assert() failure format with its TRACE stack unwind, and the practical depth thresholds all get exercised by real scripts and test suites. Nothing else halts: warnings (including under-recursion type mismatches) let evaluation continue; only assert() failure \u2014 and fatal errors like recursion detection \u2014 stop the run.",
   "edge_cases": [
    "The ternary MUST be lazy: 'f(n) = n<=0 ? 0 : f(n-1)' with eager branches recurses forever. Right-associativity: 'a ? b : c ? d : e' parses as 'a ? b : (c ? d : e)' \u2014 the else-if chain idiom.",
-   "&& and || short-circuit only since 2019.05; pre-2019.05 scripts could not rely on 'n>0 && f(n-1)' as a guard. 2021.01 semantics: short-circuiting, returning booleans (VERIFY return type, see Type chapter).",
+   "&& and || short-circuit throughout the reference window (verified back to 2015.03), so 'n>0 && f(n-1)' works as a guard. 2021.01 semantics: short-circuiting, returning booleans (VERIFY return type, see Type chapter).",
    "VERIFY: the exact set of tail positions eligible for TCO \u2014 the ternary's taken branch certainly; believed also the body of let() expressions and the trailing subexpression of echo(...) expr and assert(...) expr wrappers; probe each (a library that traces with echo inside a tail call must not lose TCO).",
    "Deep tail recursion contract: on the order of 1,000,000 frames must complete (the seed pins 'into the millions'). VERIFY the practical ceiling on the official 2021.01 binary and match or exceed it.",
    "Non-tail function recursion is stack-bounded with an error naming the function: VERIFY exact text (believed \"ERROR: Recursion detected calling function 'f'\") and the practical depth (platform stack dependent in the C++ implementation \u2014 thousands to tens of thousands; pin the oracle's observed depth and document yours).",
@@ -5202,7 +5202,7 @@
    "Performance contracts adjacent to recursion: comprehension-built lists must be O(1) amortized append, and str()-based accumulation in deep recursion is O(n^2) unless rope-like \u2014 real libraries hit both."
   ],
   "example": "function fact(n, acc=1) = n <= 1 ? acc : fact(n-1, acc*n);\necho(fact(100));                 // 9.33262e+157\nfunction count(n) = n <= 0 ? 0 : count(n-1) + 1;   // non-tail\necho(count(1000));               // fine; huge n hits the stack limit\nmodule steps(n) { if (n > 0) { translate([n,0,0]) cube(1); steps(n-1); } }\nsteps(10);\nassert(fact(3) == 6, \"factorial broken\");",
-  "since": "2019.05",
+  "since": "2015.03 (core TCE); scope broadened later",
   "impl_notes": "Build the evaluator iteratively (explicit stack/trampoline) from the start \u2014 retrofitting TCO is painful. Tail-position analysis must cover ternary branches, let bodies, and echo/assert expression wrappers (verify each against the oracle first). Pin via oracle probes: exact 'Recursion detected' texts for module and function, observed depth ceilings for module recursion and non-tail function recursion, tail-recursion at 10^6, assert failure format including TRACE order, double-echo from repeated pure calls (proving no function memoization). Document your own limits where they exceed OpenSCAD's; never undercut them. Treat infinite tail loops as user responsibility \u2014 provide cancellation in the host app, not a semantic cap."
  },
  {
