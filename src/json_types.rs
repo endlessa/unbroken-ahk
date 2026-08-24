@@ -148,7 +148,19 @@ impl FromJson for ExecutionModel {
                 }
                 Ok(ExecutionModel::Sequential)
             }
-            Some(JsonValue::Str(s)) if s == "sequential" => Ok(ExecutionModel::Sequential),
+            Some(JsonValue::Str(s)) if s == "sequential" => {
+                // Contradictory input: a concurrency bound alongside an
+                // explicit sequential type is half-honored intent (often a
+                // forgotten type edit) — reject like the type-less case.
+                if matches!(value.get("max_concurrency"), Some(v) if !matches!(v, JsonValue::Null))
+                {
+                    return Err(JsonError::InvalidField(
+                        "execution_model.max_concurrency".into(),
+                        "only valid with type \"parallel\"".into(),
+                    ));
+                }
+                Ok(ExecutionModel::Sequential)
+            }
             Some(JsonValue::Str(s)) if s == "parallel" => {
                 let mc = match value.get("max_concurrency") {
                     None | Some(JsonValue::Null) => 4,
@@ -858,6 +870,7 @@ mod tests {
             r#"{"type": "parallel", "max_concurrency": "eight"}"#,
             r#"{"type": "parallel", "max_concurrency": 0}"#,
             r#"{"type": "parallel", "max_concurrency": 5000000000}"#,
+            r#"{"type": "sequential", "max_concurrency": 8}"#,
         ] {
             let val = parse_json(bad).unwrap();
             assert!(ExecutionModel::from_json(&val).is_err(), "should reject: {}", bad);

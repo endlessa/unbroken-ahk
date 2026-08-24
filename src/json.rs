@@ -524,6 +524,7 @@ impl<'a> Parser<'a> {
         self.expect(b'{')?;
         self.skip_whitespace();
         let mut pairs = Vec::new();
+        let mut keys = std::collections::HashSet::new();
         if self.peek() == Some(b'}') {
             self.pos += 1;
             return Ok(JsonValue::Object(pairs));
@@ -534,7 +535,9 @@ impl<'a> Parser<'a> {
             // RFC 8259 leaves duplicate keys implementation-defined;
             // silently keeping one of them is exactly the kind of quiet
             // data drop this platform's strict loaders exist to prevent.
-            if pairs.iter().any(|(k, _)| *k == key) {
+            // (Set-based check — a linear scan would hand large flat
+            // objects a quadratic parse-time DoS.)
+            if !keys.insert(key.clone()) {
                 return Err(JsonError::DuplicateKey(key));
             }
             self.skip_whitespace();

@@ -100,10 +100,15 @@ impl PlatformManager {
             }
             Some(_) => {
                 // Restored from storage with an older shape — update.
-                self.registry.deregister(&id);
-                self.registry
-                    .register(definition)
-                    .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
+                // Keep the old definition restorable: a failed replacement
+                // must not drop the previously-valid entry.
+                let old = self.registry.deregister(&id);
+                if let Err(e) = self.registry.register(definition) {
+                    if let Some(old) = old {
+                        let _ = self.registry.register(old);
+                    }
+                    return Err(ManagerError::RegistrationFailed(format!("{:?}", e)));
+                }
             }
             None => {
                 self.registry
@@ -228,9 +233,12 @@ impl PlatformManager {
         let stored = if storage::registry_exists(&self.storage) {
             match storage::load_registry(&self.storage) {
                 Ok((stored, entry_errors)) => {
-                    if !entry_errors.is_empty() {
-                        // Malformed entries would be dropped by the
-                        // rewrite — keep the original as evidence.
+                    // In-file duplicate ids are collapsed by the merge
+                    // below (first wins) — like malformed entries, the
+                    // data being dropped must survive as evidence.
+                    let mut ids = std::collections::HashSet::new();
+                    let has_dups = stored.iter().any(|t| !ids.insert(t.id.clone()));
+                    if !entry_errors.is_empty() || has_dups {
                         let _ = storage::backup_corrupt_registry(&self.storage);
                     }
                     stored
@@ -333,6 +341,26 @@ impl TestManager for PlatformManager {
                  filters selects nothing"
                     .into(),
             ));
+        }
+
+        // A misspelled EXCLUDE tag silently WIDENS the run (the exclusion
+        // matches nothing and the tests it meant to skip execute) — the
+        // mirror image of the include-typo checks below, and validated
+        // even under run_all, where exclusions still apply.
+        if !config.exclude_tags.is_empty() {
+            let all_defs = self.registry.list_all();
+            let unmatched: Vec<&String> = config
+                .exclude_tags
+                .iter()
+                .filter(|tag| !all_defs.iter().any(|t| t.tags.contains(*tag)))
+                .collect();
+            if !unmatched.is_empty() {
+                return Err(ManagerError::UnsupportedConfig(format!(
+                    "exclude_tags {:?} match no registered test — a typo here \
+                     would silently run the tests it meant to exclude",
+                    unmatched
+                )));
+            }
         }
 
         // A misspelled include criterion must error, never silently shrink
@@ -936,6 +964,62 @@ mod tests {
         let summary = mgr.get_results(&run_id).unwrap();
         assert_eq!(summary.passed, 1, "replacement runnable must execute");
         assert_eq!(summary.total, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_upgrade_restores_the_old_definition() {
+        // A rejected replacement must leave the previously-valid
+        // definition in place, not drop it.
+        let dir = crate::test_util::temp_storage_dir("mgr-upgradefail");
+        let good = TestDefinition {
+            id: "t1".into(),
+            name: "good".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+        let mut mgr1 = PlatformManager::new(&dir);
+        mgr1.register_test(good.clone()).unwrap();
+
+        let mut mgr2 = PlatformManager::new(&dir);
+        assert!(mgr2.load_from_storage().unwrap().is_empty());
+        // Upgrade attempt with duplicate metadata keys — rejected.
+        let bad = TestDefinition {
+            metadata: vec![("k".into(), "a".into()), ("k".into(), "b".into())],
+            ..good
+        };
+        assert!(mgr2.register_test(bad).is_err());
+        // The old definition survived the failed upgrade.
+        assert_eq!(mgr2.summary().total_tests, 1);
+        assert_eq!(mgr2.discover(&DiscoveryQuery::default()).tests[0].name, "good");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exclude_tag_typo_errors_instead_of_widening() {
+        let dir = crate::test_util::temp_storage_dir("mgr-excludetypo");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "t".into(),
+                tags: vec!["destructive".into()],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        ).unwrap();
+        let config = RunConfig {
+            exclude_tags: vec!["destrutive".into()], // typo
+            ..Default::default()
+        };
+        match mgr.start_run(config) {
+            Err(ManagerError::UnsupportedConfig(msg)) => assert!(msg.contains("destrutive")),
+            other => panic!("expected UnsupportedConfig, got {:?}", other.map(|_| ())),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
