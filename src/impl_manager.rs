@@ -696,17 +696,30 @@ impl TestManager for PlatformManager {
         } else {
             100.0
         };
+        // Recount the status counters from the SAME capped results view
+        // completed comes from, so passed+failed+errored+skipped always
+        // sums exactly to completed — a damaged file's stored counters
+        // could otherwise claim more outcomes than completed tests. For
+        // a healthy file this reproduces the stored counters (the writer
+        // computed them from these results); get_results remains the
+        // diagnostic channel for damaged ones.
+        let (mut passed, mut failed, mut errored, mut skipped) = (0u32, 0u32, 0u32, 0u32);
+        for r in summary.results.iter().take(completed as usize) {
+            match r.status {
+                TestStatus::Passed => passed += 1,
+                TestStatus::Failed => failed += 1,
+                TestStatus::Error => errored += 1,
+                TestStatus::Skipped => skipped += 1,
+            }
+        }
         Ok(RunProgress {
             run_id: summary.run_id.clone(),
             total: summary.total,
             completed,
-            // Same reconciliation as completed: a damaged file must not
-            // yield a snapshot claiming more tests passed than completed.
-            // get_results remains the diagnostic channel for the file.
-            passed: summary.passed.min(completed),
-            failed: summary.failed.min(completed),
-            errored: summary.errored.min(completed),
-            skipped: summary.skipped.min(completed),
+            passed,
+            failed,
+            errored,
+            skipped,
             running: 0,
             percent_complete,
             elapsed_ms: summary.completed_at.saturating_sub(summary.started_at),
@@ -1260,6 +1273,36 @@ mod tests {
         // Counters reconcile the same way: never more passed than
         // completed in one snapshot.
         assert_eq!(progress.passed, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contradictory_stored_counters_reconcile_to_results() {
+        // Stored counters claiming passed 3 AND failed 3 over 3 results:
+        // the snapshot recounts from the results, so the status counters
+        // always sum exactly to completed.
+        let dir = crate::test_util::temp_storage_dir("mgr-contra-progress");
+        std::fs::create_dir_all(format!("{}/runs", dir)).unwrap();
+        std::fs::write(
+            format!("{}/runs/run_0001.json", dir),
+            r#"{"run_id": "run_0001", "total": 5, "passed": 3, "failed": 3,
+                "results": [
+                    {"test_id": "a", "status": "passed", "duration_ms": 1},
+                    {"test_id": "b", "status": "failed", "duration_ms": 1},
+                    {"test_id": "c", "status": "passed", "duration_ms": 1}
+                ],
+                "started_at": 1000, "completed_at": 2000}"#,
+        )
+        .unwrap();
+        let mgr = PlatformManager::new(&dir);
+        let progress = mgr.check_progress("run_0001").unwrap();
+        assert_eq!(progress.completed, 3);
+        assert_eq!(progress.passed, 2);
+        assert_eq!(progress.failed, 1);
+        assert_eq!(
+            progress.passed + progress.failed + progress.errored + progress.skipped,
+            progress.completed
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

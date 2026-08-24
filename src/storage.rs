@@ -55,24 +55,44 @@ fn ensure_parent_dir(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes a JSON string to a file path, atomically: the content lands in
-/// a uniquely-named temp file first and is renamed into place, so a crash
-/// mid-write can never leave a truncated JSON file behind and concurrent
-/// writers never share a temp file. Creates parent directories as needed.
+/// Writes a JSON string to a file path, atomically AND durably: the
+/// content lands in a uniquely-named temp file, is fsynced, and is then
+/// renamed into place — so neither a process crash nor a power loss can
+/// leave a truncated JSON file behind, and concurrent writers never
+/// share a temp file. Creates parent directories as needed.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_json_file(path: &str, content: &str) -> Result<(), String> {
+    use std::io::Write;
     ensure_parent_dir(path)?;
     let tmp = format!("{}.tmp{}", path, unique_suffix());
-    std::fs::write(&tmp, content).map_err(|e| {
+    let write_and_sync = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        // rename() orders the DIRECTORY entry, not the data blocks: on
+        // some journaling filesystems a power loss after the rename can
+        // leave the new name pointing at zero-length data unless the
+        // data was fsynced first.
+        f.sync_all()
+    };
+    if let Err(e) = write_and_sync() {
         // Clean up the partial temp file (disk-full, quota) — unique
         // names mean a leaked file would never be reused or overwritten.
         let _ = std::fs::remove_file(&tmp);
-        format!("write file: {}", e)
-    })?;
+        return Err(format!("write file: {}", e));
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("rename into place: {}", e)
-    })
+    })?;
+    // Make the RENAME durable too: sync the parent directory entry.
+    // Best effort — directory handles cannot be synced on every platform
+    // (Windows), and the data blocks themselves are already safe.
+    if let Some((parent, _)) = path.rsplit_once('/') {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Preserve a corrupt registry file as evidence before it would be

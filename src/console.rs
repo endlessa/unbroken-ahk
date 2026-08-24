@@ -220,6 +220,7 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
 }
 
 fn cmd_run(manager: &mut PlatformManager, args: &[&str], rest: &str) -> ConsoleOutput {
+    let from_flags = !args.is_empty() && !rest.starts_with('{');
     let config = if args.is_empty() {
         RunConfig::default()
     } else if rest.starts_with('{') {
@@ -264,7 +265,13 @@ fn cmd_run(manager: &mut PlatformManager, args: &[&str], rest: &str) -> ConsoleO
              Use 'results {}' to see the outcome — do not re-run.",
             run_id, msg, run_id
         )),
-        Err(e) => error_output(&format!("Run failed: {}", e)),
+        Err(e) => {
+            let mut msg = format!("{}", e);
+            if from_flags {
+                msg = console_vocabulary(&msg);
+            }
+            error_output(&format!("Run failed: {}", msg))
+        }
     }
 }
 
@@ -467,6 +474,20 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
 
 fn split_args(input: &str) -> Vec<&str> {
     input.split_whitespace().collect()
+}
+
+/// The manager's errors speak the JSON-config vocabulary. When the
+/// command came from FLAGS, rename those fields to the flags the console
+/// actually accepts, so the stated remedy is typeable at this surface —
+/// telling a flag user to edit "exclude_tags" points at a field that
+/// does not exist for them.
+fn console_vocabulary(msg: &str) -> String {
+    msg.replace("include_ids", "--id")
+        .replace("include_tags", "--tag")
+        .replace("exclude_tags", "--exclude")
+        .replace("name_pattern", "--pattern")
+        .replace("run_all: true", "--all")
+        .replace("run_all", "--all")
 }
 
 /// Split "--flag=value" into ("--flag", Some("value")). Only tokens that
@@ -802,6 +823,25 @@ mod tests {
             assert!(out.text.contains("--all conflicts"), "got: {}", out.text);
             assert!(!out.text.contains("run_all"), "got: {}", out.text);
         }
+    }
+
+    #[test]
+    fn manager_errors_speak_flag_vocabulary_on_the_flag_path() {
+        // A flag user must be pointed at --id/--exclude, not at JSON
+        // config keys that do not exist at their surface; the JSON path
+        // keeps the JSON names.
+        let mut mgr = setup_manager();
+        let out = execute_command(&mut mgr, "run --id nosuch");
+        assert!(out.text.contains("--id"), "got: {}", out.text);
+        assert!(!out.text.contains("include_ids"), "got: {}", out.text);
+        let out = execute_command(&mut mgr, "run --exclude typo");
+        assert!(out.text.contains("--exclude"), "got: {}", out.text);
+        assert!(!out.text.contains("exclude_tags"), "got: {}", out.text);
+        let out = execute_command(
+            &mut mgr,
+            r#"run {"run_all": false, "include_ids": ["nosuch"]}"#,
+        );
+        assert!(out.text.contains("include_ids"), "got: {}", out.text);
     }
 
     #[test]
