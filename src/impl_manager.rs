@@ -230,9 +230,12 @@ impl PlatformManager {
     /// reserved for file-level failure (unreadable file, invalid JSON),
     /// where nothing was loaded.
     pub fn load_from_storage(&mut self) -> Result<Vec<String>, String> {
-        // No file yet (first launch, or WASM) is not an error.
-        if !storage::registry_exists(&self.storage) {
-            return Ok(Vec::new());
+        // No file yet (first launch, or WASM) is not an error — but only
+        // a CLEAN not-found says that; a stat failure is a read failure.
+        match storage::registry_exists(&self.storage) {
+            Ok(false) => return Ok(Vec::new()),
+            Ok(true) => {}
+            Err(msg) => return Err(format!("registry read failed (retryable): {}", msg)),
         }
         let (tests, mut failures) = storage::load_registry(&self.storage).map_err(|e| match e {
             storage::RegistryLoadError::Io(msg) => format!("registry read failed (retryable): {}", msg),
@@ -283,7 +286,12 @@ impl PlatformManager {
     /// (If a manager-level deregister is ever added, it must delete from
     /// the file explicitly — this merge would resurrect otherwise.)
     fn persist_registry(&mut self) -> Result<(), String> {
-        let stored = if storage::registry_exists(&self.storage) {
+        // A stat FAILURE must abort like the read-failure arm below —
+        // "could not stat" is not "does not exist", and writing without
+        // the merge would erase whatever the file holds.
+        let file_present = storage::registry_exists(&self.storage)
+            .map_err(|msg| format!("registry stat failed before merge: {}", msg))?;
+        let stored = if file_present {
             match storage::load_registry(&self.storage) {
                 Ok((stored, entry_errors)) => {
                     // In-file duplicate ids are collapsed by the merge
@@ -438,10 +446,15 @@ impl TestManager for PlatformManager {
         // the run while other criteria still match something. Skipped under
         // run_all, where include filters are documented as ignored.
         if !config.run_all {
+            // Validate against the SAME snapshot selection will use — a
+            // second live-registry query here is both O(ids × registry)
+            // and a chance for the two views to drift.
+            let known_ids: std::collections::HashSet<&str> =
+                all_defs.iter().map(|t| t.id.as_str()).collect();
             let unknown_ids: Vec<String> = config
                 .include_ids
                 .iter()
-                .filter(|id| self.registry.get(id).is_none())
+                .filter(|id| !known_ids.contains(id.as_str()))
                 .cloned()
                 .collect();
             if !unknown_ids.is_empty() {
@@ -595,9 +608,28 @@ impl TestManager for PlatformManager {
     }
 
     fn check_progress(&self, run_id: &str) -> Result<RunProgress, ManagerError> {
-        self.progress
-            .get_progress(run_id)
-            .ok_or_else(|| ManagerError::UnknownRun(run_id.into()))
+        if let Some(progress) = self.progress.get_progress(run_id) {
+            return Ok(progress);
+        }
+        // Not tracked in this session. A run persisted by an earlier or
+        // sibling session is still a KNOWN run — get_results can serve
+        // it, so progress must agree rather than claim the id does not
+        // exist. Serve the completed-run snapshot; the error cases
+        // (unknown, reserved-only, unreadable, corrupt) pass through
+        // with their own truthful messages.
+        let summary = self.get_results(run_id)?;
+        Ok(RunProgress {
+            run_id: summary.run_id.clone(),
+            total: summary.total,
+            completed: summary.total,
+            passed: summary.passed,
+            failed: summary.failed,
+            errored: summary.errored,
+            skipped: summary.skipped,
+            running: 0,
+            percent_complete: 100.0,
+            elapsed_ms: summary.completed_at.saturating_sub(summary.started_at),
+        })
     }
 
     fn active_runs(&self) -> Vec<RunId> {
@@ -625,8 +657,11 @@ impl TestManager for PlatformManager {
         // failure is an access problem, not damage; only content that
         // fails to PARSE is corruption — telling the user the run never
         // happened, or that intact data is damaged, hides the real state.
-        if !storage::run_summary_exists(&self.storage, run_id) {
-            return Err(ManagerError::UnknownRun(run_id.into()));
+        match storage::run_summary_exists(&self.storage, run_id) {
+            Ok(false) => return Err(ManagerError::UnknownRun(run_id.into())),
+            Ok(true) => {}
+            // A stat failure must not make an existing run "unknown".
+            Err(msg) => return Err(ManagerError::ReadFailed(run_id.into(), msg)),
         }
         if storage::run_summary_is_reserved_only(&self.storage, run_id) {
             return Err(ManagerError::RunNotPersisted(run_id.into()));
@@ -1014,6 +1049,72 @@ mod tests {
             .map(|t| t.id.clone())
             .collect();
         assert!(ids.contains(&"x".to_string()) && ids.contains(&"y".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_failure_aborts_persist_instead_of_treating_as_absent() {
+        use crate::test_util::def;
+        let dir = crate::test_util::temp_storage_dir("mgr-stat-fail");
+        // Make the storage path a FILE: stat of <dir>/registry.json then
+        // fails with NotADirectory — an I/O failure, not "not found".
+        // Treating it as absence would skip the merge and clobber.
+        std::fs::write(&dir, "not a directory").unwrap();
+        let mut mgr = PlatformManager::new(&dir);
+        match mgr.register_runnable(def("t1"), Box::new(EchoTest { id: "t1".into(), pass: true })) {
+            Err(ManagerError::PersistFailed(_, msg)) => {
+                assert!(
+                    msg.contains("registry stat failed before merge"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected PersistFailed, got {:?}", other.map(|_| ())),
+        }
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn run_stat_failure_is_read_failed_not_unknown() {
+        let dir = crate::test_util::temp_storage_dir("mgr-run-stat");
+        std::fs::create_dir_all(&dir).unwrap();
+        // runs/ as a FILE: stat of runs/run_0001.json fails with
+        // NotADirectory — the run's existence is UNKNOWABLE right now,
+        // which must not be reported as "no run named ... exists".
+        std::fs::write(format!("{}/runs", dir), "file").unwrap();
+        let mgr = PlatformManager::new(&dir);
+        match mgr.get_results("run_0001") {
+            Err(ManagerError::ReadFailed(id, _)) => assert_eq!(id, "run_0001"),
+            other => panic!("expected ReadFailed, got {:?}", other.map(|_| ())),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn progress_of_persisted_run_from_another_session_is_served() {
+        use crate::test_util::def;
+        let dir = crate::test_util::temp_storage_dir("mgr-xsession-progress");
+        let mut a = PlatformManager::new(&dir);
+        a.register_runnable(def("t1"), Box::new(EchoTest { id: "t1".into(), pass: true }))
+            .unwrap();
+        let run_id = a.start_run(RunConfig::default()).unwrap();
+
+        // A fresh session must not claim the id "does not exist" while
+        // get_results can serve it — progress answers with the final
+        // snapshot instead.
+        let mut b = PlatformManager::new(&dir);
+        assert!(b.load_from_storage().unwrap().is_empty());
+        let progress = b.check_progress(&run_id).unwrap();
+        assert_eq!(progress.total, 1);
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.passed, 1);
+        assert_eq!(progress.running, 0);
+        assert!((progress.percent_complete - 100.0).abs() < f64::EPSILON);
+        // A genuinely unknown id still reports unknown.
+        assert!(matches!(
+            b.check_progress("run_9999"),
+            Err(ManagerError::UnknownRun(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

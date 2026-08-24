@@ -162,18 +162,23 @@ pub fn max_existing_run_number(_paths: &StoragePaths) -> u64 {
     0
 }
 
-/// Whether a persisted registry file exists. Typed check instead of
-/// string-matching error text (which breaks on Windows locale messages
-/// and the WASM stub).
+/// Whether a persisted registry file exists. Ok(false) ONLY on a clean
+/// "not found": any other stat failure (EIO, EACCES, stale handle) says
+/// nothing about existence and must surface as Err — treating it as
+/// absence is how a later merge-less write clobbers intact data.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn registry_exists(paths: &StoragePaths) -> bool {
-    std::fs::metadata(paths.registry_path()).is_ok()
+pub fn registry_exists(paths: &StoragePaths) -> Result<bool, String> {
+    match std::fs::metadata(paths.registry_path()) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}", e)),
+    }
 }
 
 /// WASM stub: no persisted registry.
 #[cfg(target_arch = "wasm32")]
-pub fn registry_exists(_paths: &StoragePaths) -> bool {
-    false
+pub fn registry_exists(_paths: &StoragePaths) -> Result<bool, String> {
+    Ok(false)
 }
 
 /// Save the test registry to JSON.
@@ -232,16 +237,25 @@ pub fn is_valid_run_id(id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether a persisted summary exists for this run id.
+/// Whether a persisted summary exists for this run id. Same contract as
+/// registry_exists: Ok(false) only on a clean "not found" — a stat
+/// failure must not make an existing run report as unknown.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn run_summary_exists(paths: &StoragePaths, run_id: &str) -> bool {
-    is_valid_run_id(run_id) && std::fs::metadata(paths.run_path(run_id)).is_ok()
+pub fn run_summary_exists(paths: &StoragePaths, run_id: &str) -> Result<bool, String> {
+    if !is_valid_run_id(run_id) {
+        return Ok(false);
+    }
+    match std::fs::metadata(paths.run_path(run_id)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}", e)),
+    }
 }
 
 /// WASM stub: no persisted runs.
 #[cfg(target_arch = "wasm32")]
-pub fn run_summary_exists(_paths: &StoragePaths, _run_id: &str) -> bool {
-    false
+pub fn run_summary_exists(_paths: &StoragePaths, _run_id: &str) -> Result<bool, String> {
+    Ok(false)
 }
 
 /// Whether a run file is a reservation placeholder only (exists, empty):

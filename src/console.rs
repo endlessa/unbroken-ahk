@@ -128,8 +128,15 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
                 }
                 Err(e) => return error_output(&e),
             },
+            // Scalar flags reject repetition: last-wins would silently
+            // drop the first value — the same intent-drop class the
+            // unknown-flag and typo checks exist to prevent. (--tag and
+            // --id accumulate; that contrast is why this must be loud.)
             "--group" | "-g" => match take_value(inline, args, i, "--group") {
                 Ok((v, used)) => {
+                    if query.group.is_some() {
+                        return error_output("--group given more than once — discover takes at most one group");
+                    }
                     query.group = Some(v.to_string());
                     i += used;
                 }
@@ -138,6 +145,9 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
             "--limit" | "-l" => match take_value(inline, args, i, "--limit") {
                 Ok((v, used)) => match v.parse() {
                     Ok(n) => {
+                        if query.limit.is_some() {
+                            return error_output("--limit given more than once");
+                        }
                         query.limit = Some(n);
                         i += used;
                     }
@@ -381,8 +391,16 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
                         .into());
                 }
             }
+            // Scalar flags reject repetition — see cmd_discover's guard:
+            // last-wins would silently not run the first pattern's tests.
             "--pattern" | "-p" => {
                 let (v, used) = take_value(inline, args, i, "--pattern")?;
+                if config.name_pattern.is_some() {
+                    return Err(
+                        "--pattern given more than once — run takes at most one name pattern"
+                            .into(),
+                    );
+                }
                 config.name_pattern = Some(v.to_string());
                 i += used;
             }
@@ -395,6 +413,9 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
             }
             "--timeout" => {
                 let (v, used) = take_value(inline, args, i, "--timeout")?;
+                if config.timeout_ms.is_some() {
+                    return Err("--timeout given more than once".into());
+                }
                 config.timeout_ms = Some(
                     v.parse()
                         .map_err(|_| format!("--timeout: '{}' is not a number", v))?,
@@ -740,6 +761,21 @@ mod tests {
         // Boolean flags take no value in either spelling.
         let out = execute_command(&mut mgr, "run --fail-fast=yes");
         assert!(out.text.contains("takes no value"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn repeated_scalar_flags_error_instead_of_last_wins() {
+        // Last-wins would silently drop the first value (and its tests);
+        // list flags (--tag, --id) accumulate, so scalars must be loud.
+        let mut mgr = setup_manager();
+        let out = execute_command(&mut mgr, "run --pattern auth_* --pattern net_*");
+        assert!(out.text.contains("more than once"), "got: {}", out.text);
+        let out = execute_command(&mut mgr, "discover --group auth --group network");
+        assert!(out.text.contains("more than once"), "got: {}", out.text);
+        let out = execute_command(&mut mgr, "run --timeout 5 --timeout 10");
+        assert!(out.text.contains("more than once"), "got: {}", out.text);
+        let out = execute_command(&mut mgr, "discover --limit 1 --limit 2");
+        assert!(out.text.contains("more than once"), "got: {}", out.text);
     }
 
     #[test]
