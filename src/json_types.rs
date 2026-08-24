@@ -108,12 +108,32 @@ impl ToJson for ExecutionModel {
 
 impl FromJson for ExecutionModel {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
-        match value.get_str("type") {
-            Some("parallel") => {
-                let mc = value.get_u32("max_concurrency").unwrap_or(4);
+        match value.get("type") {
+            None | Some(JsonValue::Null) => Ok(ExecutionModel::Sequential),
+            Some(JsonValue::Str(s)) if s == "sequential" => Ok(ExecutionModel::Sequential),
+            Some(JsonValue::Str(s)) if s == "parallel" => {
+                let mc = match value.get("max_concurrency") {
+                    None | Some(JsonValue::Null) => 4,
+                    Some(JsonValue::Number(n)) if *n >= 1.0 && n.fract() == 0.0 => *n as u32,
+                    Some(_) => {
+                        return Err(JsonError::InvalidField(
+                            "execution_model.max_concurrency".into(),
+                            "a positive integer".into(),
+                        ))
+                    }
+                };
                 Ok(ExecutionModel::Parallel { max_concurrency: mc })
             }
-            _ => Ok(ExecutionModel::Sequential),
+            // A mis-cased or unrecognized type must not silently become
+            // Sequential — that hides the caller's intent.
+            Some(JsonValue::Str(s)) => Err(JsonError::InvalidField(
+                "execution_model.type".into(),
+                format!("\"sequential\" or \"parallel\" (got \"{}\")", s),
+            )),
+            Some(_) => Err(JsonError::InvalidField(
+                "execution_model.type".into(),
+                "a string".into(),
+            )),
         }
     }
 }
@@ -150,10 +170,13 @@ impl ToJson for RunConfig {
 
 impl FromJson for RunConfig {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
-        let include_ids = parse_string_array(value.get("include_ids"));
-        let include_tags = parse_string_array(value.get("include_tags"));
-        let exclude_tags = parse_string_array(value.get("exclude_tags"));
-        let name_pattern = value.get_str("name_pattern").map(String::from);
+        // Every field is strictly typed when present: a mistyped filter
+        // (string instead of array, number in a tag list...) must be an
+        // error, never a silently-empty filter that runs the whole suite.
+        let include_ids = strict_string_array(value, "include_ids")?;
+        let include_tags = strict_string_array(value, "include_tags")?;
+        let exclude_tags = strict_string_array(value, "exclude_tags")?;
+        let name_pattern = strict_opt_string(value, "name_pattern")?;
         // run_all defaults to true only when NO filters were supplied.
         // A caller passing filters without an explicit run_all means
         // "run the filtered set", never "run everything".
@@ -161,9 +184,9 @@ impl FromJson for RunConfig {
             || !include_tags.is_empty()
             || !exclude_tags.is_empty()
             || name_pattern.is_some();
-        let run_all = value.get_bool("run_all").unwrap_or(!has_filters);
-        let fail_fast = value.get_bool("fail_fast").unwrap_or(false);
-        let timeout_ms = value.get_u64("timeout_ms");
+        let run_all = strict_opt_bool(value, "run_all")?.unwrap_or(!has_filters);
+        let fail_fast = strict_opt_bool(value, "fail_fast")?.unwrap_or(false);
+        let timeout_ms = strict_opt_u64(value, "timeout_ms")?;
         let execution_model = value
             .get("execution_model")
             .map(|v| ExecutionModel::from_json(v))
@@ -339,11 +362,11 @@ impl ToJson for DiscoveryQuery {
 impl FromJson for DiscoveryQuery {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
         Ok(DiscoveryQuery {
-            name_pattern: value.get_str("name_pattern").map(String::from),
-            tags: parse_string_array(value.get("tags")),
-            group: value.get_str("group").map(String::from),
-            limit: value.get("limit").and_then(|v| v.as_f64()).map(|n| n as usize),
-            offset: value.get("offset").and_then(|v| v.as_f64()).map(|n| n as usize),
+            name_pattern: strict_opt_string(value, "name_pattern")?,
+            tags: strict_string_array(value, "tags")?,
+            group: strict_opt_string(value, "group")?,
+            limit: strict_opt_u64(value, "limit")?.map(|n| n as usize),
+            offset: strict_opt_u64(value, "offset")?.map(|n| n as usize),
         })
     }
 }
@@ -392,11 +415,53 @@ pub fn counts_json(key: &str, items: &[(String, usize)]) -> JsonValue {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn parse_string_array(value: Option<&JsonValue>) -> Vec<String> {
-    value
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default()
+/// Strictly-typed optional field accessors. An absent field (or explicit
+/// null, the JSON convention for "not set") yields the default; a present
+/// field of the wrong type is an error, never a silent fallback.
+
+fn strict_string_array(value: &JsonValue, field: &str) -> Result<Vec<String>, JsonError> {
+    match value.get(field) {
+        None | Some(JsonValue::Null) => Ok(Vec::new()),
+        Some(JsonValue::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str().map(String::from).ok_or_else(|| {
+                    JsonError::InvalidField(field.into(), "an array of strings".into())
+                })
+            })
+            .collect(),
+        Some(_) => Err(JsonError::InvalidField(
+            field.into(),
+            "an array of strings".into(),
+        )),
+    }
+}
+
+fn strict_opt_string(value: &JsonValue, field: &str) -> Result<Option<String>, JsonError> {
+    match value.get(field) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Str(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(JsonError::InvalidField(field.into(), "a string".into())),
+    }
+}
+
+fn strict_opt_bool(value: &JsonValue, field: &str) -> Result<Option<bool>, JsonError> {
+    match value.get(field) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(JsonError::InvalidField(field.into(), "a boolean".into())),
+    }
+}
+
+fn strict_opt_u64(value: &JsonValue, field: &str) -> Result<Option<u64>, JsonError> {
+    match value.get(field) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Number(n)) if *n >= 0.0 && n.is_finite() => Ok(Some(*n as u64)),
+        Some(_) => Err(JsonError::InvalidField(
+            field.into(),
+            "a non-negative number".into(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +497,68 @@ mod tests {
         let val = parse_json(r#"{"run_all": true, "include_tags": ["fast"]}"#).unwrap();
         let config = RunConfig::from_json(&val).unwrap();
         assert!(config.run_all);
+    }
+
+    #[test]
+    fn run_config_mistyped_filters_error() {
+        // A mistyped filter must be an error, never a silently-empty
+        // filter that lets run_all default to true.
+        for bad in [
+            r#"{"include_ids": "t1"}"#,
+            r#"{"include_ids": [1, 2]}"#,
+            r#"{"include_tags": ["fast", 1]}"#,
+            r#"{"exclude_tags": 3}"#,
+            r#"{"name_pattern": 42}"#,
+            r#"{"run_all": "yes"}"#,
+            r#"{"fail_fast": "no"}"#,
+            r#"{"timeout_ms": "5s"}"#,
+        ] {
+            let val = parse_json(bad).unwrap();
+            assert!(RunConfig::from_json(&val).is_err(), "should reject: {}", bad);
+        }
+    }
+
+    #[test]
+    fn run_config_null_fields_are_absent() {
+        // Explicit null is the JSON convention for "not set".
+        let val = parse_json(r#"{"run_all": null, "include_tags": null, "name_pattern": null}"#).unwrap();
+        let config = RunConfig::from_json(&val).unwrap();
+        assert!(config.run_all);
+        assert!(config.include_tags.is_empty());
+    }
+
+    #[test]
+    fn execution_model_rejects_unknown_type() {
+        // Mis-cased or misspelled types must not silently become Sequential.
+        for bad in [
+            r#"{"type": "Parallel"}"#,
+            r#"{"type": "concurrent"}"#,
+            r#"{"type": 7}"#,
+            r#"{"type": "parallel", "max_concurrency": "eight"}"#,
+            r#"{"type": "parallel", "max_concurrency": 0}"#,
+        ] {
+            let val = parse_json(bad).unwrap();
+            assert!(ExecutionModel::from_json(&val).is_err(), "should reject: {}", bad);
+        }
+        let val = parse_json(r#"{"type": "parallel", "max_concurrency": 8}"#).unwrap();
+        assert_eq!(
+            ExecutionModel::from_json(&val).unwrap(),
+            ExecutionModel::Parallel { max_concurrency: 8 }
+        );
+        let val = parse_json(r#"{"type": "sequential"}"#).unwrap();
+        assert_eq!(ExecutionModel::from_json(&val).unwrap(), ExecutionModel::Sequential);
+    }
+
+    #[test]
+    fn discovery_query_mistyped_fields_error() {
+        for bad in [
+            r#"{"tags": "fast"}"#,
+            r#"{"name_pattern": []}"#,
+            r#"{"limit": "ten"}"#,
+        ] {
+            let val = parse_json(bad).unwrap();
+            assert!(DiscoveryQuery::from_json(&val).is_err(), "should reject: {}", bad);
+        }
     }
 
     #[test]

@@ -102,7 +102,11 @@ impl JsonValue {
 
 impl fmt::Display for JsonValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_value(f, self, 0, true)
+        // Single serializer: Display delegates to the same writer the
+        // compact path uses, so pretty and compact output can never diverge.
+        let mut out = String::new();
+        write_value_to_string(&mut out, self, 0, true);
+        f.write_str(&out)
     }
 }
 
@@ -116,73 +120,6 @@ pub fn to_json_compact(value: &JsonValue) -> String {
 /// Serialize a JsonValue to a pretty-printed JSON string.
 pub fn to_json_pretty(value: &JsonValue) -> String {
     format!("{}", value)
-}
-
-fn write_value(f: &mut fmt::Formatter<'_>, val: &JsonValue, indent: usize, pretty: bool) -> fmt::Result {
-    match val {
-        JsonValue::Null => write!(f, "null"),
-        JsonValue::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
-        JsonValue::Number(n) => {
-            if !n.is_finite() {
-                // JSON has no NaN/Infinity — emit null rather than invalid output.
-                write!(f, "null")
-            } else if *n == (*n as i64) as f64 {
-                write!(f, "{}", *n as i64)
-            } else {
-                write!(f, "{}", n)
-            }
-        }
-        JsonValue::Str(s) => write!(f, "\"{}\"", escape_json_string(s)),
-        JsonValue::Array(items) => {
-            if items.is_empty() {
-                return write!(f, "[]");
-            }
-            write!(f, "[")?;
-            for (i, item) in items.iter().enumerate() {
-                if pretty {
-                    write!(f, "\n")?;
-                    write_indent(f, indent + 1)?;
-                }
-                write_value(f, item, indent + 1, pretty)?;
-                if i + 1 < items.len() {
-                    write!(f, ",")?;
-                    if !pretty {
-                        write!(f, " ")?;
-                    }
-                }
-            }
-            if pretty {
-                write!(f, "\n")?;
-                write_indent(f, indent)?;
-            }
-            write!(f, "]")
-        }
-        JsonValue::Object(pairs) => {
-            if pairs.is_empty() {
-                return write!(f, "{{}}");
-            }
-            write!(f, "{{")?;
-            for (i, (key, val)) in pairs.iter().enumerate() {
-                if pretty {
-                    write!(f, "\n")?;
-                    write_indent(f, indent + 1)?;
-                }
-                write!(f, "\"{}\":", escape_json_string(key))?;
-                if pretty {
-                    write!(f, " ")?;
-                }
-                write_value(f, val, indent + 1, pretty)?;
-                if i + 1 < pairs.len() {
-                    write!(f, ",")?;
-                }
-            }
-            if pretty {
-                write!(f, "\n")?;
-                write_indent(f, indent)?;
-            }
-            write!(f, "}}")
-        }
-    }
 }
 
 fn write_value_to_string(out: &mut String, val: &JsonValue, indent: usize, pretty: bool) {
@@ -260,13 +197,6 @@ fn write_value_to_string(out: &mut String, val: &JsonValue, indent: usize, prett
     }
 }
 
-fn write_indent(f: &mut fmt::Formatter<'_>, level: usize) -> fmt::Result {
-    for _ in 0..level {
-        write!(f, "  ")?;
-    }
-    Ok(())
-}
-
 fn push_indent(out: &mut String, level: usize) {
     for _ in 0..level {
         out.push_str("  ");
@@ -314,6 +244,7 @@ pub enum JsonError {
     InvalidEscape(usize),
     TrailingData(usize),
     MissingField(String),
+    InvalidField(String, String),
 }
 
 impl fmt::Display for JsonError {
@@ -328,6 +259,9 @@ impl fmt::Display for JsonError {
             JsonError::TrailingData(pos) => write!(f, "trailing data at position {}", pos),
             JsonError::MissingField(name) => {
                 write!(f, "missing or invalid required field '{}'", name)
+            }
+            JsonError::InvalidField(name, expected) => {
+                write!(f, "invalid field '{}': expected {}", name, expected)
             }
         }
     }
@@ -455,12 +389,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Append input[start..end] (a run of unescaped bytes) to the output
-    /// string. Valid UTF-8 by construction — see parse_string.
+    /// string. Valid UTF-8 by construction — see parse_string. If a future
+    /// refactor ever feeds the parser non-&str bytes, fail loudly rather
+    /// than silently dropping content.
     fn push_run(&self, s: &mut String, start: usize, end: usize) {
         if end > start {
-            // The unwrap is safe: the parser input is a &str and runs are
-            // delimited only at ASCII bytes.
-            s.push_str(core::str::from_utf8(&self.input[start..end]).unwrap_or(""));
+            s.push_str(
+                core::str::from_utf8(&self.input[start..end])
+                    .expect("parser input must be valid UTF-8 (constructed from &str)"),
+            );
         }
     }
 

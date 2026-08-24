@@ -314,16 +314,18 @@ fn handle_progress(manager: &PlatformManager, params: &JsonValue) -> McpResponse
                 Err(e) => McpResponse::err(&format!("{:?}", e)),
             }
         }
-        // Present but not a string: a caller mistake, not a request to
-        // list active runs — error so the caller can correct it.
+        // Absent — or explicit null, the JSON convention for "not set" —
+        // means "list the active runs".
+        None | Some(JsonValue::Null) => {
+            let active = manager.active_runs();
+            McpResponse::ok(str_array(&active))
+        }
+        // Present with a non-string, non-null type: a caller mistake, not
+        // a request to list active runs — error so the caller can correct it.
         Some(other) => McpResponse::err(&format!(
             "Parameter 'run_id' must be a string, got: {}",
             crate::json::to_json_compact(other)
         )),
-        None => {
-            let active = manager.active_runs();
-            McpResponse::ok(str_array(&active))
-        }
     }
 }
 
@@ -335,11 +337,11 @@ fn handle_results(manager: &PlatformManager, params: &JsonValue) -> McpResponse 
                 Err(e) => McpResponse::err(&format!("{:?}", e)),
             }
         }
+        None | Some(JsonValue::Null) => McpResponse::err("Missing required parameter: 'run_id'"),
         Some(other) => McpResponse::err(&format!(
             "Parameter 'run_id' must be a string, got: {}",
             crate::json::to_json_compact(other)
         )),
-        None => McpResponse::err("Missing required parameter: 'run_id'"),
     }
 }
 
@@ -382,8 +384,19 @@ mod tests {
         }
     }
 
+    /// Fresh, hermetic storage dir per call: removed at start so no state
+    /// leaks between cargo-test invocations, and unique per call so
+    /// parallel tests never share a run counter.
+    fn temp_dir() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = format!("/tmp/unbroken-mcp-test-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     fn setup_manager() -> PlatformManager {
-        let mut mgr = PlatformManager::new("/tmp/unbroken-mcp-test");
+        let mut mgr = PlatformManager::new(&temp_dir());
         mgr.register_runnable(
             TestDefinition {
                 id: "t1".into(),
@@ -735,6 +748,27 @@ mod tests {
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
         assert!(val.get_str("error").unwrap().contains("must be a string"));
+    }
+
+    #[test]
+    fn run_mistyped_filter_returns_error_not_full_suite() {
+        // include_ids as a string (common client mistake) must error,
+        // never fall back to running every test.
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"include_ids": "t1"}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("include_ids"));
+    }
+
+    #[test]
+    fn progress_null_run_id_lists_active_runs() {
+        // Explicit null is the JSON convention for "not set" — same as absent.
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_progress", "params": {"run_id": null}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(true));
+        assert!(val.get("data").unwrap().as_array().unwrap().is_empty());
     }
 
     #[test]

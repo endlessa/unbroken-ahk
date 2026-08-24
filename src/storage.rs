@@ -120,13 +120,26 @@ pub fn save_registry(paths: &StoragePaths, tests: &[&TestDefinition]) -> Result<
 }
 
 /// Load the test registry from JSON.
-pub fn load_registry(paths: &StoragePaths) -> Result<Vec<TestDefinition>, String> {
+///
+/// Returns every definition that parsed cleanly plus a description of each
+/// entry that did not — one malformed entry must not discard the rest of
+/// the registry. The outer error is reserved for file-level problems
+/// (missing file, unparseable JSON, not an array).
+pub fn load_registry(
+    paths: &StoragePaths,
+) -> Result<(Vec<TestDefinition>, Vec<String>), String> {
     let content = read_json_file(&paths.registry_path())?;
     let value = parse_json(&content).map_err(|e| format!("{}", e))?;
     let arr = value.as_array().ok_or("expected JSON array")?;
-    arr.iter()
-        .map(|v| TestDefinition::from_json(v).map_err(|e| format!("{}", e)))
-        .collect()
+    let mut tests = Vec::new();
+    let mut entry_errors = Vec::new();
+    for (i, v) in arr.iter().enumerate() {
+        match TestDefinition::from_json(v) {
+            Ok(t) => tests.push(t),
+            Err(e) => entry_errors.push(format!("entry {}: {}", i, e)),
+        }
+    }
+    Ok((tests, entry_errors))
 }
 
 /// Save a run summary to JSON.

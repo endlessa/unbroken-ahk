@@ -62,9 +62,10 @@ impl TestRegistry for InMemoryRegistry {
     }
 
     fn search_by_name(&self, pattern: &str) -> Vec<&TestDefinition> {
+        let pattern_lower = pattern.to_lowercase();
         self.tests
             .iter()
-            .filter(|t| crate::filter::name_matches(pattern, &t.name))
+            .filter(|t| crate::filter::name_matches_lower(&pattern_lower, &t.name))
             .collect()
     }
 

@@ -430,8 +430,19 @@ mod tests {
         }
     }
 
+    /// Fresh, hermetic storage dir per call: removed at start so no state
+    /// leaks between cargo-test invocations, and unique per call so
+    /// parallel tests never share a run counter.
+    fn temp_dir() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = format!("/tmp/unbroken-console-test-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     fn setup_manager() -> PlatformManager {
-        let mut mgr = PlatformManager::new("/tmp/unbroken-console-test");
+        let mut mgr = PlatformManager::new(&temp_dir());
         mgr.register_runnable(
             TestDefinition {
                 id: "t1".into(),

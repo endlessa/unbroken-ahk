@@ -32,13 +32,18 @@ pub trait TestFilter {
 /// Supports simple globs: "auth_*" (prefix), "*_ping" (suffix),
 /// otherwise substring match.
 pub fn name_matches(pattern: &str, name: &str) -> bool {
-    let pattern = pattern.to_lowercase();
+    name_matches_lower(&pattern.to_lowercase(), name)
+}
+
+/// As name_matches, but takes an already-lowercased pattern so callers
+/// matching one pattern against many names can lowercase it once.
+pub fn name_matches_lower(pattern_lower: &str, name: &str) -> bool {
     let name = name.to_lowercase();
-    if let Some(prefix) = pattern.strip_suffix('*') {
+    if let Some(prefix) = pattern_lower.strip_suffix('*') {
         name.starts_with(prefix)
-    } else if let Some(suffix) = pattern.strip_prefix('*') {
+    } else if let Some(suffix) = pattern_lower.strip_prefix('*') {
         name.ends_with(suffix)
     } else {
-        name.contains(&pattern)
+        name.contains(pattern_lower)
     }
 }

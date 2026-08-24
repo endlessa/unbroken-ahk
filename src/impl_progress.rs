@@ -56,28 +56,32 @@ impl InMemoryProgressTracker {
         self.runs.iter_mut().find(|r| r.run_id == run_id)
     }
 
+    /// Build the progress snapshot for one run state — single source of
+    /// truth for the percent-complete contract (finished runs report 100%).
+    fn snapshot(&self, state: &RunState) -> RunProgress {
+        RunProgress {
+            run_id: state.run_id.clone(),
+            total: state.total,
+            completed: state.completed,
+            passed: state.passed,
+            failed: state.failed,
+            skipped: state.skipped,
+            running: state.running,
+            percent_complete: if state.finished {
+                100.0
+            } else if state.total > 0 {
+                (state.completed as f64 / state.total as f64) * 100.0
+            } else {
+                0.0
+            },
+            elapsed_ms: self.now().saturating_sub(state.started_ms),
+        }
+    }
+
     /// Serialize all tracked runs to JSON for debugging.
     pub fn to_json_string(&self) -> String {
-        let runs: Vec<JsonValue> = self.runs.iter().map(|r| {
-            let progress = RunProgress {
-                run_id: r.run_id.clone(),
-                total: r.total,
-                completed: r.completed,
-                passed: r.passed,
-                failed: r.failed,
-                skipped: r.skipped,
-                running: r.running,
-                percent_complete: if r.finished {
-                    100.0
-                } else if r.total > 0 {
-                    (r.completed as f64 / r.total as f64) * 100.0
-                } else {
-                    0.0
-                },
-                elapsed_ms: self.now().saturating_sub(r.started_ms),
-            };
-            progress.to_json()
-        }).collect();
+        let runs: Vec<JsonValue> =
+            self.runs.iter().map(|r| self.snapshot(r).to_json()).collect();
         to_json_pretty(&JsonValue::Array(runs))
     }
 }
@@ -119,27 +123,7 @@ impl ProgressTracker for InMemoryProgressTracker {
     }
 
     fn get_progress(&self, run_id: &str) -> Option<RunProgress> {
-        let state = self.find(run_id)?;
-        Some(RunProgress {
-            run_id: state.run_id.clone(),
-            total: state.total,
-            completed: state.completed,
-            passed: state.passed,
-            failed: state.failed,
-            skipped: state.skipped,
-            running: state.running,
-            // Trait contract: after finish_run, progress reports 100%.
-            // The per-status counts stay truthful even if fewer results
-            // arrived than expected.
-            percent_complete: if state.finished {
-                100.0
-            } else if state.total > 0 {
-                (state.completed as f64 / state.total as f64) * 100.0
-            } else {
-                0.0
-            },
-            elapsed_ms: self.now().saturating_sub(state.started_ms),
-        })
+        self.find(run_id).map(|state| self.snapshot(state))
     }
 
     fn finish_run(&mut self, run_id: &str) {

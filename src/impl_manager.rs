@@ -89,14 +89,21 @@ impl PlatformManager {
 
     /// Load registry from JSON storage.
     ///
-    /// Definitions that fail to register (e.g. duplicates of already-
-    /// registered tests) are reported in the error rather than silently
-    /// dropped.
+    /// Definitions already registered in memory are skipped — that is the
+    /// normal restart flow (register_runnable persists every definition,
+    /// so stored and live definitions overlap by design). Every valid
+    /// stored definition is registered even when some entries are
+    /// malformed; an Err reports what was skipped or corrupt, after
+    /// loading everything that could be loaded.
     pub fn load_from_storage(&mut self) -> Result<(), String> {
         match storage::load_registry(&self.storage) {
-            Ok(tests) => {
-                let mut failures: Vec<String> = Vec::new();
+            Ok((tests, mut failures)) => {
                 for test in tests {
+                    // Already present in memory (typically re-registered by
+                    // the embedder before loading) — not an error.
+                    if self.registry.get(&test.id).is_some() {
+                        continue;
+                    }
                     let id = test.id.clone();
                     if let Err(e) = self.registry.register(test) {
                         failures.push(format!("{}: {:?}", id, e));
@@ -106,8 +113,9 @@ impl PlatformManager {
                     Ok(())
                 } else {
                     Err(format!(
-                        "failed to register {} stored definition(s): {}",
+                        "loaded registry with {} problem entr{}: {}",
                         failures.len(),
+                        if failures.len() == 1 { "y" } else { "ies" },
                         failures.join("; ")
                     ))
                 }
@@ -267,7 +275,9 @@ impl TestManager for PlatformManager {
             errored,
             total_duration_ms: total_duration,
             started_at,
-            completed_at: storage::now_ms().max(started_at),
+            // Real clock when available; on WASM (now_ms() == 0) fall back
+            // to started_at + duration so the pair still encodes elapsed time.
+            completed_at: storage::now_ms().max(started_at.saturating_add(total_duration)),
         };
 
         self.persist_run(&summary);
@@ -421,6 +431,62 @@ mod tests {
         assert_eq!(prog.completed, 2);
         assert_eq!(prog.percent_complete, 100.0);
         assert!(mgr.active_runs().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_flow_with_duplicate_definitions_is_ok() {
+        // The normal restart sequence: register runnables (which persists
+        // their definitions), then load_from_storage. The stored duplicates
+        // must be skipped silently, not reported as failures.
+        let dir = "/tmp/unbroken-test-restart";
+        let _ = std::fs::remove_dir_all(dir);
+
+        let def = TestDefinition {
+            id: "t1".into(),
+            name: "t".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+
+        // Session 1 persists the definition.
+        let mut mgr1 = PlatformManager::new(dir);
+        mgr1.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+
+        // Session 2 re-registers, then loads — must succeed.
+        let mut mgr2 = PlatformManager::new(dir);
+        mgr2.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        assert!(mgr2.load_from_storage().is_ok());
+        assert_eq!(mgr2.summary().total_tests, 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn corrupt_registry_entry_does_not_discard_the_rest() {
+        let dir = "/tmp/unbroken-test-corrupt";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        // Two valid entries around one with a missing id.
+        std::fs::write(
+            format!("{}/registry.json", dir),
+            r#"[
+              {"id": "good1", "name": "first", "tags": []},
+              {"name": "no_id_here", "tags": []},
+              {"id": "good2", "name": "second", "tags": []}
+            ]"#,
+        ).unwrap();
+
+        let mut mgr = PlatformManager::new(dir);
+        let result = mgr.load_from_storage();
+        // The corrupt entry is reported...
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("entry 1"));
+        // ...but both valid definitions loaded.
+        assert_eq!(mgr.summary().total_tests, 2);
 
         let _ = std::fs::remove_dir_all(dir);
     }
