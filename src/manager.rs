@@ -65,6 +65,10 @@ pub enum ManagerError {
     /// A run file exists but could not be READ (permissions, transient
     /// I/O) — says nothing about the data; retry may succeed.
     ReadFailed(RunId, String),
+    /// The run id was claimed by some session but no summary was ever
+    /// persisted: still executing in another session, or that session
+    /// died mid-run. If it is known dead, delete runs/<id>.json to clear.
+    RunNotPersisted(RunId),
     /// The run has not completed yet.
     RunInProgress(RunId),
     /// The run already completed — cannot start again.

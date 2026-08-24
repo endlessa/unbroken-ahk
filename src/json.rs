@@ -256,6 +256,7 @@ pub enum JsonError {
     InvalidField(String, String),
     UnknownField(String, String, String),
     TooDeep(usize),
+    DuplicateKey(String),
 }
 
 impl fmt::Display for JsonError {
@@ -279,6 +280,9 @@ impl fmt::Display for JsonError {
             }
             JsonError::TooDeep(pos) => {
                 write!(f, "nesting deeper than {} levels at position {}", MAX_DEPTH, pos)
+            }
+            JsonError::DuplicateKey(key) => {
+                write!(f, "duplicate object key '{}'", key)
             }
         }
     }
@@ -527,6 +531,12 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_whitespace();
             let key = self.parse_string()?;
+            // RFC 8259 leaves duplicate keys implementation-defined;
+            // silently keeping one of them is exactly the kind of quiet
+            // data drop this platform's strict loaders exist to prevent.
+            if pairs.iter().any(|(k, _)| *k == key) {
+                return Err(JsonError::DuplicateKey(key));
+            }
             self.skip_whitespace();
             self.expect(b':')?;
             let val = self.parse_value()?;
@@ -684,6 +694,19 @@ mod tests {
         // Reasonable nesting still parses.
         let ok = "[".repeat(50) + &"]".repeat(50);
         assert!(parse_json(&ok).is_ok());
+    }
+
+    #[test]
+    fn duplicate_object_keys_error() {
+        // Silently keeping one of two duplicate keys is a quiet data
+        // drop — reject at the parser so every loader is covered.
+        assert!(matches!(
+            parse_json(r#"{"a": 1, "a": 2}"#),
+            Err(JsonError::DuplicateKey(_))
+        ));
+        assert!(parse_json(r#"{"a": 1, "b": 2}"#).is_ok());
+        // Nested objects each get their own key space.
+        assert!(parse_json(r#"{"a": {"x": 1}, "b": {"x": 2}}"#).is_ok());
     }
 
     #[test]

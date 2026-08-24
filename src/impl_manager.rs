@@ -98,7 +98,13 @@ impl PlatformManager {
             ));
         }
         let id = self.ensure_definition(definition)?;
-        if !self.runnables.iter().any(|r| r.id() == id) {
+        // REPLACE any already-attached runnable for this id: on a retry
+        // or a redeploy with a fixed implementation, the freshly supplied
+        // code must win — silently keeping stale code behind an Ok would
+        // be worse than either erroring or replacing.
+        if let Some(slot) = self.runnables.iter().position(|r| r.id() == id) {
+            self.runnables[slot] = runnable;
+        } else {
             self.runnables.push(runnable);
         }
         // Persist unconditionally — "already in memory" does not mean
@@ -275,8 +281,23 @@ impl TestManager for PlatformManager {
             ));
         }
 
-        // A misspelled include id must error, never silently shrink the
-        // run while other criteria still match something. Skipped under
+        // A programmatic exclude-only config with run_all=false selects
+        // nothing by construction — point at the fix instead of a bare
+        // no-tests-matched (the JSON layer already rejects this shape).
+        if !config.run_all
+            && !config.has_include_filters()
+            && !config.exclude_tags.is_empty()
+        {
+            return Err(ManagerError::UnsupportedConfig(
+                "exclude-only configs must set run_all: true (run everything \
+                 except the excluded tags); run_all: false with no include \
+                 filters selects nothing"
+                    .into(),
+            ));
+        }
+
+        // A misspelled include criterion must error, never silently shrink
+        // the run while other criteria still match something. Skipped under
         // run_all, where include filters are documented as ignored.
         if !config.run_all {
             let unknown_ids: Vec<String> = config
@@ -287,6 +308,32 @@ impl TestManager for PlatformManager {
                 .collect();
             if !unknown_ids.is_empty() {
                 return Err(ManagerError::UnknownTestIds(unknown_ids));
+            }
+            // Same symmetry for the other include criteria: a tag set or
+            // pattern matching ZERO tests is a typo, not an empty union
+            // contribution.
+            let all_defs = self.registry.list_all();
+            if !config.include_tags.is_empty()
+                && !all_defs
+                    .iter()
+                    .any(|t| config.include_tags.iter().all(|tag| t.tags.contains(tag)))
+            {
+                return Err(ManagerError::UnsupportedConfig(format!(
+                    "include_tags {:?} match no registered test",
+                    config.include_tags
+                )));
+            }
+            if let Some(ref pattern) = config.name_pattern {
+                let pattern_lower = pattern.to_lowercase();
+                if !all_defs
+                    .iter()
+                    .any(|t| crate::filter::name_matches_lower(&pattern_lower, &t.name))
+                {
+                    return Err(ManagerError::UnsupportedConfig(format!(
+                        "name_pattern '{}' matches no registered test",
+                        pattern
+                    )));
+                }
             }
         }
 
@@ -447,7 +494,7 @@ impl TestManager for PlatformManager {
             return Err(ManagerError::UnknownRun(run_id.into()));
         }
         if storage::run_summary_is_reserved_only(&self.storage, run_id) {
-            return Err(ManagerError::RunInProgress(run_id.into()));
+            return Err(ManagerError::RunNotPersisted(run_id.into()));
         }
         storage::load_run_summary(&self.storage, run_id).map_err(|e| match e {
             storage::RunLoadError::Io(msg) => ManagerError::ReadFailed(run_id.into(), msg),
@@ -788,17 +835,113 @@ mod tests {
     }
 
     #[test]
-    fn reserved_only_run_file_reports_in_progress_not_corrupt() {
+    fn reserved_only_run_file_reports_not_persisted() {
         // Another session claimed the id (empty reservation file) but has
-        // not persisted a summary — that is "no results yet", never
-        // corruption.
+        // not persisted a summary — running elsewhere or died mid-run:
+        // "no results yet, and here is how to clear it", never corruption.
         let dir = crate::test_util::temp_storage_dir("mgr-reserved");
         std::fs::create_dir_all(format!("{}/runs", dir)).unwrap();
         std::fs::write(format!("{}/runs/run_0005.json", dir), "").unwrap();
         let mgr = PlatformManager::new(&dir);
         match mgr.get_results("run_0005") {
-            Err(ManagerError::RunInProgress(_)) => {}
-            other => panic!("expected RunInProgress, got {:?}", other.map(|_| ())),
+            Err(ManagerError::RunNotPersisted(_)) => {}
+            other => panic!("expected RunNotPersisted, got {:?}", other.map(|_| ())),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hostile_run_filename_cannot_poison_the_counter() {
+        // A hand-crafted run_<u64::MAX>.json must not overflow every
+        // later mint.
+        let dir = crate::test_util::temp_storage_dir("mgr-hostile");
+        std::fs::create_dir_all(format!("{}/runs", dir)).unwrap();
+        std::fs::write(
+            format!("{}/runs/run_18446744073709551615.json", dir),
+            "{}",
+        ).unwrap();
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "t".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        ).unwrap();
+        let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        assert_eq!(run_id, "run_0001");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reregistration_replaces_the_runnable() {
+        // Redeploying a fixed implementation under the same definition
+        // must execute the NEW code, never silently keep the stale one.
+        let dir = crate::test_util::temp_storage_dir("mgr-replace");
+        let def = TestDefinition {
+            id: "t1".into(),
+            name: "t".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        };
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(def.clone(), Box::new(EchoTest { id: "t1".into(), pass: false })).unwrap();
+        mgr.register_runnable(def, Box::new(EchoTest { id: "t1".into(), pass: true })).unwrap();
+        let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        let summary = mgr.get_results(&run_id).unwrap();
+        assert_eq!(summary.passed, 1, "replacement runnable must execute");
+        assert_eq!(summary.total, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_match_include_criteria_error() {
+        let dir = crate::test_util::temp_storage_dir("mgr-zerocrit");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "fast_test".into(),
+                tags: vec!["fast".into()],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        ).unwrap();
+        // A typo'd tag unioned with a valid id must error, not shrink.
+        let config = RunConfig {
+            run_all: false,
+            include_ids: vec!["t1".into()],
+            include_tags: vec!["fastt".into()],
+            ..Default::default()
+        };
+        match mgr.start_run(config) {
+            Err(ManagerError::UnsupportedConfig(msg)) => assert!(msg.contains("fastt")),
+            other => panic!("expected UnsupportedConfig, got {:?}", other.map(|_| ())),
+        }
+        // Same for a pattern matching nothing.
+        let config = RunConfig {
+            run_all: false,
+            name_pattern: Some("nonexistent_zzz".into()),
+            ..Default::default()
+        };
+        assert!(matches!(mgr.start_run(config), Err(ManagerError::UnsupportedConfig(_))));
+        // Exclude-only programmatic configs get pointed at run_all: true.
+        let config = RunConfig {
+            run_all: false,
+            exclude_tags: vec!["fast".into()],
+            ..Default::default()
+        };
+        match mgr.start_run(config) {
+            Err(ManagerError::UnsupportedConfig(msg)) => assert!(msg.contains("run_all")),
+            other => panic!("expected UnsupportedConfig, got {:?}", other.map(|_| ())),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

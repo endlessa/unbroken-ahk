@@ -63,7 +63,12 @@ fn ensure_parent_dir(path: &str) -> Result<(), String> {
 pub fn write_json_file(path: &str, content: &str) -> Result<(), String> {
     ensure_parent_dir(path)?;
     let tmp = format!("{}.tmp{}", path, unique_suffix());
-    std::fs::write(&tmp, content).map_err(|e| format!("write file: {}", e))?;
+    std::fs::write(&tmp, content).map_err(|e| {
+        // Clean up the partial temp file (disk-full, quota) — unique
+        // names mean a leaked file would never be reused or overwritten.
+        let _ = std::fs::remove_file(&tmp);
+        format!("write file: {}", e)
+    })?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("rename into place: {}", e)
@@ -139,6 +144,10 @@ pub fn max_existing_run_number(paths: &StoragePaths) -> u64 {
                 .strip_prefix("run_")
                 .and_then(|rest| rest.strip_suffix(".json"))
                 .and_then(|digits| digits.parse::<u64>().ok())
+                // Ignore absurd numbers a malformed/hostile file could
+                // carry (run_18446744073709551615.json) — seeding the
+                // counter near u64::MAX would overflow every later mint.
+                .filter(|n| *n < 1_000_000_000)
             {
                 max = max.max(num);
             }
