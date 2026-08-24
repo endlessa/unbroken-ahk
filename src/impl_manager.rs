@@ -35,11 +35,6 @@ pub struct PlatformManager {
     completed_runs: Vec<RunSummary>,
     /// Counter for generating unique run IDs
     run_counter: u64,
-    /// Stored-registry definitions not registered in memory, read at most
-    /// once per session (None = file not read yet) and re-preserved on
-    /// every persist so a register-before-load restart cannot clobber
-    /// definition-only tests a previous session persisted.
-    preserved_from_file: Option<Vec<TestDefinition>>,
 }
 
 impl PlatformManager {
@@ -58,7 +53,6 @@ impl PlatformManager {
             runnables: Vec::new(),
             completed_runs: Vec::new(),
             run_counter,
-            preserved_from_file: None,
         }
     }
 
@@ -163,41 +157,39 @@ impl PlatformManager {
         &self.storage
     }
 
-    /// Persist the registry, MERGED with what the file already holds:
-    /// stored definitions not present in memory are preserved, so a
-    /// register-before-load restart cannot clobber definition-only tests
-    /// that a previous session persisted. In-memory definitions win on id
-    /// conflict. The file is read at most once per session (cached in
-    /// preserved_from_file) so bulk registration stays O(N). A corrupt
-    /// file — whole-file or individual entries — is backed up to
-    /// registry.json.corrupt before the rewrite would destroy the
-    /// evidence. Write errors are returned, never swallowed. (If a
-    /// manager-level deregister is ever added, it must delete from the
-    /// file explicitly — this merge would resurrect otherwise.)
+    /// Persist the registry, MERGED with what the file holds RIGHT NOW:
+    /// stored definitions not present in memory are preserved, so neither
+    /// a register-before-load restart nor a concurrent session's
+    /// registrations get clobbered. In-memory definitions win on id
+    /// conflict. The file is deliberately re-read on every persist —
+    /// correctness under concurrent sessions over speed; registering N
+    /// tests costs N file reads, acceptable at test-registry sizes. A
+    /// corrupt file — whole-file or individual entries — is backed up to
+    /// a unique registry.json.corrupt-* name before the rewrite would
+    /// destroy the evidence. Write errors are returned, never swallowed.
+    /// (If a manager-level deregister is ever added, it must delete from
+    /// the file explicitly — this merge would resurrect otherwise.)
     fn persist_registry(&mut self) -> Result<(), String> {
-        if self.preserved_from_file.is_none() {
-            let stored = if storage::registry_exists(&self.storage) {
-                match storage::load_registry(&self.storage) {
-                    Ok((stored, entry_errors)) => {
-                        if !entry_errors.is_empty() {
-                            // Malformed entries would be dropped by the
-                            // rewrite — keep the original as evidence.
-                            let _ = storage::backup_corrupt_registry(&self.storage);
-                        }
-                        stored
-                    }
-                    Err(_) => {
-                        // File-level corruption: preserve the evidence
-                        // instead of silently overwriting it.
+        let stored = if storage::registry_exists(&self.storage) {
+            match storage::load_registry(&self.storage) {
+                Ok((stored, entry_errors)) => {
+                    if !entry_errors.is_empty() {
+                        // Malformed entries would be dropped by the
+                        // rewrite — keep the original as evidence.
                         let _ = storage::backup_corrupt_registry(&self.storage);
-                        Vec::new()
                     }
+                    stored
                 }
-            } else {
-                Vec::new()
-            };
-            self.preserved_from_file = Some(stored);
-        }
+                Err(_) => {
+                    // File-level corruption: preserve the evidence
+                    // instead of silently overwriting it.
+                    let _ = storage::backup_corrupt_registry(&self.storage);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let in_memory: std::collections::HashSet<String> = self
             .registry
             .list_all()
@@ -207,12 +199,9 @@ impl PlatformManager {
         let mut all: Vec<TestDefinition> =
             self.registry.list_all().into_iter().cloned().collect();
         all.extend(
-            self.preserved_from_file
-                .as_ref()
-                .expect("populated above")
-                .iter()
-                .filter(|t| !in_memory.contains(t.id.as_str()))
-                .cloned(),
+            stored
+                .into_iter()
+                .filter(|t| !in_memory.contains(t.id.as_str())),
         );
         let refs: Vec<&TestDefinition> = all.iter().collect();
         storage::save_registry(&self.storage, &refs)
@@ -223,19 +212,24 @@ impl PlatformManager {
     }
 
     fn next_run_id(&mut self) -> RunId {
-        // Re-scan persisted runs at mint time and then CLAIM the id by
-        // atomically creating its file — two sessions racing on the same
-        // storage dir can no longer mint the same id and clobber each
-        // other. On a claimed id, advance and retry.
+        // Mint an id and CLAIM it by atomically creating its file — two
+        // sessions racing on the same storage dir can never mint the same
+        // id. The directory is scanned only on the first mint of a
+        // session, and re-scanned after a failed claim (someone else got
+        // there first) — never on the hot path once the counter is ahead.
         loop {
-            self.run_counter = self
-                .run_counter
-                .max(storage::max_existing_run_number(&self.storage));
+            if self.run_counter == 0 {
+                self.run_counter = storage::max_existing_run_number(&self.storage);
+            }
             self.run_counter += 1;
             let run_id = format!("run_{:04}", self.run_counter);
             if storage::reserve_run_file(&self.storage, &run_id) {
                 return run_id;
             }
+            // Claimed by another session: resync with disk, then retry.
+            self.run_counter = self
+                .run_counter
+                .max(storage::max_existing_run_number(&self.storage));
         }
     }
 }
@@ -638,6 +632,45 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_session_registrations_survive_merge() {
+        // Session A caches nothing: every persist merges against the file
+        // as it is NOW, so a concurrent session's registrations survive
+        // A's later persists.
+        let dir = crate::test_util::temp_storage_dir("mgr-xsession");
+        fn def(id: &str) -> TestDefinition {
+            TestDefinition {
+                id: id.into(),
+                name: id.into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            }
+        }
+        let mut a = PlatformManager::new(&dir);
+        let mut b = PlatformManager::new(&dir);
+        a.register_runnable(def("a1"), Box::new(EchoTest { id: "a1".into(), pass: true })).unwrap();
+        b.register_runnable(def("b1"), Box::new(EchoTest { id: "b1".into(), pass: true })).unwrap();
+        // A persists again after B wrote — B's b1 must survive.
+        a.register_runnable(def("a2"), Box::new(EchoTest { id: "a2".into(), pass: true })).unwrap();
+
+        let mut fresh = PlatformManager::new(&dir);
+        assert!(fresh.load_from_storage().unwrap().is_empty());
+        let ids: Vec<String> = {
+            let mut v: Vec<String> = fresh
+                .discover(&DiscoveryQuery::default())
+                .tests
+                .iter()
+                .map(|t| t.id.clone())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids, vec!["a1", "a2", "b1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn corrupt_registry_is_backed_up_not_silently_overwritten() {
         // Register-first restart over a file-level-corrupt registry must
         // preserve the corrupt file as evidence before rewriting.
@@ -657,8 +690,14 @@ mod tests {
             },
             Box::new(EchoTest { id: "t1".into(), pass: true }),
         ).unwrap();
-        // Evidence preserved, and the live file is clean again.
-        let backup = std::fs::read_to_string(format!("{}/registry.json.corrupt", dir)).unwrap();
+        // Evidence preserved under a unique .corrupt-* name, and the live
+        // file is clean again.
+        let backups: Vec<_> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("registry.json.corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let backup = std::fs::read_to_string(backups[0].path()).unwrap();
         assert_eq!(backup, "{ truncated garb");
         assert!(crate::json::parse_json(
             &std::fs::read_to_string(format!("{}/registry.json", dir)).unwrap()

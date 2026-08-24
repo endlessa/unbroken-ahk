@@ -311,17 +311,24 @@ impl ToJson for TestResult {
 
 impl FromJson for TestResult {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
+        // Strict like every other loader: a result whose identity or
+        // status is missing/mistyped is a damaged record (CorruptRun
+        // upstream), never a silent Error-status placeholder.
+        let test_id = match value.get_str("test_id") {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return Err(JsonError::MissingField("test_id".into())),
+        };
+        let status = match value.get("status") {
+            Some(v) => TestStatus::from_json(v)?,
+            None => return Err(JsonError::MissingField("status".into())),
+        };
         Ok(TestResult {
-            test_id: value.get_str("test_id").unwrap_or("").to_string(),
-            status: value
-                .get("status")
-                .map(|v| TestStatus::from_json(v))
-                .transpose()?
-                .unwrap_or(TestStatus::Error),
-            duration_ms: value.get_u64("duration_ms").unwrap_or(0),
-            message: value.get_str("message").map(String::from),
-            stdout: value.get_str("stdout").map(String::from),
-            stderr: value.get_str("stderr").map(String::from),
+            test_id,
+            status,
+            duration_ms: strict_opt_u64(value, "duration_ms")?.unwrap_or(0),
+            message: strict_opt_string(value, "message")?,
+            stdout: strict_opt_string(value, "stdout")?,
+            stderr: strict_opt_string(value, "stderr")?,
         })
     }
 }
@@ -415,7 +422,15 @@ impl FromJson for RunSummary {
             .transpose()?
             .unwrap_or_default();
         let count = |field: &str| -> Result<u32, JsonError> {
-            Ok(strict_opt_u64(value, field)?.unwrap_or(0) as u32)
+            match strict_opt_u64(value, field)?.unwrap_or(0) {
+                n if n <= u32::MAX as u64 => Ok(n as u32),
+                // Reject rather than wrap modulo 2^32 — a fabricated count
+                // is exactly what strict loading exists to prevent.
+                _ => Err(JsonError::InvalidField(
+                    field.into(),
+                    "a count that fits in 32 bits".into(),
+                )),
+            }
         };
         Ok(RunSummary {
             run_id,
@@ -753,6 +768,11 @@ mod tests {
             r#"{"run_id": "run_0001", "results": "oops", "total": 5}"#,
             r#"{"run_id": "run_0001", "results": [], "total": "five"}"#,
             r#"{"results": [], "total": 1}"#,
+            // Out-of-range counters must reject, not wrap modulo 2^32.
+            r#"{"run_id": "run_0001", "results": [], "total": 4294967296}"#,
+            // A result entry missing its status or test_id is damage too.
+            r#"{"run_id": "run_0001", "results": [{"test_id": "t1", "duration_ms": 5}]}"#,
+            r#"{"run_id": "run_0001", "results": [{"status": "passed", "duration_ms": 5}]}"#,
         ] {
             let val = parse_json(bad).unwrap();
             assert!(RunSummary::from_json(&val).is_err(), "should reject: {}", bad);

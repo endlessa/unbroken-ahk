@@ -36,17 +36,33 @@ impl StoragePaths {
     }
 }
 
+/// Monotonic per-process sequence for unique temp/backup file names —
+/// keyed by (pid, seq) so neither concurrent processes nor concurrent
+/// threads within one process can collide on the same scratch path.
+#[cfg(not(target_arch = "wasm32"))]
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Create the parent directory of a file path.
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_parent_dir(path: &str) -> Result<(), String> {
+    if let Some((parent, _)) = path.rsplit_once('/') {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {}", e))?;
+    }
+    Ok(())
+}
+
 /// Writes a JSON string to a file path, atomically: the content lands in
-/// a temp file first and is renamed into place, so a crash mid-write can
-/// never leave a truncated JSON file behind. Creates parent directories
-/// as needed.
+/// a uniquely-named temp file first and is renamed into place, so a crash
+/// mid-write can never leave a truncated JSON file behind and concurrent
+/// writers never share a temp file. Creates parent directories as needed.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_json_file(path: &str, content: &str) -> Result<(), String> {
-    // Ensure parent directory exists
-    if let Some(parent) = path.rsplit_once('/') {
-        std::fs::create_dir_all(parent.0).map_err(|e| format!("create dir: {}", e))?;
-    }
-    let tmp = format!("{}.tmp{}", path, std::process::id());
+    ensure_parent_dir(path)?;
+    let tmp = format!("{}.tmp{}", path, unique_suffix());
     std::fs::write(&tmp, content).map_err(|e| format!("write file: {}", e))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -55,12 +71,13 @@ pub fn write_json_file(path: &str, content: &str) -> Result<(), String> {
 }
 
 /// Preserve a corrupt registry file as evidence before it would be
-/// overwritten. Best effort — returns the backup path when the copy
-/// succeeded.
+/// overwritten. Each incident gets a unique backup name, so a later
+/// corruption never clobbers earlier evidence. Best effort — returns the
+/// backup path when the copy succeeded.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn backup_corrupt_registry(paths: &StoragePaths) -> Option<String> {
     let src = paths.registry_path();
-    let dst = format!("{}.corrupt", src);
+    let dst = format!("{}.corrupt-{}", src, unique_suffix());
     std::fs::copy(&src, &dst).ok().map(|_| dst)
 }
 
@@ -229,9 +246,8 @@ pub fn reserve_run_file(paths: &StoragePaths, run_id: &str) -> bool {
         return false;
     }
     let path = paths.run_path(run_id);
-    if let Some((parent, _)) = path.rsplit_once('/') {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    // Best effort — a create_dir failure surfaces via the open below.
+    let _ = ensure_parent_dir(&path);
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(_) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
