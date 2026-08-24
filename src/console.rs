@@ -348,6 +348,7 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
         run_all: false,
         ..Default::default()
     };
+    let mut explicit_all = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -358,6 +359,7 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
                     return Err("--all takes no value".into());
                 }
                 config.run_all = true;
+                explicit_all = true;
                 i += 1;
             }
             "--tag" | "-t" => {
@@ -440,6 +442,17 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
                 i += 1;
             }
         }
+    }
+
+    // The manager rejects this contradiction too, but its message speaks
+    // the JSON vocabulary (run_all, include_ids) — meaningless to someone
+    // typing flags. Say it in the words the console accepts.
+    if explicit_all && config.has_include_filters() {
+        return Err(
+            "--all conflicts with --id, --tag, and --pattern — those flags \
+             already narrow the run, so drop --all or drop them"
+                .into(),
+        );
     }
 
     // If no include-side filters were set, run everything. Exclusions
@@ -776,6 +789,19 @@ mod tests {
         // Boolean flags take no value in either spelling.
         let out = execute_command(&mut mgr, "run --fail-fast=yes");
         assert!(out.text.contains("takes no value"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn all_flag_with_include_flags_errors_in_console_vocabulary() {
+        // The remedy must be typeable at this surface: name the FLAGS,
+        // not the JSON keys (run_all/include_ids) the console never
+        // accepts.
+        let mut mgr = setup_manager();
+        for cmd in ["run --all --id t1", "run --all --tag smoke", "run --all --pattern auth_*"] {
+            let out = execute_command(&mut mgr, cmd);
+            assert!(out.text.contains("--all conflicts"), "got: {}", out.text);
+            assert!(!out.text.contains("run_all"), "got: {}", out.text);
+        }
     }
 
     #[test]
