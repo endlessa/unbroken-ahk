@@ -141,61 +141,69 @@ impl ToJson for ExecutionModel {
 
 impl FromJson for ExecutionModel {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
-        reject_unknown_keys(value, "execution_model", &["type", "max_concurrency"])?;
-        match value.get("type") {
-            None | Some(JsonValue::Null) => {
-                // max_concurrency without a type is a clear parallel intent
-                // that would otherwise silently run sequentially.
-                if matches!(value.get("max_concurrency"), Some(v) if !matches!(v, JsonValue::Null))
-                {
-                    return Err(JsonError::InvalidField(
-                        "execution_model.type".into(),
-                        "required when max_concurrency is given (use \"parallel\")".into(),
-                    ));
-                }
-                Ok(ExecutionModel::Sequential)
+        parse_execution_model(value, false)
+    }
+}
+
+fn parse_execution_model(value: &JsonValue, stored: bool) -> Result<ExecutionModel, JsonError> {
+    reject_unknown_keys(value, "execution_model", &["type", "max_concurrency"])?;
+    match value.get("type") {
+        None | Some(JsonValue::Null) => {
+            // max_concurrency without a type is a clear parallel intent
+            // that would otherwise silently run sequentially.
+            if matches!(value.get("max_concurrency"), Some(v) if !matches!(v, JsonValue::Null)) {
+                return Err(JsonError::InvalidField(
+                    "execution_model.type".into(),
+                    "required when max_concurrency is given (use \"parallel\")".into(),
+                ));
             }
-            Some(JsonValue::Str(s)) if s == "sequential" => {
-                // Contradictory input: a concurrency bound alongside an
-                // explicit sequential type is half-honored intent (often a
-                // forgotten type edit) — reject like the type-less case.
-                if matches!(value.get("max_concurrency"), Some(v) if !matches!(v, JsonValue::Null))
+            Ok(ExecutionModel::Sequential)
+        }
+        Some(JsonValue::Str(s)) if s == "sequential" => {
+            // Contradictory input: a concurrency bound alongside an
+            // explicit sequential type is half-honored intent (often a
+            // forgotten type edit) — reject like the type-less case.
+            if matches!(value.get("max_concurrency"), Some(v) if !matches!(v, JsonValue::Null)) {
+                return Err(JsonError::InvalidField(
+                    "execution_model.max_concurrency".into(),
+                    "only valid with type \"parallel\"".into(),
+                ));
+            }
+            Ok(ExecutionModel::Sequential)
+        }
+        Some(JsonValue::Str(s)) if s == "parallel" => {
+            // Stored leniency for the lower bound only: the pre-strict
+            // parser accepted max_concurrency 0 (and ran sequentially
+            // regardless), and the writer persisted it verbatim into run
+            // files — that history must reload with its recorded 0, not
+            // become CorruptRun. Caller input still requires >= 1.
+            let min = if stored { 0.0 } else { 1.0 };
+            let mc = match value.get("max_concurrency") {
+                None | Some(JsonValue::Null) => 4,
+                Some(JsonValue::Number(n))
+                    if *n >= min && n.fract() == 0.0 && *n <= u32::MAX as f64 =>
                 {
+                    *n as u32
+                }
+                Some(_) => {
                     return Err(JsonError::InvalidField(
                         "execution_model.max_concurrency".into(),
-                        "only valid with type \"parallel\"".into(),
-                    ));
+                        "a positive integer that fits in 32 bits".into(),
+                    ))
                 }
-                Ok(ExecutionModel::Sequential)
-            }
-            Some(JsonValue::Str(s)) if s == "parallel" => {
-                let mc = match value.get("max_concurrency") {
-                    None | Some(JsonValue::Null) => 4,
-                    Some(JsonValue::Number(n))
-                        if *n >= 1.0 && n.fract() == 0.0 && *n <= u32::MAX as f64 =>
-                    {
-                        *n as u32
-                    }
-                    Some(_) => {
-                        return Err(JsonError::InvalidField(
-                            "execution_model.max_concurrency".into(),
-                            "a positive integer that fits in 32 bits".into(),
-                        ))
-                    }
-                };
-                Ok(ExecutionModel::Parallel { max_concurrency: mc })
-            }
-            // A mis-cased or unrecognized type must not silently become
-            // Sequential — that hides the caller's intent.
-            Some(JsonValue::Str(s)) => Err(JsonError::InvalidField(
-                "execution_model.type".into(),
-                format!("\"sequential\" or \"parallel\" (got \"{}\")", s),
-            )),
-            Some(_) => Err(JsonError::InvalidField(
-                "execution_model.type".into(),
-                "a string".into(),
-            )),
+            };
+            Ok(ExecutionModel::Parallel { max_concurrency: mc })
         }
+        // A mis-cased or unrecognized type must not silently become
+        // Sequential — that hides the caller's intent.
+        Some(JsonValue::Str(s)) => Err(JsonError::InvalidField(
+            "execution_model.type".into(),
+            format!("\"sequential\" or \"parallel\" (got \"{}\")", s),
+        )),
+        Some(_) => Err(JsonError::InvalidField(
+            "execution_model.type".into(),
+            "a string".into(),
+        )),
     }
 }
 
@@ -317,7 +325,9 @@ fn parse_run_config(value: &JsonValue, reject_bare_run_all_false: bool) -> Resul
     };
     let execution_model = match value.get("execution_model") {
         None | Some(JsonValue::Null) => ExecutionModel::Sequential,
-        Some(obj @ JsonValue::Object(_)) => ExecutionModel::from_json(obj)?,
+        Some(obj @ JsonValue::Object(_)) => {
+            parse_execution_model(obj, !reject_bare_run_all_false)?
+        }
         // A bare string like "parallel" must not silently become
         // Sequential — the caller's intent would be ignored.
         Some(_) => {
@@ -934,6 +944,29 @@ mod tests {
             RunConfig::from_json_stored(&cfg).unwrap().timeout_ms,
             Some(9_007_199_254_740_992)
         );
+    }
+
+    #[test]
+    fn legacy_zero_max_concurrency_loads_from_stored_configs_only() {
+        // The pre-strict parser accepted max_concurrency 0 and the writer
+        // persisted it verbatim into run files — that history must reload
+        // with its recorded 0, not become CorruptRun.
+        let raw = r#"{"run_all": true, "execution_model": {"type": "parallel", "max_concurrency": 0}}"#;
+        let val = parse_json(raw).unwrap();
+        assert!(RunConfig::from_json(&val).is_err(), "caller input must stay strict");
+        let stored = RunConfig::from_json_stored(&val).unwrap();
+        assert!(matches!(
+            stored.execution_model,
+            crate::types::ExecutionModel::Parallel { max_concurrency: 0 }
+        ));
+
+        // And through the full run-summary path get_results depends on.
+        let summary_raw = format!(
+            r#"{{"run_id": "run_0001", "results": [], "config": {}}}"#,
+            raw
+        );
+        let summary_val = parse_json(&summary_raw).unwrap();
+        assert!(RunSummary::from_json(&summary_val).is_ok());
     }
 
     #[test]

@@ -895,16 +895,7 @@ mod tests {
         // as it is NOW, so a concurrent session's registrations survive
         // A's later persists.
         let dir = crate::test_util::temp_storage_dir("mgr-xsession");
-        fn def(id: &str) -> TestDefinition {
-            TestDefinition {
-                id: id.into(),
-                name: id.into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            }
-        }
+        use crate::test_util::def;
         let mut a = PlatformManager::new(&dir);
         let mut b = PlatformManager::new(&dir);
         a.register_runnable(def("a1"), Box::new(EchoTest { id: "a1".into(), pass: true })).unwrap();
@@ -931,16 +922,7 @@ mod tests {
     #[test]
     fn transient_read_failure_aborts_persist_instead_of_clobbering() {
         let dir = crate::test_util::temp_storage_dir("mgr-io-abort");
-        fn def(id: &str) -> TestDefinition {
-            TestDefinition {
-                id: id.into(),
-                name: id.into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            }
-        }
+        use crate::test_util::def;
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnable(def("t1"), Box::new(EchoTest { id: "t1".into(), pass: true }))
             .unwrap();
@@ -974,16 +956,7 @@ mod tests {
     #[test]
     fn register_runnables_batch_persists_all() {
         let dir = crate::test_util::temp_storage_dir("mgr-batch");
-        fn def(id: &str) -> TestDefinition {
-            TestDefinition {
-                id: id.into(),
-                name: id.into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            }
-        }
+        use crate::test_util::def;
         let mut mgr = PlatformManager::new(&dir);
         mgr.register_runnables(vec![
             (def("b1"), Box::new(EchoTest { id: "b1".into(), pass: true }) as Box<dyn RunnableTest>),
@@ -1003,16 +976,7 @@ mod tests {
     #[test]
     fn register_runnables_batch_id_mismatch_persists_nothing() {
         let dir = crate::test_util::temp_storage_dir("mgr-batch-mismatch");
-        fn def(id: &str) -> TestDefinition {
-            TestDefinition {
-                id: id.into(),
-                name: id.into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            }
-        }
+        use crate::test_util::def;
         let mut mgr = PlatformManager::new(&dir);
         let err = mgr.register_runnables(vec![(
             def("b1"),
@@ -1027,16 +991,7 @@ mod tests {
     #[test]
     fn mid_batch_conflict_persists_the_applied_prefix() {
         let dir = crate::test_util::temp_storage_dir("mgr-batch-prefix");
-        fn def(id: &str) -> TestDefinition {
-            TestDefinition {
-                id: id.into(),
-                name: id.into(),
-                tags: vec![],
-                group: None,
-                description: None,
-                metadata: vec![],
-            }
-        }
+        use crate::test_util::def;
         let mut mgr = PlatformManager::new(&dir);
         // "x" is session-defined, so a conflicting redefinition must fail.
         mgr.register_runnable(def("x"), Box::new(EchoTest { id: "x".into(), pass: true }))

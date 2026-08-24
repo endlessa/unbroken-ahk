@@ -20,3 +20,16 @@ pub fn temp_storage_dir(prefix: &str) -> String {
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
+
+/// Minimal TestDefinition whose name mirrors its id — the shape most
+/// tests need; set fields explicitly where a test cares about them.
+pub fn def(id: &str) -> crate::types::TestDefinition {
+    crate::types::TestDefinition {
+        id: id.into(),
+        name: id.into(),
+        tags: vec![],
+        group: None,
+        description: None,
+        metadata: vec![],
+    }
+}

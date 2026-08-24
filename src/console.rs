@@ -75,6 +75,7 @@ Commands:
   summary                        Overview of all registered tests
   discover                       List all tests
   discover <pattern>             Search tests by name pattern
+  discover --pattern <pattern>   Same; use --pattern=<p> if it starts with '-'
   discover --tag <tag>           Filter tests by tag
   discover --group <group>       Filter tests by group
   tags                           List all available tags
@@ -144,6 +145,21 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
                         return error_output(&format!("--limit: '{}' is not a number", v))
                     }
                 },
+                Err(e) => return error_output(&e),
+            },
+            // Same pattern as the bare argument, but reachable for
+            // patterns that begin with '-' via --pattern=<value> —
+            // a bare one would be rejected as an unknown flag.
+            "--pattern" | "-p" => match take_value(inline, args, i, "--pattern") {
+                Ok((v, used)) => {
+                    if query.name_pattern.is_some() {
+                        return error_output(
+                            "multiple name patterns given — discover takes at most one",
+                        );
+                    }
+                    query.name_pattern = Some(v.to_string());
+                    i += used;
+                }
                 Err(e) => return error_output(&e),
             },
             // A misspelled flag must error, not silently become a name
@@ -724,6 +740,39 @@ mod tests {
         // Boolean flags take no value in either spelling.
         let out = execute_command(&mut mgr, "run --fail-fast=yes");
         assert!(out.text.contains("takes no value"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn dash_prefixed_name_pattern_reachable_via_pattern_flag() {
+        // Names are unvalidated, so a name beginning with '-' is legal.
+        // A bare dash-prefixed pattern reads as an unknown flag (typo
+        // safety), so discover needs --pattern=<value> to reach it.
+        let mut mgr = setup_manager();
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t8".into(),
+                name: "-dash_name".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(StubTest { id: "t8".into(), pass: true }),
+        )
+        .unwrap();
+
+        let out = execute_command(&mut mgr, "discover -dash_name");
+        assert!(out.text.contains("unknown flag"), "got: {}", out.text);
+
+        let out = execute_command(&mut mgr, "discover --pattern=-dash*");
+        assert!(out.text.contains("-dash_name"), "got: {}", out.text);
+
+        // The spaced spelling works for ordinary patterns too, and the
+        // one-pattern rule spans both spellings.
+        let out = execute_command(&mut mgr, "discover --pattern auth_*");
+        assert!(out.text.contains("auth_basic"), "got: {}", out.text);
+        let out = execute_command(&mut mgr, "discover auth_* --pattern=net_*");
+        assert!(out.text.contains("at most one"), "got: {}", out.text);
     }
 
     #[test]
