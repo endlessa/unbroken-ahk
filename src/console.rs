@@ -416,10 +416,19 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
                 if config.timeout_ms.is_some() {
                     return Err("--timeout given more than once".into());
                 }
-                config.timeout_ms = Some(
-                    v.parse()
-                        .map_err(|_| format!("--timeout: '{}' is not a number", v))?,
-                );
+                let ms: u64 = v
+                    .parse()
+                    .map_err(|_| format!("--timeout: '{}' is not a number", v))?;
+                // Same bound the JSON config path enforces: a value above
+                // 2^53 would persist clamped — a timeout the caller never
+                // asked for.
+                if ms > crate::json_types::MAX_SAFE_JSON_INT as u64 {
+                    return Err(format!(
+                        "--timeout: '{}' exceeds the exact JSON integer range (2^53)",
+                        v
+                    ));
+                }
+                config.timeout_ms = Some(ms);
                 i += used;
             }
             other if other.starts_with('-') => {
@@ -715,6 +724,12 @@ mod tests {
 
         let out = execute_command(&mut mgr, "run --timeout abc");
         assert!(out.text.contains("Error"));
+
+        // The console spelling enforces the same 2^53 bound as the JSON
+        // config path — a clamped-on-write timeout is a value the caller
+        // never asked for.
+        let out = execute_command(&mut mgr, "run --timeout 18446744073709551615");
+        assert!(out.text.contains("exceeds"), "got: {}", out.text);
 
         let out = execute_command(&mut mgr, "run --bogus-flag");
         assert!(out.text.contains("unknown flag"));

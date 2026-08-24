@@ -10,7 +10,7 @@ use crate::discovery::{DiscoveryQuery, DiscoveryResult, DiscoverySummary};
 /// clamps u64 fields to it (u64_json) and the strict readers reject
 /// beyond it (strict_opt_u64) — defined once so they cannot drift into
 /// writing values the platform itself cannot reload.
-const MAX_SAFE_JSON_INT: f64 = 9_007_199_254_740_992.0;
+pub(crate) const MAX_SAFE_JSON_INT: f64 = 9_007_199_254_740_992.0;
 
 /// Serialize a u64 for JSON, clamped to the exact-integer range (2^53):
 /// the strict read side rejects larger values, so the write side must

@@ -299,8 +299,11 @@ pub fn reserve_run_file(paths: &StoragePaths, run_id: &str) -> ReserveOutcome {
         return ReserveOutcome::Failed(format!("invalid run id '{}'", run_id));
     }
     let path = paths.run_path(run_id);
-    // A create_dir failure surfaces via the open below.
-    let _ = ensure_parent_dir(&path);
+    // Keep a create_dir failure for the diagnostic below: the open that
+    // follows it fails with a misleading NotFound (parent missing), and
+    // pointing the user at a phantom missing file instead of the real
+    // permission/IO problem sends recovery the wrong way.
+    let parent_err = ensure_parent_dir(&path).err();
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(_) => ReserveOutcome::Claimed,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => ReserveOutcome::Taken,
@@ -312,7 +315,12 @@ pub fn reserve_run_file(paths: &StoragePaths, run_id: &str) -> ReserveOutcome {
             if std::fs::metadata(&path).is_ok() {
                 ReserveOutcome::Taken
             } else {
-                ReserveOutcome::Failed(format!("{}", e))
+                ReserveOutcome::Failed(match parent_err {
+                    Some(pe) => {
+                        format!("{} (runs directory could not be created: {})", e, pe)
+                    }
+                    None => format!("{}", e),
+                })
             }
         }
     }

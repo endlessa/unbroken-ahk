@@ -608,12 +608,15 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
             let mut depth = 0usize;
             let mut in_string = false;
             let mut escaped = false;
-            // Once the element's string or bracketed value has closed at
-            // depth 0, only whitespace may follow before the ',' or ']'.
-            // Anything else means the comma BETWEEN elements is missing —
-            // skeleton damage, which must not merge two healthy entries
-            // into one unparseable "entry" that gets dropped.
+            // Once the element's value has closed at depth 0 — a string's
+            // closing quote, a bracket returning to depth 0, or a scalar
+            // ending at whitespace — only whitespace may follow before
+            // the ',' or ']'. Anything else means the comma BETWEEN
+            // elements is missing: skeleton damage, which must not merge
+            // two healthy entries into one unparseable "entry" that gets
+            // dropped.
             let mut value_closed = false;
+            let mut in_scalar = false;
             let end;
             loop {
                 let b = match bytes.get(pos) {
@@ -631,7 +634,7 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                             value_closed = true;
                         }
                     }
-                } else if value_closed {
+                } else if depth == 0 && value_closed {
                     match b {
                         b',' | b']' => {
                             end = pos;
@@ -640,19 +643,45 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                         _ if b.is_ascii_whitespace() => {}
                         _ => return Err(JsonError::UnexpectedChar(pos, b as char)),
                     }
+                } else if depth == 0 && in_scalar {
+                    match b {
+                        b',' | b']' => {
+                            end = pos;
+                            break;
+                        }
+                        _ if b.is_ascii_whitespace() => {
+                            in_scalar = false;
+                            value_closed = true;
+                        }
+                        // A new value starting right after a scalar is
+                        // the same missing-comma damage.
+                        b'"' | b'{' | b'[' => {
+                            return Err(JsonError::UnexpectedChar(pos, b as char))
+                        }
+                        _ => {}
+                    }
+                } else if depth == 0 {
+                    match b {
+                        b'"' => in_string = true,
+                        b'[' | b'{' => depth += 1,
+                        b',' | b']' => {
+                            end = pos;
+                            break;
+                        }
+                        _ if b.is_ascii_whitespace() => {}
+                        // Start of a scalar (number, true/false/null, or
+                        // garbage the per-element parse will reject).
+                        _ => in_scalar = true,
+                    }
                 } else {
                     match b {
                         b'"' => in_string = true,
                         b'[' | b'{' => depth += 1,
-                        b']' | b'}' if depth > 0 => {
+                        b']' | b'}' => {
                             depth -= 1;
                             if depth == 0 {
                                 value_closed = true;
                             }
-                        }
-                        b',' | b']' if depth == 0 => {
-                            end = pos;
-                            break;
                         }
                         _ => {}
                     }
@@ -778,6 +807,19 @@ mod tests {
             split_top_level_array(r#"["a" "b"]"#),
             Err(JsonError::UnexpectedChar(_, _))
         ));
+        // Scalar elements get the same missing-comma detection as
+        // strings and objects.
+        assert!(matches!(split_top_level_array("[1 2]"), Err(JsonError::UnexpectedChar(_, _))));
+        assert!(matches!(
+            split_top_level_array(r#"[1 {"a": 2}]"#),
+            Err(JsonError::UnexpectedChar(_, _))
+        ));
+        assert!(matches!(
+            split_top_level_array("[true false]"),
+            Err(JsonError::UnexpectedChar(_, _))
+        ));
+        // Scalars themselves still split fine.
+        assert_eq!(split_top_level_array("[1 , true, null]").unwrap(), vec!["1", "true", "null"]);
     }
 
     #[test]

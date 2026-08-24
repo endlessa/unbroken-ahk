@@ -423,6 +423,18 @@ impl TestManager for PlatformManager {
             ));
         }
 
+        // A timeout above 2^53 cannot round-trip (the run-summary writer
+        // clamps u64 fields), so accepting it would persist a different
+        // timeout than the caller asked for. The JSON layer rejects it
+        // for its callers; programmatic configs must hit the same wall.
+        if config.timeout_ms.map_or(false, |t| t > crate::json_types::MAX_SAFE_JSON_INT as u64) {
+            return Err(ManagerError::UnsupportedConfig(
+                "timeout_ms exceeds the exact JSON integer range (2^53) \
+                 and would not round-trip through the persisted summary"
+                    .into(),
+            ));
+        }
+
         // An empty name_pattern substring-matches EVERY test. The JSON
         // layer rejects this for its callers; a programmatic RunConfig
         // (say, built from an empty UI field) must hit the same wall
@@ -596,6 +608,16 @@ impl TestManager for PlatformManager {
 
         self.progress.finish_run(&run_id);
 
+        // Clamp self-reported durations to the exact-JSON range HERE, at
+        // ingestion, not only in the serializer: clamping only on write
+        // would let this session serve u64::MAX from memory while every
+        // other session reads the clamped value from disk — the same
+        // run_id answering differently depending on who asks.
+        let max_safe = crate::json_types::MAX_SAFE_JSON_INT as u64;
+        for r in &mut results {
+            r.duration_ms = r.duration_ms.min(max_safe);
+        }
+
         // Build summary
         let mut passed = 0u32;
         let mut failed = 0u32;
@@ -606,7 +628,7 @@ impl TestManager for PlatformManager {
         for r in &results {
             // Saturate — a runnable reporting a pathological duration must
             // not panic (debug) or wrap (release) after tests already ran.
-            total_duration = total_duration.saturating_add(r.duration_ms);
+            total_duration = total_duration.saturating_add(r.duration_ms).min(max_safe);
             match r.status {
                 TestStatus::Passed => passed += 1,
                 TestStatus::Failed => failed += 1,
@@ -1461,11 +1483,42 @@ mod tests {
             Box::new(SlowLiar),
         ).unwrap();
         let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        // The clamp happens at INGESTION, so the session that ran the
+        // test serves the same values as everyone reading from disk —
+        // never u64::MAX from memory and 2^53 from the file.
+        let in_mem = mgr.get_results(&run_id).unwrap();
+        assert_eq!(in_mem.results[0].duration_ms, 9_007_199_254_740_992);
+        assert_eq!(in_mem.total_duration_ms, 9_007_199_254_740_992);
         // A fresh manager reads the run purely from storage.
         let fresh = PlatformManager::new(&dir);
         let summary = fresh.get_results(&run_id).unwrap();
         assert_eq!(summary.passed, 1);
-        assert_eq!(summary.results[0].duration_ms, 9_007_199_254_740_992);
+        assert_eq!(summary.results[0].duration_ms, in_mem.results[0].duration_ms);
+        assert_eq!(summary.total_duration_ms, in_mem.total_duration_ms);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_timeout_is_rejected_before_running() {
+        // A timeout above 2^53 would persist clamped — a value the
+        // caller never asked for. Reject up front, like the JSON layer.
+        let dir = crate::test_util::temp_storage_dir("mgr-big-timeout");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            crate::test_util::def("t1"),
+            Box::new(EchoTest { id: "t1".into(), pass: true }),
+        )
+        .unwrap();
+        let config = RunConfig {
+            timeout_ms: Some(u64::MAX),
+            ..Default::default()
+        };
+        match mgr.start_run(config) {
+            Err(ManagerError::UnsupportedConfig(msg)) => {
+                assert!(msg.contains("timeout_ms exceeds"), "got: {}", msg);
+            }
+            other => panic!("expected UnsupportedConfig, got {:?}", other),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
