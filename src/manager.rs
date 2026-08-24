@@ -84,6 +84,7 @@ pub enum ManagerError {
     UnsupportedConfig(String),
     /// The operation SUCCEEDED in memory (a run executed and is queryable
     /// via get_results, or a test registered) but could not be written to
-    /// storage. The id names the run or test involved.
+    /// storage. The first field names what was being persisted: a run id,
+    /// a test id, or a registration-batch descriptor.
     PersistFailed(String, String),
 }

@@ -202,14 +202,19 @@ pub fn load_registry(
     paths: &StoragePaths,
 ) -> Result<(Vec<TestDefinition>, Vec<String>), RegistryLoadError> {
     let content = read_json_file(&paths.registry_path()).map_err(RegistryLoadError::Io)?;
-    let value = parse_json(&content).map_err(|e| RegistryLoadError::Parse(format!("{}", e)))?;
-    let arr = value
-        .as_array()
-        .ok_or_else(|| RegistryLoadError::Parse("expected JSON array".into()))?;
+    // Split the array FIRST, then parse each element on its own: a
+    // parse-level defect inside one entry (a duplicate object key, a
+    // malformed number) is that entry's problem. Parsing the whole
+    // document in one strict call would let one such entry discard every
+    // healthy definition around it — exactly what per-entry tolerance
+    // exists to prevent. Only structural damage to the array skeleton
+    // itself is file-level corruption.
+    let slices = crate::json::split_top_level_array(&content)
+        .map_err(|e| RegistryLoadError::Parse(format!("{}", e)))?;
     let mut tests = Vec::new();
     let mut entry_errors = Vec::new();
-    for (i, v) in arr.iter().enumerate() {
-        match TestDefinition::from_json(v) {
+    for (i, slice) in slices.iter().enumerate() {
+        match parse_json(slice).and_then(|v| TestDefinition::from_json(&v)) {
             Ok(t) => tests.push(t),
             Err(e) => entry_errors.push(format!("entry {}: {}", i, e)),
         }

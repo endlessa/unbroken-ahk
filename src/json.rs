@@ -571,6 +571,84 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Split a JSON array document into raw per-element slices WITHOUT parsing
+/// the elements, so a parse-level defect inside one element (a duplicate
+/// object key, a malformed number) can be confined to that element instead
+/// of failing the whole document. Used by the registry loader, whose
+/// contract is per-entry tolerance: one damaged entry must not discard the
+/// healthy entries around it.
+///
+/// Only the array skeleton is validated here — the opening/closing
+/// brackets, commas, and string boundaries. Every returned slice still
+/// needs `parse_json` to be trusted.
+pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
+    let bytes = input.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    match bytes.get(pos) {
+        None => return Err(JsonError::UnexpectedEnd),
+        Some(b'[') => pos += 1,
+        Some(&b) => return Err(JsonError::UnexpectedChar(pos, b as char)),
+    }
+    let mut elements = Vec::new();
+    let mut lookahead = pos;
+    while lookahead < bytes.len() && bytes[lookahead].is_ascii_whitespace() {
+        lookahead += 1;
+    }
+    if bytes.get(lookahead) == Some(&b']') {
+        pos = lookahead + 1;
+    } else {
+        loop {
+            let start = pos;
+            // Scan one element: bracket depth plus string state is enough
+            // to find the ',' or ']' that ends it — brackets inside
+            // strings don't count, and escaped quotes don't end strings.
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let mut escaped = false;
+            loop {
+                let b = match bytes.get(pos) {
+                    Some(&b) => b,
+                    None => return Err(JsonError::UnexpectedEnd),
+                };
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if b == b'\\' {
+                        escaped = true;
+                    } else if b == b'"' {
+                        in_string = false;
+                    }
+                } else {
+                    match b {
+                        b'"' => in_string = true,
+                        b'[' | b'{' => depth += 1,
+                        b']' | b'}' if depth > 0 => depth -= 1,
+                        b',' | b']' if depth == 0 => break,
+                        _ => {}
+                    }
+                }
+                pos += 1;
+            }
+            elements.push(input[start..pos].trim());
+            let closed = bytes[pos] == b']';
+            pos += 1;
+            if closed {
+                break;
+            }
+        }
+    }
+    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    if pos < bytes.len() {
+        return Err(JsonError::TrailingData(pos));
+    }
+    Ok(elements)
+}
+
 // ---------------------------------------------------------------------------
 // ToJson / FromJson traits for our domain types
 // ---------------------------------------------------------------------------
@@ -608,6 +686,49 @@ pub fn str_array(items: &[String]) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_top_level_array_basic() {
+        assert_eq!(split_top_level_array("[]").unwrap(), Vec::<&str>::new());
+        assert_eq!(split_top_level_array(" [ ] ").unwrap(), Vec::<&str>::new());
+        assert_eq!(split_top_level_array("[1, 2, 3]").unwrap(), vec!["1", "2", "3"]);
+        assert_eq!(
+            split_top_level_array(r#"[{"a": [1, 2]}, {"b": {"c": 3}}]"#).unwrap(),
+            vec![r#"{"a": [1, 2]}"#, r#"{"b": {"c": 3}}"#]
+        );
+    }
+
+    #[test]
+    fn split_top_level_array_ignores_brackets_in_strings() {
+        // Brackets, commas, and escaped quotes inside strings must not
+        // end an element.
+        let input = r#"[{"name": "a,b]c"}, {"name": "d\"e[f"}]"#;
+        let parts = split_top_level_array(input).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parse_json(parts[0]).is_ok());
+        assert!(parse_json(parts[1]).is_ok());
+    }
+
+    #[test]
+    fn split_top_level_array_confines_element_defects() {
+        // The whole point: an element the strict parser rejects (duplicate
+        // key) is still isolated as its own slice, leaving the others
+        // parseable.
+        let input = r#"[{"id": "a"}, {"k": 1, "k": 2}, {"id": "b"}]"#;
+        let parts = split_top_level_array(input).unwrap();
+        assert_eq!(parts.len(), 3);
+        assert!(parse_json(parts[0]).is_ok());
+        assert!(matches!(parse_json(parts[1]), Err(JsonError::DuplicateKey(_))));
+        assert!(parse_json(parts[2]).is_ok());
+    }
+
+    #[test]
+    fn split_top_level_array_rejects_structural_damage() {
+        assert!(matches!(split_top_level_array(""), Err(JsonError::UnexpectedEnd)));
+        assert!(matches!(split_top_level_array("{}"), Err(JsonError::UnexpectedChar(_, _))));
+        assert!(matches!(split_top_level_array("[1, 2"), Err(JsonError::UnexpectedEnd)));
+        assert!(matches!(split_top_level_array("[1] junk"), Err(JsonError::TrailingData(_))));
+    }
 
     #[test]
     fn round_trip_simple() {

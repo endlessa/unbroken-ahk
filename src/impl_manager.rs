@@ -155,25 +155,54 @@ impl PlatformManager {
     /// The per-call re-read/merge/write that keeps persistence lossless
     /// makes one-at-a-time registration cost one file read each; bulk
     /// startup registration should come through here instead — same
-    /// semantics as register_runnable per item, one merge+write total.
+    /// per-item semantics as register_runnable, one merge+write total.
+    ///
+    /// Failure behavior: id mismatches are detected before ANY item is
+    /// applied. A definition conflict mid-batch stops the batch, and the
+    /// items applied before it are persisted before the error returns —
+    /// exactly the state per-item register_runnable calls would have
+    /// left, never registered-in-memory-but-absent-from-disk.
     pub fn register_runnables(
         &mut self,
         items: Vec<(TestDefinition, Box<dyn RunnableTest>)>,
     ) -> Result<(), ManagerError> {
-        let mut last_id = String::new();
-        for (definition, runnable) in items {
-            if runnable.id() != definition.id {
-                return Err(ManagerError::RegistrationFailed(
-                    "runnable ID does not match definition ID".into(),
-                ));
-            }
-            let id = self.ensure_definition(definition)?;
-            self.attach_runnable(&id, runnable);
-            last_id = id;
+        if items.is_empty() {
+            return Ok(());
         }
-        self.persist_registry()
-            .map_err(|e| ManagerError::PersistFailed(last_id, e))?;
-        Ok(())
+        for (definition, runnable) in &items {
+            if runnable.id() != definition.id {
+                return Err(ManagerError::RegistrationFailed(format!(
+                    "runnable ID '{}' does not match definition ID '{}'",
+                    runnable.id(),
+                    definition.id
+                )));
+            }
+        }
+        let mut applied = 0usize;
+        let mut batch_error = None;
+        for (definition, runnable) in items {
+            match self.ensure_definition(definition) {
+                Ok(id) => {
+                    self.attach_runnable(&id, runnable);
+                    applied += 1;
+                }
+                Err(e) => {
+                    batch_error = Some(e);
+                    break;
+                }
+            }
+        }
+        if applied > 0 {
+            // If both the batch and the persist fail, the persist failure
+            // wins — durability of what DID apply is the more urgent news.
+            self.persist_registry().map_err(|e| {
+                ManagerError::PersistFailed(format!("registration batch ({} tests)", applied), e)
+            })?;
+        }
+        match batch_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Format a run summary for output.
@@ -374,6 +403,11 @@ impl TestManager for PlatformManager {
             ));
         }
 
+        // ONE registry snapshot serves the exclude validation, include
+        // validation, and selection below — three traversals of the same
+        // data that must never drift apart.
+        let all_defs = self.registry.list_all();
+
         // A misspelled EXCLUDE tag silently WIDENS the run (the exclusion
         // matches nothing and the tests it meant to skip execute) — the
         // mirror image of the include-typo checks below, and validated
@@ -385,7 +419,6 @@ impl TestManager for PlatformManager {
         // destructive tests, a loud no-op beats a silent widening; the
         // error names the recovery for the drained-tag case.
         if !config.exclude_tags.is_empty() {
-            let all_defs = self.registry.list_all();
             let unmatched: Vec<&String> = config
                 .exclude_tags
                 .iter()
@@ -417,7 +450,6 @@ impl TestManager for PlatformManager {
             // Same symmetry for the other include criteria: a tag set or
             // pattern matching ZERO tests is a typo, not an empty union
             // contribution.
-            let all_defs = self.registry.list_all();
             if !config.include_tags.is_empty()
                 && !all_defs
                     .iter()
@@ -444,9 +476,7 @@ impl TestManager for PlatformManager {
 
         // Collect selected test IDs upfront to avoid borrow conflicts
         let selected_ids: Vec<String> = {
-            let all_defs = self.registry.list_all();
-            let all_refs: Vec<&TestDefinition> = all_defs.into_iter().collect();
-            let selected = self.filter.apply(&all_refs, &config);
+            let selected = self.filter.apply(&all_defs, &config);
             if selected.is_empty() {
                 return Err(ManagerError::NoTestsMatched);
             }
@@ -991,6 +1021,94 @@ mod tests {
         assert!(matches!(err, Err(ManagerError::RegistrationFailed(_))));
         // The batch failed before its single persist — nothing on disk.
         assert!(std::fs::metadata(format!("{}/registry.json", dir)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mid_batch_conflict_persists_the_applied_prefix() {
+        let dir = crate::test_util::temp_storage_dir("mgr-batch-prefix");
+        fn def(id: &str) -> TestDefinition {
+            TestDefinition {
+                id: id.into(),
+                name: id.into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            }
+        }
+        let mut mgr = PlatformManager::new(&dir);
+        // "x" is session-defined, so a conflicting redefinition must fail.
+        mgr.register_runnable(def("x"), Box::new(EchoTest { id: "x".into(), pass: true }))
+            .unwrap();
+        let mut conflicting = def("x");
+        conflicting.name = "renamed".into();
+        let err = mgr.register_runnables(vec![
+            (def("y"), Box::new(EchoTest { id: "y".into(), pass: true }) as Box<dyn RunnableTest>),
+            (conflicting, Box::new(EchoTest { id: "x".into(), pass: true })),
+        ]);
+        assert!(matches!(err, Err(ManagerError::RegistrationFailed(_))));
+        // "y" was applied before the conflict stopped the batch — it must
+        // be durable, never registered-in-memory-but-absent-from-disk.
+        let mut fresh = PlatformManager::new(&dir);
+        assert!(fresh.load_from_storage().unwrap().is_empty());
+        let ids: Vec<String> = fresh
+            .discover(&DiscoveryQuery::default())
+            .tests
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        assert!(ids.contains(&"x".to_string()) && ids.contains(&"y".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_defect_in_one_registry_entry_spares_the_rest() {
+        // A duplicate object key INSIDE one entry is that entry's damage:
+        // the healthy definitions around it must load, and the next
+        // persist must keep them in the live file (the damaged entry
+        // survives as a .corrupt backup, not in silence).
+        let dir = crate::test_util::temp_storage_dir("mgr-entry-defect");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            format!("{}/registry.json", dir),
+            r#"[
+                {"id": "good1", "name": "good1"},
+                {"id": "bad", "name": "bad", "metadata": {"k": "a", "k": "b"}},
+                {"id": "good2", "name": "good2"}
+            ]"#,
+        )
+        .unwrap();
+        let mut mgr = PlatformManager::new(&dir);
+        let warnings = mgr.load_from_storage().unwrap();
+        assert_eq!(warnings.len(), 1, "got: {:?}", warnings);
+        assert!(warnings[0].contains("duplicate object key"), "got: {:?}", warnings);
+        let loaded: Vec<String> = mgr
+            .discover(&DiscoveryQuery::default())
+            .tests
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        assert_eq!(loaded, vec!["good1", "good2"]);
+
+        mgr.register_test(TestDefinition {
+            id: "new1".into(),
+            name: "new1".into(),
+            tags: vec![],
+            group: None,
+            description: None,
+            metadata: vec![],
+        })
+        .unwrap();
+        let rewritten = std::fs::read_to_string(format!("{}/registry.json", dir)).unwrap();
+        for id in ["good1", "good2", "new1"] {
+            assert!(rewritten.contains(id), "{} missing after persist", id);
+        }
+        let has_backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("corrupt"));
+        assert!(has_backup, "damaged entry must be preserved as evidence");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

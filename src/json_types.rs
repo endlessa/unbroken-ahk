@@ -301,7 +301,13 @@ fn parse_run_config(value: &JsonValue, reject_bare_run_all_false: bool) -> Resul
         ));
     }
     let fail_fast = strict_opt_bool(value, "fail_fast")?.unwrap_or(false);
-    let timeout_ms = strict_opt_u64(value, "timeout_ms")?;
+    // Caller input stays fully strict; a stored config may carry a
+    // pre-clamp timeout above 2^53 (see stored_opt_u64).
+    let timeout_ms = if reject_bare_run_all_false {
+        strict_opt_u64(value, "timeout_ms")?
+    } else {
+        stored_opt_u64(value, "timeout_ms")?
+    };
     let execution_model = match value.get("execution_model") {
         None | Some(JsonValue::Null) => ExecutionModel::Sequential,
         Some(obj @ JsonValue::Object(_)) => ExecutionModel::from_json(obj)?,
@@ -366,7 +372,9 @@ impl FromJson for TestResult {
         Ok(TestResult {
             test_id,
             status,
-            duration_ms: strict_opt_u64(value, "duration_ms")?.unwrap_or(0),
+            // stored_opt_u64: results are only parsed back from run files,
+            // where a pre-clamp writer may have persisted > 2^53.
+            duration_ms: stored_opt_u64(value, "duration_ms")?.unwrap_or(0),
             message: strict_opt_string(value, "message")?,
             stdout: strict_opt_string(value, "stdout")?,
             stderr: strict_opt_string(value, "stderr")?,
@@ -397,17 +405,38 @@ impl ToJson for RunProgress {
 
 impl FromJson for RunProgress {
     fn from_json(value: &JsonValue) -> Result<Self, JsonError> {
+        // Strictly typed when present, like every sibling loader. Nothing
+        // in-tree reads progress documents back yet — but the first caller
+        // that does (a WASM host bridge) must get an error for a mistyped
+        // field, never a snapshot silently claiming zero progress.
+        let run_id = match value.get_str("run_id") {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return Err(JsonError::MissingField("run_id".into())),
+        };
+        let counter = |field: &str| -> Result<u32, JsonError> {
+            Ok(strict_opt_u32(value, field)?.unwrap_or(0))
+        };
+        let percent_complete = match value.get("percent_complete") {
+            None | Some(JsonValue::Null) => 0.0,
+            Some(JsonValue::Number(n)) if n.is_finite() => *n,
+            Some(_) => {
+                return Err(JsonError::InvalidField(
+                    "percent_complete".into(),
+                    "a finite number".into(),
+                ))
+            }
+        };
         Ok(RunProgress {
-            run_id: value.get_str("run_id").unwrap_or("").to_string(),
-            total: value.get_u32("total").unwrap_or(0),
-            completed: value.get_u32("completed").unwrap_or(0),
-            passed: value.get_u32("passed").unwrap_or(0),
-            failed: value.get_u32("failed").unwrap_or(0),
-            errored: value.get_u32("errored").unwrap_or(0),
-            skipped: value.get_u32("skipped").unwrap_or(0),
-            running: value.get_u32("running").unwrap_or(0),
-            percent_complete: value.get("percent_complete").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            elapsed_ms: value.get_u64("elapsed_ms").unwrap_or(0),
+            run_id,
+            total: counter("total")?,
+            completed: counter("completed")?,
+            passed: counter("passed")?,
+            failed: counter("failed")?,
+            errored: counter("errored")?,
+            skipped: counter("skipped")?,
+            running: counter("running")?,
+            percent_complete,
+            elapsed_ms: strict_opt_u64(value, "elapsed_ms")?.unwrap_or(0),
         })
     }
 }
@@ -463,15 +492,7 @@ impl FromJson for RunSummary {
             .transpose()?
             .unwrap_or_default();
         let count = |field: &str| -> Result<u32, JsonError> {
-            match strict_opt_u64(value, field)?.unwrap_or(0) {
-                n if n <= u32::MAX as u64 => Ok(n as u32),
-                // Reject rather than wrap modulo 2^32 — a fabricated count
-                // is exactly what strict loading exists to prevent.
-                _ => Err(JsonError::InvalidField(
-                    field.into(),
-                    "a count that fits in 32 bits".into(),
-                )),
-            }
+            Ok(strict_opt_u32(value, field)?.unwrap_or(0))
         };
         Ok(RunSummary {
             run_id,
@@ -482,9 +503,13 @@ impl FromJson for RunSummary {
             failed: count("failed")?,
             skipped: count("skipped")?,
             errored: count("errored")?,
-            total_duration_ms: strict_opt_u64(value, "total_duration_ms")?.unwrap_or(0),
-            started_at: strict_opt_u64(value, "started_at")?.unwrap_or(0),
-            completed_at: strict_opt_u64(value, "completed_at")?.unwrap_or(0),
+            // stored_opt_u64 for the u64 fields: summaries are only parsed
+            // back from run files, where a pre-clamp writer may have
+            // persisted values above 2^53. Counts stay strict — nothing
+            // ever legitimately wrote one beyond u32.
+            total_duration_ms: stored_opt_u64(value, "total_duration_ms")?.unwrap_or(0),
+            started_at: stored_opt_u64(value, "started_at")?.unwrap_or(0),
+            completed_at: stored_opt_u64(value, "completed_at")?.unwrap_or(0),
         })
     }
 }
@@ -662,6 +687,35 @@ fn strict_opt_u64(value: &JsonValue, field: &str) -> Result<Option<u64>, JsonErr
         Some(_) => Err(JsonError::InvalidField(
             field.into(),
             "a non-negative integer within the exact JSON range (<= 2^53)".into(),
+        )),
+    }
+}
+
+/// Like strict_opt_u64, but for STORED documents: a finite integer above
+/// 2^53 is legacy data from before the writer clamped u64 fields (u64
+/// values were serialized verbatim, so a runnable reporting a duration
+/// near u64::MAX persisted ~1.8e19), not damage — clamp it the way the
+/// writer now does instead of refusing to load previously readable
+/// history as CorruptRun. Everything else (mistyped, negative,
+/// fractional, non-finite) is still an error.
+fn stored_opt_u64(value: &JsonValue, field: &str) -> Result<Option<u64>, JsonError> {
+    match value.get(field) {
+        Some(JsonValue::Number(n)) if n.is_finite() && *n > MAX_SAFE_JSON_INT => {
+            Ok(Some(MAX_SAFE_JSON_INT as u64))
+        }
+        _ => strict_opt_u64(value, field),
+    }
+}
+
+fn strict_opt_u32(value: &JsonValue, field: &str) -> Result<Option<u32>, JsonError> {
+    match strict_opt_u64(value, field)? {
+        None => Ok(None),
+        Some(n) if n <= u32::MAX as u64 => Ok(Some(n as u32)),
+        // Reject rather than wrap modulo 2^32 — a fabricated count is
+        // exactly what strict loading exists to prevent.
+        Some(_) => Err(JsonError::InvalidField(
+            field.into(),
+            "a count that fits in 32 bits".into(),
         )),
     }
 }
@@ -848,6 +902,58 @@ mod tests {
         ] {
             let val = parse_json(bad).unwrap();
             assert!(RunSummary::from_json(&val).is_err(), "should reject: {}", bad);
+        }
+    }
+
+    #[test]
+    fn legacy_overlarge_u64s_in_stored_summaries_clamp_instead_of_corrupt() {
+        // The pre-clamp writer serialized u64 values verbatim, so a
+        // runnable reporting a duration near u64::MAX persisted ~1.8e19.
+        // Such history must stay loadable, clamped the way the writer now
+        // clamps — not rejected wholesale as CorruptRun.
+        let val = parse_json(
+            r#"{"run_id": "run_0001", "results": [
+                {"test_id": "t1", "status": "passed", "duration_ms": 18446744073709552000}
+            ], "total": 1, "passed": 1,
+            "total_duration_ms": 18446744073709552000,
+            "started_at": 18446744073709552000,
+            "completed_at": 18446744073709552000}"#,
+        )
+        .unwrap();
+        let summary = RunSummary::from_json(&val).unwrap();
+        assert_eq!(summary.results[0].duration_ms, 9_007_199_254_740_992);
+        assert_eq!(summary.total_duration_ms, 9_007_199_254_740_992);
+        assert_eq!(summary.started_at, 9_007_199_254_740_992);
+
+        // Caller input keeps full strictness; only STORED configs clamp.
+        let cfg = parse_json(r#"{"run_all": true, "timeout_ms": 18446744073709552000}"#).unwrap();
+        assert!(RunConfig::from_json(&cfg).is_err());
+        assert_eq!(
+            RunConfig::from_json_stored(&cfg).unwrap().timeout_ms,
+            Some(9_007_199_254_740_992)
+        );
+    }
+
+    #[test]
+    fn run_progress_loads_strictly() {
+        let good = parse_json(
+            r#"{"run_id": "run_0001", "total": 5, "completed": 2, "percent_complete": 40.0}"#,
+        )
+        .unwrap();
+        let progress = RunProgress::from_json(&good).unwrap();
+        assert_eq!(progress.total, 5);
+        assert_eq!(progress.completed, 2);
+        assert_eq!(progress.percent_complete, 40.0);
+
+        // Mistyped or missing-identity documents error instead of loading
+        // as a snapshot silently claiming zero progress.
+        for bad in [
+            r#"{"run_id": "run_0001", "total": "five"}"#,
+            r#"{"run_id": "run_0001", "percent_complete": true}"#,
+            r#"{"total": 5}"#,
+        ] {
+            let val = parse_json(bad).unwrap();
+            assert!(RunProgress::from_json(&val).is_err(), "should reject: {}", bad);
         }
     }
 
