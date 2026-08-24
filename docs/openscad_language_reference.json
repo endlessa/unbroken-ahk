@@ -2044,7 +2044,7 @@
    "Vector/range indices are each bounds-checked individually; a mixed valid/invalid vector instantiates the valid ones \u2014 VERIFY.",
    "Multiple children() calls (or one inside a for) stamp the children multiple times \u2014 idiomatic; each stamping re-runs child evaluation (echo inside a child fires per stamping \u2014 VERIFY).",
    "children() at top level / outside any module: error or warning \u2014 VERIFY text ('children() called outside module scope' approx).",
-   "Legacy child(i) is REMOVED by 2021.01: calling it hits the unknown-module warning path \u2014 VERIFY it is fully gone rather than deprecated.",
+   "Legacy child(i) still works in 2021.01 as a deprecated builtin: it instantiates the indexed child and emits 'DEPRECATED: child() will be removed in future releases. Use children() instead.' (removed only after 2021.01).",
    "Scope rule probe: module m(){ x=99; children(); } x=1; m() echo(x); must print 1 (caller's lexical scope), while module m(){ $q=5; children(); } m() echo($q); prints 5 (callee's $-env).",
    "Range index with reversed bounds inherits range deprecation-swap semantics \u2014 VERIFY in this position."
   ],
@@ -2195,9 +2195,9 @@
    "Literals exceeding double range (1e999) become inf silently (strtod overflow).",
    "VERIFY: trailing-dot form '5.' accepted by the lexer.",
    "Negative numbers are unary minus applied to a positive literal, not part of the literal - matters for precedence with ^.",
-   "-0 exists as a distinct double; echo prints it as -0 (VERIFY exact display)."
+   "-0 exists as a distinct double but echo prints it as 0 (UNIQUE_ZERO in 2021.01's double-conversion formatter); its sign is observable only via arithmetic such as 1/-0 == -inf."
   ],
-  "example": "echo(1e-3, .5, 2.5E+6, 1e999); // ECHO: 0.001, 0.5, 2.5e+06, inf",
+  "example": "echo(1e-3, .5, 2.5E+6, 1e999); // ECHO: 0.001, 0.5, 2.5e+6, inf",
   "since": "pre-2015.03",
   "impl_notes": "Parse with strtod-equivalent; store f64 everywhere. Pin 0x, 5., and 1e999 behavior via oracle probes."
  },
@@ -2550,7 +2550,7 @@
    "A ternary in tail position is eligible for tail-call elimination (2019.05+) - both branches are tail contexts.",
    "No warning ever originates from ?: itself; warnings come from the evaluated branch only."
   ],
-  "example": "function fact(n) = n<=1 ? 1 : n*fact(n-1); echo(fact(10)); // ECHO: 3.6288e+06",
+  "example": "function fact(n) = n<=1 ? 1 : n*fact(n-1); echo(fact(10)); // ECHO: 3.6288e+6",
   "since": "pre-2015.03"
  },
  {
@@ -2818,7 +2818,7 @@
   ],
   "semantics": "tan in degrees; special-cased so tan(45)==1 and tan(180)==0 exactly.",
   "edge_cases": [
-   "tan(90) returns +inf and tan(270) returns -inf via explicit special case; tan(180) returns -0.0 (observable in echo).",
+   "tan(90) returns +inf and tan(270) returns -inf via explicit special case; tan(180) returns -0.0 internally \u2014 echo prints it as \"0\" (the 2021.01 formatter maps negative zero to \"0\"); the sign is observable only indirectly, e.g. 1/tan(180) == -inf.",
    "tan(30)==1/sqrt(3), tan(45)==1, tan(60)==sqrt(3) exactly \u2014 30/45/60 are special-cased in every quadrant (2019.05+).",
    "tan(nan)/tan(inf) -> nan.",
    "Non-numeric: undef with WARNING."
@@ -3201,13 +3201,13 @@
   "semantics": "For 3-vectors returns [a1*b2-a2*b1, a2*b0-a0*b2, a0*b1-a1*b0]. For two 2-vectors returns the scalar a0*b1-a1*b0. Both arguments must have the same length, 2 or 3.",
   "edge_cases": [
    "Length mismatch (3 with 2) or lengths other than 2/3: undef with WARNING (approx 'Invalid parameters for cross()' - VERIFY text).",
-   "2D form only since 2019.05; earlier releases: undef/warning for 2-vectors.",
+   "2D form since 2015.03 (returns the scalar v0[0]*v1[1] - v0[1]*v1[0]); only 2014.03-era releases warned/returned undef for 2-vectors.",
    "Non-numeric elements: undef with WARNING (VERIFY vs nan propagation).",
    "Missing second argument: undef with WARNING.",
    "No n-ary or chained form; exactly two arguments."
   ],
   "example": "echo(cross([1,0,0],[0,1,0]), cross([1,0],[0,1])); // ECHO: [0, 0, 1], 1",
-  "since": "2019.05",
+  "since": "2015.03 (2D scalar form; 3D form pre-2015.03)",
   "impl_notes": "since marks the material 2D change; 3D form is pre-2015.03."
  },
  {
@@ -3378,14 +3378,14 @@
     "desc": "Any number of values of any type (number, string, boolean, vector, range, undef, function literal). Each is converted to its textual form and appended in order. Zero arguments allowed."
    }
   ],
-  "semantics": "Each argument is rendered using the exact same value formatter that echo uses, with one asymmetry: a string passed DIRECTLY as an argument is inserted unquoted, whereas echo would quote it. Strings nested inside vector arguments ARE quoted, exactly as in echo. Numbers are formatted %g-style with 6 significant digits: integers print without a decimal point, trailing zeros are trimmed, and the representation switches to scientific notation for large/small magnitudes exactly as printf %g does (exponent >= 6 or < -4). Booleans render as true/false, undef as undef, vectors as [a, b, c] (comma+space, recursive), ranges in spaced-colon form, function literals as a source-like rendering. The results are concatenated with no separators. str never fails and never warns; every value has a rendering.",
+  "semantics": "Each argument is rendered using the exact same value formatter that echo uses, with one asymmetry: a string passed DIRECTLY as an argument is inserted unquoted, whereas echo would quote it. Strings nested inside vector arguments ARE quoted, exactly as in echo. Numbers are formatted by the shared 6-significant-digit double-conversion formatter: integers print without a decimal point, trailing zeros are trimmed, fixed notation covers 1e-5 <= |x| < 1e6, and scientific notation with an unpadded exponent is used outside that range. Booleans render as true/false, undef as undef, vectors as [a, b, c] (comma+space, recursive), ranges in spaced-colon form, function literals as a source-like rendering. The results are concatenated with no separators. str never fails and never warns; every value has a rendering.",
   "edge_cases": [
    "str() with zero arguments returns \"\" (empty string).",
    "Number formatting is 6 significant digits: str(1/3) == \"0.333333\", str(PI) == \"3.14159\", str(10.0) == \"10\" (no decimal point for integral values), trailing zeros trimmed.",
-   "Scientific switch at 1e6 like %g: str(1000000) == \"1e+06\", str(1234567) == \"1.23457e+06\" \u2014 large integers go scientific AND GET ROUNDED (famous trap; user code that builds numbers into strings inherits this loss).",
-   "Small magnitudes: str(0.0001) == \"0.0001\" but str(0.00001) == \"1e-05\" (%g threshold at exponent < -4). VERIFY: exponent field width for 3-digit exponents (str(1e100) expected \"1e+100\").",
+   "Scientific switch at 1e6: str(1000000) == \"1e+6\", str(1234567) == \"1.23457e+6\" \u2014 large integers go scientific AND GET ROUNDED (famous trap; user code that builds numbers into strings inherits this loss).",
+   "Small magnitudes: str(0.0001) == \"0.0001\" AND str(0.00001) == \"0.00001\" \u2014 fixed notation persists down to 1e-5; scientific only below it, unpadded: str(1.1e-6) == \"1.1e-6\", str(1e100) == \"1e+100\".",
    "str(1/0) == \"inf\" (after the division-by-zero WARNING from the division itself), str(-1/0) == \"-inf\", str(0/0) == \"nan\".",
-   "VERIFY: negative zero renders as \"-0\" (printf %g behavior; pin against oracle).",
+   "Negative zero renders as \"0\" (UNIQUE_ZERO in the 2021.01 formatter); its sign is observable only via arithmetic (1/-0 == -inf).",
    "Top-level string args are unquoted: str(\"a\",\"b\") == \"ab\" \u2014 this is THE concatenation idiom; echo(str(...)) vs echo(...) differ in string quoting.",
    "Strings nested inside vector arguments are quoted: str([\"a\"]) == \"[\\\"a\\\"]\". VERIFY: interior quotes/backslashes in such nested strings are NOT re-escaped in the output (echo(\"a\\\"b\") style probes).",
    "Booleans -> \"true\"/\"false\"; undef -> \"undef\"; empty vector -> \"[]\"; nested vectors recursive with \", \" separators.",
@@ -3393,7 +3393,7 @@
    "VERIFY: function-literal arguments render as source-like text, e.g. \"function(x, y = 1) x + y\" (pin exact spacing/body serialization).",
    "str never emits warnings or errors regardless of argument types \u2014 total function.",
    "Formatting is identical between str, echo, and the assert-message renderer; a single shared formatter is compatibility-critical because golden .echo output and user string-building both depend on it.",
-   "VERIFY: dev snapshots have moved toward full-precision shortest-roundtrip number output \u2014 2021.01 baseline must keep 6-significant-digit %g."
+   "VERIFY: dev snapshots have moved toward full-precision shortest-roundtrip number output \u2014 2021.01 baseline must keep 6-significant-digit double-conversion output."
   ],
   "example": "echo(str(\"r=\", 1/3, \" v=\", [1,\"a\"], \" big=\", 1234567));",
   "impl_notes": "Implement ONE shared value-to-text formatter used by str/echo/assert. Pin via oracle probes: magnitude sweep 10^-7..10^9, negative values, -0, 0.1+0.2, inf/nan, nested vectors with strings containing quotes/backslashes, ranges with and without explicit step, function literals. Deep recursive str() accumulation must not be O(n^2) \u2014 use ropes or amortized buffers; libraries build long strings recursively.",
@@ -3777,7 +3777,7 @@
   ],
   "semantics": "Module/statement form: echo(...) emits exactly one line, 'ECHO: ' followed by the rendered arguments joined by ', '. Emission happens during tree instantiation, depth-first, in source order \u2014 before and independent of geometry evaluation, and NOT suppressed by geometry caching (a module instantiated 100 times echoes 100 times). Expression form (2019.05): 'echo(args) expr' prints the line, then evaluates and yields expr; it prints on EVERY evaluation, making it the only tracing tool inside functions and comprehensions; echo-expressions chain and nest with let/assert expressions.",
   "edge_cases": [
-   "Rendering: strings quoted at top level (echo(\"hi\") -> ECHO: \"hi\") \u2014 the deliberate asymmetry with str(); numbers exactly as str() (6 significant digits, 1234567 -> 1.23457e+06, inf/nan); vectors [a, b, c] with interior strings quoted; booleans true/false; undef prints undef; ranges spaced-colon form (VERIFY implicit step display); function literals as source-like text (VERIFY exact).",
+   "Rendering: strings quoted at top level (echo(\"hi\") -> ECHO: \"hi\") \u2014 the deliberate asymmetry with str(); numbers exactly as str() (6 significant digits, 1234567 -> 1.23457e+6, inf/nan); vectors [a, b, c] with interior strings quoted; booleans true/false; undef prints undef; ranges spaced-colon form (VERIFY implicit step display); function literals as source-like text (VERIFY exact).",
    "VERIFY: interior quotes/backslashes in printed strings are NOT re-escaped (echo(\"a\\\"b\") believed 'ECHO: \"a\"b\"').",
    "Named args: echo(b=2) -> 'ECHO: b = 2' (spaces around =); mixed echo(1, x=2, 3) preserves written order (VERIFY ordering).",
    "VERIFY: echo() with no arguments prints bare 'ECHO: ' (trailing space presence \u2014 pin exactly for golden tests).",
@@ -3832,7 +3832,7 @@
   "signature": "version() -> [year, month] (release builds) | [year, month, day] (date-versioned snapshots)",
   "summary": "Returns the OpenSCAD version as a numeric vector, e.g. [2021, 1]; the vector-shaped twin of version_num().",
   "params": [],
-  "semantics": "Returns a three-element vector of numbers identifying the running interpreter: [2021, 1] for release 2021.01. Libraries use it (usually via version_num instead, since vectors don't compare with <) to feature-gate code paths.",
+  "semantics": "Returns a vector of numbers identifying the running interpreter (two elements on release builds, three on date-versioned snapshot builds): [2021, 1] for release 2021.01. Libraries use it (usually via version_num instead, since vectors don't compare with <) to feature-gate code paths.",
   "edge_cases": [
    "Release mapping: 2021.01 -> [2021, 1]; 2019.05 -> [2019, 5]; 2015.03 -> [2015, 3]. VERIFY: point releases like 2015.03-3 -> believed [2015, 3, 3].",
    "Dev snapshots report their snapshot date: believed [YYYY, M, D] (e.g. a 2025-02-19 nightly -> [2025, 2, 19]) \u2014 VERIFY mapping.",
@@ -3856,7 +3856,7 @@
   "edge_cases": [
    "2021.01 -> 20210100; 2019.05 -> 20190500; 2015.03 -> 20150300. VERIFY: patch releases (2015.03-2 believed 20150302).",
    "Dev snapshots: believed YYYYMMDD of the snapshot date (e.g. 20250219) \u2014 which makes snapshot values numerically interleave oddly with release+patch encoding; VERIFY mapping before mimicking snapshots.",
-   "Returns a double like every OpenSCAD number; 6-significant-digit echo formatting renders it in scientific notation (echo(version_num()) -> 2.02101e+07) \u2014 the VALUE is exact even though the echo text is rounded; feature tests compare the value, not the text.",
+   "Returns a double like every OpenSCAD number; 6-significant-digit echo formatting renders it in scientific notation (echo(version_num()) -> 2.02101e+7) \u2014 the VALUE is exact even though the echo text is rounded; feature tests compare the value, not the text.",
    "VERIFY: arguments ignored / warned.",
    "Real-world gates to satisfy: >= 20150300 (concat/chr/text era), >= 20190500 (assert/ord/each era), >= 20210100 (function literals/^). Whatever you report toggles those library branches."
   ],
@@ -4459,7 +4459,7 @@
   "kind": "concept",
   "category": "import() and export formats",
   "signature": "openscad -o out.dxf|svg|pdf file.scad",
-  "summary": "2D geometry export surface of 2021.01: DXF (pre-2015.03) and SVG (2015.03+), plus PDF (new in 2021.01), plus PDF (new in 2021.01). Requires the top-level result to be 2D.",
+  "summary": "2D geometry export surface of 2021.01: DXF (pre-2015.03) and SVG (2015.03+), plus PDF (new in 2021.01). Requires the top-level result to be 2D.",
   "params": [],
   "semantics": "The rendered 2D polygon set (outer boundaries plus holes) is written in millimeter units. DXF writes polyline entities; SVG writes a single document with path data (holes via fill-rule); PDF writes a one-page vector document.",
   "edge_cases": [
@@ -4702,27 +4702,27 @@
   "impl_notes": "Implement literally as appended assignments to the parsed main file before evaluation \u2014 that single mechanism reproduces every precedence quirk automatically. Pin the -D-vs-preset ordering and the forward-reference case with oracle probes."
  },
  {
-  "name": "number formatting (%g, 6 significant digits)",
+  "name": "number formatting (6 significant digits)",
   "kind": "concept",
   "category": "echo/assert output formatting (observable text surface)",
-  "signature": "format(x) == C printf \"%g\" (precision 6) \u2014 shared by echo, str(), assert messages, and value-embedding warnings",
+  "signature": "format(x) \u2014 double-conversion library, 6 significant digits \u2014 shared by echo, str(), assert messages, and value-embedding warnings",
   "summary": "All user-visible number-to-text conversion in 2021.01 uses %g with 6 significant digits: trailing zeros trimmed, no decimal point for integer values, scientific notation for large/small magnitudes \u2014 famously rounding large integers.",
   "params": [],
-  "semantics": "Rules (C %g, precision 6): choose fixed or scientific by the decimal exponent e of the rounded value \u2014 scientific when e < -4 or e >= 6; keep at most 6 significant digits; strip trailing zeros and a bare decimal point. Examples: 1/3 -> 0.333333; PI -> 3.14159; 10.0 -> 10; 100000 -> 100000; 1000000 -> 1e+06; 1234567 -> 1.23457e+06; 0.0001 -> 0.0001; 0.00001 -> 1e-05; 0.1+0.2 -> 0.3 (error hidden by rounding). inf -> inf, -inf -> -inf, nan -> nan.",
+  "semantics": "Rules (2021.01, double-conversion library at 6 significant digits): fixed notation for 1e-5 <= |x| < 1e6, scientific otherwise; lowercase 'e' with explicit sign and NO zero padding of the exponent; at most 6 significant digits; trailing zeros trimmed and a bare decimal point stripped; -0 prints as 0 (UNIQUE_ZERO). Examples: 1/3 -> 0.333333; PI -> 3.14159; 10.0 -> 10; 100000 -> 100000; 1000000 -> 1e+6; 1234567 -> 1.23457e+6; 0.0001 -> 0.0001; 0.00001 -> 0.00001; 1.1e-6 -> 1.1e-6; 1e100 -> 1e+100; 0.1+0.2 -> 0.3 (error hidden by rounding). inf -> inf, -inf -> -inf, nan -> nan. Pre-2021 releases used printf %g (zero-padded exponents like 1e+06 and scientific already at 1e-5, printing 1e-05) \u2014 2021.01 is exactly where the formatter changed.",
   "edge_cases": [
-   "Large-integer trap: any |x| >= 1e6 goes scientific AND gets rounded to 6 digits \u2014 echo(1234567) prints 1.23457e+06; str() inherits this, so user string-building silently corrupts big numbers. Must clone.",
-   "Exponent format: lowercase 'e', explicit sign, minimum two digits ('1e+06', '1.5e-05'); three digits when needed ('1e+100'). VERIFY minimum-two-digit padding on all platforms (MSVC historically printed 3 \u2014 OpenSCAD normalized; pin).",
-   "-0: VERIFY whether it prints '-0' or '0' \u2014 pin via echo(-0) and echo(0*-1).",
-   "0.5 -> 0.5; 1e-4 boundary: 0.0001 fixed, 0.00001 scientific \u2014 the switch is at e < -4.",
+   "Large-integer trap: any |x| >= 1e6 goes scientific AND gets rounded to 6 digits \u2014 echo(1234567) prints 1.23457e+6; str() inherits this, so user string-building silently corrupts big numbers. Must clone.",
+   "Exponent format: lowercase 'e', explicit sign, NO zero padding \u2014 '1e+6', '1.1e-6', '1e+100'. (Pre-2021 %g output padded to two digits: '1e+06'.)",
+   "-0 prints as '0' (UNIQUE_ZERO flag in the 2021.01 formatter); the sign survives arithmetic \u2014 1/-0 == -inf.",
+   "0.5 -> 0.5; the small-number scientific switch is BELOW 1e-5: 0.0001 and 0.00001 both print fixed ('0.0001', '0.00001'); 1.1e-6 prints '1.1e-6'.",
    "Rounding is round-half-even per printf? VERIFY the tie behavior at the 6th digit (printf uses the current FP rounding, effectively round-half-even on the decimal conversion) \u2014 matters only for exact-tie goldens.",
    "true/false/undef are NOT numbers; booleans print true/false.",
    "The same formatter renders numbers INSIDE vectors and named-argument values.",
    ".csg export and STL/AMF writers use DIFFERENT (higher) precision \u2014 do not unify the formatters. VERIFY each writer's precision separately.",
-   "Dev snapshots have moved toward shortest-round-trip full precision output \u2014 2021.01 baseline stays 6-digit %g; only chase snapshot behavior behind an explicit flag.",
+   "Dev snapshots have moved toward shortest-round-trip full precision output \u2014 2021.01 baseline stays 6-digit double-conversion output; only chase snapshot behavior behind an explicit flag.",
    "str(1/3) == \"0.333333\" exactly \u2014 string-comparison user code depends on it."
   ],
-  "example": "echo(1/3, PI, 10.0, 1234567, 0.00001, 0.1 + 0.2);\n// ECHO: 0.333333, 3.14159, 10, 1.23457e+06, 1e-05, 0.3",
-  "since": "pre-2015.03 (stable through 2021.01)",
+  "example": "echo(1/3, PI, 10.0, 1234567, 0.00001, 0.1 + 0.2);\n// ECHO: 0.333333, 3.14159, 10, 1.23457e+6, 0.00001, 0.3",
+  "since": "precision (6 sig digits) pre-2015.03; formatter changed to double-conversion in 2021.01 (unpadded exponents, -0 prints 0)",
   "impl_notes": "Implement one canonical dtoa-%g(6) routine, byte-identical to glibc printf %g for the reachable domain, and use it for echo/str/assert/warnings ONLY. Golden-test a sweep: powers of ten 1e-7..1e7, ties, negatives, -0, inf, nan, and the 999999.5 boundary."
  },
  {
@@ -4985,7 +4985,7 @@
   "name": "Numbers & output formatting",
   "kind": "concept",
   "category": "Semantic model",
-  "signature": "echo(1/3, PI, 1234567, 10.0, 0.1 + 0.2);\n// ECHO: 0.333333, 3.14159, 1.23457e+06, 10, 0.3\necho(sin(180), 1/0, 0/0);   // ECHO: 0, inf, nan  (+ 'WARNING: division by zero')\necho(str(\"r=\", 1/3));       // ECHO: \"r=0.333333\"  (str uses the same formatter)",
+  "signature": "echo(1/3, PI, 1234567, 10.0, 0.1 + 0.2);\n// ECHO: 0.333333, 3.14159, 1.23457e+6, 10, 0.3\necho(sin(180), 1/0, 0/0);   // ECHO: 0, inf, nan  (+ 'WARNING: division by zero')\necho(str(\"r=\", 1/3));       // ECHO: \"r=0.333333\"  (str uses the same formatter)",
   "summary": "Every number is an IEEE-754 double; all angles everywhere are degrees; echo/str format numbers %g-style with 6 significant digits (so large integers go scientific and get rounded, and float error is hidden); domain errors and type mismatches produce nan/undef with WARNINGs instead of halting; the exact set and text of warnings is compatibility surface because --hardwarnings promotes any warning to a fatal error.",
   "params": [
    {
@@ -5013,13 +5013,13 @@
     "desc": "CLI/preferences mode that turns the FIRST warning into a fatal error; CI pipelines rely on it, making the warning set itself part of the contract."
    }
   ],
-  "semantics": "Arithmetic is plain IEEE-754 double arithmetic with these language-level decorations: division by zero warns ('WARNING: division by zero') and yields inf/-inf (0/0 yields nan); modulo is C fmod (result sign follows the dividend; x % 0 is nan); domain errors in sqrt/ln/log/asin/acos produce nan with a WARNING (since 2019.05; silently nan before). Nothing numeric ever throws \u2014 evaluation continues with inf/nan/undef flowing onward. All trigonometry is in degrees, and multiples of 30 and 45 degrees are special-cased to exact results in every quadrant (sin(180) == 0 exactly, cos(60) == 0.5; introduced 2019.05), which golden echo-based tests will expose. The observable text surface: echo prints 'ECHO: ' plus arguments joined by ', '; numbers are formatted %g-style with 6 SIGNIFICANT digits \u2014 1/3 prints 0.333333, PI prints 3.14159, 10.0 prints 10 (no decimal point), 1234567 prints 1.23457e+06 (large integers go scientific AND get rounded \u2014 a famous trap), tiny values print like 1.5e-05, inf prints inf, nan prints nan. str() uses the IDENTICAL formatter, so user string-building inherits the 6-digit rounding; 0.1+0.2 both echoes and str()s as 0.3, hiding float error. Diagnostics follow fixed shapes \u2014 'WARNING: <message>, in file <path>, line <N>.', 'ERROR: ...', 'DEPRECATED: ...', and assert failures with 'TRACE: called by ...' stack lines \u2014 and are parsed by users, test suites, and tooling, so the strings must match the oracle verbatim. Because --hardwarnings turns any warning fatal, emitting too many warnings breaks scripts as surely as emitting too few.",
+  "semantics": "Arithmetic is plain IEEE-754 double arithmetic with these language-level decorations: division by zero warns ('WARNING: division by zero') and yields inf/-inf (0/0 yields nan); modulo is C fmod (result sign follows the dividend; x % 0 is nan); domain errors in sqrt/ln/log/asin/acos produce nan with a WARNING (since 2019.05; silently nan before). Nothing numeric ever throws \u2014 evaluation continues with inf/nan/undef flowing onward. All trigonometry is in degrees, and multiples of 30 and 45 degrees are special-cased to exact results in every quadrant (sin(180) == 0 exactly, cos(60) == 0.5; introduced 2019.05), which golden echo-based tests will expose. The observable text surface: echo prints 'ECHO: ' plus arguments joined by ', '; numbers are formatted double-conversion-style (6 significant digits, unpadded exponents \u2014 see the number formatting entry) with 6 SIGNIFICANT digits \u2014 1/3 prints 0.333333, PI prints 3.14159, 10.0 prints 10 (no decimal point), 1234567 prints 1.23457e+6 (large integers go scientific AND get rounded \u2014 a famous trap), values below 1e-5 print scientific with an unpadded exponent ('1.5e-6'); 1.5e-5 itself prints fixed as '0.000015', inf prints inf, nan prints nan. str() uses the IDENTICAL formatter, so user string-building inherits the 6-digit rounding; 0.1+0.2 both echoes and str()s as 0.3, hiding float error. Diagnostics follow fixed shapes \u2014 'WARNING: <message>, in file <path>, line <N>.', 'ERROR: ...', 'DEPRECATED: ...', and assert failures with 'TRACE: called by ...' stack lines \u2014 and are parsed by users, test suites, and tooling, so the strings must match the oracle verbatim. Because --hardwarnings turns any warning fatal, emitting too many warnings breaks scripts as surely as emitting too few.",
   "edge_cases": [
-   "Large integers in echo go scientific and ROUNDED: echo(1234567) prints 1.23457e+06; echo(123456) prints 123456; VERIFY the exact %g cutover (believed standard %g: scientific when exponent >= 6, so 1000000 prints 1e+06 while 999999 prints 999999).",
+   "Large integers in echo go scientific and ROUNDED: echo(1234567) prints 1.23457e+6; echo(123456) prints 123456; the cutover is at 1e6 (1000000 prints 1e+6, 999999 prints 999999) with unpadded exponents.",
    "echo hides float error: 0.1+0.2 prints 0.3; 6-significant-digit rounding applies inside vectors too ([1/3] prints [0.333333]).",
-   "str() formats numbers exactly like echo \u2014 str(1e7) is \"1e+07\"; any user code building filenames/labels from big numbers inherits this. The two must share one formatter implementation.",
+   "str() formats numbers exactly like echo \u2014 str(1e7) is \"1e+7\"; any user code building filenames/labels from big numbers inherits this. The two must share one formatter implementation.",
    "Integers print without decimal point: 10.0 prints 10; 2.0*5 prints 10.",
-   "VERIFY: -0 \u2014 believed %g prints it as -0; 0 == -0 is true; pin echo(-0) and sign(-0) (believed 0).",
+   "-0: echo prints '0' (UNIQUE_ZERO in the 2021.01 double-conversion formatter); 0 == -0 is true; sign(-0) is 0; the sign shows only via arithmetic (1/-0 == -inf).",
    "inf prints 'inf', nan prints 'nan'; VERIFY -inf prints '-inf'. There are no literals; 1/0 (with warning) is the accessible source of inf, 0/0 of nan.",
    "1/0 yields inf with 'WARNING: division by zero'; -1/0 yields -inf; VERIFY whether 0/0 emits the same division-by-zero warning text (result nan); x % 0 yields nan (VERIFY its warning, believed 'WARNING: modulo by zero' or the division text \u2014 pin).",
    "Domain errors yield nan with WARNING since 2019.05: sqrt(-1), ln(-1), log(-1), asin(2), acos(-2). VERIFY per-function warning texts. VERIFY ln(0)/log(0) \u2014 believed -inf (C behavior), possibly with warning.",
@@ -5035,10 +5035,10 @@
    "Diagnostic formats to clone verbatim (capture from oracle): 'WARNING: <msg>, in file <path>, line <N>.', 'ERROR: ...', 'DEPRECATED: ...', assert: ERROR: Assertion '(<condition source text>)' failed[: <message>] in file <path>, line <N>, then 'TRACE: called by '<module>', in file ..., line ...' lines unwinding the module stack. VERIFY exact punctuation of each.",
    "The warning SET is surface (compatibility-critical under --hardwarnings): variable reassignment, unknown variable, undefined operation/type mismatch, unequal-length vector +/-, scalar+vector, division by zero, deprecated reversed range, $fa/$fs clamp, unknown named parameter, empty min/max, range step problems, deprecations (assign, triangles=), unknown module/function call. VERIFY completeness by diffing against oracle runs of a warning-torture script.",
    "Warning/echo emission order is depth-first instantiation order, before/independent of geometry evaluation; duplicate-warning rate limiting in the GUI console is app behavior, not language.",
-   "Dev snapshots have been moving echo toward full-precision shortest-roundtrip number output \u2014 2021.01 is firmly 6-significant-digit %g; VERIFY per-snapshot before chasing snapshot parity.",
-   "version() returns [2021, 1] style vectors (two elements on release builds; a third day element only on date-versioned snapshots) and version_num() returns 20210100-style numbers \u2014 these numbers flow through the same formatter rules when echoed (20210100 prints as 2.02101e+07!)."
+   "Dev snapshots have been moving echo toward full-precision shortest-roundtrip number output \u2014 2021.01 is firmly 6-significant-digit double-conversion output; VERIFY per-snapshot before chasing snapshot parity.",
+   "version() returns [2021, 1] style vectors (two elements on release builds; a third day element only on date-versioned snapshots) and version_num() returns 20210100-style numbers \u2014 these numbers flow through the same formatter rules when echoed (20210100 prints as 2.02101e+7!)."
   ],
-  "example": "echo(1/3, PI, 10.0, 1234567);   // ECHO: 0.333333, 3.14159, 10, 1.23457e+06\necho(0.1 + 0.2);                 // ECHO: 0.3\necho(sin(180), cos(90));         // ECHO: 0, 0\necho(-5 % 3, 5 % -3);            // ECHO: -2, 2\necho(2^3^2, -2^2);               // ECHO: 512, -4\necho(str(1/3), len(str(1/3)));   // ECHO: \"0.333333\", 8\ncube(1);",
+  "example": "echo(1/3, PI, 10.0, 1234567);   // ECHO: 0.333333, 3.14159, 10, 1.23457e+6\necho(0.1 + 0.2);                 // ECHO: 0.3\necho(sin(180), cos(90));         // ECHO: 0, 0\necho(-5 % 3, 5 % -3);            // ECHO: -2, 2\necho(2^3^2, -2^2);               // ECHO: 512, -4\necho(str(1/3), len(str(1/3)));   // ECHO: \"0.333333\", 8\ncube(1);",
   "since": "2015.03",
   "impl_notes": "Write ONE number-formatting routine that both echo and str() call and freeze it against oracle output for a battery of magnitudes (10^-7..10^9, negative, -0, inf, nan, 6-digit boundary values like 999999.5). Implement warnings through a single channel with a --hardwarnings escalation switch. Pin via oracle probes: the %g cutover boundaries, -0, round() ties, ^ precedence vs unary minus, 0^0, x%0 warning, ln(0), every domain-error warning text, unary plus, and the exact-trig angle set and introduction release. Do not use platform printf %g blindly \u2014 verify it matches OpenSCAD's output for the boundary cases (it is believed to literally be %g, but freeze by test, not assumption)."
  },
@@ -5207,12 +5207,12 @@
   "name": "Determinism & compatibility posture",
   "kind": "concept",
   "category": "Semantic model",
-  "signature": "// Same script + same implementation version => same console text, same solid.\n// Never promised: byte-identical STL versus OpenSCAD or across versions.\necho(version(), version_num());   // ECHO: [2021, 1], 2.02101e+07\nif (version_num() >= 20190500) echo(\"2019.05+ features available\");",
-  "summary": "The compatibility contract for a 2021.01 reimplementation: PROMISE full determinism (identical script and inputs give identical console output, warning set/order, and geometry), exact tessellation/fragment-formula parity, and mesh-level (solid) equivalence with OpenSCAD 2021.01; NEVER promise byte-identical STL/vertex ordering versus the official binary or across versions, cloned CGAL error strings, or bit-compatible seeded rands(); report version()=[2021,1,0]/version_num()=20210100 so libraries feature-detect correctly, and pin every uncertainty by differential testing against the official AppImage as an oracle.",
+  "signature": "// Same script + same implementation version => same console text, same solid.\n// Never promised: byte-identical STL versus OpenSCAD or across versions.\necho(version(), version_num());   // ECHO: [2021, 1], 2.02101e+7\nif (version_num() >= 20190500) echo(\"2019.05+ features available\");",
+  "summary": "The compatibility contract for a 2021.01 reimplementation: PROMISE full determinism (identical script and inputs give identical console output, warning set/order, and geometry), exact tessellation/fragment-formula parity, and mesh-level (solid) equivalence with OpenSCAD 2021.01; NEVER promise byte-identical STL/vertex ordering versus the official binary or across versions, cloned CGAL error strings, or bit-compatible seeded rands(); report version()=[2021,1]/version_num()=20210100 so libraries feature-detect correctly, and pin every uncertainty by differential testing against the official AppImage as an oracle.",
   "params": [
    {
     "name": "version()",
-    "desc": "Returns [year, month, patch], e.g. [2021, 1]; libraries (BOSL2 etc.) feature-test on it, so the reported value gates which library code paths run."
+    "desc": "Returns [year, month] on release builds ([year, month, day] on snapshots), e.g. [2021, 1]; libraries (BOSL2 etc.) feature-test on it, so the reported value gates which library code paths run."
    },
    {
     "name": "version_num()",
@@ -5227,7 +5227,7 @@
     "desc": "OpenSCAD gates snapshot features behind explicit flags (lazy-union, manifold, roof, textmetrics); mirror this opt-in model rather than silently enabling snapshot behavior in a 2021.01-baseline implementation."
    }
   ],
-  "semantics": "The contract has two tiers. Tier 1 \u2014 self-consistency (absolute): the implementation is a pure function of (script, file inputs, CLI defines, feature flags, $t/camera inputs): every run produces the identical echo/warning/error text in identical depth-first instantiation order, the identical geometry with identical vertex coordinates and identical vertex/triangle ordering, and identical export bytes. No hash-map iteration order, thread scheduling, locale, or wall clock may leak into results; geometry caching must be semantically invisible. Tier 2 \u2014 parity with OpenSCAD 2021.01: language-level observables should match the official binary verbatim (echo/str %g formatting, warning texts and counts, deprecation and assert/TRACE formats, the fragment formula and tessellation phase contracts, search()'s ragged results, reversed-range swapping), because scripts, CI pipelines with --hardwarnings, and golden tests parse them. Geometry parity is promised at the SOLID level: the same point sets and volumes given the same tessellation contracts \u2014 primitive vertex positions should match to double precision since the tessellation formulas are pinned, but the triangulation of polygon interiors, the vertex/triangle ORDER in exports, and near-degenerate CSG outcomes follow kernel internals (CGAL in 2021.01, Manifold in snapshots) that OpenSCAD itself does not keep stable across versions. Therefore: never promise byte-identical STL against the official binary, never promise its internal error messages, and treat rands() bit-compatibility as out of scope unless std::mt19937 plus its distribution mapping is deliberately cloned (std::uniform_real_distribution is not even specified identically across C++ standard libraries). Report the 2021.01 version numbers, add snapshot features only behind explicit flags mirroring --enable, and convert every VERIFY item in this reference into an oracle-diff test before freezing semantics.",
+  "semantics": "The contract has two tiers. Tier 1 \u2014 self-consistency (absolute): the implementation is a pure function of (script, file inputs, CLI defines, feature flags, $t/camera inputs): every run produces the identical echo/warning/error text in identical depth-first instantiation order, the identical geometry with identical vertex coordinates and identical vertex/triangle ordering, and identical export bytes. No hash-map iteration order, thread scheduling, locale, or wall clock may leak into results; geometry caching must be semantically invisible. Tier 2 \u2014 parity with OpenSCAD 2021.01: language-level observables should match the official binary verbatim (echo/str 6-significant-digit double-conversion formatting, warning texts and counts, deprecation and assert/TRACE formats, the fragment formula and tessellation phase contracts, search()'s ragged results, reversed-range swapping), because scripts, CI pipelines with --hardwarnings, and golden tests parse them. Geometry parity is promised at the SOLID level: the same point sets and volumes given the same tessellation contracts \u2014 primitive vertex positions should match to double precision since the tessellation formulas are pinned, but the triangulation of polygon interiors, the vertex/triangle ORDER in exports, and near-degenerate CSG outcomes follow kernel internals (CGAL in 2021.01, Manifold in snapshots) that OpenSCAD itself does not keep stable across versions. Therefore: never promise byte-identical STL against the official binary, never promise its internal error messages, and treat rands() bit-compatibility as out of scope unless std::mt19937 plus its distribution mapping is deliberately cloned (std::uniform_real_distribution is not even specified identically across C++ standard libraries). Report the 2021.01 version numbers, add snapshot features only behind explicit flags mirroring --enable, and convert every VERIFY item in this reference into an oracle-diff test before freezing semantics.",
   "edge_cases": [
    "PROMISE: identical (script, inputs, version) yields identical console byte stream \u2014 echo text, warning set, warning ORDER (depth-first instantiation), and error/TRACE formats. Users' golden tests and MCP-layer parsers depend on it.",
    "PROMISE: reproducible tessellation \u2014 the fragment formula, circle first-vertex-at-+X CCW inscribed contract, sphere half-step ring phase with no pole vertices, cylinder fragment phase, and rotate_extrude +X seam produce identical vertex coordinates run-to-run and match the oracle to double precision.",
@@ -5237,8 +5237,8 @@
    "NEVER promise: cloned CGAL error/assertion strings on invalid geometry \u2014 promise the detection TIMING (failures surface at exact-evaluation/render, not instantiation) and a documented error of your own.",
    "NEVER promise near-degenerate CSG parity: exactly-coincident faces, zero-thickness results, and epsilon-scale 2D features may legitimately differ from CGAL/Clipper outcomes; document as unspecified rather than chasing.",
    "rands(): with a seed, reproducible WITHIN your implementation forever (freeze your PRNG); bit-matching OpenSCAD requires cloning std::mt19937 AND its uniform_real_distribution mapping \u2014 VERIFY: std::uniform_real_distribution output is not pinned by the C++ standard, so the official binary itself may differ across platform stdlibs; recommended posture is to NOT promise cross-implementation rands() equality. Unseeded rands() is nondeterministic by definition \u2014 the only sanctioned nondeterminism in the language.",
-   "version()/version_num() gate real library code paths (BOSL2 feature-detects): report [2021,1]/20210100 for baseline claims. VERIFY: what official snapshots report (snapshot date forms like [2025,x,y]) before emulating one. Note the echo trap: version_num() echoes as 2.02101e+07 under %g \u2014 comparisons work, display looks odd; clone as-is.",
-   "Echo number formatting is part of determinism surface: the 6-significant-digit %g formatter must be frozen and shared by echo/str; snapshots moving to shortest-roundtrip output are a DIFFERENT contract \u2014 never mix behind the 2021.01 flag.",
+   "version()/version_num() gate real library code paths (BOSL2 feature-detects): report [2021,1]/20210100 for baseline claims. VERIFY: what official snapshots report (snapshot date forms like [2025,x,y]) before emulating one. Note the echo trap: version_num() echoes as 2.02101e+7 under %g \u2014 comparisons work, display looks odd; clone as-is.",
+   "Echo number formatting is part of determinism surface: the 6-significant-digit double-conversion formatter must be frozen and shared by echo/str; snapshots moving to shortest-roundtrip output are a DIFFERENT contract \u2014 never mix behind the 2021.01 flag.",
    "--hardwarnings parity: the exact SET of emitted warnings is a compatibility gate \u2014 an extra warning your implementation adds turns green CI runs red; a missing one hides bugs. Diff warning inventories against the oracle on a torture script and freeze.",
    "$t and camera ($vpr/$vpt/$vpd/$vpf) are INPUTS: per-frame determinism given their values; animation runs are deterministic frame-by-frame.",
    "Locale/platform independence: '.' decimal separator always; UTF-8 handling identical across platforms; no filesystem ordering leaks (e.g. font enumeration for text() must be deterministic or pinned).",
@@ -5248,7 +5248,7 @@
    "Performance posture (expectation, not semantics): subtree geometry caching, O(1) amortized list building, and fast recursive functions are required for real scripts to complete; document that timing is never part of the compatibility promise.",
    "Licensing constraint on methodology: the reference implementation is GPLv2+ and CGAL is GPL \u2014 a cleanroom reimplementation pins behavior via the CC BY-SA manual and BLACK-BOX oracle observation only; never port OpenSCAD/CGAL source. Manifold (Apache-2.0) and Clipper2 (BSL-1.0) algorithms/papers are safe references."
   ],
-  "example": "echo(version(), version_num());   // ECHO: [2021, 1], 2.02101e+07\nassert(version_num() >= 20210100);\nr = rands(0, 1, 3, 42);            // seeded: reproducible per implementation\necho(r);                            // freeze YOUR values; don't promise OpenSCAD's\nsphere(5, $fn=24);                  // vertex positions: promised; STL bytes: not",
+  "example": "echo(version(), version_num());   // ECHO: [2021, 1], 2.02101e+7\nassert(version_num() >= 20210100);\nr = rands(0, 1, 3, 42);            // seeded: reproducible per implementation\necho(r);                            // freeze YOUR values; don't promise OpenSCAD's\nsphere(5, $fn=24);                  // vertex positions: promised; STL bytes: not",
   "since": "2021.01",
   "impl_notes": "Engineer determinism structurally: ordered maps everywhere results can leak, a single frozen number formatter, deterministic ID/ordering for generated vertices, and cache designs proven invisible by cache-on/cache-off byte-diff tests in CI. Build the oracle harness first \u2014 script corpus, run official 2021.01 headless, capture ECHO/.csg/meshes, diff on every commit; promote each VERIFY item from this reference into that corpus. Freeze your seeded rands() stream as YOUR contract with a documented note that it diverges from OpenSCAD. Publish the compatibility statement in these exact tiers (self-consistency: byte-exact; OpenSCAD parity: console-verbatim + solid-equivalent; explicitly excluded: STL bytes, triangulation, CGAL errors, rands bits, timing) so users and downstream tests target the right guarantees."
  },
@@ -5257,21 +5257,21 @@
   "kind": "module",
   "category": "Modules, functions, children",
   "signature": "child(); child(index);",
-  "summary": "Legacy singular predecessor of children(). Deprecated when children() arrived (2014.03) and removed in later releases.",
+  "summary": "Legacy singular predecessor of children(). Deprecated when children() arrived (2014.03), but STILL registered and functional in 2021.01; removed only after 2021.01.",
   "params": [
    {
     "name": "index",
     "desc": "0-based index of the passed child to instantiate; omitted = first child."
    }
   ],
-  "semantics": "Pre-2014 modules re-instantiated their passed subtree with child(). children() replaced it with range/index support; child() was removed in 2019.05, so in 2021.01 calling it is an unknown-module condition and the subtree is dropped.",
+  "semantics": "Pre-2014 modules re-instantiated their passed subtree with child(). children() replaced it with range/index support in 2014.03. In 2021.01 child() still works: each call instantiates the indexed child and emits \"DEPRECATED: child() will be removed in future releases. Use children() instead.\" Actual removal happened only after 2021.01.",
   "edge_cases": [
-   "VERIFY: exact 2021.01 behavior for a child() call \u2014 believed an ordinary unknown-module warning (module ignored) rather than a hard parse error; pin the message text.",
+   "Functional in 2021.01 with a per-call DEPRECATED message \u2014 VERIFY the exact text and whether it repeats per call or is deduplicated.",
    "Migration is mechanical: child() -> children(0) / children(i)."
   ],
   "example": "// legacy: child(0);  \u2014 modern equivalent:\nmodule pair(){ children(0); translate([10,0,0]) children(0); }\npair() circle(2);",
-  "since": "pre-2015.03 (deprecated 2014.03, removed in 2019.05)",
-  "impl_notes": "Do not implement; recognize the name in diagnostics and suggest children() \u2014 a targeted hint beats the generic unknown-module warning."
+  "since": "pre-2015.03 (deprecated 2014.03; still functional in 2021.01; removed post-2021.01)",
+  "impl_notes": "Implement as a deprecated alias of children() emitting the deprecation warning \u2014 2021.01 parity requires it to work."
  },
  {
   "name": "import_stl / import_dxf / import_off (deprecated)",
@@ -5288,7 +5288,7 @@
   "semantics": "Each behaves as import() restricted to one format. In 2021.01 all three still function as deprecated aliases, emitting the DEPRECATED-removal warning on every use; they were removed only after 2021.01. Scripts in the wild (pre-2014 Thingiverse era) still contain them.",
   "edge_cases": [
    "Functional in 2021.01: each call emits 'DEPRECATED: The import_stl() module will be removed in future releases. Use import() instead.' \u2014 VERIFY the exact per-name message text.",
-   "Among the classic deprecations only child() was actually REMOVED by the 2021.01 baseline; these aliases survived through it."
+   "None of the classic deprecations (child(), assign(), import_stl/import_dxf/import_off, dxf_linear_extrude/dxf_rotate_extrude, triangles=) was removed by the 2021.01 baseline \u2014 all remain deprecated-but-functional; removals came only after 2021.01."
   ],
   "example": "import_stl(\"part.stl\"); // legacy \u2014 write import(\"part.stl\");",
   "since": "pre-2015.03 (deprecated ~2013)",
@@ -5401,7 +5401,7 @@
   "semantics": "These are the same modules as linear_extrude/rotate_extrude reached through their legacy file=/layer= parameters \u2014 which is exactly why linear_extrude's true positional order starts (file, layer, height, origin, scale, ...). Calling them works in 2021.01 and emits the DEPRECATED-removal warning; the modern equivalent is an extrusion over a child import().",
   "edge_cases": [
    "Emits 'DEPRECATED: The dxf_linear_extrude() module will be removed in future releases. Use linear_extrude() instead.' (and the rotate twin) \u2014 VERIFY exact wording per name.",
-   "Only child() among the classic deprecations was actually removed by 2021.01 (gone in 2019.05); these five legacy import/dxf names all survived through 2021.01."
+   "All the classic deprecations \u2014 including child() \u2014 survived through 2021.01 as deprecated-but-functional builtins; none was removed by the 2021.01 baseline."
   ],
   "example": "// deprecated, still works in 2021.01:\n// dxf_linear_extrude(file=\"p.dxf\", height=5);\n// modern equivalent:\nlinear_extrude(5) import(\"p.dxf\");",
   "since": "pre-2015.03 (deprecated; removed after 2021.01)",
