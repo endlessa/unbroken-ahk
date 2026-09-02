@@ -114,10 +114,11 @@ impl PlatformManager {
     /// Register a runnable test implementation alongside its definition.
     ///
     /// Idempotent for an identical definition: re-registering (a restart
-    /// after load_from_storage, or a retry after PersistFailed) keeps the
-    /// already-attached runnable, re-attempts persistence, and reports
-    /// success only when the definition is durable. A conflicting
-    /// definition is an error.
+    /// after load_from_storage, or a retry after PersistFailed)
+    /// REPLACES any already-attached runnable with the freshly supplied
+    /// one (see attach_runnable — new code must win), re-attempts
+    /// persistence, and reports success only when the definition is
+    /// durable. A conflicting definition is an error.
     pub fn register_runnable(
         &mut self,
         definition: TestDefinition,
@@ -481,7 +482,10 @@ impl PlatformManager {
                     .any(|t| crate::filter::name_matches_lower(&pattern_lower, &t.name))
                 {
                     return Err(ManagerError::UnsupportedConfig(format!(
-                        "name_pattern '{}' matches no registered test",
+                        // {:?}, not '{}': Debug escapes interior quotes,
+                        // so the echo survives the console's quoted-span
+                        // protection whatever the pattern contains.
+                        "name_pattern {:?} matches no registered test",
                         pattern
                     )));
                 }

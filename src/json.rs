@@ -574,6 +574,14 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// The RFC 8259 whitespace set — the SAME set parse_json skips. The
+/// splitter must not accept separators (form feed, vertical tab, NBSP)
+/// that the strict parser rejects, or load_registry would call a file
+/// healthy that parse_json calls corrupt.
+fn is_json_whitespace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
 /// Split a JSON array document into raw per-element slices WITHOUT parsing
 /// the elements, so a parse-level defect inside one element (a duplicate
 /// object key, a malformed number) can be confined to that element instead
@@ -587,7 +595,7 @@ impl<'a> Parser<'a> {
 pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
     let bytes = input.as_bytes();
     let mut pos = 0;
-    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+    while pos < bytes.len() && is_json_whitespace(bytes[pos]) {
         pos += 1;
     }
     match bytes.get(pos) {
@@ -597,13 +605,26 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
     }
     let mut elements = Vec::new();
     let mut lookahead = pos;
-    while lookahead < bytes.len() && bytes[lookahead].is_ascii_whitespace() {
+    while lookahead < bytes.len() && is_json_whitespace(bytes[lookahead]) {
         lookahead += 1;
     }
     if bytes.get(lookahead) == Some(&b']') {
         pos = lookahead + 1;
     } else {
         loop {
+            // Every element must BEGIN like a JSON value begins. Anything
+            // else at this position (a stray comma, a form feed, '@') is
+            // skeleton damage that parse_json would reject file-level —
+            // classifying it as one damaged "entry" would let the two
+            // loaders disagree about the same file.
+            while pos < bytes.len() && is_json_whitespace(bytes[pos]) {
+                pos += 1;
+            }
+            match bytes.get(pos) {
+                None => return Err(JsonError::UnexpectedEnd),
+                Some(b'"' | b'{' | b'[' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n') => {}
+                Some(&b) => return Err(JsonError::UnexpectedChar(pos, b as char)),
+            }
             let start = pos;
             // Scan one element: bracket depth plus string state is enough
             // to find the ',' or ']' that ends it — brackets inside
@@ -643,7 +664,7 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                             end = pos;
                             break;
                         }
-                        _ if b.is_ascii_whitespace() => {}
+                        _ if is_json_whitespace(b) => {}
                         _ => return Err(JsonError::UnexpectedChar(pos, b as char)),
                     }
                 } else if depth == 0 && in_scalar {
@@ -652,7 +673,7 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                             end = pos;
                             break;
                         }
-                        _ if b.is_ascii_whitespace() => {
+                        _ if is_json_whitespace(b) => {
                             in_scalar = false;
                             value_closed = true;
                         }
@@ -671,7 +692,7 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                             end = pos;
                             break;
                         }
-                        _ if b.is_ascii_whitespace() => {}
+                        _ if is_json_whitespace(b) => {}
                         // Start of a scalar (number, true/false/null, or
                         // garbage the per-element parse will reject).
                         _ => in_scalar = true,
@@ -691,14 +712,11 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                 }
                 pos += 1;
             }
-            let piece = input[start..end].trim();
-            if piece.is_empty() {
-                // A zero-length element is damage to the array SKELETON
-                // (a trailing or doubled comma), not a damaged entry —
-                // reporting it per-entry would warn about a nonexistent
-                // entry and back up an intact file as corrupt.
-                return Err(JsonError::UnexpectedChar(end, bytes[end] as char));
-            }
+            // Never empty: start points at a verified value-starter byte
+            // (trailing/doubled commas already errored at the check
+            // above), so only trailing whitespace needs trimming.
+            let piece =
+                input[start..end].trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
             elements.push(piece);
             let closed = bytes[end] == b']';
             pos = end + 1;
@@ -707,7 +725,7 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
             }
         }
     }
-    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+    while pos < bytes.len() && is_json_whitespace(bytes[pos]) {
         pos += 1;
     }
     if pos < bytes.len() {
@@ -808,6 +826,13 @@ mod tests {
         ));
         assert!(matches!(
             split_top_level_array(r#"["a" "b"]"#),
+            Err(JsonError::UnexpectedChar(_, _))
+        ));
+        // The splitter accepts EXACTLY the parser's whitespace set: a
+        // form feed between elements is rejected by parse_json, so the
+        // splitter must not call that file healthy.
+        assert!(matches!(
+            split_top_level_array("[1,\u{0C}2]"),
             Err(JsonError::UnexpectedChar(_, _))
         ));
         // Scalar elements get the same missing-comma detection as

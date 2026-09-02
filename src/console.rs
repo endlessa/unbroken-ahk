@@ -974,12 +974,16 @@ mod tests {
         assert!(out.text.contains("x\\\"include_tags"), "got: {}", out.text);
         assert!(!out.text.contains("x\\\"--tag"), "got: {}", out.text);
 
-        // Single-quoted echoes (the pattern zero-match error) are user
-        // data too — a pattern containing a field-name substring must
-        // come back verbatim.
+        // The pattern zero-match echo is user data too — a pattern
+        // containing a field-name substring must come back verbatim
+        // (Debug-quoted at the source so quoting survives any content).
         let out = execute_command(&mut mgr, "run --pattern=run_all_zz");
-        assert!(out.text.contains("'run_all_zz'"), "got: {}", out.text);
+        assert!(out.text.contains("\"run_all_zz\""), "got: {}", out.text);
         assert!(!out.text.contains("--all_zz"), "got: {}", out.text);
+        // ...including a pattern that itself contains a quote.
+        let out = execute_command(&mut mgr, "run --pattern=x'exclude_tags");
+        assert!(out.text.contains("x'exclude_tags"), "got: {}", out.text);
+        assert!(!out.text.contains("x'--exclude"), "got: {}", out.text);
     }
 
     #[test]
