@@ -394,11 +394,178 @@ pub fn load_run_summary(_paths: &StoragePaths, _run_id: &str) -> Result<RunSumma
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manager::TestManager;
+    use crate::types::{DurationMs, RunConfig, TestResult, TestStatus};
 
     #[test]
     fn storage_paths_format() {
         let paths = StoragePaths::new("/tmp/test-platform");
         assert_eq!(paths.registry_path(), "/tmp/test-platform/registry.json");
         assert_eq!(paths.run_path("run123"), "/tmp/test-platform/runs/run123.json");
+    }
+
+    #[test]
+    fn reserve_run_file_claims_once_then_reports_taken() {
+        // INVARIANT: a run id can be claimed exactly once — a second
+        // reservation of the same id must come back Taken, never a
+        // duplicate Claimed that would let two sessions silently write
+        // the same summary file over each other.
+        let dir = crate::test_util::temp_storage_dir("store-reserve");
+        let paths = StoragePaths::new(&dir);
+        match reserve_run_file(&paths, "run_0001") {
+            ReserveOutcome::Claimed => {}
+            other => panic!("expected Claimed on first reserve, got {:?}", other),
+        }
+        match reserve_run_file(&paths, "run_0001") {
+            ReserveOutcome::Taken => {}
+            other => panic!("expected Taken on second reserve, got {:?}", other),
+        }
+        // The losing attempt wrote nothing: the winner's reservation is
+        // still the empty placeholder.
+        assert_eq!(std::fs::read_to_string(paths.run_path("run_0001")).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct StubTest {
+        id: String,
+    }
+
+    impl crate::executor::RunnableTest for StubTest {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn run(&self, _timeout: Option<DurationMs>) -> TestResult {
+            TestResult {
+                test_id: self.id.clone(),
+                status: TestStatus::Passed,
+                duration_ms: 1,
+                message: None,
+                stdout: None,
+                stderr: None,
+            }
+        }
+    }
+
+    #[test]
+    fn stale_counter_resyncs_past_foreign_reservations() {
+        // INVARIANT: when a session's counter collides with an id another
+        // session already claimed on disk, the manager resyncs with the
+        // on-disk MAXIMUM and mints past it — it neither reuses a foreign
+        // id (whose summary it would later overwrite) nor probes claimed
+        // numbers one by one.
+        let dir = crate::test_util::temp_storage_dir("store-resync");
+        let mut mgr = crate::impl_manager::PlatformManager::new(&dir);
+        mgr.register_runnable(
+            crate::test_util::def("t1"),
+            Box::new(StubTest { id: "t1".into() }),
+        )
+        .unwrap();
+        let first = mgr.start_run(RunConfig::default()).unwrap();
+        assert_eq!(first, "run_0001");
+        // Sibling sessions claim the id this manager's counter points at
+        // next, plus a later one — the resync must land past BOTH.
+        std::fs::write(format!("{}/runs/run_0002.json", dir), "").unwrap();
+        std::fs::write(format!("{}/runs/run_0009.json", dir), "").unwrap();
+        let second = mgr.start_run(RunConfig::default()).unwrap();
+        assert_eq!(second, "run_0010");
+        // The foreign reservations are untouched — still empty placeholders.
+        assert_eq!(std::fs::read_to_string(format!("{}/runs/run_0002.json", dir)).unwrap(), "");
+        assert_eq!(std::fs::read_to_string(format!("{}/runs/run_0009.json", dir)).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_rename_is_reported_and_leaves_no_temp_file() {
+        // INVARIANT: when the rename into place fails, write_json_file
+        // surfaces the failure labeled with the step that failed and
+        // cleans up its partial temp file — a swallowed error breaks the
+        // durability contract, and leaked temp files would accumulate
+        // next to registry.json forever.
+        let dir = crate::test_util::temp_storage_dir("store-renamefail");
+        let dest = format!("{}/registry.json", dir);
+        // A non-empty directory at the destination: creating the temp
+        // file beside it succeeds, renaming a file over it cannot.
+        std::fs::create_dir_all(format!("{}/occupied", dest)).unwrap();
+        let err = write_json_file(&dest, "[]").unwrap_err();
+        assert!(err.contains("rename into place"), "unexpected error: {}", err);
+        // The partial temp file was removed, not leaked.
+        let stray: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(stray.is_empty(), "leaked temp files: {:?}", stray);
+        // The occupying content survived the failed write.
+        assert!(std::fs::metadata(format!("{}/occupied", dest)).unwrap().is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_side_guards_reject_invalid_run_ids() {
+        // INVARIANT: run-id validity is enforced at the layer that builds
+        // the path, on the WRITE side too — a crafted id like "../escape"
+        // handed to save_run_summary or reserve_run_file by a direct
+        // embedder must never reach the filesystem, where it would write
+        // outside the runs directory (over registry.json, or worse).
+        let dir = crate::test_util::temp_storage_dir("store-writeguard");
+        let paths = StoragePaths::new(&dir);
+        for evil in ["../escape", "run_", "run_1x", "runs", ""] {
+            let summary = RunSummary {
+                run_id: evil.into(),
+                config: RunConfig::default(),
+                results: vec![],
+                total: 0,
+                passed: 0,
+                failed: 0,
+                skipped: 0,
+                errored: 0,
+                total_duration_ms: 0,
+                started_at: 0,
+                completed_at: 0,
+            };
+            let err = save_run_summary(&paths, &summary).unwrap_err();
+            assert!(
+                err.contains("invalid run id"),
+                "id {:?}: unexpected save error {}",
+                evil,
+                err
+            );
+            match reserve_run_file(&paths, evil) {
+                ReserveOutcome::Failed(msg) => assert!(
+                    msg.contains("invalid run id"),
+                    "id {:?}: unexpected reserve error {}",
+                    evil,
+                    msg
+                ),
+                other => panic!("expected Failed for {:?}, got {:?}", evil, other),
+            }
+        }
+        // Nothing touched the filesystem: the base directory itself was
+        // never created, so no write can have escaped runs/.
+        assert!(std::fs::metadata(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_backups_get_unique_names_per_incident() {
+        // INVARIANT: each corruption incident is preserved under its own
+        // backup name — a later incident must never clobber the evidence
+        // an earlier one left behind.
+        let dir = crate::test_util::temp_storage_dir("store-backup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = StoragePaths::new(&dir);
+        std::fs::write(paths.registry_path(), "first incident").unwrap();
+        let b1 = backup_corrupt_registry(&paths).unwrap();
+        std::fs::write(paths.registry_path(), "second incident").unwrap();
+        let b2 = backup_corrupt_registry(&paths).unwrap();
+        assert_ne!(b1, b2, "second incident reused the first backup's name");
+        // Both incidents' contents survive, each under a name that says
+        // what it is.
+        assert_eq!(std::fs::read_to_string(&b1).unwrap(), "first incident");
+        assert_eq!(std::fs::read_to_string(&b2).unwrap(), "second incident");
+        let prefix = format!("{}/registry.json.corrupt-", dir);
+        assert!(b1.starts_with(&prefix), "unexpected backup path {}", b1);
+        assert!(b2.starts_with(&prefix), "unexpected backup path {}", b2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

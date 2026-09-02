@@ -104,4 +104,34 @@ mod tests {
         // No star: plain substring, case-insensitive via lowered name.
         assert!(name_matches_lower("ping", "Net_Ping"));
     }
+
+    #[test]
+    fn interior_segments_match_in_order_without_overlap() {
+        // INVARIANT: with two or more interior segments, each must be found
+        // AFTER the previous one's match ends — segments match in pattern
+        // order and never overlap. Re-searching the whole window would let
+        // "*one*two*" accept out-of-order text; advancing by the match
+        // index alone would let one run of "bb" satisfy two "bb" segments.
+        assert!(name_matches_lower("*one*two*", "x_one_y_two_z"));
+        // "one" appears only AFTER "two": in-order matching must reject.
+        assert!(!name_matches_lower("*one*two*", "two_then_one"));
+        // Only one "bb" run between the anchors: the two "bb" segments
+        // must consume disjoint text, so this cannot match.
+        assert!(!name_matches_lower("a*bb*bb*c", "abbbc"));
+        // Sanity: disjoint runs for both segments do match.
+        assert!(name_matches_lower("a*bb*bb*c", "abb_bbc"));
+    }
+
+    #[test]
+    fn glob_path_lowercases_the_name() {
+        // INVARIANT: the case-insensitivity contract (lowercase the NAME
+        // against the pre-lowered pattern) holds on the glob branch, not
+        // just the no-star substring branch — a mixed-case registered name
+        // must still match a lowercase glob through discovery and run
+        // filtering alike.
+        assert!(name_matches_lower("auth_*", "AUTH_Basic"));
+        assert!(name_matches_lower("net_*_v4", "Net_Ping_V4"));
+        // Case-insensitive is not anything-goes: content still gates.
+        assert!(!name_matches_lower("auth_*", "NET_Basic"));
+    }
 }

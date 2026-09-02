@@ -169,3 +169,96 @@ impl std::fmt::Display for ManagerError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_match_tags_display_distinguishes_include_from_exclude() {
+        // INVARIANT: the two ZeroMatchTags Display arms render their OWN
+        // field's vocabulary — an include typo (would silently shrink the
+        // run) must speak of include_tags, an exclude typo (would silently
+        // WIDEN it) must speak of exclude_tags and carry the would-run-
+        // excluded-tests guidance. Swapping the arms would hand the wrong
+        // recovery advice to the MCP/JSON surface, where this Display is
+        // the only rendering.
+        let include = ManagerError::ZeroMatchTags {
+            exclude: false,
+            tags: vec!["fast".into()],
+        };
+        assert_eq!(
+            format!("{}", include),
+            "include_tags [\"fast\"] match no registered test"
+        );
+        let exclude = ManagerError::ZeroMatchTags {
+            exclude: true,
+            tags: vec!["gone".into()],
+        };
+        assert_eq!(
+            format!("{}", exclude),
+            "exclude_tags [\"gone\"] match no registered test — a typo here \
+             would silently run the tests it meant to exclude; if the \
+             tag was intentionally retired, remove it from exclude_tags"
+        );
+    }
+
+    #[test]
+    fn corrupt_run_and_read_failed_display_carry_their_own_guidance() {
+        // INVARIANT: CorruptRun and ReadFailed carry identical (id, msg)
+        // payloads but OPPOSITE recovery advice — corruption says the data
+        // is damaged (do not expect a retry to help), a read failure says
+        // nothing about the data (a retry may succeed). Swapped bodies
+        // would invite deleting an intact record or endlessly retrying a
+        // damaged one.
+        let corrupt = ManagerError::CorruptRun("run_0042".into(), "bad json".into());
+        assert_eq!(
+            format!("{}", corrupt),
+            "run 'run_0042' happened but its record is damaged or written by an \
+             incompatible version: bad json"
+        );
+        let unreadable = ManagerError::ReadFailed("run_0042".into(), "permission denied".into());
+        assert_eq!(
+            format!("{}", unreadable),
+            "run 'run_0042' exists but could not be read (permission denied); \
+             this says nothing about the data — a retry may succeed"
+        );
+    }
+
+    #[test]
+    fn run_in_progress_display_says_not_completed() {
+        // INVARIANT: a live same-session run renders as still-executing —
+        // not as any of the storage-shaped outcomes (unknown, reserved by
+        // another session, damaged) — so a poller knows to wait rather
+        // than re-run or clean up.
+        let live = ManagerError::RunInProgress("run_0007".into());
+        assert_eq!(format!("{}", live), "run 'run_0007' has not completed yet");
+    }
+
+    #[test]
+    fn zero_match_pattern_display_echoes_the_pattern_in_json_vocabulary() {
+        // INVARIANT: the pattern-typo error names the JSON field
+        // (name_pattern) and echoes the offending pattern verbatim
+        // (Debug-quoted), so an agent reading the MCP surface can see
+        // WHICH pattern missed without re-deriving it from the request.
+        let miss = ManagerError::ZeroMatchPattern("zz_nomatch_*".into());
+        assert_eq!(
+            format!("{}", miss),
+            "name_pattern \"zz_nomatch_*\" matches no registered test"
+        );
+    }
+
+    #[test]
+    fn persist_failed_display_states_memory_success() {
+        // INVARIANT: PersistFailed's generic rendering — the only one
+        // library callers see on registration-path failures — names WHAT
+        // was being persisted and states the operation already succeeded
+        // in memory, so a caller retries the WRITE rather than redoing
+        // (and possibly double-applying) the operation itself.
+        let stranded = ManagerError::PersistFailed("t1".into(), "disk full".into());
+        assert_eq!(
+            format!("{}", stranded),
+            "'t1' succeeded in memory but could not be written to storage: disk full"
+        );
+    }
+}

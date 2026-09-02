@@ -1108,4 +1108,201 @@ mod tests {
         // JSON format for debugging
         assert!(out.json.starts_with('{'));
     }
+
+    #[test]
+    fn bare_run_arguments_select_tests_by_id() {
+        // INVARIANT: bare (non-flag) run arguments are test IDs. If they
+        // were silently skipped, has_include_filters() would be false and
+        // the run_all fallback would execute the ENTIRE suite instead of
+        // the named tests — the silent-intent-drop class the rest of this
+        // surface rejects loudly.
+        let mut mgr = setup_manager();
+        let out = execute_command(&mut mgr, "run t1 t3");
+        assert!(out.text.contains("Total: 2"), "got: {}", out.text);
+        assert!(out.json.contains("\"t1\""), "got: {}", out.json);
+        assert!(out.json.contains("\"t3\""), "got: {}", out.json);
+        assert!(!out.json.contains("\"t2\""), "got: {}", out.json);
+    }
+
+    #[test]
+    fn inline_id_value_is_used_and_empty_inline_id_errors() {
+        // INVARIANT: --id=<value> — the documented escape hatch for IDs
+        // beginning with '-' — must land its inline value in the run's
+        // include set (not drop it while trailing bare IDs still
+        // collect), and the empty spelling '--id=' must error rather
+        // than fall through to running everything.
+        let mut mgr = setup_manager();
+        mgr.register_runnable(
+            TestDefinition {
+                id: "-x".into(),
+                name: "dash_id_test".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(StubTest { id: "-x".into(), pass: true }),
+        )
+        .unwrap();
+
+        let out = execute_command(&mut mgr, "run --id=-x");
+        assert!(out.text.contains("Total: 1"), "got: {}", out.text);
+        assert!(out.json.contains("\"-x\""), "got: {}", out.json);
+
+        // Inline and trailing spellings combine — a dropped inline value
+        // would silently run only t2 (the trailing loop still collects
+        // it, so no error would surface).
+        let out = execute_command(&mut mgr, "run --id=t1 t2");
+        assert!(out.text.contains("Total: 2"), "got: {}", out.text);
+        assert!(out.json.contains("\"t1\""), "got: {}", out.json);
+        assert!(out.json.contains("\"t2\""), "got: {}", out.json);
+
+        let out = execute_command(&mut mgr, "run --id=");
+        assert!(
+            out.text.contains("requires at least one test ID"),
+            "got: {}",
+            out.text
+        );
+    }
+
+    /// Passes its own run, then breaks the runs directory so the SUMMARY
+    /// persist (and only it — the reservation already succeeded) fails.
+    struct SabotageTest {
+        id: String,
+        dir: String,
+    }
+
+    impl RunnableTest for SabotageTest {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn run(&self, _timeout: Option<DurationMs>) -> TestResult {
+            let runs = format!("{}/runs", self.dir);
+            let _ = std::fs::remove_dir_all(&runs);
+            let _ = std::fs::write(&runs, "not a directory");
+            TestResult {
+                test_id: self.id.clone(),
+                status: TestStatus::Passed,
+                duration_ms: 1,
+                message: None,
+                stdout: None,
+                stderr: None,
+            }
+        }
+    }
+
+    #[test]
+    fn run_persist_failure_says_executed_and_do_not_rerun() {
+        // INVARIANT: a run whose tests EXECUTED but whose summary could
+        // not be persisted must say exactly that — naming the run_id,
+        // pointing at 'results <run_id>', and warning against re-running
+        // — never the generic "Run failed:" wording, which reads as
+        // "nothing happened" and invites re-executing an already-executed
+        // (possibly slow or destructive) suite.
+        let dir = crate::test_util::temp_storage_dir("console-persist-fail");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            TestDefinition {
+                id: "t1".into(),
+                name: "storage_saboteur".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(SabotageTest { id: "t1".into(), dir: dir.clone() }),
+        )
+        .unwrap();
+
+        let out = execute_command(&mut mgr, "run --id t1");
+        assert!(out.text.contains("run_0001 EXECUTED"), "got: {}", out.text);
+        assert!(out.text.contains("do not re-run"), "got: {}", out.text);
+        assert!(out.text.contains("results run_0001"), "got: {}", out.text);
+        assert!(!out.text.contains("Run failed"), "got: {}", out.text);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_json_errors_distinguish_parse_from_config() {
+        // INVARIANT: '{'-prefixed input is JSON and gets a JSON
+        // diagnostic — unparseable text classifies as 'Invalid JSON',
+        // well-formed JSON that fails config validation as 'Invalid
+        // config JSON' — never a misleading unknown-test-ID error from
+        // the flag-parsing path.
+        let mut mgr = setup_manager();
+        let out = execute_command(&mut mgr, "run {not json");
+        assert!(out.text.contains("Invalid JSON:"), "got: {}", out.text);
+        assert!(!out.text.contains("Invalid config"), "got: {}", out.text);
+
+        let out = execute_command(&mut mgr, r#"run {"timeout_ms": "abc"}"#);
+        assert!(out.text.contains("Invalid config JSON:"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn bare_pattern_containing_equals_is_not_split() {
+        // INVARIANT: only tokens that LOOK like flags are split at '=' —
+        // a bare pattern containing '=' must reach discovery whole. A
+        // regressed split would truncate at the '=', and the leftover
+        // prefix would silently match names the full pattern does not.
+        let mut mgr = setup_manager();
+        mgr.register_runnable(
+            TestDefinition {
+                id: "tv".into(),
+                name: "ver=2_check".into(),
+                tags: vec![],
+                group: None,
+                description: None,
+                metadata: vec![],
+            },
+            Box::new(StubTest { id: "tv".into(), pass: true }),
+        )
+        .unwrap();
+
+        let out = execute_command(&mut mgr, "discover ver=2*");
+        assert!(out.text.contains("Found 1 test(s)"), "got: {}", out.text);
+        assert!(out.text.contains("ver=2_check"), "got: {}", out.text);
+
+        // The discriminator: a pattern truncated to 'ver' would match
+        // ver=2_check on its prefix — the full non-matching pattern must
+        // report zero.
+        let out = execute_command(&mut mgr, "discover ver=9*");
+        assert!(out.text.contains("Found 0 test(s)"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn aliases_and_uppercase_dispatch_to_real_commands() {
+        // INVARIANT: every alias help documents dispatches to its real
+        // command, and dispatch is case-insensitive. The help test pins
+        // only the TEXT — this is the guard against a documented alias
+        // regressing to 'Unknown command' while help keeps advertising it.
+        let mut mgr = setup_manager();
+
+        let out = execute_command(&mut mgr, "status");
+        assert!(out.text.contains("No active runs"), "got: {}", out.text);
+
+        let out = execute_command(&mut mgr, "search auth_*");
+        assert!(out.text.contains("Found 2 test(s)"), "got: {}", out.text);
+        let out = execute_command(&mut mgr, "find net_*");
+        assert!(out.text.contains("Found 1 test(s)"), "got: {}", out.text);
+
+        let out = execute_command(&mut mgr, "execute --id t1");
+        assert!(out.text.contains("Total: 1"), "got: {}", out.text);
+        let run_id = parse_json(&out.json)
+            .unwrap()
+            .get_str("run_id")
+            .unwrap()
+            .to_string();
+
+        let out = execute_command(&mut mgr, "start --id t2");
+        assert!(out.text.contains("Total: 1"), "got: {}", out.text);
+
+        let out = execute_command(&mut mgr, &format!("result {}", run_id));
+        assert!(out.text.contains("Run Summary"), "got: {}", out.text);
+
+        let out = execute_command(&mut mgr, "SUMMARY");
+        assert!(out.text.contains("Total tests: 3"), "got: {}", out.text);
+        let out = execute_command(&mut mgr, "Discover");
+        assert!(out.text.contains("Found 3 test(s)"), "got: {}", out.text);
+    }
 }

@@ -172,7 +172,77 @@ mod tests {
         let disc = RegistryDiscovery::new(&reg);
         let sum = disc.summary();
         assert_eq!(sum.total_tests, 4);
-        assert!(sum.tags.iter().any(|(t, c)| t == "smoke" && *c == 3));
-        assert!(sum.groups.iter().any(|(g, c)| g == "auth" && *c == 2));
+        // INVARIANT: summary tag/group counts come back as SORTED ordered
+        // sequences (the BTreeMap guarantee callers render verbatim) — a
+        // HashMap swap would randomize console/MCP output per process.
+        assert_eq!(
+            sum.tags,
+            vec![
+                ("fast".to_string(), 1),
+                ("slow".to_string(), 2),
+                ("smoke".to_string(), 3),
+            ]
+        );
+        assert_eq!(
+            sum.groups,
+            vec![("auth".to_string(), 2), ("network".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn facets_cover_all_filtered_matches_despite_pagination() {
+        let reg = setup();
+        let disc = RegistryDiscovery::new(&reg);
+        let result = disc.discover(&DiscoveryQuery {
+            group: Some("network".into()),
+            limit: Some(1),
+            ..Default::default()
+        });
+        // INVARIANT: available_tags/available_groups aggregate over the
+        // FILTERED set, not the paginated page and not the whole registry
+        // — "smoke" appears only on the second network test (t4), which
+        // the 1-item page cuts off, while auth-only facets ("fast",
+        // "auth") must not leak in; output is sorted and deduped.
+        assert_eq!(result.tests.len(), 1);
+        assert_eq!(result.tests[0].id, "t3");
+        assert_eq!(result.available_tags, vec!["slow", "smoke"]);
+        assert_eq!(result.available_groups, vec!["network"]);
+        assert_eq!(result.total_matches, 2);
+    }
+
+    #[test]
+    fn offset_past_end_returns_empty_page_not_panic() {
+        let reg = setup();
+        let disc = RegistryDiscovery::new(&reg);
+        let result = disc.discover(&DiscoveryQuery {
+            offset: Some(10),
+            ..Default::default()
+        });
+        // INVARIANT: an offset at or past the end of the matches yields an
+        // empty page (never an out-of-range slice panic), while
+        // total_matches and the facets still describe the full filtered
+        // set so a paging client can recover.
+        assert!(result.tests.is_empty());
+        assert_eq!(result.total_matches, 4);
+        assert_eq!(result.available_tags, vec!["fast", "slow", "smoke"]);
+        assert_eq!(result.available_groups, vec!["auth", "network"]);
+    }
+
+    #[test]
+    fn discover_lowercases_caller_pattern() {
+        let reg = setup();
+        let disc = RegistryDiscovery::new(&reg);
+        let result = disc.discover(&DiscoveryQuery {
+            name_pattern: Some("AUTH_*".into()),
+            ..Default::default()
+        });
+        // INVARIANT: discover lowercases the caller's pattern before
+        // handing it to name_matches_lower (whose contract requires an
+        // already-lowered pattern) — an uppercase pattern must still find
+        // the lowercase-named tests, or case-insensitivity is silently
+        // half-implemented at this call site.
+        assert_eq!(result.total_matches, 2);
+        let ids: Vec<&str> = result.tests.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["t1", "t2"]);
     }
 }

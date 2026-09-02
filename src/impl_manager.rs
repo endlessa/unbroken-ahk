@@ -1925,6 +1925,21 @@ mod tests {
         assert_eq!(content.matches("\"t1\"").count(), 1, "duplicate must collapse");
         assert!(content.contains("first"));
         assert!(content.contains("\"t2\""));
+        // In-file duplicate ids ALONE (no entry parse errors) trigger the
+        // evidence backup: the collapse discards the losing definition's
+        // only copy, which must survive in a registry.json.corrupt-* file.
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("registry.json.corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "duplicate ids alone must produce an evidence backup");
+        let backup = std::fs::read_to_string(backups[0].path()).unwrap();
+        assert!(
+            backup.contains("\"second\""),
+            "backup must preserve the discarded duplicate: {}",
+            backup
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2349,6 +2364,170 @@ mod tests {
         assert_eq!(results.total, 1);
         assert_eq!(results.results[0].test_id, "t1");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Destroys the runs directory from inside run(): the reservation
+    /// file vanishes and runs/ becomes a FILE, so the summary persist
+    /// that follows execution must fail.
+    struct StorageSaboteur {
+        dir: String,
+    }
+    impl RunnableTest for StorageSaboteur {
+        fn id(&self) -> &str {
+            "t1"
+        }
+        fn run(&self, _timeout: Option<DurationMs>) -> TestResult {
+            let runs = format!("{}/runs", self.dir);
+            let _ = std::fs::remove_dir_all(&runs);
+            let _ = std::fs::write(&runs, "not a directory");
+            TestResult {
+                test_id: "t1".into(),
+                status: TestStatus::Passed,
+                duration_ms: 1,
+                message: None,
+                stdout: None,
+                stderr: None,
+            }
+        }
+    }
+
+    #[test]
+    fn failed_persist_keeps_results_queryable_from_memory() {
+        // A failed run-summary persist returns PersistFailed(run_id) but
+        // RETAINS the executed summary in memory: the error's contract
+        // ("results are queryable — do NOT re-run") depends on
+        // get_results and check_progress still serving the run, unlike
+        // the durable path where memory is evicted in favor of disk.
+        let dir = crate::test_util::temp_storage_dir("mgr-persistfail-retain");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            crate::test_util::def("t1"),
+            Box::new(StorageSaboteur { dir: dir.clone() }),
+        )
+        .unwrap();
+        let run_id = match mgr.start_run(RunConfig::default()) {
+            Err(ManagerError::PersistFailed(id, _)) => id,
+            other => panic!("expected PersistFailed, got {:?}", other),
+        };
+        assert_eq!(run_id, "run_0001");
+        // The executed results are served from memory despite dead storage.
+        let summary = mgr.get_results(&run_id).unwrap();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.results[0].test_id, "t1");
+        // And progress agrees the run finished instead of erroring.
+        let progress = mgr.check_progress(&run_id).unwrap();
+        assert!(progress.finished);
+        assert_eq!(progress.completed, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_counter_collision_resyncs_and_mints_past_disk() {
+        // A failed claim on an id another session already holds is Taken,
+        // not fatal: the counter resyncs to the on-disk MAX and mints
+        // past it — never reusing (and overwriting) the sibling's file,
+        // and never re-colliding with each sibling id one by one.
+        use crate::test_util::def;
+        let dir = crate::test_util::temp_storage_dir("mgr-taken-resync");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(def("t1"), Box::new(EchoTest { id: "t1".into(), pass: true }))
+            .unwrap();
+        assert_eq!(mgr.start_run(RunConfig::default()).unwrap(), "run_0001");
+        // A sibling session claimed run_0002 and has advanced to run_0005;
+        // this session's counter still believes "next is 2".
+        std::fs::write(format!("{}/runs/run_0002.json", dir), "sibling-claim").unwrap();
+        std::fs::write(format!("{}/runs/run_0005.json", dir), "").unwrap();
+        let second = mgr.start_run(RunConfig::default()).unwrap();
+        assert_eq!(second, "run_0006");
+        // The sibling's reservation survived untouched.
+        assert_eq!(
+            std::fs::read_to_string(format!("{}/runs/run_0002.json", dir)).unwrap(),
+            "sibling-claim"
+        );
+        assert_eq!(mgr.get_results("run_0006").unwrap().passed, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_level_load_failures_classify_io_vs_corrupt() {
+        // load_from_storage's Err distinguishes cause: an unreadable file
+        // is "retryable" (the data may be intact), a file-level parse
+        // failure is "corrupt" — and in BOTH cases nothing was loaded,
+        // unlike the per-entry warning path where healthy siblings load.
+        let dir_io = crate::test_util::temp_storage_dir("mgr-load-io");
+        // registry.json as a DIRECTORY: stat succeeds, reading fails.
+        std::fs::create_dir_all(format!("{}/registry.json", dir_io)).unwrap();
+        let mut mgr = PlatformManager::new(&dir_io);
+        let err = mgr.load_from_storage().unwrap_err();
+        assert!(err.contains("retryable"), "got: {}", err);
+        assert_eq!(mgr.summary().total_tests, 0);
+
+        let dir_parse = crate::test_util::temp_storage_dir("mgr-load-parse");
+        std::fs::create_dir_all(&dir_parse).unwrap();
+        std::fs::write(format!("{}/registry.json", dir_parse), "{ truncated garb").unwrap();
+        let mut mgr = PlatformManager::new(&dir_parse);
+        let err = mgr.load_from_storage().unwrap_err();
+        assert!(err.contains("corrupt"), "got: {}", err);
+        assert_eq!(mgr.summary().total_tests, 0);
+
+        let _ = std::fs::remove_dir_all(&dir_io);
+        let _ = std::fs::remove_dir_all(&dir_parse);
+    }
+
+    #[test]
+    fn register_runnable_id_mismatch_applies_nothing() {
+        // The single-call guard mirrors the batch one: a runnable whose
+        // id disagrees with its definition fails at REGISTRATION time,
+        // before anything is applied — no definition in the registry, no
+        // attached runnable to ghost-error at run time, nothing on disk.
+        let dir = crate::test_util::temp_storage_dir("mgr-single-mismatch");
+        let mut mgr = PlatformManager::new(&dir);
+        let err = mgr.register_runnable(
+            crate::test_util::def("t1"),
+            Box::new(EchoTest { id: "WRONG".into(), pass: true }),
+        );
+        assert!(matches!(err, Err(ManagerError::RegistrationFailed(_))));
+        assert_eq!(mgr.summary().total_tests, 0);
+        assert!(mgr.runnables.is_empty());
+        assert!(std::fs::metadata(format!("{}/registry.json", dir)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reserved_run_that_later_persists_serves_fresh_progress() {
+        // check_progress's storage fallback caches ONLY Ok snapshots: a
+        // reservation-only file answers RunNotPersisted, and once the
+        // owning session's real summary lands in that same file a later
+        // poll serves its counts — never a stale error or placeholder.
+        let dir = crate::test_util::temp_storage_dir("mgr-fallback-fresh");
+        std::fs::create_dir_all(format!("{}/runs", dir)).unwrap();
+        let path = format!("{}/runs/run_0007.json", dir);
+        std::fs::write(&path, "").unwrap();
+        let mgr = PlatformManager::new(&dir);
+        assert!(matches!(
+            mgr.check_progress("run_0007"),
+            Err(ManagerError::RunNotPersisted(_))
+        ));
+        // The owning session finishes and persists into its reservation.
+        std::fs::write(
+            &path,
+            r#"{"run_id": "run_0007", "total": 2, "passed": 1, "failed": 1,
+                "results": [
+                    {"test_id": "a", "status": "passed", "duration_ms": 1},
+                    {"test_id": "b", "status": "failed", "duration_ms": 1}
+                ],
+                "started_at": 1000, "completed_at": 3000}"#,
+        )
+        .unwrap();
+        let progress = mgr.check_progress("run_0007").unwrap();
+        assert_eq!(progress.total, 2);
+        assert_eq!(progress.completed, 2);
+        assert_eq!(progress.passed, 1);
+        assert_eq!(progress.failed, 1);
+        assert!(progress.finished);
+        assert_eq!(progress.elapsed_ms, 2000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

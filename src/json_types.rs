@@ -1171,4 +1171,141 @@ mod tests {
         assert!(TestDefinition::from_json(&parse_json(r#"{"id": 7, "name": "x"}"#).unwrap()).is_err());
         assert!(TestDefinition::from_json(&parse_json(r#"{"id": "t", "name": "x"}"#).unwrap()).is_ok());
     }
+
+    #[test]
+    fn all_four_statuses_round_trip_and_unknown_statuses_reject() {
+        // Every status a run can persist — including the fail_fast
+        // "skipped" and ghost "error" outcomes — must survive a
+        // write-then-reload verbatim, and an unrecognized status must be
+        // a load error, never a silent remap that skews the counts.
+        for (status, wire) in [
+            (TestStatus::Passed, "passed"),
+            (TestStatus::Failed, "failed"),
+            (TestStatus::Error, "error"),
+            (TestStatus::Skipped, "skipped"),
+        ] {
+            // The wire string is part of the on-disk contract: pin it
+            // exactly, not just "round-trips through today's reader".
+            assert_eq!(status.to_json(), str_val(wire));
+            let result = TestResult {
+                test_id: "t1".into(),
+                status,
+                duration_ms: 7,
+                message: Some("why".into()),
+                stdout: None,
+                stderr: None,
+            };
+            let parsed = TestResult::from_json(&result.to_json()).unwrap();
+            assert_eq!(parsed.status, status, "status {} must reload as itself", wire);
+            assert_eq!(parsed.test_id, "t1");
+            assert_eq!(parsed.duration_ms, 7);
+            assert_eq!(parsed.message.as_deref(), Some("why"));
+        }
+        // Near-miss and mistyped statuses must reject, not become Error.
+        assert!(TestStatus::from_json(&str_val("pased")).is_err());
+        assert!(TestStatus::from_json(&str_val("Passed")).is_err());
+        assert!(TestStatus::from_json(&JsonValue::Number(5.0)).is_err());
+    }
+
+    #[test]
+    fn run_config_optional_fields_round_trip_through_strict_readers() {
+        // The writer's key names must match what the strict readers
+        // accept: a misspelled or dropped key in to_json would make every
+        // filtered run's persisted summary reload as CorruptRun (unknown
+        // key) or silently lose the filter — so a config with EVERY
+        // optional branch exercised must reload field-for-field.
+        let original = RunConfig {
+            run_all: false,
+            include_ids: vec!["t1".into(), "t2".into()],
+            include_tags: vec!["fast".into()],
+            exclude_tags: vec!["slow".into()],
+            name_pattern: Some("auth_".into()),
+            fail_fast: true,
+            timeout_ms: Some(5000),
+            execution_model: ExecutionModel::Parallel { max_concurrency: 2 },
+        };
+        let wire = original.to_json();
+        for parsed in [
+            RunConfig::from_json(&wire).unwrap(),
+            RunConfig::from_json_stored(&wire).unwrap(),
+        ] {
+            assert!(!parsed.run_all);
+            assert_eq!(parsed.include_ids, vec!["t1".to_string(), "t2".to_string()]);
+            assert_eq!(parsed.include_tags, vec!["fast".to_string()]);
+            assert_eq!(parsed.exclude_tags, vec!["slow".to_string()]);
+            assert_eq!(parsed.name_pattern.as_deref(), Some("auth_"));
+            assert!(parsed.fail_fast);
+            assert_eq!(parsed.timeout_ms, Some(5000));
+            assert_eq!(
+                parsed.execution_model,
+                ExecutionModel::Parallel { max_concurrency: 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn test_definition_description_and_metadata_round_trip() {
+        // registry.json survives sessions only if to_json emits what the
+        // strict loader accepts: a definition with a description and
+        // non-empty metadata must reload intact, not drop fields or lose
+        // the whole entry to load_registry's parse-failure discard.
+        let mut original = crate::test_util::def("t1");
+        original.name = "Login works".into();
+        original.tags = vec!["smoke".into(), "auth".into()];
+        original.group = Some("authentication".into());
+        original.description = Some("verifies the login flow".into());
+        original.metadata =
+            vec![("owner".into(), "qa".into()), ("ticket".into(), "AHK-7".into())];
+        let parsed = TestDefinition::from_json(&original.to_json()).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn parallel_without_max_concurrency_defaults_to_four() {
+        // {"type": "parallel"} is explicit parallel intent: it must keep
+        // the documented default of 4, never quietly degrade to
+        // Sequential (which would also bypass the manager's loud
+        // "parallel not supported yet" rejection).
+        for raw in [
+            r#"{"type": "parallel"}"#,
+            r#"{"type": "parallel", "max_concurrency": null}"#,
+        ] {
+            let val = parse_json(raw).unwrap();
+            assert_eq!(
+                ExecutionModel::from_json(&val).unwrap(),
+                ExecutionModel::Parallel { max_concurrency: 4 },
+                "should default to 4: {}",
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn negative_numbers_reject_instead_of_saturating_to_zero() {
+        // A negative number must be an InvalidField error, never an
+        // f64->u64 saturating cast to 0 — {"timeout_ms": -5} silently
+        // becoming an instant-timeout 0 is the exact silent fallback the
+        // strict readers exist to prevent. Stored leniency covers only
+        // legacy OVERLARGE values; negatives were never legally written.
+        let val = parse_json(r#"{"timeout_ms": -5}"#).unwrap();
+        assert!(RunConfig::from_json(&val).is_err());
+        assert!(RunConfig::from_json_stored(&val).is_err());
+        let val = parse_json(r#"{"run_id": "r", "total": -1}"#).unwrap();
+        assert!(RunSummary::from_json(&val).is_err());
+    }
+
+    #[test]
+    fn discovery_query_unknown_keys_error() {
+        // A misspelled discover filter must error, never parse as an
+        // empty query that returns the ENTIRE registry dressed up as a
+        // filtered search result.
+        let val = parse_json(r#"{"pattern": "auth_*"}"#).unwrap();
+        match DiscoveryQuery::from_json(&val) {
+            Err(JsonError::UnknownField(what, key, _)) => {
+                assert_eq!(what, "discovery query");
+                assert_eq!(key, "pattern");
+            }
+            other => panic!("expected UnknownField error, got {:?}", other),
+        }
+    }
 }

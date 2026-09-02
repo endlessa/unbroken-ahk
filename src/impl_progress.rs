@@ -244,6 +244,103 @@ mod tests {
     }
 
     #[test]
+    fn running_counter_tracks_starts_completions_and_finish() {
+        // Invariant: `running` reflects tests that have started but not yet
+        // completed, and a finished run never reports anything as running.
+        let mut tracker = InMemoryProgressTracker::new();
+        tracker.start_run("run1".into(), 2);
+
+        tracker.test_started("run1", "t1");
+        tracker.test_started("run1", "t2");
+        assert_eq!(tracker.get_progress("run1").unwrap().running, 2);
+
+        tracker.test_completed("run1", &result("t1", TestStatus::Passed));
+        assert_eq!(tracker.get_progress("run1").unwrap().running, 1);
+
+        tracker.finish_run("run1");
+        assert_eq!(tracker.get_progress("run1").unwrap().running, 0);
+    }
+
+    #[test]
+    fn elapsed_is_live_while_run_is_unfinished() {
+        // Invariant: an in-flight run reports elapsed time against the
+        // current clock, not 0 and not a value frozen at start.
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let mut tracker = InMemoryProgressTracker::new().with_clock(clock);
+        NOW.store(1_000, Ordering::Relaxed);
+        tracker.start_run("run1".into(), 2);
+        NOW.store(1_400, Ordering::Relaxed);
+        let prog = tracker.get_progress("run1").unwrap();
+        assert_eq!(prog.elapsed_ms, 400);
+        assert!(!prog.finished);
+    }
+
+    #[test]
+    fn finish_run_is_idempotent_first_finish_wins() {
+        // Invariant: a run's duration freezes at the FIRST finish_run; a
+        // later duplicate finish_run must not inflate elapsed_ms.
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let mut tracker = InMemoryProgressTracker::new().with_clock(clock);
+        NOW.store(1_000, Ordering::Relaxed);
+        tracker.start_run("run1".into(), 1);
+        tracker.test_completed("run1", &result("t1", TestStatus::Passed));
+        NOW.store(1_500, Ordering::Relaxed);
+        tracker.finish_run("run1");
+        NOW.store(9_000, Ordering::Relaxed);
+        tracker.finish_run("run1");
+        assert_eq!(tracker.get_progress("run1").unwrap().elapsed_ms, 500);
+    }
+
+    #[test]
+    fn concurrent_runs_are_isolated_by_exact_id() {
+        // Invariant: with several runs tracked at once, every update and
+        // query routes by exact run id (no first-match or prefix-match
+        // cross-contamination), and active_runs lists only unfinished runs.
+        let mut tracker = InMemoryProgressTracker::new();
+        // "run_1" is a prefix of "run_10": a prefix-matching lookup would
+        // route "run_10" updates into "run_1".
+        tracker.start_run("run_1".into(), 2);
+        tracker.start_run("run_10".into(), 3);
+
+        tracker.test_started("run_10", "t1");
+        tracker.test_completed("run_10", &result("t1", TestStatus::Passed));
+
+        let first = tracker.get_progress("run_1").unwrap();
+        assert_eq!(first.completed, 0);
+        assert_eq!(first.passed, 0);
+        assert_eq!(first.total, 2);
+        let second = tracker.get_progress("run_10").unwrap();
+        assert_eq!(second.completed, 1);
+        assert_eq!(second.passed, 1);
+        assert_eq!(second.total, 3);
+
+        tracker.finish_run("run_1");
+        assert_eq!(tracker.active_runs(), vec![RunId::from("run_10")]);
+        assert!(tracker.get_progress("run_1").unwrap().finished);
+        assert!(!tracker.get_progress("run_10").unwrap().finished);
+        // The finish of run_1 left run_10's counts untouched.
+        assert_eq!(tracker.get_progress("run_10").unwrap().completed, 1);
+    }
+
+    #[test]
+    fn zero_total_unfinished_run_reports_zero_percent() {
+        // Invariant: an unfinished run with zero total tests reports 0%
+        // complete — a finite number, never NaN from a bare 0/0 division.
+        let mut tracker = InMemoryProgressTracker::new();
+        tracker.start_run("run1".into(), 0);
+        let prog = tracker.get_progress("run1").unwrap();
+        assert!(prog.percent_complete.is_finite());
+        assert_eq!(prog.percent_complete, 0.0);
+        assert!(!prog.finished);
+    }
+
+    #[test]
     fn finish_removes_from_active() {
         let mut tracker = InMemoryProgressTracker::new();
         tracker.start_run("run1".into(), 1);

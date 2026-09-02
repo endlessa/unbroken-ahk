@@ -191,6 +191,133 @@ mod tests {
     }
 
     #[test]
+    fn include_steps_union_and_dedup() {
+        // INVARIANT: include criteria are ADDITIVE — each step appends to
+        // the candidates of the previous steps (never replaces them) — and
+        // a test matching more than one criterion appears exactly once.
+        let tests = vec![
+            td("a", "a", &["fast"]),
+            td("b", "b", &["fast"]),
+            td("c", "c", &[]),
+        ];
+        let refs: Vec<&TestDefinition> = tests.iter().collect();
+        // "a" matches BOTH include_ids and include_tags; "c" matches only
+        // include_ids (no tags), so a replace-instead-of-append regression
+        // in Step 2 would drop it.
+        let config = RunConfig {
+            run_all: false,
+            include_ids: vec!["c".into(), "a".into()],
+            include_tags: vec!["fast".into()],
+            ..Default::default()
+        };
+        let result = StandardFilter::new().apply(&refs, &config);
+        let ids: Vec<&str> = result.iter().map(|t| t.id.as_str()).collect();
+        // Step 1 walks registry order (a then c), Step 2 appends b; "a"
+        // is not pushed a second time by the tag step.
+        assert_eq!(ids, vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn excludes_apply_to_include_selected_candidates() {
+        // INVARIANT: exclude_tags prunes the include-selected candidates
+        // too, not only the run_all population — "run the fast tests but
+        // never the flaky ones" must drop a fast+flaky test.
+        let tests = vec![
+            td("a", "a", &["fast"]),
+            td("b", "b", &["fast", "flaky"]),
+        ];
+        let refs: Vec<&TestDefinition> = tests.iter().collect();
+        let config = RunConfig {
+            run_all: false,
+            include_tags: vec!["fast".into()],
+            exclude_tags: vec!["flaky".into()],
+            ..Default::default()
+        };
+        let result = StandardFilter::new().apply(&refs, &config);
+        let ids: Vec<&str> = result.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[test]
+    fn exclude_tags_are_any_of() {
+        // INVARIANT: a test is excluded when it carries ANY one of the
+        // exclude_tags — it need not carry all of them. An ALL-of
+        // regression would keep running tests the config meant to exclude.
+        let tests = vec![
+            td("a", "a", &["slow"]),
+            td("b", "b", &["flaky"]),
+            td("c", "c", &["fast"]),
+        ];
+        let refs: Vec<&TestDefinition> = tests.iter().collect();
+        let config = RunConfig {
+            run_all: true,
+            exclude_tags: vec!["slow".into(), "flaky".into()],
+            ..Default::default()
+        };
+        let result = StandardFilter::new().apply(&refs, &config);
+        let ids: Vec<&str> = result.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["c"]);
+    }
+
+    #[test]
+    fn include_tags_are_all_of() {
+        // INVARIANT: include_tags is a conjunction — only tests carrying
+        // ALL of the requested tags are selected, so multi-tag includes
+        // never over-select tests carrying just one of the tags.
+        let tests = vec![
+            td("a", "a", &["smoke", "fast"]),
+            td("b", "b", &["smoke"]),
+        ];
+        let refs: Vec<&TestDefinition> = tests.iter().collect();
+        let config = RunConfig {
+            run_all: false,
+            include_tags: vec!["smoke".into(), "fast".into()],
+            ..Default::default()
+        };
+        let result = StandardFilter::new().apply(&refs, &config);
+        let ids: Vec<&str> = result.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[test]
+    fn name_pattern_is_lowercased_before_matching() {
+        // INVARIANT: the filter lowercases the caller's pattern before
+        // handing it to name_matches_lower (whose contract requires a
+        // pre-lowered pattern), so an uppercase pattern still selects.
+        let tests = vec![
+            td("a", "auth_basic", &[]),
+            td("b", "network_ping", &[]),
+        ];
+        let refs: Vec<&TestDefinition> = tests.iter().collect();
+        let config = RunConfig {
+            run_all: false,
+            name_pattern: Some("AUTH_*".into()),
+            ..Default::default()
+        };
+        let result = StandardFilter::new().apply(&refs, &config);
+        let ids: Vec<&str> = result.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[test]
+    fn run_all_ignores_include_filters() {
+        // INVARIANT: under run_all, include filters are ignored (defense
+        // in depth for direct filter users — the manager rejects the
+        // combination earlier): the full population is returned, never an
+        // intersection with the includes.
+        let tests = vec![td("a", "a", &[]), td("b", "b", &[])];
+        let refs: Vec<&TestDefinition> = tests.iter().collect();
+        let config = RunConfig {
+            run_all: true,
+            include_ids: vec!["a".into()],
+            ..Default::default()
+        };
+        let result = StandardFilter::new().apply(&refs, &config);
+        let ids: Vec<&str> = result.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
     fn name_pattern_glob() {
         let tests = vec![
             td("a", "auth_basic", &[]),

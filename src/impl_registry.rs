@@ -232,6 +232,90 @@ mod tests {
     }
 
     #[test]
+    fn deregister_returns_the_removed_test_and_preserves_order() {
+        // Deregister must hand back exactly the named definition and
+        // leave the survivors in insertion order — the order discovery
+        // pagination and fail_fast execution depend on. Four tests so a
+        // swap_remove regression ([t1, t4, t3]) cannot masquerade as
+        // ordered removal; a missing id must remove nothing.
+        let mut reg = InMemoryRegistry::new();
+        reg.register(make_test("t1", "a", &[], None)).unwrap();
+        reg.register(make_test("t2", "b", &[], None)).unwrap();
+        reg.register(make_test("t3", "c", &[], None)).unwrap();
+        reg.register(make_test("t4", "d", &[], None)).unwrap();
+        let removed = reg.deregister("t2").unwrap();
+        assert_eq!(removed.id, "t2");
+        assert_eq!(reg.count(), 3);
+        assert!(reg.get("t2").is_none());
+        let order: Vec<&str> = reg.list_all().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(order, vec!["t1", "t3", "t4"]);
+        assert!(reg.deregister("missing").is_none());
+        assert_eq!(reg.count(), 3);
+    }
+
+    #[test]
+    fn reorder_to_puts_unlisted_ids_last_keeping_their_relative_order() {
+        // Ids absent from the given order must land AFTER the listed
+        // ones, keeping their existing relative order — never jump to
+        // the front or shuffle — so file order stays authoritative for
+        // discovery pages and fail_fast even when memory holds ids the
+        // file does not.
+        let mut reg = InMemoryRegistry::new();
+        for id in ["a", "b", "c", "d"] {
+            reg.register(make_test(id, id, &[], None)).unwrap();
+        }
+        reg.reorder_to(&["c".to_string(), "a".to_string()]);
+        let order: Vec<&str> = reg.list_all().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(order, vec!["c", "a", "b", "d"]);
+    }
+
+    #[test]
+    fn replace_of_unknown_id_errors_instead_of_inserting() {
+        // Replace upgrades an EXISTING definition; an unknown id must
+        // error and mutate nothing — it must never degrade into an
+        // insert that creates a definition no one registered.
+        let mut reg = InMemoryRegistry::new();
+        reg.register(make_test("t1", "a", &[], None)).unwrap();
+        let err = reg.replace(make_test("t2", "b", &[], None)).unwrap_err();
+        match err {
+            RegistryError::InvalidDefinition(msg) => {
+                assert_eq!(msg, "no existing definition 't2' to replace");
+            }
+            other => panic!("expected InvalidDefinition, got {:?}", other),
+        }
+        assert_eq!(reg.count(), 1);
+        assert!(reg.get("t2").is_none());
+    }
+
+    #[test]
+    fn search_by_name_lowercases_the_caller_pattern() {
+        // name_matches_lower demands an already-lowered pattern; THIS
+        // call site owns that lowering, so a mixed-case search — glob
+        // or substring — must still find its test.
+        let mut reg = InMemoryRegistry::new();
+        reg.register(make_test("t1", "auth_basic", &[], None)).unwrap();
+        assert_eq!(reg.search_by_name("AUTH_*").len(), 1);
+        assert_eq!(reg.search_by_name("Basic").len(), 1);
+    }
+
+    #[test]
+    fn all_tags_and_groups_are_sorted_deduped_and_skip_ungrouped() {
+        // The facet accessors must return each value exactly once, in
+        // sorted order regardless of registration order, and all_groups
+        // must omit ungrouped tests — duplicates or insertion-order
+        // output would corrupt the drill-down surfaces built on them.
+        let mut reg = InMemoryRegistry::new();
+        reg.register(make_test("t1", "a", &["zeta", "smoke"], Some("net"))).unwrap();
+        reg.register(make_test("t2", "b", &["smoke", "alpha"], Some("auth"))).unwrap();
+        reg.register(make_test("t3", "c", &["zeta"], None)).unwrap();
+        let expected_tags: Vec<String> =
+            vec!["alpha".into(), "smoke".into(), "zeta".into()];
+        assert_eq!(reg.all_tags(), expected_tags);
+        let expected_groups: Vec<String> = vec!["auth".into(), "net".into()];
+        assert_eq!(reg.all_groups(), expected_groups);
+    }
+
+    #[test]
     fn json_round_trip() {
         use crate::json::{parse_json, FromJson};
         use crate::types::TestDefinition;

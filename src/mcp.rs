@@ -491,19 +491,46 @@ mod tests {
 
     #[test]
     fn tool_list_returns_all_tools() {
+        // INVARIANT: tool_list advertises EXACTLY the tool names that
+        // handle_request dispatches — agents discover tools by reading this
+        // list, so a renamed descriptor (or one with no dispatch arm) turns
+        // every advertised call into "Unknown tool".
         let mut mgr = setup_manager();
         let resp = execute_mcp(&mut mgr, r#"{"tool": "tool_list"}"#);
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(true));
         let data = val.get("data").unwrap().as_array().unwrap();
-        assert!(data.len() >= 8);
-        // Should include our core tools
-        let names: Vec<&str> = data.iter().filter_map(|t| t.get_str("name")).collect();
-        assert!(names.contains(&"test_summary"));
-        assert!(names.contains(&"test_discover"));
-        assert!(names.contains(&"test_run"));
-        assert!(names.contains(&"test_progress"));
-        assert!(names.contains(&"test_results"));
+        let mut names: Vec<&str> = data.iter().filter_map(|t| t.get_str("name")).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "test_discover",
+                "test_list_groups",
+                "test_list_tags",
+                "test_progress",
+                "test_results",
+                "test_run",
+                "test_summary",
+                "tool_list",
+            ]
+        );
+        // Every advertised name must reach a real handler, never the
+        // Unknown-tool fallback.
+        for name in names {
+            let resp = handle_request(
+                &mut mgr,
+                &McpRequest { tool: name.into(), params: JsonValue::Object(vec![]) },
+            );
+            if let Some(err) = &resp.error {
+                assert!(
+                    !err.contains("Unknown tool"),
+                    "advertised tool '{}' does not dispatch: {}",
+                    name,
+                    err
+                );
+            }
+        }
     }
 
     // -- test_summary --
@@ -625,17 +652,50 @@ mod tests {
 
     #[test]
     fn run_with_fail_fast() {
-        let mut mgr = setup_manager();
-        // Run all 3 tests with fail_fast — t3 fails, so at least one should be skipped
+        // INVARIANT: a JSON {"fail_fast": true} reaches the run — the tests
+        // after the first failure are Skipped, not executed. The failing
+        // test registers FIRST so a parse regression that type-checks the
+        // flag but discards its value (always false) produces zero skips
+        // and fails this test.
+        let dir = crate::test_util::temp_storage_dir("mcp-failfast");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            crate::test_util::def("f1"),
+            Box::new(StubTest { id: "f1".into(), pass: false }),
+        )
+        .unwrap();
+        mgr.register_runnable(
+            crate::test_util::def("p2"),
+            Box::new(StubTest { id: "p2".into(), pass: true }),
+        )
+        .unwrap();
+        mgr.register_runnable(
+            crate::test_util::def("p3"),
+            Box::new(StubTest { id: "p3".into(), pass: true }),
+        )
+        .unwrap();
+
         let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run", "params": {"fail_fast": true}}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(true));
+        let data = val.get("data").unwrap();
+        let results = data.get("results").unwrap().as_array().unwrap();
+        let statuses: Vec<&str> = results.iter().filter_map(|r| r.get_str("status")).collect();
+        assert_eq!(statuses, vec!["failed", "skipped", "skipped"]);
+        assert_eq!(data.get("failed").and_then(|v| v.as_f64()), Some(1.0));
+        assert_eq!(data.get("skipped").and_then(|v| v.as_f64()), Some(2.0));
+
+        // The same suite WITHOUT the flag runs everything — the skips above
+        // came from fail_fast, not from the fixture.
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run"}"#);
         let val = parse_json(&resp).unwrap();
         let data = val.get("data").unwrap();
         let results = data.get("results").unwrap().as_array().unwrap();
         let statuses: Vec<&str> = results.iter().filter_map(|r| r.get_str("status")).collect();
-        assert!(statuses.contains(&"failed"));
-        // With fail_fast and 3 tests where one fails, we expect at least one skip
-        let has_skip_or_fewer_runs = statuses.contains(&"skipped") || results.len() < 3;
-        assert!(has_skip_or_fewer_runs || statuses.iter().filter(|s| **s == "failed").count() >= 1);
+        assert_eq!(statuses, vec!["failed", "passed", "passed"]);
+        assert_eq!(data.get("skipped").and_then(|v| v.as_f64()), Some(0.0));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -654,6 +714,73 @@ mod tests {
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(false));
         assert!(val.get_str("error").unwrap().contains("tpyo3"));
+    }
+
+    /// Destroys the runs directory from inside run(), so the summary
+    /// persist that follows execution fails (same fault-injection shape
+    /// as impl_manager's StorageSaboteur).
+    struct StorageSaboteur {
+        dir: String,
+    }
+    impl RunnableTest for StorageSaboteur {
+        fn id(&self) -> &str {
+            "t1"
+        }
+        fn run(&self, _timeout: Option<DurationMs>) -> TestResult {
+            let runs = format!("{}/runs", self.dir);
+            let _ = std::fs::remove_dir_all(&runs);
+            let _ = std::fs::write(&runs, "not a directory");
+            TestResult {
+                test_id: "t1".into(),
+                status: TestStatus::Passed,
+                duration_ms: 1,
+                message: None,
+                stdout: None,
+                stderr: None,
+            }
+        }
+    }
+
+    #[test]
+    fn run_persist_failure_reports_executed_with_run_id() {
+        // INVARIANT: when the run EXECUTED but its summary could not be
+        // persisted, the MCP response is not a bare error — it carries the
+        // run_id and an executed=true flag machine-readably, and the error
+        // text steers the agent to test_results instead of re-running the
+        // (possibly slow or destructive) suite.
+        let dir = crate::test_util::temp_storage_dir("mcp-persistfail");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_runnable(
+            crate::test_util::def("t1"),
+            Box::new(StorageSaboteur { dir: dir.clone() }),
+        )
+        .unwrap();
+
+        let resp = execute_mcp(&mut mgr, r#"{"tool": "test_run"}"#);
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        let data = val.get("data").unwrap();
+        assert_eq!(data.get_str("run_id"), Some("run_0001"));
+        assert_eq!(data.get_bool("executed"), Some(true));
+        let err = val.get_str("error").unwrap();
+        assert!(err.contains("run_0001"), "got: {}", err);
+        assert!(err.contains("EXECUTED"), "got: {}", err);
+        assert!(err.contains("do NOT re-run"), "got: {}", err);
+        assert!(err.contains("test_results"), "got: {}", err);
+
+        // The guidance must be true: test_results with that run_id serves
+        // the executed results (from memory, despite dead storage).
+        let resp = execute_mcp(
+            &mut mgr,
+            r#"{"tool": "test_results", "params": {"run_id": "run_0001"}}"#,
+        );
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(true));
+        let data = val.get("data").unwrap();
+        assert_eq!(data.get("total").and_then(|v| v.as_f64()), Some(1.0));
+        assert_eq!(data.get("passed").and_then(|v| v.as_f64()), Some(1.0));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- test_progress --
@@ -730,27 +857,48 @@ mod tests {
 
     #[test]
     fn list_tags() {
+        // INVARIANT: each entry carries the tag's TRUE cardinality in its
+        // "count" field — agents size and select runs from these numbers,
+        // so a wrong count (or a dropped field) misleads with no other
+        // signal. Fixture: smoke on t1+t2, fast on t1, slow on t3.
         let mut mgr = setup_manager();
         let resp = execute_mcp(&mut mgr, r#"{"tool": "test_list_tags"}"#);
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(true));
         let data = val.get("data").unwrap().as_array().unwrap();
-        let tag_names: Vec<&str> = data.iter().filter_map(|t| t.get_str("tag")).collect();
-        assert!(tag_names.contains(&"smoke"));
-        assert!(tag_names.contains(&"fast"));
-        assert!(tag_names.contains(&"slow"));
+        let mut entries: Vec<(&str, f64)> = data
+            .iter()
+            .map(|t| {
+                (
+                    t.get_str("tag").expect("entry must carry 'tag'"),
+                    t.get("count").and_then(|v| v.as_f64()).expect("entry must carry 'count'"),
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(entries, vec![("fast", 1.0), ("slow", 1.0), ("smoke", 2.0)]);
     }
 
     #[test]
     fn list_groups() {
+        // INVARIANT: group entries carry the true member count, same
+        // contract as list_tags. Fixture: auth holds t1+t2, network t3.
         let mut mgr = setup_manager();
         let resp = execute_mcp(&mut mgr, r#"{"tool": "test_list_groups"}"#);
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(true));
         let data = val.get("data").unwrap().as_array().unwrap();
-        let group_names: Vec<&str> = data.iter().filter_map(|g| g.get_str("group")).collect();
-        assert!(group_names.contains(&"auth"));
-        assert!(group_names.contains(&"network"));
+        let mut entries: Vec<(&str, f64)> = data
+            .iter()
+            .map(|g| {
+                (
+                    g.get_str("group").expect("entry must carry 'group'"),
+                    g.get("count").and_then(|v| v.as_f64()).expect("entry must carry 'count'"),
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(entries, vec![("auth", 2.0), ("network", 1.0)]);
     }
 
     // -- Error handling --

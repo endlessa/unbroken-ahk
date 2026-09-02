@@ -1050,4 +1050,95 @@ mod tests {
         let min = -9_223_372_036_854_775_808.0f64;
         assert_eq!(to_json_compact(&JsonValue::Number(min)), "-9223372036854775808");
     }
+
+    #[test]
+    fn top_level_trailing_data_is_rejected() {
+        // INVARIANT: parse_json accepts a document only when NOTHING but
+        // whitespace follows the first value — a healthy-looking prefix of
+        // a damaged registry/run file must never be returned as a valid
+        // value, and parse_json must agree with split_top_level_array's
+        // own trailing-data check about the same file.
+        assert!(matches!(parse_json("{} x"), Err(JsonError::TrailingData(_))));
+        assert!(matches!(parse_json("[1] 2"), Err(JsonError::TrailingData(_))));
+        // Leading-zero numbers are rejected ONLY via this check: "01"
+        // parses as the value 0 with '1' left over.
+        assert!(matches!(parse_json("01"), Err(JsonError::TrailingData(_))));
+        // Trailing whitespace alone stays accepted.
+        assert!(parse_json("{} ").is_ok());
+        assert!(parse_json("[1]\n").is_ok());
+    }
+
+    #[test]
+    fn strict_number_grammar_rejects_nonconforming_literals() {
+        // INVARIANT: the parser enforces RFC 8259's number grammar itself
+        // rather than deferring to f64::FromStr — FromStr happily parses
+        // "1." as 1.0, so a regression here would silently accept
+        // non-JSON input and re-serialize it as a DIFFERENT literal,
+        // diverging from every conforming parser.
+        for bad in ["1.", "1e", "1e+", "-", ".5", "+1"] {
+            assert!(
+                matches!(
+                    parse_json(bad),
+                    Err(JsonError::InvalidNumber(_)) | Err(JsonError::UnexpectedChar(_, _))
+                ),
+                "{:?} must be rejected",
+                bad
+            );
+        }
+        // The conforming spellings still parse to their exact values.
+        assert_eq!(parse_json("1.5").unwrap().as_f64(), Some(1.5));
+        assert_eq!(parse_json("1e5").unwrap().as_f64(), Some(100_000.0));
+        assert_eq!(parse_json("-0.5").unwrap().as_f64(), Some(-0.5));
+    }
+
+    #[test]
+    fn unknown_and_malformed_escapes_are_rejected() {
+        // INVARIANT: an unrecognized escape letter and a non-hex digit
+        // inside \uXXXX are errors, never leniently decoded into some
+        // other character — the strict loaders must not read string
+        // content that every conforming parser refuses.
+        assert!(matches!(parse_json(r#""\q""#), Err(JsonError::InvalidEscape(_))));
+        assert!(matches!(parse_json(r#""\u00gz""#), Err(JsonError::InvalidEscape(_))));
+    }
+
+    #[test]
+    fn object_keys_are_escaped_like_values() {
+        // INVARIANT: serializer escaping applies to object KEYS, not just
+        // string values — metadata keys are user-controlled, and an
+        // unescaped quote or newline in a key would write a registry file
+        // the parser itself calls corrupt (data loss on the next load).
+        let val = obj(vec![("we\"ird\nkey", str_val("v"))]);
+        let compact = to_json_compact(&val);
+        assert_eq!(parse_json(&compact).unwrap(), val);
+        let pretty = to_json_pretty(&val);
+        assert_eq!(parse_json(&pretty).unwrap(), val);
+        // The escaped spellings actually appear in the output.
+        assert_eq!(compact, r#"{"we\"ird\nkey":"v"}"#);
+    }
+
+    #[test]
+    fn pretty_and_compact_golden_shapes() {
+        // INVARIANT: the exact layout of emitted JSON — two-space
+        // indentation growing one level per nesting depth, pretty newline
+        // placement, compact's ", " array separator and no-space object
+        // colon — is the module's stated purpose (readable, indented JSON
+        // for storage); every consumer test only re-parses the output, so
+        // the shape is pinned here.
+        let val = obj(vec![
+            ("a", JsonValue::Number(1.0)),
+            ("b", JsonValue::Array(vec![JsonValue::Number(2.0), str_val("x")])),
+            ("c", obj(vec![("d", JsonValue::Bool(true))])),
+        ]);
+        assert_eq!(to_json_compact(&val), r#"{"a":1,"b":[2, "x"],"c":{"d":true}}"#);
+        let expected_pretty = "{\n  \"a\": 1,\n  \"b\": [\n    2,\n    \"x\"\n  ],\n  \"c\": {\n    \"d\": true\n  }\n}";
+        assert_eq!(to_json_pretty(&val), expected_pretty);
+        // Display delegates to the same writer as pretty — the two must
+        // never diverge.
+        assert_eq!(format!("{}", val), expected_pretty);
+        // Empty containers stay inline even in pretty mode.
+        assert_eq!(
+            to_json_pretty(&obj(vec![("e", JsonValue::Array(vec![]))])),
+            "{\n  \"e\": []\n}"
+        );
+    }
 }

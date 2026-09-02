@@ -212,3 +212,104 @@ pub struct RunSummary {
     pub started_at: Timestamp,
     pub completed_at: Timestamp,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::RunnableTest;
+    use crate::impl_manager::PlatformManager;
+    use crate::manager::TestManager;
+
+    struct EchoTest {
+        id: String,
+        pass: bool,
+    }
+
+    impl RunnableTest for EchoTest {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn run(&self, _timeout: Option<DurationMs>) -> TestResult {
+            TestResult {
+                test_id: self.id.clone(),
+                status: if self.pass { TestStatus::Passed } else { TestStatus::Failed },
+                duration_ms: 1,
+                message: if self.pass { None } else { Some("assertion failed".into()) },
+                stdout: None,
+                stderr: None,
+            }
+        }
+    }
+
+    #[test]
+    fn default_config_is_not_fail_fast() {
+        // INVARIANT: RunConfig::default() must NOT be fail-fast — a bare
+        // console `run` or programmatic default run keeps executing after
+        // a failure. If the default flipped to true, a failing test that
+        // sorts BEFORE a passing one would silently skip the remainder of
+        // the suite; every other default-config fixture in the crate puts
+        // its failing test last, so only this test observes the flip.
+        assert!(!RunConfig::default().fail_fast);
+
+        let dir = crate::test_util::temp_storage_dir("types-default-ff");
+        let mut mgr = PlatformManager::new(&dir);
+        // Failing test registered FIRST so it executes first in
+        // insertion/selection order, ahead of the passing test.
+        mgr.register_runnable(
+            crate::test_util::def("t1"),
+            Box::new(EchoTest { id: "t1".into(), pass: false }),
+        )
+        .unwrap();
+        mgr.register_runnable(
+            crate::test_util::def("t2"),
+            Box::new(EchoTest { id: "t2".into(), pass: true }),
+        )
+        .unwrap();
+
+        let run_id = mgr.start_run(RunConfig::default()).unwrap();
+        let summary = mgr.get_results(&run_id).unwrap();
+        // The test AFTER the failure still executed — nothing was skipped.
+        assert_eq!(summary.results[1].test_id, "t2");
+        assert_eq!(summary.results[1].status, TestStatus::Passed);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.passed, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fail_fast_skip_carries_the_shared_skip_reason() {
+        // INVARIANT: the ONE fail_fast-skip constructor shared by the
+        // executor's early stop and the manager's post-ghost remainder
+        // emits a Skipped record that EXPLAINS itself — the message is
+        // persisted to run files and shown to MCP/console consumers, so
+        // it must exist and name fail_fast, not regress to None or drift
+        // in wording between the two call sites.
+        let r = TestResult::fail_fast_skip("t9");
+        assert_eq!(r.test_id, "t9");
+        assert_eq!(r.status, TestStatus::Skipped);
+        assert_eq!(r.duration_ms, 0);
+        assert_eq!(r.message.as_deref(), Some("Skipped due to fail_fast"));
+        assert_eq!(r.stdout, None);
+        assert_eq!(r.stderr, None);
+    }
+
+    #[test]
+    fn ghost_error_message_names_the_offending_test() {
+        // INVARIANT: the ghost-Error record's message identifies WHICH
+        // test is definition-only, so the diagnostic survives contexts
+        // where the message is read in isolation (flattened logs, an
+        // agent quoting the error) without the surrounding test_id field.
+        let r = TestResult::ghost_error("t2");
+        assert_eq!(r.test_id, "t2");
+        assert_eq!(r.status, TestStatus::Error);
+        assert_eq!(r.duration_ms, 0);
+        assert_eq!(
+            r.message.as_deref(),
+            Some("no runnable registered for test 't2' (definition only)")
+        );
+        assert_eq!(r.stdout, None);
+        assert_eq!(r.stderr, None);
+    }
+}
