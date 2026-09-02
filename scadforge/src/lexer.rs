@@ -24,6 +24,18 @@ pub enum Tok {
     Star,
     Slash,
     Percent,
+    Caret,
+    Question,
+    Dot,
+    Bang,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    EqEq,
+    NotEq,
+    AndAnd,
+    OrOr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,12 +81,28 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b',' => push1(&mut out, Tok::Comma, &mut i),
             b';' => push1(&mut out, Tok::Semi, &mut i),
             b':' => push1(&mut out, Tok::Colon, &mut i),
+            b'=' if b.get(i + 1) == Some(&b'=') => push2(&mut out, Tok::EqEq, &mut i),
             b'=' => push1(&mut out, Tok::Assign, &mut i),
+            b'!' if b.get(i + 1) == Some(&b'=') => push2(&mut out, Tok::NotEq, &mut i),
+            b'!' => push1(&mut out, Tok::Bang, &mut i),
+            b'<' if b.get(i + 1) == Some(&b'=') => push2(&mut out, Tok::Le, &mut i),
+            b'<' => push1(&mut out, Tok::Lt, &mut i),
+            b'>' if b.get(i + 1) == Some(&b'=') => push2(&mut out, Tok::Ge, &mut i),
+            b'>' => push1(&mut out, Tok::Gt, &mut i),
+            b'&' if b.get(i + 1) == Some(&b'&') => push2(&mut out, Tok::AndAnd, &mut i),
+            b'|' if b.get(i + 1) == Some(&b'|') => push2(&mut out, Tok::OrOr, &mut i),
+            b'?' => push1(&mut out, Tok::Question, &mut i),
+            b'^' => push1(&mut out, Tok::Caret, &mut i),
             b'+' => push1(&mut out, Tok::Plus, &mut i),
             b'-' => push1(&mut out, Tok::Minus, &mut i),
             b'*' => push1(&mut out, Tok::Star, &mut i),
             b'/' => push1(&mut out, Tok::Slash, &mut i),
             b'%' => push1(&mut out, Tok::Percent, &mut i),
+            // '.' followed by a digit starts a number (.5); otherwise it
+            // is member access (v.x).
+            b'.' if !matches!(b.get(i + 1), Some(d) if d.is_ascii_digit()) => {
+                push1(&mut out, Tok::Dot, &mut i)
+            }
             b'"' => {
                 let start = i;
                 i += 1;
@@ -104,10 +132,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                             }
                             _ => return Err(format!("bad escape in string at byte {}", i)),
                         },
-                        Some(&ch) => {
-                            // Multi-byte UTF-8 is copied through untouched.
+                        Some(&ch) if ch < 0x80 => {
                             s.push(ch as char);
                             i += 1;
+                        }
+                        Some(_) => {
+                            // Multi-byte UTF-8: decode the whole character so
+                            // string values hold code points, not raw bytes.
+                            let ch = src[i..].chars().next().unwrap();
+                            s.push(ch);
+                            i += ch.len_utf8();
                         }
                         None => return Err(format!("unterminated string at byte {}", start)),
                     }
@@ -162,6 +196,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 fn push1(out: &mut Vec<Token>, tok: Tok, i: &mut usize) {
     out.push(Token { tok, pos: *i });
     *i += 1;
+}
+
+fn push2(out: &mut Vec<Token>, tok: Tok, i: &mut usize) {
+    out.push(Token { tok, pos: *i });
+    *i += 2;
 }
 
 #[cfg(test)]

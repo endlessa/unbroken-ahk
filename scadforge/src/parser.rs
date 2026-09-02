@@ -159,7 +159,83 @@ impl Parser {
         Ok(args)
     }
 
+    /// Full precedence chain, per the reference (high to low):
+    /// postfix call/index/member > ^ (right-assoc) > unary ! - + >
+    /// * / % > + - > < <= >= > > == != > && > || > ?: (right-assoc).
     fn expr(&mut self) -> Result<Expr, String> {
+        self.ternary()
+    }
+
+    fn ternary(&mut self) -> Result<Expr, String> {
+        let cond = self.or_expr()?;
+        if self.peek() == Some(&Tok::Question) {
+            self.pos += 1;
+            let then = self.expr()?;
+            self.expect(&Tok::Colon, "in ternary '?:'")?;
+            // Right-associative: the else branch swallows further ?:.
+            let els = self.ternary()?;
+            return Ok(Expr::Ternary {
+                cond: Box::new(cond),
+                then: Box::new(then),
+                els: Box::new(els),
+            });
+        }
+        Ok(cond)
+    }
+
+    fn or_expr(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.and_expr()?;
+        while self.peek() == Some(&Tok::OrOr) {
+            self.pos += 1;
+            let rhs = self.and_expr()?;
+            lhs = Expr::Binary { op: BinOp::Or, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn and_expr(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.equality()?;
+        while self.peek() == Some(&Tok::AndAnd) {
+            self.pos += 1;
+            let rhs = self.equality()?;
+            lhs = Expr::Binary { op: BinOp::And, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn equality(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.relational()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::EqEq) => BinOp::Eq,
+                Some(Tok::NotEq) => BinOp::Ne,
+                _ => break,
+            };
+            self.pos += 1;
+            let rhs = self.relational()?;
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn relational(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.additive()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Lt) => BinOp::Lt,
+                Some(Tok::Le) => BinOp::Le,
+                Some(Tok::Gt) => BinOp::Gt,
+                Some(Tok::Ge) => BinOp::Ge,
+                _ => break,
+            };
+            self.pos += 1;
+            let rhs = self.additive()?;
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn additive(&mut self) -> Result<Expr, String> {
         let mut lhs = self.term()?;
         loop {
             let op = match self.peek() {
@@ -191,11 +267,76 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
-        if self.peek() == Some(&Tok::Minus) {
-            self.pos += 1;
-            return Ok(Expr::Neg(Box::new(self.unary()?)));
+        match self.peek() {
+            Some(Tok::Minus) => {
+                self.pos += 1;
+                Ok(Expr::Neg(Box::new(self.unary()?)))
+            }
+            Some(Tok::Plus) => {
+                self.pos += 1;
+                Ok(Expr::Pos(Box::new(self.unary()?)))
+            }
+            Some(Tok::Bang) => {
+                self.pos += 1;
+                Ok(Expr::Not(Box::new(self.unary()?)))
+            }
+            _ => self.power(),
         }
-        self.primary()
+    }
+
+    /// ^ binds TIGHTER than unary minus (-2^2 == -4) but its exponent
+    /// operand re-enters unary so 2^-3 parses; right-associative.
+    fn power(&mut self) -> Result<Expr, String> {
+        let base = self.postfix()?;
+        if self.peek() == Some(&Tok::Caret) {
+            self.pos += 1;
+            let exp = self.unary()?;
+            return Ok(Expr::Binary {
+                op: BinOp::Pow,
+                lhs: Box::new(base),
+                rhs: Box::new(exp),
+            });
+        }
+        Ok(base)
+    }
+
+    /// Postfix operators bind tightest: f(x), v[i], v.x — chainable
+    /// (m[1].z, f(x)[0]).
+    fn postfix(&mut self) -> Result<Expr, String> {
+        let mut e = self.primary()?;
+        loop {
+            match self.peek() {
+                Some(Tok::LBracket) => {
+                    self.pos += 1;
+                    let index = self.expr()?;
+                    self.expect(&Tok::RBracket, "to close '[' index")?;
+                    e = Expr::Index { base: Box::new(e), index: Box::new(index) };
+                }
+                Some(Tok::Dot) => {
+                    self.pos += 1;
+                    let name = match self.bump() {
+                        Some(Tok::Ident(s)) => s,
+                        _ => return Err(format!("expected member name after '.', found {}", self.here())),
+                    };
+                    e = Expr::Member { base: Box::new(e), name };
+                }
+                Some(Tok::LParen) => {
+                    // Only identifiers are callable in this slice
+                    // (expression-callees like fs[i](x) are a later
+                    // milestone).
+                    let name = match &e {
+                        Expr::Ident(name) => name.clone(),
+                        _ => break,
+                    };
+                    self.pos += 1;
+                    let args = self.args()?;
+                    self.expect(&Tok::RParen, "to close the call")?;
+                    e = Expr::Call { name, args };
+                }
+                _ => break,
+            }
+        }
+        Ok(e)
     }
 
     fn primary(&mut self) -> Result<Expr, String> {

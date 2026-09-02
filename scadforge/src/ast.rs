@@ -13,6 +13,17 @@ pub enum Expr {
     Range { start: Box<Expr>, step: Option<Box<Expr>>, end: Box<Expr> },
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Neg(Box<Expr>),
+    /// Unary + — accepted as a no-op on numbers per the reference.
+    Pos(Box<Expr>),
+    Not(Box<Expr>),
+    /// cond ? then : else — both branches LAZY (only the taken one
+    /// evaluates), the property recursive library code depends on.
+    Ternary { cond: Box<Expr>, then: Box<Expr>, els: Box<Expr> },
+    Index { base: Box<Expr>, index: Box<Expr> },
+    Member { base: Box<Expr>, name: String },
+    /// Function-call operator in expression position (builtins for now;
+    /// functions and modules are separate namespaces).
+    Call { name: String, args: Vec<Arg> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -22,6 +33,15 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    Pow,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone, PartialEq)]

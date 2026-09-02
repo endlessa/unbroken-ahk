@@ -6,7 +6,10 @@ pub enum Value {
     Bool(bool),
     Str(String),
     Vector(Vec<Value>),
-    Range { start: f64, step: f64, end: f64 },
+    /// implicit_step records the two-part [a:b] spelling — only that form
+    /// gets the legacy reversed-range swap; [10:1:0] iterates zero times.
+    /// Semantic equality (value_eq) compares begin/step/end only.
+    Range { start: f64, step: f64, end: f64, implicit_step: bool },
     Undef,
 }
 
