@@ -1,0 +1,54 @@
+//! Runtime values for the SCAD-compatible subset.
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Num(f64),
+    Bool(bool),
+    Str(String),
+    Vector(Vec<Value>),
+    Range { start: f64, step: f64, end: f64 },
+    Undef,
+}
+
+impl Value {
+    pub fn as_num(&self) -> Option<f64> {
+        match self {
+            Value::Num(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// A numeric 3-vector; shorter vectors zero-fill (the reference's
+    /// rotate([90]) behavior), longer ones are rejected by callers that
+    /// care.
+    pub fn as_vec3(&self) -> Option<[f64; 3]> {
+        match self {
+            Value::Vector(items) if items.len() <= 3 => {
+                let mut out = [0.0; 3];
+                for (i, item) in items.iter().enumerate() {
+                    out[i] = item.as_num()?;
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Num(_) => "number",
+            Value::Bool(_) => "boolean",
+            Value::Str(_) => "string",
+            Value::Vector(_) => "vector",
+            Value::Range { .. } => "range",
+            Value::Undef => "undef",
+        }
+    }
+}

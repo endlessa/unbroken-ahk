@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "scadforge"
+version = "0.1.0"
+dependencies = [
+ "unbroken-test-platform",
+]
+
+[[package]]
 name = "unbroken-test-platform"
 version = "0.1.0"

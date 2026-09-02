@@ -1,0 +1,13 @@
+[package]
+name = "scadforge"
+version = "0.1.0"
+edition = "2021"
+description = "From-scratch OpenSCAD-compatible modeler: localhost web app, zero third-party dependencies"
+
+[dependencies]
+# Our own JSON layer — reused from the sibling crate, no third-party code.
+unbroken-test-platform = { path = ".." }
+
+[[bin]]
+name = "scadforge"
+path = "src/main.rs"
