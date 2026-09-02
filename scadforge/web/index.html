@@ -45,9 +45,10 @@ $fn = 32;
 n = 14;         // pillars around the ring
 R = 30;         // ring radius
 
-// base plate sized from the ring: scalar * vector + vector math
+// base plate sized from the ring: scalar * vector + vector math,
+// sunk by its own .z so the top surface sits at z = 0
 plate = 2 * (R + 8) * [1, 1, 0] + [0, 0, 3];
-color("#39404f") translate(-plate / 2) cube(plate);
+color("#39404f") translate(-plate / 2 - [0, 0, plate.z] / 2) cube(plate);
 
 // a ring of pillars: trig drives placement AND height,
 // a ternary alternates the shape, comparisons pick colors
@@ -199,7 +200,7 @@ function mvpMatrix(w, h) {
     a*s[0], b*u[0], c*-f[0], f[0],
     a*s[1], b*u[1], c*-f[1], f[1],
     a*s[2], b*u[2], c*-f[2], f[2],
-    a*ex,   b*ey,   c*-ez+d, -ez + 0,
+    a*ex,   b*ey,   c*ez+d,  -ez,
   ]);
 }
 
@@ -243,42 +244,81 @@ function draw() {
   softwareDraw(w, h);
 }
 
-// Painter's-algorithm fallback: same scene, no GPU required.
+// Software z-buffer fallback: same scene, no GPU required. Per-pixel
+// depth testing — painter's-algorithm sorting fails when large faces
+// (the base plate) overlap small nearby ones.
 function softwareDraw(w, h) {
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#0d1217';
-  ctx.fillRect(0, 0, w, h);
+  const img = ctx.createImageData(w, h);
+  const px = img.data;
+  const bg = [13, 18, 23]; // #0d1217
+  for (let i = 0; i < px.length; i += 4) {
+    px[i] = bg[0]; px[i+1] = bg[1]; px[i+2] = bg[2]; px[i+3] = 255;
+  }
+  const zbuf = new Float32Array(w * h).fill(Infinity);
   const cam = viewProj(w, h);
-  const L = [0.5, 0.35, 0.85];
-  const tris = [];
+  // Same light as the GL shader, normalized to match its shading exactly.
+  const Ll = Math.hypot(0.5, 0.35, 0.85);
+  const L = [0.5/Ll, 0.35/Ll, 0.85/Ll];
   for (const m of soup) {
     const v = m.verts;
+    const [cr, cg, cb, ca] = m.color;
     for (let i = 0; i < v.length; i += 18) {
-      const pts = [], zs = [];
+      const sx = [], sy = [], sz = [];
       let behind = false;
       for (let k = 0; k < 3; k++) {
         const o = i + k*6;
         const clip = cam.tx([v[o], v[o+1], v[o+2]]);
         if (clip[3] <= 0) { behind = true; break; }
-        pts.push([ (clip[0]/clip[3]*0.5+0.5)*w, (0.5-clip[1]/clip[3]*0.5)*h ]);
-        zs.push(clip[3]);
+        sx.push((clip[0]/clip[3]*0.5+0.5)*w);
+        sy.push((0.5-clip[1]/clip[3]*0.5)*h);
+        // NDC z is affine in screen space, so barycentric interpolation
+        // of it gives a correct per-pixel depth test.
+        sz.push(clip[2]/clip[3]);
       }
       if (behind) continue;
+      let area = (sx[1]-sx[0])*(sy[2]-sy[0]) - (sx[2]-sx[0])*(sy[1]-sy[0]);
+      if (Math.abs(area) < 1e-9) continue;
       const shade = Math.max(v[i+3]*L[0]+v[i+4]*L[1]+v[i+5]*L[2], 0)*0.75+0.25;
-      tris.push({ pts, depth: (zs[0]+zs[1]+zs[2])/3, color: m.color, shade });
+      const r = Math.min(255, (cr*shade*255)|0);
+      const g = Math.min(255, (cg*shade*255)|0);
+      const b = Math.min(255, (cb*shade*255)|0);
+      const x0 = Math.max(0, Math.floor(Math.min(sx[0], sx[1], sx[2])));
+      const x1 = Math.min(w - 1, Math.ceil(Math.max(sx[0], sx[1], sx[2])));
+      const y0 = Math.max(0, Math.floor(Math.min(sy[0], sy[1], sy[2])));
+      const y1 = Math.min(h - 1, Math.ceil(Math.max(sy[0], sy[1], sy[2])));
+      const inv = 1 / area;
+      for (let y = y0; y <= y1; y++) {
+        const cy = y + 0.5;
+        for (let x = x0; x <= x1; x++) {
+          const cx = x + 0.5;
+          // Barycentric weights via edge functions, normalized by the
+          // signed area so either winding rasterizes (no face culling,
+          // matching the GL path).
+          const w0 = ((sx[1]-cx)*(sy[2]-cy) - (sx[2]-cx)*(sy[1]-cy)) * inv;
+          const w1 = ((sx[2]-cx)*(sy[0]-cy) - (sx[0]-cx)*(sy[2]-cy)) * inv;
+          const w2 = 1 - w0 - w1;
+          if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+          const z = w0*sz[0] + w1*sz[1] + w2*sz[2];
+          const at = y * w + x;
+          if (z >= zbuf[at]) continue;
+          const o = at * 4;
+          if (ca >= 1) {
+            zbuf[at] = z;
+            px[o] = r; px[o+1] = g; px[o+2] = b;
+          } else {
+            // Unsorted transparency: blend over what's there, keep the
+            // depth so nearer opaque faces still win later.
+            zbuf[at] = z;
+            px[o]   = (r*ca + px[o]  *(1-ca))|0;
+            px[o+1] = (g*ca + px[o+1]*(1-ca))|0;
+            px[o+2] = (b*ca + px[o+2]*(1-ca))|0;
+          }
+        }
+      }
     }
   }
-  tris.sort((a, b) => b.depth - a.depth);
-  for (const t of tris) {
-    const [r, g, bl] = t.color;
-    ctx.fillStyle = `rgba(${(r*t.shade*255)|0},${(g*t.shade*255)|0},${(bl*t.shade*255)|0},${t.color[3]})`;
-    ctx.beginPath();
-    ctx.moveTo(t.pts[0][0], t.pts[0][1]);
-    ctx.lineTo(t.pts[1][0], t.pts[1][1]);
-    ctx.lineTo(t.pts[2][0], t.pts[2][1]);
-    ctx.closePath();
-    ctx.fill();
-  }
+  ctx.putImageData(img, 0, 0);
 }
 
 // ---- interaction ----------------------------------------------------------
