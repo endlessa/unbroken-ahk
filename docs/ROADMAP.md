@@ -4,8 +4,8 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 2 (2026-09-02): **113 full / 10 partial / 60
-untouched — 62% full, 67% touched.**
+Standing after phase 3 core (2026-09-02): **117 full / 9 partial / 57
+untouched — 64% full, 69% touched.**
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -42,12 +42,19 @@ serialized condition text), `search`, `lookup`, `rands`,
 Remaining partials here: assert lacks file/line + TRACE stack; string
 literal escapes are the basic four.
 
-### Phase 3 — CSG booleans (few entries, hardest geometry)
+### Phase 3 — CSG booleans (core DONE)
 
-- Real mesh `union` (today it is pass-through grouping)
-- `difference`, `intersection`, `intersection_for`
-- `hull`, `minkowski` at the edge of this phase
-- From-scratch mesh boolean algorithms (clean-room; no CGAL)
+Done: `difference`, `intersection`, `intersection_for` compute real mesh
+geometry via a from-scratch BSP-tree-merging kernel (`scadforge/src/
+csg.rs`; Thibault & Naylor 1987 — clean-room, no CGAL). `union`/`group`
+stay preview concatenation (faithful to the reference's F5 preview),
+with the exact union used internally to combine multi-shape operands.
+
+Still open in this phase:
+- `hull` (3D convex hull — quickhull/incremental)
+- `minkowski` (convex decomposition; hull-of-sums for convex operands)
+- Preview-vs-render niceties (`render()`, `convexity`, 2-manifold
+  export warnings) — mostly observable-surface, low priority
 
 ### Phase 4 — 2D + extrusions (~15 entries)
 

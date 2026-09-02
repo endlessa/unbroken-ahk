@@ -40,45 +40,42 @@
 </header>
 <main>
   <div id="left">
-    <textarea id="editor" spellcheck="false">// scadforge demo — modules, functions, children, comprehensions
-$fn = 24;
+    <textarea id="editor" spellcheck="false">// scadforge demo — CSG booleans (real mesh union/difference/intersection)
+$fn = 40;
 
-// a user module that stamps its CHILDREN around a circle,
-// alternating them via $children
-module ring(n = 10, r = 26) {
-  for (i = [0 : n - 1])
-    rotate([0, 0, i * 360 / n]) translate([r, 0, 0])
-      children(i % $children);
+// base plate
+color("#39404f") translate([0, 0, -1.5]) cube([80, 80, 3], center = true);
+
+// a bracket: a rounded-ish block with a bolt hole and a slot cut out
+color("goldenrod")
+translate([-22, 0, 6])
+difference() {
+  cube([20, 20, 12], center = true);        // body
+  cylinder(h = 13, r = 5, center = true);    // through hole
+  translate([0, 0, 6]) cube([24, 6, 6], center = true); // top slot
 }
 
-// a named function + a list comprehension
-function wave(x) = 4 + 3 * sin(x * 45);
-heights = [for (i = [0 : 10]) wave(i)];
-echo(heights = heights);
-
-// base plate, top surface at z = 0
-plate = [72, 72, 3];
-color("#39404f") translate(-plate / 2 - [0, 0, plate.z] / 2) cube(plate);
-
-// two alternating child shapes stamped by the module
-ring(n = 12) {
-  color("goldenrod")  cylinder(h = 10, r1 = 3, r2 = 0);
-  color("steelblue") cylinder(h = 7, r = 2.5);
+// intersection: a sphere clipped to a cube gives a cushion
+color("tomato")
+translate([4, 0, 6])
+intersection() {
+  sphere(r = 9);
+  cube([13, 13, 13], center = true);
 }
 
-// the comprehension drives a wave wall
-for (i = [0 : len(heights) - 1])
-  color([0.35 + i / 18, 0.4, 0.9])
-    translate([i * 5 - 26, -2, 0]) cube([4, 4, heights[i]]);
+// intersection_for: the common core of three rotated bars — a hex prism
+color("steelblue")
+translate([28, 0, 5])
+intersection_for (a = [0, 60, 120])
+  rotate([0, 0, a]) cube([26, 9, 10], center = true);
 
-// a RECURSIVE module: tower of shrinking slabs
-module tower(n) {
-  if (n > 0) {
-    color([0.9, 0.3 + n / 15, 0.25]) cube([n * 2, n * 2, 3], center = true);
-    translate([0, 0, 3]) tower(n - 1);
-  }
+// difference again: a ring (tube) = big cylinder minus small cylinder
+color([0.4, 0.7, 0.5])
+translate([4, 26, 3])
+difference() {
+  cylinder(h = 6, r = 8, center = true);
+  cylinder(h = 7, r = 5, center = true);
 }
-translate([0, 16, 1.5]) tower(6);
 </textarea>
     <div id="messages"><span class="ok">ready.</span></div>
   </div>
