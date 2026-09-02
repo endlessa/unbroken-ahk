@@ -837,6 +837,24 @@ mod tests {
     }
 
     #[test]
+    fn empty_includes_with_excludes_is_no_tests_matched_not_widening_advice() {
+        // An agent whose computed selection came out empty, plus a
+        // standing exclude list: the answer is the truthful
+        // NoTestsMatched — never "set run_all: true", which would flip a
+        // deliberate zero-test selection into running the whole suite.
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(
+            &mut mgr,
+            r#"{"tool": "test_run", "params": {"include_ids": [], "exclude_tags": ["slow"]}}"#,
+        );
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        let err = val.get_str("error").unwrap();
+        assert!(err.contains("no tests matched"), "got: {}", err);
+        assert!(!err.contains("run_all"), "got: {}", err);
+    }
+
+    #[test]
     fn run_all_with_include_filters_is_rejected() {
         // Contradictory intent must never silently widen the run past
         // the includes (the destructive tests a tag was scoping out).

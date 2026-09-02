@@ -418,20 +418,16 @@ impl PlatformManager {
             ));
         }
 
-        // A programmatic exclude-only config with run_all=false selects
-        // nothing by construction — point at the fix instead of a bare
-        // no-tests-matched (the JSON layer already rejects this shape).
-        if !config.run_all
-            && !config.has_include_filters()
-            && !config.exclude_tags.is_empty()
-        {
-            return Err(ManagerError::UnsupportedConfig(
-                "exclude-only configs must set run_all: true (run everything \
-                 except the excluded tags); run_all: false with no include \
-                 filters selects nothing"
-                    .into(),
-            ));
-        }
+        // NOTE deliberately ABSENT here: no exclude-only guard. A struct
+        // with run_all=false, empty includes, and exclude_tags cannot be
+        // told apart from one whose caller SUPPLIED an empty include
+        // filter (key presence is a JSON-layer fact, and that layer
+        // already rejects the bare exclude-only wire shape with the
+        // run_all guidance). Advising "set run_all: true" for a
+        // deliberate zero-test selection would flip it into running the
+        // whole suite minus exclusions — the silent widening this
+        // platform exists to prevent — so both readings fall through to
+        // the truthful NoTestsMatched below.
 
         // ONE registry snapshot serves the exclude validation, include
         // validation, and selection below — three traversals of the same
@@ -1954,16 +1950,17 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(mgr.start_run(config), Err(ManagerError::UnsupportedConfig(_))));
-        // Exclude-only programmatic configs get pointed at run_all: true.
+        // Exclude-only-looking programmatic configs get the truthful
+        // NoTestsMatched, never advice to set run_all: true — the struct
+        // cannot distinguish "forgot run_all" from "my computed include
+        // selection was deliberately empty", and the run_all remedy
+        // would silently widen the latter to the whole suite.
         let config = RunConfig {
             run_all: false,
             exclude_tags: vec!["fast".into()],
             ..Default::default()
         };
-        match mgr.start_run(config) {
-            Err(ManagerError::UnsupportedConfig(msg)) => assert!(msg.contains("run_all")),
-            other => panic!("expected UnsupportedConfig, got {:?}", other.map(|_| ())),
-        }
+        assert!(matches!(mgr.start_run(config), Err(ManagerError::NoTestsMatched)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
