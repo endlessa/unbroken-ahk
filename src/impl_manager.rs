@@ -828,22 +828,16 @@ impl TestManager for PlatformManager {
         if self.progress.active_runs().contains(&run_id.to_string()) {
             return Err(ManagerError::RunInProgress(run_id.into()));
         }
-        // Try loading from storage. A missing file is an unknown run; an
-        // empty file is another session's reservation (running, or died
-        // before persisting) — no results yet, not corruption; a read
-        // failure is an access problem, not damage; only content that
-        // fails to PARSE is corruption — telling the user the run never
-        // happened, or that intact data is damaged, hides the real state.
-        match storage::run_summary_exists(&self.storage, run_id) {
-            Ok(false) => return Err(ManagerError::UnknownRun(run_id.into())),
-            Ok(true) => {}
-            // A stat failure must not make an existing run "unknown".
-            Err(msg) => return Err(ManagerError::ReadFailed(run_id.into(), msg)),
-        }
-        if storage::run_summary_is_reserved_only(&self.storage, run_id) {
-            return Err(ManagerError::RunNotPersisted(run_id.into()));
-        }
+        // Load from storage — ONE read classifies every case. A missing
+        // file is an unknown run; an empty file is another session's
+        // reservation (running, or died before persisting) — no results
+        // yet, not corruption; a read failure is an access problem, not
+        // damage; only content that fails to PARSE is corruption —
+        // telling the user the run never happened, or that intact data
+        // is damaged, hides the real state.
         storage::load_run_summary(&self.storage, run_id).map_err(|e| match e {
+            storage::RunLoadError::NotFound => ManagerError::UnknownRun(run_id.into()),
+            storage::RunLoadError::ReservedOnly => ManagerError::RunNotPersisted(run_id.into()),
             storage::RunLoadError::Io(msg) => ManagerError::ReadFailed(run_id.into(), msg),
             storage::RunLoadError::Parse(msg) => ManagerError::CorruptRun(run_id.into(), msg),
         })

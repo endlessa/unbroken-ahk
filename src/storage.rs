@@ -278,24 +278,6 @@ pub fn run_summary_exists(_paths: &StoragePaths, _run_id: &str) -> Result<bool, 
     Ok(false)
 }
 
-/// Whether a run file is a reservation placeholder only (exists, empty):
-/// the run was claimed by some session but its summary has not been
-/// written — still executing, or that session died mid-run. Either way
-/// it is "no results yet", never corruption.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn run_summary_is_reserved_only(paths: &StoragePaths, run_id: &str) -> bool {
-    is_valid_run_id(run_id)
-        && std::fs::metadata(paths.run_path(run_id))
-            .map(|m| m.len() == 0)
-            .unwrap_or(false)
-}
-
-/// WASM stub: no filesystem, no reservations.
-#[cfg(target_arch = "wasm32")]
-pub fn run_summary_is_reserved_only(_paths: &StoragePaths, _run_id: &str) -> bool {
-    false
-}
-
 /// Outcome of attempting to claim a run id.
 #[derive(Debug)]
 pub enum ReserveOutcome {
@@ -365,22 +347,48 @@ pub fn save_run_summary(paths: &StoragePaths, summary: &RunSummary) -> Result<()
 /// damaged record and callers must not report it as corruption.
 #[derive(Debug)]
 pub enum RunLoadError {
-    /// The file could not be read (permissions, transient I/O, deleted
-    /// between checks). Says nothing about the data.
+    /// No file exists for this run id — the run is unknown.
+    NotFound,
+    /// The file exists but is an empty reservation placeholder: the run
+    /// was claimed by some session but its summary has not been written —
+    /// still executing, or that session died mid-run. "No results yet",
+    /// never corruption.
+    ReservedOnly,
+    /// The file could not be read (permissions, transient I/O). Says
+    /// nothing about the data.
     Io(String),
     /// The file was read but its content does not parse as a valid
     /// summary — the record is damaged or version-incompatible.
     Parse(String),
 }
 
-/// Load a run summary from JSON.
+/// Load a run summary from JSON. ONE read classifies every case —
+/// separate exists/reserved stats before the read left TOCTOU windows
+/// where a file removed between checks was reported as a retryable read
+/// failure instead of the truthful "unknown run".
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_run_summary(paths: &StoragePaths, run_id: &str) -> Result<RunSummary, RunLoadError> {
     if !is_valid_run_id(run_id) {
-        return Err(RunLoadError::Io(format!("invalid run id '{}'", run_id)));
+        return Err(RunLoadError::NotFound);
     }
-    let content = read_json_file(&paths.run_path(run_id)).map_err(RunLoadError::Io)?;
+    let content = match std::fs::read_to_string(paths.run_path(run_id)) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RunLoadError::NotFound)
+        }
+        Err(e) => return Err(RunLoadError::Io(format!("read file: {}", e))),
+    };
+    if content.trim().is_empty() {
+        return Err(RunLoadError::ReservedOnly);
+    }
     let value = parse_json(&content).map_err(|e| RunLoadError::Parse(format!("{}", e)))?;
     RunSummary::from_json(&value).map_err(|e| RunLoadError::Parse(format!("{}", e)))
+}
+
+/// WASM stub: no filesystem — nothing was ever persisted.
+#[cfg(target_arch = "wasm32")]
+pub fn load_run_summary(_paths: &StoragePaths, _run_id: &str) -> Result<RunSummary, RunLoadError> {
+    Err(RunLoadError::NotFound)
 }
 
 #[cfg(test)]

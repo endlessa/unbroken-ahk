@@ -53,8 +53,15 @@ pub fn execute_command(manager: &mut PlatformManager, input: &str) -> ConsoleOut
 
     // Argument-less commands reject surplus tokens like every other part
     // of this surface: 'tags smoke' silently printing the UNFILTERED
-    // list reads as a filtered result.
-    if matches!(command.as_str(), "help" | "summary" | "tags" | "groups") && !args.is_empty() {
+    // list reads as a filtered result. 'help <cmd>' gets its own remedy —
+    // there is no per-command help, and pointing at discover filtering
+    // would steer the user somewhere unrelated.
+    if command == "help" && !args.is_empty() {
+        return error_output(
+            "'help' takes no arguments — it already lists every command and flag",
+        );
+    }
+    if matches!(command.as_str(), "summary" | "tags" | "groups") && !args.is_empty() {
         return error_output(&format!(
             "'{}' takes no arguments (try 'discover --tag <tag>' to filter tests)",
             command
@@ -510,11 +517,13 @@ fn console_vocabulary(msg: &str) -> String {
             .replace("run_all: true", "--all")
             .replace("run_all", "--all")
     }
-    // The values are echoed in Debug form, where an interior quote
-    // appears as \" — the span-close scan must skip escaped quotes or a
-    // value containing '"' would spill field names into the "unquoted"
-    // region and get rewritten.
-    fn find_close(s: &str) -> Option<usize> {
+    // Values are echoed back BOTH ways: Debug lists use double quotes
+    // (with interior quotes escaped as \"), single scalars use single
+    // quotes ('pattern'). Both span kinds are protected — the close scan
+    // must match the opening quote kind and skip backslash escapes, or a
+    // value's tail would spill into the "unquoted" region and get
+    // rewritten.
+    fn find_close(s: &str, quote: u8) -> Option<usize> {
         let bytes = s.as_bytes();
         let mut escaped = false;
         for (i, &b) in bytes.iter().enumerate() {
@@ -522,7 +531,7 @@ fn console_vocabulary(msg: &str) -> String {
                 escaped = false;
             } else if b == b'\\' {
                 escaped = true;
-            } else if b == b'"' {
+            } else if b == quote {
                 return Some(i);
             }
         }
@@ -531,23 +540,27 @@ fn console_vocabulary(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
     loop {
-        match rest.find('"') {
+        let open = rest
+            .bytes()
+            .position(|b| b == b'"' || b == b'\'');
+        match open {
             None => {
                 out.push_str(&replace_fields(rest));
                 return out;
             }
             Some(open) => {
+                let quote = rest.as_bytes()[open];
                 out.push_str(&replace_fields(&rest[..open]));
                 let quoted = &rest[open + 1..];
-                match find_close(quoted) {
+                match find_close(quoted, quote) {
                     Some(close) => {
-                        out.push('"');
+                        out.push(quote as char);
                         out.push_str(&quoted[..=close]);
                         rest = &quoted[close + 1..];
                     }
                     None => {
                         // Unbalanced quote: copy the tail verbatim.
-                        out.push('"');
+                        out.push(quote as char);
                         out.push_str(quoted);
                         return out;
                     }
@@ -910,6 +923,11 @@ mod tests {
             let out = execute_command(&mut mgr, cmd);
             assert!(out.text.contains("takes no arguments"), "{}: got: {}", cmd, out.text);
         }
+        // 'help <cmd>' is the standard per-command-help idiom; its remedy
+        // must point at help itself, not at test filtering.
+        let out = execute_command(&mut mgr, "help run");
+        assert!(!out.text.contains("discover"), "got: {}", out.text);
+        assert!(out.text.contains("every command"), "got: {}", out.text);
     }
 
     #[test]
@@ -955,6 +973,13 @@ mod tests {
         let out = execute_command(&mut mgr, "run --tag=x\"include_tags");
         assert!(out.text.contains("x\\\"include_tags"), "got: {}", out.text);
         assert!(!out.text.contains("x\\\"--tag"), "got: {}", out.text);
+
+        // Single-quoted echoes (the pattern zero-match error) are user
+        // data too — a pattern containing a field-name substring must
+        // come back verbatim.
+        let out = execute_command(&mut mgr, "run --pattern=run_all_zz");
+        assert!(out.text.contains("'run_all_zz'"), "got: {}", out.text);
+        assert!(!out.text.contains("--all_zz"), "got: {}", out.text);
     }
 
     #[test]
