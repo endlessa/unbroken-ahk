@@ -505,13 +505,10 @@ impl PlatformManager {
 
         self.progress.start_run(run_id.clone(), total);
 
-        let selected_set: std::collections::HashSet<&str> =
-            selected_ids.iter().map(|s| s.as_str()).collect();
-        let attached: std::collections::HashSet<&str> = self
+        let runnable_by_id: std::collections::HashMap<&str, &dyn RunnableTest> = self
             .runnables
             .iter()
-            .map(|r| r.id())
-            .filter(|id| selected_set.contains(id))
+            .map(|r| (r.id(), r.as_ref()))
             .collect();
 
         // Under fail_fast, a selected definition with no runnable is a
@@ -519,13 +516,11 @@ impl PlatformManager {
         // position in selection order, not execute the whole suite and
         // append the Error at the end.
         let first_ghost = if config.fail_fast {
-            selected_ids.iter().position(|id| !attached.contains(id.as_str()))
+            selected_ids
+                .iter()
+                .position(|id| !runnable_by_id.contains_key(id.as_str()))
         } else {
             None
-        };
-        let execute_ids: std::collections::HashSet<&str> = match first_ghost {
-            Some(i) => selected_ids[..i].iter().map(|s| s.as_str()).collect(),
-            None => selected_set,
         };
         // Execute in SELECTION order, not runnable-attach order: the two
         // can diverge (definitions restored from storage, runnables
@@ -533,14 +528,12 @@ impl PlatformManager {
         // order would decide which tests get skipped — contradicting the
         // selection-order contract the ghost stop position and the
         // in-place registry upgrades are built around.
-        let runnable_by_id: std::collections::HashMap<&str, &dyn RunnableTest> = self
-            .runnables
+        let execute_slice: &[String] = match first_ghost {
+            Some(i) => &selected_ids[..i],
+            None => &selected_ids,
+        };
+        let runnables: Vec<&dyn RunnableTest> = execute_slice
             .iter()
-            .map(|r| (r.id(), r.as_ref()))
-            .collect();
-        let runnables: Vec<&dyn RunnableTest> = selected_ids
-            .iter()
-            .filter(|id| execute_ids.contains(id.as_str()))
             .filter_map(|id| runnable_by_id.get(id.as_str()).copied())
             .collect();
 
@@ -588,17 +581,28 @@ impl PlatformManager {
                 results.push(result);
             }
         } else {
-            let ran: std::collections::HashSet<&str> = runnables.iter().map(|r| r.id()).collect();
-            let missing: Vec<String> = selected_ids
-                .iter()
-                .filter(|id| !ran.contains(id.as_str()))
-                .cloned()
-                .collect();
-            for id in missing {
-                let result = TestResult::ghost_error(&id);
-                self.progress.test_completed(&run_id, &result);
-                results.push(result);
+            // Ghost Errors go at their SELECTION positions, not the end:
+            // the record order in a summary must not flip with the
+            // fail_fast flag. Executor results are already in selection
+            // order (unique, executor-normalized ids), so rebuilding by
+            // walking selected_ids preserves them and slots each ghost in
+            // place.
+            let mut by_id: std::collections::HashMap<String, TestResult> =
+                results.drain(..).map(|r| (r.test_id.clone(), r)).collect();
+            for id in &selected_ids {
+                match by_id.remove(id.as_str()) {
+                    Some(result) => results.push(result),
+                    None => {
+                        let result = TestResult::ghost_error(id);
+                        self.progress.test_completed(&run_id, &result);
+                        results.push(result);
+                    }
+                }
             }
+            // Unreachable with normalized unique ids — but if a result
+            // ever escaped the mapping, losing it would be worse than an
+            // odd position.
+            results.extend(by_id.into_values());
         }
 
         self.progress.finish_run(&run_id);
@@ -614,22 +618,12 @@ impl PlatformManager {
         }
 
         // Build summary
-        let mut passed = 0u32;
-        let mut failed = 0u32;
-        let mut skipped = 0u32;
-        let mut errored = 0u32;
+        let (passed, failed, errored, skipped) = count_statuses(&results);
         let mut total_duration = 0u64;
-
         for r in &results {
             // Saturate — a runnable reporting a pathological duration must
             // not panic (debug) or wrap (release) after tests already ran.
             total_duration = total_duration.saturating_add(r.duration_ms).min(max_safe);
-            match r.status {
-                TestStatus::Passed => passed += 1,
-                TestStatus::Failed => failed += 1,
-                TestStatus::Skipped => skipped += 1,
-                TestStatus::Error => errored += 1,
-            }
         }
 
         let summary = RunSummary {
@@ -713,6 +707,22 @@ impl PlatformManager {
 }
 
 
+/// Tally results by status — (passed, failed, errored, skipped). ONE
+/// counting rule shared by the summary build and the progress fallback,
+/// so the two can never drift.
+fn count_statuses(results: &[TestResult]) -> (u32, u32, u32, u32) {
+    let (mut passed, mut failed, mut errored, mut skipped) = (0u32, 0u32, 0u32, 0u32);
+    for r in results {
+        match r.status {
+            TestStatus::Passed => passed += 1,
+            TestStatus::Failed => failed += 1,
+            TestStatus::Error => errored += 1,
+            TestStatus::Skipped => skipped += 1,
+        }
+    }
+    (passed, failed, errored, skipped)
+}
+
 impl TestManager for PlatformManager {
     fn discover(&self, query: &DiscoveryQuery) -> DiscoveryResult {
         let disc = RegistryDiscovery::new(&self.registry);
@@ -767,15 +777,8 @@ impl TestManager for PlatformManager {
         // a healthy file this reproduces the stored counters (the writer
         // computed them from these results); get_results remains the
         // diagnostic channel for damaged ones.
-        let (mut passed, mut failed, mut errored, mut skipped) = (0u32, 0u32, 0u32, 0u32);
-        for r in summary.results.iter().take(completed as usize) {
-            match r.status {
-                TestStatus::Passed => passed += 1,
-                TestStatus::Failed => failed += 1,
-                TestStatus::Error => errored += 1,
-                TestStatus::Skipped => skipped += 1,
-            }
-        }
+        let (passed, failed, errored, skipped) =
+            count_statuses(&summary.results[..completed as usize]);
         Ok(RunProgress {
             run_id: summary.run_id.clone(),
             total: summary.total,
@@ -1381,6 +1384,24 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["t1", "t2"]);
         assert_eq!(b.discover(&DiscoveryQuery::default()).tests[0].tags, vec!["new".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ghost_errors_sit_at_their_selection_positions() {
+        // Non-fail_fast: a definition-only test's Error appears at its
+        // selection position, not appended — record order must not flip
+        // with the fail_fast flag.
+        use crate::test_util::def;
+        let dir = crate::test_util::temp_storage_dir("mgr-ghost-order");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_test(def("t1")).unwrap(); // definition only
+        mgr.register_runnable(def("t2"), Box::new(EchoTest { id: "t2".into(), pass: true }))
+            .unwrap();
+        let summary = mgr.run_to_completion(RunConfig::default()).unwrap();
+        assert_eq!(summary.results[0].test_id, "t1");
+        assert!(matches!(summary.results[0].status, TestStatus::Error));
+        assert_eq!(summary.results[1].test_id, "t2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
