@@ -617,8 +617,18 @@ impl FromJson for DiscoveryQuery {
             "discovery query",
             &["name_pattern", "tags", "group", "limit", "offset"],
         )?;
+        let name_pattern = strict_opt_string(value, "name_pattern")?;
+        // Same rule the run config enforces: an empty pattern substring-
+        // matches EVERY test, so the full registry would come back
+        // presented as a filtered search result.
+        if name_pattern.as_deref() == Some("") {
+            return Err(JsonError::InvalidField(
+                "name_pattern".into(),
+                "a non-empty string (an empty pattern would match every test)".into(),
+            ));
+        }
         Ok(DiscoveryQuery {
-            name_pattern: strict_opt_string(value, "name_pattern")?,
+            name_pattern,
             tags: strict_string_array(value, "tags")?,
             group: strict_opt_string(value, "group")?,
             // Saturate rather than truncate: on 32-bit targets (wasm32) an

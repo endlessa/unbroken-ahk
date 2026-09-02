@@ -837,6 +837,20 @@ mod tests {
     }
 
     #[test]
+    fn discover_empty_pattern_is_rejected() {
+        // The full registry must never come back presented as the
+        // matches for an (empty) pattern — same rule as test_run.
+        let mut mgr = setup_manager();
+        let resp = execute_mcp(
+            &mut mgr,
+            r#"{"tool": "test_discover", "params": {"name_pattern": ""}}"#,
+        );
+        let val = parse_json(&resp).unwrap();
+        assert_eq!(val.get_bool("success"), Some(false));
+        assert!(val.get_str("error").unwrap().contains("empty pattern"));
+    }
+
+    #[test]
     fn empty_includes_with_excludes_is_no_tests_matched_not_widening_advice() {
         // An agent whose computed selection came out empty, plus a
         // standing exclude list: the answer is the truthful
