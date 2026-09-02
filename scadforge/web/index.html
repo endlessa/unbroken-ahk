@@ -77,9 +77,20 @@ color("tomato") translate([0, 0, 14 + -(-2 ^ 2)])
 </main>
 <script>
 'use strict';
-const canvas = document.getElementById('view');
+let canvas = document.getElementById('view');
+const viewport = document.getElementById('right');
 const messages = document.getElementById('messages');
 const editor = document.getElementById('editor');
+
+// A canvas that has ever returned a 'webgl' context can never hand out a
+// '2d' one. If GL init gets a context but then fails (shader compile,
+// link), swap in a fresh node so the software path still works.
+// Interaction listeners live on the container, so they survive the swap.
+function replaceCanvas() {
+  const fresh = canvas.cloneNode(false);
+  canvas.replaceWith(fresh);
+  canvas = fresh;
+}
 
 // ---- scene state ----------------------------------------------------------
 let soup = [];        // per-mesh: {verts: Float32Array (x,y,z,nx,ny,nz)*, color:[r,g,b,a]}
@@ -93,8 +104,15 @@ function setMessages(items) {
 }
 
 async function render() {
-  const res = await fetch('/render', { method: 'POST', body: editor.value });
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch('/render', { method: 'POST', body: editor.value });
+    data = await res.json();
+  } catch (e) {
+    setMessages([{cls:'err', text: 'render request failed: ' + e}]);
+    uploadAndDraw(); // still size and clear the canvas
+    return;
+  }
   const msgs = [];
   if (data.error) msgs.push({cls:'err', text: 'error: ' + data.error});
   for (const w of data.warnings || []) msgs.push({cls:'warn', text: 'warning: ' + w});
@@ -122,6 +140,10 @@ async function render() {
     }
     soup.push({ verts, color: mesh.color });
   }
+  // Opaque meshes first so both render paths can draw transparency in a
+  // second pass (depth-tested, no depth write). Stable sort keeps source
+  // order within each group.
+  soup.sort((a, b) => (b.color[3] >= 1) - (a.color[3] >= 1));
   if (tris > 0) {
     center = [(lo[0]+hi[0])/2, (lo[1]+hi[1])/2, (lo[2]+hi[2])/2];
     radius = Math.max(1e-6, Math.hypot(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]) / 2);
@@ -160,11 +182,11 @@ function viewProj(w, h) {
 }
 
 // ---- WebGL renderer with 2D-canvas software fallback ----------------------
-let gl = null, prog = null, tried = false;
+let gl = null, prog = null, tried = false, loc = null;
 function initGL() {
   if (tried) return gl; tried = true;
-  gl = canvas.getContext('webgl', { antialias: true });
-  if (!gl) return null;
+  gl = canvas.getContext('webgl', { antialias: true, alpha: false });
+  if (!gl) { gl = null; return null; }
   const vs = `attribute vec3 aPos; attribute vec3 aNorm; uniform mat4 uMVP;
     varying vec3 vNorm; void main(){ vNorm=aNorm; gl_Position=uMVP*vec4(aPos,1.0); }`;
   const fs = `precision mediump float; uniform vec4 uColor; varying vec3 vNorm;
@@ -174,10 +196,16 @@ function initGL() {
   const mk = (type, src) => { const sh = gl.createShader(type); gl.shaderSource(sh, src);
     gl.compileShader(sh); return gl.getShaderParameter(sh, gl.COMPILE_STATUS) ? sh : null; };
   const v = mk(gl.VERTEX_SHADER, vs), f = mk(gl.FRAGMENT_SHADER, fs);
-  if (!v || !f) { gl = null; return null; }
+  if (!v || !f) { gl = null; replaceCanvas(); return null; }
   prog = gl.createProgram(); gl.attachShader(prog, v); gl.attachShader(prog, f); gl.linkProgram(prog);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { gl = null; return null; }
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { gl = null; replaceCanvas(); return null; }
   gl.enable(gl.DEPTH_TEST);
+  loc = {
+    aPos: gl.getAttribLocation(prog, 'aPos'),
+    aNorm: gl.getAttribLocation(prog, 'aNorm'),
+    uMVP: gl.getUniformLocation(prog, 'uMVP'),
+    uColor: gl.getUniformLocation(prog, 'uColor'),
+  };
   return gl;
 }
 
@@ -220,25 +248,38 @@ function uploadAndDraw() {
 
 function draw() {
   const w = canvas.clientWidth, h = canvas.clientHeight;
-  canvas.width = w; canvas.height = h;
+  if (w < 1 || h < 1) return;
+  // Resizing the backing store clears it, so only touch it on change.
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
   if (gl) {
     gl.viewport(0, 0, w, h);
     gl.clearColor(0.05, 0.07, 0.09, 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     gl.useProgram(prog);
-    const mvp = mvpMatrix(w, h);
-    gl.uniformMatrix4fv(gl.getUniformLocation(prog, 'uMVP'), false, mvp);
-    for (const m of glBuffers) {
+    gl.uniformMatrix4fv(loc.uMVP, false, mvpMatrix(w, h));
+    const drawMesh = m => {
       gl.bindBuffer(gl.ARRAY_BUFFER, m.buf);
-      const aPos = gl.getAttribLocation(prog, 'aPos');
-      const aNorm = gl.getAttribLocation(prog, 'aNorm');
-      gl.enableVertexAttribArray(aPos);
-      gl.enableVertexAttribArray(aNorm);
-      gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 24, 0);
-      gl.vertexAttribPointer(aNorm, 3, gl.FLOAT, false, 24, 12);
-      gl.uniform4fv(gl.getUniformLocation(prog, 'uColor'), m.color);
+      gl.enableVertexAttribArray(loc.aPos);
+      gl.enableVertexAttribArray(loc.aNorm);
+      gl.vertexAttribPointer(loc.aPos, 3, gl.FLOAT, false, 24, 0);
+      gl.vertexAttribPointer(loc.aNorm, 3, gl.FLOAT, false, 24, 12);
+      gl.uniform4fv(loc.uColor, m.color);
       gl.drawArrays(gl.TRIANGLES, 0, m.count);
+    };
+    // glBuffers mirrors soup's opaque-first order: draw opaque with the
+    // depth buffer, then transparency blended without depth writes.
+    let blending = false;
+    for (const m of glBuffers) {
+      if (!blending && m.color[3] < 1) {
+        blending = true;
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        gl.depthMask(false);
+      }
+      drawMesh(m);
     }
+    if (blending) { gl.depthMask(true); gl.disable(gl.BLEND); }
     return;
   }
   softwareDraw(w, h);
@@ -246,24 +287,45 @@ function draw() {
 
 // Software z-buffer fallback: same scene, no GPU required. Per-pixel
 // depth testing — painter's-algorithm sorting fails when large faces
-// (the base plate) overlap small nearby ones.
+// (the base plate) overlap small nearby ones. Frame buffers are reused
+// across frames; soup is opaque-first so transparency runs as a second
+// pass with depth test but no depth write, mirroring the GL path.
+let swCache = null;
 function softwareDraw(w, h) {
   const ctx = canvas.getContext('2d');
-  const img = ctx.createImageData(w, h);
-  const px = img.data;
-  const bg = [13, 18, 23]; // #0d1217
-  for (let i = 0; i < px.length; i += 4) {
-    px[i] = bg[0]; px[i+1] = bg[1]; px[i+2] = bg[2]; px[i+3] = 255;
+  if (!ctx) {
+    setMessages([{cls:'err', text: 'no renderer available (canvas context unavailable)'}]);
+    return;
   }
-  const zbuf = new Float32Array(w * h).fill(Infinity);
+  if (!swCache || swCache.w !== w || swCache.h !== h) {
+    const img = ctx.createImageData(w, h);
+    const bg = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < bg.length; i += 4) {
+      bg[i] = 13; bg[i+1] = 18; bg[i+2] = 23; bg[i+3] = 255; // #0d1217
+    }
+    swCache = { w, h, img, bg, zbuf: new Float32Array(w * h) };
+  }
+  const { img, bg, zbuf } = swCache;
+  const px = img.data;
+  px.set(bg);
+  zbuf.fill(Infinity);
   const cam = viewProj(w, h);
+  const eye = cam.eye;
   // Same light as the GL shader, normalized to match its shading exactly.
   const Ll = Math.hypot(0.5, 0.35, 0.85);
-  const L = [0.5/Ll, 0.35/Ll, 0.85/Ll];
+  const L0 = 0.5/Ll, L1 = 0.35/Ll, L2 = 0.85/Ll;
   for (const m of soup) {
     const v = m.verts;
     const [cr, cg, cb, ca] = m.color;
+    const opaque = ca >= 1;
     for (let i = 0; i < v.length; i += 18) {
+      // Backface cull opaque meshes (winding-convention-free: the face
+      // normal comes from the vertex data, so test it against the eye
+      // ray). Transparent meshes keep interior faces, like the GL path.
+      if (opaque) {
+        const facing = v[i+3]*(eye[0]-v[i]) + v[i+4]*(eye[1]-v[i+1]) + v[i+5]*(eye[2]-v[i+2]);
+        if (facing <= 0) continue;
+      }
       const sx = [], sy = [], sz = [];
       let behind = false;
       for (let k = 0; k < 3; k++) {
@@ -277,9 +339,9 @@ function softwareDraw(w, h) {
         sz.push(clip[2]/clip[3]);
       }
       if (behind) continue;
-      let area = (sx[1]-sx[0])*(sy[2]-sy[0]) - (sx[2]-sx[0])*(sy[1]-sy[0]);
+      const area = (sx[1]-sx[0])*(sy[2]-sy[0]) - (sx[2]-sx[0])*(sy[1]-sy[0]);
       if (Math.abs(area) < 1e-9) continue;
-      const shade = Math.max(v[i+3]*L[0]+v[i+4]*L[1]+v[i+5]*L[2], 0)*0.75+0.25;
+      const shade = Math.max(v[i+3]*L0+v[i+4]*L1+v[i+5]*L2, 0)*0.75+0.25;
       const r = Math.min(255, (cr*shade*255)|0);
       const g = Math.min(255, (cg*shade*255)|0);
       const b = Math.min(255, (cb*shade*255)|0);
@@ -287,29 +349,31 @@ function softwareDraw(w, h) {
       const x1 = Math.min(w - 1, Math.ceil(Math.max(sx[0], sx[1], sx[2])));
       const y0 = Math.max(0, Math.floor(Math.min(sy[0], sy[1], sy[2])));
       const y1 = Math.min(h - 1, Math.ceil(Math.max(sy[0], sy[1], sy[2])));
+      // Barycentric weights are affine in screen space; step them
+      // incrementally instead of re-deriving edge functions per pixel.
+      // Normalizing by the signed area makes either winding rasterize.
       const inv = 1 / area;
+      const dw0x = (sy[1]-sy[2]) * inv, dw0y = (sx[2]-sx[1]) * inv;
+      const dw1x = (sy[2]-sy[0]) * inv, dw1y = (sx[0]-sx[2]) * inv;
+      const k0 = (sx[1]*sy[2] - sx[2]*sy[1]) * inv;
+      const k1 = (sx[2]*sy[0] - sx[0]*sy[2]) * inv;
+      const dz0 = sz[0]-sz[2], dz1 = sz[1]-sz[2];
+      const dzx = dw0x*dz0 + dw1x*dz1;
       for (let y = y0; y <= y1; y++) {
-        const cy = y + 0.5;
-        for (let x = x0; x <= x1; x++) {
-          const cx = x + 0.5;
-          // Barycentric weights via edge functions, normalized by the
-          // signed area so either winding rasterizes (no face culling,
-          // matching the GL path).
-          const w0 = ((sx[1]-cx)*(sy[2]-cy) - (sx[2]-cx)*(sy[1]-cy)) * inv;
-          const w1 = ((sx[2]-cx)*(sy[0]-cy) - (sx[0]-cx)*(sy[2]-cy)) * inv;
-          const w2 = 1 - w0 - w1;
-          if (w0 < 0 || w1 < 0 || w2 < 0) continue;
-          const z = w0*sz[0] + w1*sz[1] + w2*sz[2];
-          const at = y * w + x;
+        const cy = y + 0.5, cx = x0 + 0.5;
+        let w0 = k0 + dw0x*cx + dw0y*cy;
+        let w1 = k1 + dw1x*cx + dw1y*cy;
+        let z = sz[2] + w0*dz0 + w1*dz1;
+        let at = y * w + x0;
+        for (let x = x0; x <= x1; x++, at++, w0 += dw0x, w1 += dw1x, z += dzx) {
+          if (w0 < 0 || w1 < 0 || w0 + w1 > 1) continue;
           if (z >= zbuf[at]) continue;
           const o = at * 4;
-          if (ca >= 1) {
+          if (opaque) {
             zbuf[at] = z;
             px[o] = r; px[o+1] = g; px[o+2] = b;
           } else {
-            // Unsorted transparency: blend over what's there, keep the
-            // depth so nearer opaque faces still win later.
-            zbuf[at] = z;
+            // Transparent pass: blend, leave the depth buffer alone.
             px[o]   = (r*ca + px[o]  *(1-ca))|0;
             px[o+1] = (g*ca + px[o+1]*(1-ca))|0;
             px[o+2] = (b*ca + px[o+2]*(1-ca))|0;
@@ -322,27 +386,40 @@ function softwareDraw(w, h) {
 }
 
 // ---- interaction ----------------------------------------------------------
+// Coalesce redraw requests to one per animation frame — mousemove and
+// wheel can fire far faster than the software path can paint.
+let drawQueued = false;
+function scheduleDraw() {
+  if (drawQueued) return;
+  drawQueued = true;
+  requestAnimationFrame(() => { drawQueued = false; draw(); });
+}
+
 let dragging = false, lastX = 0, lastY = 0;
-canvas.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+viewport.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
 window.addEventListener('mouseup', () => dragging = false);
 window.addEventListener('mousemove', e => {
   if (!dragging) return;
   yaw   -= (e.clientX - lastX) * 0.008;
   pitch = Math.min(1.5, Math.max(-1.5, pitch + (e.clientY - lastY) * 0.008));
   lastX = e.clientX; lastY = e.clientY;
-  draw();
+  scheduleDraw();
 });
-canvas.addEventListener('wheel', e => {
+viewport.addEventListener('wheel', e => {
   e.preventDefault();
   dist = Math.min(12, Math.max(1.2, dist * (e.deltaY > 0 ? 1.1 : 0.9)));
-  draw();
+  scheduleDraw();
 }, { passive: false });
-window.addEventListener('resize', draw);
+window.addEventListener('resize', scheduleDraw);
 document.getElementById('renderBtn').addEventListener('click', render);
 editor.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); render(); }
 });
 
+// Shareable links: #src=<url-encoded source> pre-loads the editor.
+if (location.hash.startsWith('#src=')) {
+  try { editor.value = decodeURIComponent(location.hash.slice(5)); } catch (e) {}
+}
 render();
 </script>
 </body>
