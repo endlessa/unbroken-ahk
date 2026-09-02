@@ -40,33 +40,45 @@
 </header>
 <main>
   <div id="left">
-    <textarea id="editor" spellcheck="false">// scadforge demo — expression engine
-$fn = 32;
-n = 14;         // pillars around the ring
-R = 30;         // ring radius
+    <textarea id="editor" spellcheck="false">// scadforge demo — modules, functions, children, comprehensions
+$fn = 24;
 
-// base plate sized from the ring: scalar * vector + vector math,
-// sunk by its own .z so the top surface sits at z = 0
-plate = 2 * (R + 8) * [1, 1, 0] + [0, 0, 3];
+// a user module that stamps its CHILDREN around a circle,
+// alternating them via $children
+module ring(n = 10, r = 26) {
+  for (i = [0 : n - 1])
+    rotate([0, 0, i * 360 / n]) translate([r, 0, 0])
+      children(i % $children);
+}
+
+// a named function + a list comprehension
+function wave(x) = 4 + 3 * sin(x * 45);
+heights = [for (i = [0 : 10]) wave(i)];
+echo(heights = heights);
+
+// base plate, top surface at z = 0
+plate = [72, 72, 3];
 color("#39404f") translate(-plate / 2 - [0, 0, plate.z] / 2) cube(plate);
 
-// a ring of pillars: trig drives placement AND height,
-// a ternary alternates the shape, comparisons pick colors
-for (i = [0 : n - 1])
-  translate([R * cos(i * 360 / n), R * sin(i * 360 / n), 0])
-    color(i % 2 == 0 ? "goldenrod" : [0.3, 0.5, 0.2 + 0.8 * i / n])
-      cylinder(h = 8 + 6 * abs(sin(i * 720 / n)),
-               r1 = 3, r2 = i % 4 == 0 ? 0 : 2);
+// two alternating child shapes stamped by the module
+ring(n = 12) {
+  color("goldenrod")  cylinder(h = 10, r1 = 3, r2 = 0);
+  color("steelblue") cylinder(h = 7, r = 2.5);
+}
 
-// a sine-wave causeway through the middle
-for (x = [-24 : 4 : 24])
-  color([0.5 + x / 60, 0.4, 0.9])
-    translate([x, 0, 0])
-      cube([3, 6, 4 + 3 * sin(x * 7.5)]);
+// the comprehension drives a wave wall
+for (i = [0 : len(heights) - 1])
+  color([0.35 + i / 18, 0.4, 0.9])
+    translate([i * 5 - 26, -2, 0]) cube([4, 4, heights[i]]);
 
-// centerpiece scaled by an exponent: -2^2 == -4 keeps it honest
-color("tomato") translate([0, 0, 14 + -(-2 ^ 2)])
-  rotate([0, 0, 45]) cube(min(9, 2 ^ 3.2), center = true);
+// a RECURSIVE module: tower of shrinking slabs
+module tower(n) {
+  if (n > 0) {
+    color([0.9, 0.3 + n / 15, 0.25]) cube([n * 2, n * 2, 3], center = true);
+    translate([0, 0, 3]) tower(n - 1);
+  }
+}
+translate([0, 16, 1.5]) tower(6);
 </textarea>
     <div id="messages"><span class="ok">ready.</span></div>
   </div>
@@ -114,7 +126,8 @@ async function render() {
     return;
   }
   const msgs = [];
-  if (data.error) msgs.push({cls:'err', text: 'error: ' + data.error});
+  if (data.error) msgs.push({cls:'err', text: data.error.startsWith('ERROR') ? data.error : 'error: ' + data.error});
+  for (const e of data.echoes || []) msgs.push({cls:'ok', text: e});
   for (const w of data.warnings || []) msgs.push({cls:'warn', text: 'warning: ' + w});
   soup = [];
   let tris = 0;

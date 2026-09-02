@@ -4,8 +4,8 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 1 (2026-09-02): **67 full / 18 partial / 98
-untouched — 46% touched.**
+Standing after phase 2 (2026-09-02): **113 full / 10 partial / 60
+untouched — 62% full, 67% touched.**
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -25,24 +25,22 @@ shape dispatch, five-value truthiness, lazy `?:`, short-circuit
 `&&`/`||`. Viewer: per-pixel z-buffer software renderer + WebGL path,
 verified pixel-identical, two-pass transparency.
 
-### Phase 2 — Language core (~35 entries; the biggest lever)
+### ✅ Phase 2 — Language core (DONE)
 
-- `module name(params) { ... }` definitions and instantiation
-- `function name(params) = expr;` named functions
-- `children()` / `$children`, argument matching rules
-- `let` (expression and statement forms), `assign` (deprecated)
-- `if / else` statements
-- List comprehensions: `[for ...]`, C-style `for`, `each`,
-  `if`/`if-else` clauses, `let` clauses
-- Scoping semantics: hoisting with last-assignment-wins + warning,
-  dynamic `$`-variable scoping, module/function namespaces, shadowing
-- Function literals (2021.01) + calling conventions, real `is_function`
-- Builtins needing this machinery: `str`, `chr`, `ord`, `echo`,
-  `assert`, `search`, `lookup`, `rands`, `version`/`version_num`,
-  `parent_module`/`$parent_modules`, string iteration
-- Recursion limits and evaluation limits
-
-Expected score afterwards: ~70–75% touched.
+Everything on the list landed: module/function definitions with
+hoisting, three namespaces, the two-phase slot rule (first-slot
+position, last-write-wins), lazy `children()` with the caller-lexical /
+callee-dynamic split, the dynamic `$`-environment, `let`/`assign`,
+`if/else`, all six comprehension clause forms (C-style `for` with
+simultaneous updates), function literals with closures and
+value-calling conventions, tail-call elimination (through ternary, let,
+echo, assert wrappers; 200k-frame contract pinned) with named recursion
+errors, and the builtins: `str` (shared 6-significant-digit formatter),
+`chr`, `ord`, `echo` (statement + expression), `assert` (halting, with
+serialized condition text), `search`, `lookup`, `rands`,
+`version`/`version_num`, `parent_module`/`$parent_modules`.
+Remaining partials here: assert lacks file/line + TRACE stack; string
+literal escapes are the basic four.
 
 ### Phase 3 — CSG booleans (few entries, hardest geometry)
 

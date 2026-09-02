@@ -45,7 +45,7 @@ pub fn handle(method: &str, path: &str, body: &str) -> Response {
 
 /// Compile + evaluate source into the viewer's mesh JSON:
 /// {"meshes": [{"positions": [x,y,z,...], "indices": [...], "color": [r,g,b,a]}],
-///  "warnings": [...], "error": "..."?}
+///  "warnings": [...], "echoes": [...], "error": "..."?}
 pub fn render_json(source: &str) -> String {
     let mut pairs: Vec<(&str, JsonValue)> = Vec::new();
     match parser::parse(source) {
@@ -83,10 +83,18 @@ pub fn render_json(source: &str) -> String {
                 "warnings",
                 JsonValue::Array(out.warnings.iter().map(|w| str_val(w)).collect()),
             ));
+            pairs.push((
+                "echoes",
+                JsonValue::Array(out.echoes.iter().map(|e| str_val(e)).collect()),
+            ));
+            if let Some(err) = &out.error {
+                pairs.push(("error", str_val(err)));
+            }
         }
         Err(e) => {
             pairs.push(("meshes", JsonValue::Array(Vec::new())));
             pairs.push(("warnings", JsonValue::Array(Vec::new())));
+            pairs.push(("echoes", JsonValue::Array(Vec::new())));
             pairs.push(("error", str_val(&e)));
         }
     }

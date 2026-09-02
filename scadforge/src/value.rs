@@ -1,6 +1,26 @@
 //! Runtime values for the SCAD-compatible subset.
 
-#[derive(Debug, Clone, PartialEq)]
+use crate::ast::{Expr, Param};
+use std::rc::Rc;
+
+/// A first-class function value (2021.01 function literals). Captures the
+/// lexical scope at the definition site; `$`-names still resolve
+/// dynamically at each call.
+pub struct FuncVal {
+    pub params: Vec<Param>,
+    pub body: Expr,
+    /// The captured lexical environment (an eval::Scope), type-erased so
+    /// value.rs does not depend on the evaluator's scope type.
+    pub env: Rc<dyn std::any::Any>,
+}
+
+impl std::fmt::Debug for FuncVal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FuncVal").field("params", &self.params).finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Value {
     Num(f64),
     Bool(bool),
@@ -10,7 +30,28 @@ pub enum Value {
     /// gets the legacy reversed-range swap; [10:1:0] iterates zero times.
     /// Semantic equality (value_eq) compares begin/step/end only.
     Range { start: f64, step: f64, end: f64, implicit_step: bool },
+    /// Function value: equality is identity (two literals are never equal
+    /// unless they are the same evaluation result).
+    Function(Rc<FuncVal>),
     Undef,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Num(a), Value::Num(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => a == b,
+            (
+                Value::Range { start: a, step: b, end: c, .. },
+                Value::Range { start: d, step: e, end: f, .. },
+            ) => a == d && b == e && c == f,
+            (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
+            (Value::Undef, Value::Undef) => true,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -51,6 +92,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::Vector(_) => "vector",
             Value::Range { .. } => "range",
+            Value::Function(_) => "function",
             Value::Undef => "undef",
         }
     }
