@@ -73,8 +73,6 @@ pub enum ManagerError {
     RunNotPersisted(RunId),
     /// The run has not completed yet.
     RunInProgress(RunId),
-    /// The run already completed — cannot start again.
-    RunAlreadyComplete(RunId),
     /// No tests matched the given configuration.
     NoTestsMatched,
     /// include_ids named tests that are not registered — a typo must
@@ -134,9 +132,6 @@ impl std::fmt::Display for ManagerError {
             ),
             ManagerError::RunInProgress(id) => {
                 write!(f, "run '{}' has not completed yet", id)
-            }
-            ManagerError::RunAlreadyComplete(id) => {
-                write!(f, "run '{}' already completed and cannot be started again", id)
             }
             ManagerError::NoTestsMatched => {
                 write!(f, "no tests matched the given configuration")
