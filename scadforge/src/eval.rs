@@ -59,11 +59,28 @@ fn evaluate_inner(program: &[Stmt]) -> EvalOutput {
         mod_stack: Vec::new(),
         children: None,
         fn_depth: 0,
+        cycle_scopes: Vec::new(),
     };
     let root = Scope::root();
     let shapes = exec_scope(program, &root, &mut ctx);
     ctx.out.shapes.extend(shapes);
+    // Function values capture their defining scope; storing one in a
+    // scope on that capture chain forms an Rc cycle. Clearing the
+    // variables of every scope that received a function-containing value
+    // breaks all such cycles so the render's memory actually frees.
+    for s in ctx.cycle_scopes.drain(..) {
+        s.vars.borrow_mut().clear();
+    }
     ctx.out
+}
+
+/// Does a value hold a function anywhere (and so keep a scope alive)?
+fn contains_function(v: &Value) -> bool {
+    match v {
+        Value::Function(_) => true,
+        Value::Vector(items) => items.iter().any(contains_function),
+        _ => false,
+    }
 }
 
 /// Non-tail function recursion guard (tail calls are eliminated and do
@@ -196,6 +213,9 @@ struct Ctx {
     mod_stack: Vec<String>,
     children: Option<Rc<ChildrenCtx>>,
     fn_depth: usize,
+    /// Scopes holding function-containing values — potential Rc cycles,
+    /// broken at the end of evaluation.
+    cycle_scopes: Vec<Rc<Scope>>,
 }
 
 impl Ctx {
@@ -317,6 +337,9 @@ fn eval_slots(stmts: &[Stmt], scope: &Rc<Scope>, ctx: &mut Ctx) {
 fn set_var(scope: &Rc<Scope>, ctx: &mut Ctx, name: &str, v: Value) {
     if name.starts_with('$') {
         ctx.dynv.vars.borrow_mut().insert(name.to_string(), v.clone());
+    }
+    if contains_function(&v) {
+        ctx.cycle_scopes.push(scope.clone());
     }
     scope.vars.borrow_mut().insert(name.to_string(), v);
 }
@@ -1483,7 +1506,7 @@ fn eval_vec_items(items: &[VecItem], scope: &Rc<Scope>, ctx: &mut Ctx, out: &mut
                     // Carry over every init binding, then apply updates.
                     for (name, _) in inits {
                         if let Some(v) = cur.lookup(name) {
-                            next.vars.borrow_mut().insert(name.clone(), v);
+                            set_var(&next, ctx, name, v);
                         }
                     }
                     for (name, v) in new_vals {
@@ -2588,6 +2611,7 @@ mod tests {
             mod_stack: Vec::new(),
             children: None,
             fn_depth: 0,
+            cycle_scopes: Vec::new(),
         };
         let root = Scope::root();
         let v = eval_expr(&value, &root, &mut ctx);
@@ -3240,6 +3264,34 @@ mod tests {
              outer();",
         );
         assert_eq!(out.echoes, vec!["ECHO: \"inner\", \"outer\", 2"]);
+    }
+
+    #[test]
+    fn function_value_scope_cycles_are_broken_after_evaluation() {
+        // f's closure captures the scope that stores f — an Rc cycle
+        // unless evaluation breaks it on the way out.
+        let prog = parse(
+            "f = function (x) x; g = [function () 1, 2]; y = f(2) + g[1];",
+        )
+        .unwrap();
+        let mut ctx = Ctx {
+            out: EvalOutput::default(),
+            dynv: DynScope::root(),
+            mod_stack: Vec::new(),
+            children: None,
+            fn_depth: 0,
+            cycle_scopes: Vec::new(),
+        };
+        let root = Scope::root();
+        let weak = Rc::downgrade(&root);
+        let _ = exec_scope(&prog, &root, &mut ctx);
+        assert!(!ctx.cycle_scopes.is_empty(), "function stores must register");
+        for s in ctx.cycle_scopes.drain(..) {
+            s.vars.borrow_mut().clear();
+        }
+        drop(root);
+        drop(ctx);
+        assert!(weak.upgrade().is_none(), "the scope graph leaked");
     }
 
     #[test]
