@@ -90,16 +90,15 @@ impl PlatformManager {
                 )));
             }
             Some(_) => {
-                // Restored from storage with an older shape — update.
-                // Keep the old definition restorable: a failed replacement
-                // must not drop the previously-valid entry.
-                let old = self.registry.deregister(&id);
-                if let Err(e) = self.registry.register(definition) {
-                    if let Some(old) = old {
-                        let _ = self.registry.register(old);
-                    }
-                    return Err(ManagerError::RegistrationFailed(format!("{:?}", e)));
-                }
+                // Restored from storage with an older shape — upgrade IN
+                // PLACE. Deregister-then-register moved the test to the
+                // end of registry order, silently shifting discovery
+                // pages and which tests execute first under fail_fast.
+                // replace validates before mutating, so a failed upgrade
+                // leaves the old definition untouched.
+                self.registry
+                    .replace(definition)
+                    .map_err(|e| ManagerError::RegistrationFailed(format!("{:?}", e)))?;
             }
             None => {
                 self.registry
@@ -571,26 +570,9 @@ impl PlatformManager {
                 .any(|r| matches!(r.status, TestStatus::Failed | TestStatus::Error));
             for (offset, id) in selected_ids[i..].iter().enumerate() {
                 let result = if offset == 0 && !executor_failed {
-                    TestResult {
-                        test_id: id.clone(),
-                        status: TestStatus::Error,
-                        duration_ms: 0,
-                        message: Some(format!(
-                            "no runnable registered for test '{}' (definition only)",
-                            id
-                        )),
-                        stdout: None,
-                        stderr: None,
-                    }
+                    TestResult::ghost_error(id)
                 } else {
-                    TestResult {
-                        test_id: id.clone(),
-                        status: TestStatus::Skipped,
-                        duration_ms: 0,
-                        message: Some("Skipped due to fail_fast".into()),
-                        stdout: None,
-                        stderr: None,
-                    }
+                    TestResult::fail_fast_skip(id)
                 };
                 self.progress.test_completed(&run_id, &result);
                 results.push(result);
@@ -603,17 +585,7 @@ impl PlatformManager {
                 .cloned()
                 .collect();
             for id in missing {
-                let result = TestResult {
-                    test_id: id.clone(),
-                    status: TestStatus::Error,
-                    duration_ms: 0,
-                    message: Some(format!(
-                        "no runnable registered for test '{}' (definition only)",
-                        id
-                    )),
-                    stdout: None,
-                    stderr: None,
-                };
+                let result = TestResult::ghost_error(&id);
                 self.progress.test_completed(&run_id, &result);
                 results.push(result);
             }
@@ -1370,6 +1342,35 @@ mod tests {
         let progress = mgr.check_progress(&run_id).unwrap();
         assert!(progress.finished);
         assert_eq!(progress.completed, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn definition_upgrade_preserves_registry_order() {
+        // Session 1 persists [t1, t2]; session 2 upgrades t1's shape
+        // after loading. t1 must stay FIRST — moving it to the end would
+        // shift discovery pages and change which test executes first
+        // under fail_fast.
+        use crate::test_util::def;
+        let dir = crate::test_util::temp_storage_dir("mgr-upgrade-order");
+        let mut a = PlatformManager::new(&dir);
+        a.register_test(def("t1")).unwrap();
+        a.register_test(def("t2")).unwrap();
+
+        let mut b = PlatformManager::new(&dir);
+        assert!(b.load_from_storage().unwrap().is_empty());
+        let mut upgraded = def("t1");
+        upgraded.tags = vec!["new".into()];
+        b.register_runnable(upgraded, Box::new(EchoTest { id: "t1".into(), pass: true }))
+            .unwrap();
+        let ids: Vec<String> = b
+            .discover(&DiscoveryQuery::default())
+            .tests
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["t1", "t2"]);
+        assert_eq!(b.discover(&DiscoveryQuery::default()).tests[0].tags, vec!["new".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

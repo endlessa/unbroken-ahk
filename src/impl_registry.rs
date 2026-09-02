@@ -25,21 +25,18 @@ impl InMemoryRegistry {
         let arr = JsonValue::Array(self.tests.iter().map(|t| t.to_json()).collect());
         to_json_pretty(&arr)
     }
-}
 
-impl TestRegistry for InMemoryRegistry {
-    fn register(&mut self, test: TestDefinition) -> Result<(), RegistryError> {
-        // Mirror the load-side strictness: a definition the registry
-        // accepts must survive its own persistence round-trip, and
-        // TestDefinition::from_json rejects empty id/name.
+    /// Round-trip validity shared by register and replace: what the
+    /// registry accepts must survive its own persistence round-trip, and
+    /// the strict loader rejects empty id/name and duplicate metadata
+    /// keys.
+    fn validate(test: &TestDefinition) -> Result<(), RegistryError> {
         if test.id.is_empty() {
             return Err(RegistryError::InvalidDefinition("empty id".into()));
         }
         if test.name.is_empty() {
             return Err(RegistryError::InvalidDefinition("empty name".into()));
         }
-        // Duplicate metadata keys would serialize to a JSON object the
-        // strict parser rejects — same round-trip invariant as above.
         let mut meta_keys = std::collections::HashSet::new();
         for (k, _) in &test.metadata {
             if !meta_keys.insert(k.as_str()) {
@@ -49,6 +46,32 @@ impl TestRegistry for InMemoryRegistry {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Replace an EXISTING definition IN PLACE, preserving registry
+    /// order — a definition upgrade must not move the test to the end,
+    /// silently shifting discovery pages and which tests execute first
+    /// under fail_fast. Validation runs before any mutation, so a failed
+    /// replacement leaves the old definition untouched.
+    pub fn replace(&mut self, test: TestDefinition) -> Result<(), RegistryError> {
+        Self::validate(&test)?;
+        match self.tests.iter().position(|t| t.id == test.id) {
+            Some(pos) => {
+                self.tests[pos] = test;
+                Ok(())
+            }
+            None => Err(RegistryError::InvalidDefinition(format!(
+                "no existing definition '{}' to replace",
+                test.id
+            ))),
+        }
+    }
+}
+
+impl TestRegistry for InMemoryRegistry {
+    fn register(&mut self, test: TestDefinition) -> Result<(), RegistryError> {
+        Self::validate(&test)?;
         if self.tests.iter().any(|t| t.id == test.id) {
             return Err(RegistryError::DuplicateId(test.id));
         }

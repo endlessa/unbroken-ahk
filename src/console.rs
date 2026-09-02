@@ -88,27 +88,30 @@ fn cmd_help() -> ConsoleOutput {
     let text = "\
 === Unbroken Test Platform ===
 
-Commands:
-  summary                        Overview of all registered tests
-  discover                       List all tests
-  discover <pattern>             Search tests by name pattern
-  discover --pattern <pattern>   Same; use --pattern=<p> if it starts with '-'
-  discover --tag <tag>           Filter tests by tag
-  discover --group <group>       Filter tests by group
-  discover --limit <n>           Show at most n matches
-  tags                           List all available tags
-  groups                         List all available groups
-  run                            Run all tests
-  run --tag <tag>                Run tests matching a tag
-  run --id <id1> <id2> ...       Run specific tests by ID
-  run --exclude <tag>            Skip tests with a tag (combines with above)
-  run --pattern <pattern>        Run tests matching a name pattern
-  run --timeout <ms>             Per-test timeout in milliseconds
-  run --fail-fast                Stop on first failure
-  run <json>                     Run with JSON configuration
-  progress <run_id>              Check progress of a running suite
-  results <run_id>               Get results of a completed run
-  help                           Show this message
+Commands (aliases in parentheses; every value-taking flag also accepts
+--flag=<value>, needed when the value begins with '-'):
+  summary                          Overview of all registered tests
+  discover (search, find)          List all tests
+  discover <pattern>               Search tests by name pattern (globs: a*, *b, a*b)
+  discover --pattern <p> (-p)      Same; use --pattern=<p> if it starts with '-'
+  discover --tag <tag> (-t)        Filter tests by tag (repeatable)
+  discover --group <group> (-g)    Filter tests by group
+  discover --limit <n> (-l)        Show at most n matches
+  tags                             List all available tags
+  groups                           List all available groups
+  run (execute, start)             Run all tests
+  run --all (-a)                   Run everything explicitly (the default when
+                                   no include flags are given)
+  run --tag <tag> (-t)             Run tests matching a tag (repeatable)
+  run --id <id1> <id2> ...         Run specific tests by ID
+  run --exclude <tag> (-e)         Skip tests with a tag (combines with above)
+  run --pattern <pattern> (-p)     Run tests matching a name pattern
+  run --timeout <ms>               Per-test timeout in milliseconds
+  run --fail-fast (-f)             Stop on first failure
+  run <json>                       Run with JSON configuration
+  progress <run_id> (status)       Check progress of a running suite
+  results <run_id> (result)        Get results of a completed run
+  help                             Show this message
 ";
     ConsoleOutput {
         text: text.into(),
@@ -694,9 +697,18 @@ mod tests {
     fn help_command() {
         let mut mgr = setup_manager();
         let out = execute_command(&mut mgr, "help");
-        assert!(out.text.contains("Commands:"));
+        assert!(out.text.contains("Commands"));
         assert!(out.text.contains("discover"));
         assert!(out.text.contains("run"));
+        // The help-rejection message claims completeness — every flag,
+        // short form, and alias the parser accepts must appear here.
+        for token in [
+            "--all", "-a", "--tag", "-t", "--group", "-g", "--limit", "-l", "--pattern",
+            "-p", "--exclude", "-e", "--fail-fast", "-f", "--timeout", "--id",
+            "search", "find", "execute", "start", "status", "result", "--flag=<value>",
+        ] {
+            assert!(out.text.contains(token), "help missing: {}", token);
+        }
     }
 
     #[test]

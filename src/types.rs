@@ -133,6 +133,40 @@ pub struct TestResult {
     pub stderr: Option<String>,
 }
 
+impl TestResult {
+    /// The Error recorded for a selected definition with no registered
+    /// runnable. ONE constructor: the manager builds this in two places,
+    /// and a drifting message or shape would make records inconsistent
+    /// within a single run summary.
+    pub fn ghost_error(id: &str) -> TestResult {
+        TestResult {
+            test_id: id.into(),
+            status: TestStatus::Error,
+            duration_ms: 0,
+            message: Some(format!(
+                "no runnable registered for test '{}' (definition only)",
+                id
+            )),
+            stdout: None,
+            stderr: None,
+        }
+    }
+
+    /// The Skipped result for tests cut off by fail_fast — shared by the
+    /// executor (its own early stop) and the manager (the remainder
+    /// after a definition-only Error), so the two sites cannot diverge.
+    pub fn fail_fast_skip(id: &str) -> TestResult {
+        TestResult {
+            test_id: id.into(),
+            status: TestStatus::Skipped,
+            duration_ms: 0,
+            message: Some("Skipped due to fail_fast".into()),
+            stdout: None,
+            stderr: None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Progress Tracking
 // ---------------------------------------------------------------------------

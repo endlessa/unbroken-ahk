@@ -46,14 +46,7 @@ impl TestExecutor for SequentialExecutor {
             if should_stop {
                 // Mark remaining tests as skipped
                 for remaining in &tests[results.len()..] {
-                    let skipped = TestResult {
-                        test_id: remaining.id().to_string(),
-                        status: TestStatus::Skipped,
-                        duration_ms: 0,
-                        message: Some("Skipped due to fail_fast".into()),
-                        stdout: None,
-                        stderr: None,
-                    };
+                    let skipped = TestResult::fail_fast_skip(remaining.id());
                     on_result(&skipped);
                     results.push(skipped);
                 }

@@ -43,23 +43,21 @@ impl<'a, R: TestRegistry> TestDiscovery for RegistryDiscovery<'a, R> {
 
         let total_matches = matches.len();
 
-        // Collect tags and groups from matches
-        let mut available_tags: Vec<String> = Vec::new();
-        let mut available_groups: Vec<String> = Vec::new();
+        // Collect tags and groups from matches — set-based so an
+        // interactive listing stays linear instead of Vec::contains
+        // per tag; BTreeSet iteration is already sorted.
+        let mut tag_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut group_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for test in &matches {
             for tag in &test.tags {
-                if !available_tags.contains(tag) {
-                    available_tags.push(tag.clone());
-                }
+                tag_set.insert(tag.clone());
             }
             if let Some(ref g) = test.group {
-                if !available_groups.contains(g) {
-                    available_groups.push(g.clone());
-                }
+                group_set.insert(g.clone());
             }
         }
-        available_tags.sort();
-        available_groups.sort();
+        let available_tags: Vec<String> = tag_set.into_iter().collect();
+        let available_groups: Vec<String> = group_set.into_iter().collect();
 
         // Apply pagination
         let offset = query.offset.unwrap_or(0);
@@ -84,31 +82,23 @@ impl<'a, R: TestRegistry> TestDiscovery for RegistryDiscovery<'a, R> {
     fn summary(&self) -> DiscoverySummary {
         let all = self.registry.list_all();
 
-        // Count tags
-        let mut tag_counts: Vec<(String, usize)> = Vec::new();
+        // Count tags and groups map-based — a linear find per occurrence
+        // was quadratic on this interactive path; BTreeMap keeps the
+        // sorted output the callers expect.
+        let mut tag_counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut group_counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
         for test in &all {
             for tag in &test.tags {
-                if let Some(entry) = tag_counts.iter_mut().find(|(t, _)| t == tag) {
-                    entry.1 += 1;
-                } else {
-                    tag_counts.push((tag.clone(), 1));
-                }
+                *tag_counts.entry(tag.clone()).or_insert(0) += 1;
             }
-        }
-        tag_counts.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Count groups
-        let mut group_counts: Vec<(String, usize)> = Vec::new();
-        for test in &all {
             if let Some(ref g) = test.group {
-                if let Some(entry) = group_counts.iter_mut().find(|(grp, _)| grp == g) {
-                    entry.1 += 1;
-                } else {
-                    group_counts.push((g.clone(), 1));
-                }
+                *group_counts.entry(g.clone()).or_insert(0) += 1;
             }
         }
-        group_counts.sort_by(|a, b| a.0.cmp(&b.0));
+        let tag_counts: Vec<(String, usize)> = tag_counts.into_iter().collect();
+        let group_counts: Vec<(String, usize)> = group_counts.into_iter().collect();
 
         DiscoverySummary {
             total_tests: all.len(),
