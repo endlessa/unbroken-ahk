@@ -30,6 +30,10 @@ pub enum Expr {
     Call { name: String, args: Vec<Arg> },
     /// Non-identifier callee: (expr)(x), v[i](x), f(x)(y).
     CallValue { callee: Box<Expr>, args: Vec<Arg> },
+    /// A parenthesized bare identifier. Only the callee decision cares:
+    /// (f)(x) resolves through the VALUE path (variables), never the
+    /// function namespace, per the calling-conventions contract.
+    Paren(Box<Expr>),
     /// let (a = 1, b = a + 1) body — sequential bindings, lexical scope.
     Let { bindings: Vec<(String, Expr)>, body: Box<Expr> },
     /// echo(args) body — prints on every evaluation, yields body.

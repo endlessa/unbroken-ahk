@@ -74,11 +74,24 @@ fn evaluate_inner(program: &[Stmt]) -> EvalOutput {
     ctx.out
 }
 
-/// Does a value hold a function anywhere (and so keep a scope alive)?
-fn contains_function(v: &Value) -> bool {
+/// Would storing `v` in `scope` close an Rc cycle? Only if some function
+/// inside `v` captured an environment from which `scope` is reachable
+/// (Scope → vars → Function → env → … → Scope). A function passed as an
+/// argument, whose closure was defined elsewhere, forms no cycle — so we
+/// don't retain those scopes (the fold-with-callback O(n) leak).
+fn stores_cycle(scope: &Rc<Scope>, v: &Value) -> bool {
     match v {
-        Value::Function(_) => true,
-        Value::Vector(items) => items.iter().any(contains_function),
+        Value::Function(fv) => {
+            let mut cur = Some(fn_env(fv));
+            while let Some(s) = cur {
+                if Rc::ptr_eq(&s, scope) {
+                    return true;
+                }
+                cur = s.parent.clone();
+            }
+            false
+        }
+        Value::Vector(items) => items.iter().any(|i| stores_cycle(scope, i)),
         _ => false,
     }
 }
@@ -91,8 +104,10 @@ const MAX_MODULE_DEPTH: usize = 2_000;
 /// Backstop for runaway tail loops / C-style generators, far above the
 /// reference's practical contracts.
 const MAX_TAIL_ITERS: usize = 50_000_000;
-const MAX_GENERATOR_ITERS: usize = 1_000_000;
-const MAX_RANGE_ITEMS: usize = 1_000_000;
+const MAX_GENERATOR_ITERS: usize = 10_000_000;
+/// Above the reference's pinned [0:1e6] = 1_000_001-iteration workload,
+/// but still a bounded backstop for a public render endpoint.
+const MAX_RANGE_ITEMS: usize = 4_000_000;
 
 // ---------------------------------------------------------------------------
 // Environments
@@ -200,10 +215,15 @@ impl DynScope {
 
 /// The children a module call was given: instantiated lazily by each
 /// children() call, in the CALLER's lexical scope under the CALLEE's
-/// current `$`-environment.
+/// current `$`-environment. `outer` is the children context that was in
+/// force AT the call site, restored while the block runs — so a
+/// children() statement INSIDE the block forwards the caller's own
+/// children (the wrapper idiom) instead of re-instantiating itself
+/// forever.
 struct ChildrenCtx {
     stmts: Rc<Vec<Stmt>>,
     lex: Rc<Scope>,
+    outer: Option<Rc<ChildrenCtx>>,
 }
 
 struct Ctx {
@@ -338,8 +358,12 @@ fn set_var(scope: &Rc<Scope>, ctx: &mut Ctx, name: &str, v: Value) {
     if name.starts_with('$') {
         ctx.dynv.vars.borrow_mut().insert(name.to_string(), v.clone());
     }
-    if contains_function(&v) {
-        ctx.cycle_scopes.push(scope.clone());
+    if stores_cycle(scope, &v) {
+        // Dedup consecutive registrations so a loop rebinding the same
+        // scope doesn't grow the list per iteration.
+        if ctx.cycle_scopes.last().map_or(true, |s| !Rc::ptr_eq(s, scope)) {
+            ctx.cycle_scopes.push(scope.clone());
+        }
     }
     scope.vars.borrow_mut().insert(name.to_string(), v);
 }
@@ -464,22 +488,27 @@ fn iterate(v: &Value, ctx: &mut Ctx) -> Vec<Value> {
                      greater than end; bounds swapped"
                         .into(),
                 );
-                (end, start)
+                (*end, *start)
             } else {
-                (start, end)
+                (*start, *end)
             };
-            let mut x = *start;
-            // Inclusive of end, in either direction, with a sane cap.
-            while (*step > 0.0 && x <= *end + 1e-12) || (*step < 0.0 && x >= *end - 1e-12) {
-                items.push(Value::Num(x));
-                if items.len() >= MAX_RANGE_ITEMS {
-                    ctx.out.warnings.push(format!(
-                        "for: range truncated at {} iterations",
-                        MAX_RANGE_ITEMS
-                    ));
-                    break;
-                }
-                x += *step;
+            // ONE canonical count/iteration routine, shared with the
+            // relational comparison via range_count — no ad-hoc epsilon,
+            // so [0:0.1:0.3] yields exactly 3 elements, not 4.
+            let count = range_count(start, *step, end);
+            if !count.is_finite() || count <= 0.0 {
+                return items;
+            }
+            if count > MAX_RANGE_ITEMS as f64 {
+                ctx.out.warnings.push(format!(
+                    "for: range of {} elements truncated at {}",
+                    fmt_num(count),
+                    MAX_RANGE_ITEMS
+                ));
+            }
+            let n = (count as usize).min(MAX_RANGE_ITEMS);
+            for k in 0..n {
+                items.push(Value::Num(start + k as f64 * step));
             }
             items
         }
@@ -550,6 +579,7 @@ fn call_user_module(
     ctx.children = Some(Rc::new(ChildrenCtx {
         stmts: Rc::new(children.to_vec()),
         lex: caller.clone(),
+        outer: saved_children.clone(),
     }));
     ctx.mod_stack.push(name.to_string());
     {
@@ -679,6 +709,12 @@ fn instantiate_children(selection: Option<&Value>, ctx: &mut Ctx) -> Vec<Shape> 
         }
     };
     let mut shapes = Vec::new();
+    // The block runs in the CALLER's context: restore the children that
+    // were in force at the call site so a nested children() forwards
+    // them (and a top-level block gets the outside-module warning)
+    // instead of recursing into this very block.
+    let saved = ctx.children.take();
+    ctx.children = cctx.outer.clone();
     for i in indices {
         if ctx.halted() {
             break;
@@ -693,6 +729,7 @@ fn instantiate_children(selection: Option<&Value>, ctx: &mut Ctx) -> Vec<Shape> 
         }
         shapes.extend(exec_stmt(geo[i as usize], &scope, ctx));
     }
+    ctx.children = saved;
     shapes
 }
 
@@ -1108,6 +1145,9 @@ fn eval_expr(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Value {
                 }
             }
         }
+        // A parenthesized identifier is transparent as a value; it only
+        // steered the callee resolution in postfix.
+        Expr::Paren(inner) => eval_expr(inner, scope, ctx),
         Expr::Vector(items) => {
             let mut out = Vec::new();
             eval_vec_items(items, scope, ctx, &mut out);
@@ -1200,28 +1240,29 @@ fn eval_expr(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Value {
             env: scope.clone() as Rc<dyn std::any::Any>,
         })),
         Expr::Call { name, args } => {
-            // is_undef(name) is the defined-guard idiom: it probes without
-            // the unknown-variable warning.
-            if name == "is_undef" && args.len() == 1 && args[0].name.is_none() {
-                if let Expr::Ident(var) = &args[0].value {
-                    let defined = if var.starts_with('$') {
-                        ctx.dynv.lookup(var).is_some()
-                    } else {
-                        scope.lookup(var).is_some()
-                    };
-                    let is_undef = match (defined, if var.starts_with('$') { ctx.dynv.lookup(var) } else { scope.lookup(var) }) {
-                        (true, Some(v)) => matches!(v, Value::Undef),
-                        _ => true,
-                    };
-                    return Value::Bool(is_undef);
-                }
-            }
             match resolve_function(name, scope) {
                 Some((params, body, env)) => {
                     let ev = eval_args(args, scope, ctx);
                     call_function(name, params, body, env, ev, ctx)
                 }
                 None => {
+                    // is_undef(<ident>) is the defined-guard idiom: probe
+                    // without the unknown-variable warning. Only when no
+                    // user function shadows is_undef (checked above).
+                    if name == "is_undef" && args.len() == 1 && args[0].name.is_none() {
+                        if let Expr::Ident(var) = &args[0].value {
+                            let looked = if var.starts_with('$') {
+                                ctx.dynv.lookup(var)
+                            } else {
+                                scope.lookup(var)
+                            };
+                            let is_undef = match looked {
+                                Some(v) => matches!(v, Value::Undef),
+                                None => true,
+                            };
+                            return Value::Bool(is_undef);
+                        }
+                    }
                     let ev = eval_args(args, scope, ctx);
                     call_builtin(name, &ev, scope, ctx)
                 }
@@ -1316,7 +1357,16 @@ fn resolve_function(name: &str, scope: &Rc<Scope>) -> Option<(Vec<Param>, Expr, 
 /// call to run in the caller's reused frame.
 enum Tail {
     Done(Value),
-    Next { params: Vec<Param>, body: Expr, env: Rc<Scope>, args: Vec<EvArg> },
+    Next {
+        params: Vec<Param>,
+        body: Expr,
+        env: Rc<Scope>,
+        args: Vec<EvArg>,
+        /// The dynamic `$`-environment in force at the tail-call site.
+        /// The next frame runs within it (TCE must be transparent to
+        /// dynamic scoping), not reset to the original entry env.
+        dynv: Rc<DynScope>,
+    },
 }
 
 /// Call a user function (named or value) with tail-call elimination: the
@@ -1337,6 +1387,11 @@ fn call_function(
         return Value::Undef;
     }
     let entry_dyn = ctx.dynv.clone();
+    // The base env each frame layers over: the entry env first, then the
+    // dynamic env captured at each tail call so eliminated frames' $-args
+    // and let($q) bindings stay visible. Empty frame layers collapse away
+    // (base_for_next) so plain tail loops keep O(1) dynamic-chain depth.
+    let mut base_dyn = entry_dyn.clone();
     let mut iters = 0usize;
     let result = loop {
         if ctx.halted() {
@@ -1350,9 +1405,7 @@ fn call_function(
             ));
             break Value::Undef;
         }
-        // Fresh dynamic layer per iteration (so tail loops don't grow the
-        // chain), carrying this call's $-args.
-        ctx.dynv = DynScope::layer(&entry_dyn);
+        ctx.dynv = DynScope::layer(&base_dyn);
         for a in &args {
             if let Some(n) = &a.name {
                 if n.starts_with('$') {
@@ -1363,17 +1416,32 @@ fn call_function(
         let param_scope = bind_params(name, &params, &args, &env, ctx);
         match eval_tail(&body, &param_scope, ctx) {
             Tail::Done(v) => break v,
-            Tail::Next { params: p, body: b, env: e, args: a } => {
+            Tail::Next { params: p, body: b, env: e, args: a, dynv } => {
                 params = p;
                 body = b;
                 env = e;
                 args = a;
+                base_dyn = base_for_next(&dynv);
             }
         }
     };
     ctx.dynv = entry_dyn;
     ctx.fn_depth -= 1;
     result
+}
+
+/// The base a tail call's next frame should layer over: the captured env,
+/// but with transparent (empty) layers skipped so a plain tail loop does
+/// not build one dynamic-chain link per iteration.
+fn base_for_next(dyn_at_call: &Rc<DynScope>) -> Rc<DynScope> {
+    let mut cur = dyn_at_call.clone();
+    loop {
+        let empty = cur.vars.borrow().is_empty();
+        match (empty, cur.parent.clone()) {
+            (true, Some(parent)) => cur = parent,
+            _ => return cur,
+        }
+    }
 }
 
 fn eval_tail(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Tail {
@@ -1415,7 +1483,7 @@ fn eval_tail(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Tail {
         Expr::Call { name, args } => match resolve_function(name, scope) {
             Some((params, body, env)) => {
                 let ev = eval_args(args, scope, ctx);
-                Tail::Next { params, body, env, args: ev }
+                Tail::Next { params, body, env, args: ev, dynv: ctx.dynv.clone() }
             }
             None => Tail::Done(eval_expr(expr, scope, ctx)),
         },
@@ -1429,6 +1497,7 @@ fn eval_tail(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Tail {
                         body: fv.body.clone(),
                         env: fn_env(&fv),
                         args: ev,
+                        dynv: ctx.dynv.clone(),
                     }
                 }
                 other => {
@@ -1484,11 +1553,16 @@ fn eval_vec_items(items: &[VecItem], scope: &Rc<Scope>, ctx: &mut Ctx, out: &mut
                 }, ctx);
             }
             VecItem::CForC { inits, cond, updates, rest } => {
+                // The clause's bindings ($-names included) scope to the
+                // clause only: layer the dynamic env so they never leak
+                // into the enclosing scope's later statements.
+                let outer_dyn = ctx.dynv.clone();
+                ctx.dynv = DynScope::layer(&outer_dyn);
                 let mut cur = sequential_bindings(inits, scope, ctx);
                 let mut iters = 0usize;
                 loop {
                     if ctx.halted() {
-                        return;
+                        break;
                     }
                     let c = eval_expr(cond, &cur, ctx);
                     if !truthy(&c) {
@@ -1522,6 +1596,7 @@ fn eval_vec_items(items: &[VecItem], scope: &Rc<Scope>, ctx: &mut Ctx, out: &mut
                         break;
                     }
                 }
+                ctx.dynv = outer_dyn;
             }
             VecItem::CIf { cond, then, els } => {
                 let c = eval_expr(cond, scope, ctx);
@@ -1952,8 +2027,46 @@ pub fn fmt_value(v: &Value, quote_strings: bool) -> String {
                     None => p.name.clone(),
                 })
                 .collect();
-            format!("function({}) {}", params.join(", "), serialize_expr(&fv.body))
+            format!("function({}) {}", params.join(", "), serialize_body(&fv.body))
         }
+    }
+}
+
+/// Like serialize_expr but without the outermost parentheses — the
+/// source-like form for a function value's body (echo/str display),
+/// where `function(x) x + 1` reads better than `function(x) (x + 1)`.
+/// Sub-expressions keep their disambiguating parens.
+fn serialize_body(e: &Expr) -> String {
+    match e {
+        Expr::Binary { op, lhs, rhs } => {
+            format!("{} {} {}", serialize_expr(lhs), binop_str(*op), serialize_expr(rhs))
+        }
+        Expr::Ternary { cond, then, els } => format!(
+            "{} ? {} : {}",
+            serialize_expr(cond),
+            serialize_expr(then),
+            serialize_expr(els)
+        ),
+        _ => serialize_expr(e),
+    }
+}
+
+fn binop_str(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Pow => "^",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::And => "&&",
+        BinOp::Or => "||",
     }
 }
 
@@ -1987,23 +2100,7 @@ pub fn serialize_expr(e: &Expr) -> String {
             None => format!("[{} : {}]", serialize_expr(start), serialize_expr(end)),
         },
         Expr::Binary { op, lhs, rhs } => {
-            let op = match op {
-                BinOp::Add => "+",
-                BinOp::Sub => "-",
-                BinOp::Mul => "*",
-                BinOp::Div => "/",
-                BinOp::Mod => "%",
-                BinOp::Pow => "^",
-                BinOp::Lt => "<",
-                BinOp::Le => "<=",
-                BinOp::Gt => ">",
-                BinOp::Ge => ">=",
-                BinOp::Eq => "==",
-                BinOp::Ne => "!=",
-                BinOp::And => "&&",
-                BinOp::Or => "||",
-            };
-            format!("({} {} {})", serialize_expr(lhs), op, serialize_expr(rhs))
+            format!("({} {} {})", serialize_expr(lhs), binop_str(*op), serialize_expr(rhs))
         }
         Expr::Neg(inner) => format!("-{}", serialize_expr(inner)),
         Expr::Pos(inner) => format!("+{}", serialize_expr(inner)),
@@ -2018,6 +2115,7 @@ pub fn serialize_expr(e: &Expr) -> String {
             format!("{}[{}]", serialize_expr(base), serialize_expr(index))
         }
         Expr::Member { base, name } => format!("{}.{}", serialize_expr(base), name),
+        Expr::Paren(inner) => format!("({})", serialize_expr(inner)),
         Expr::Call { name, args } => format!("{}({})", name, serialize_args(args)),
         Expr::CallValue { callee, args } => {
             format!("{}({})", serialize_expr(callee), serialize_args(args))
@@ -2147,15 +2245,72 @@ impl Prng {
     }
 }
 
+/// Documented positional-parameter names for the builtin FUNCTIONS, so
+/// named arguments (rands(..., seed_value=7), search(..., index_col_num=1))
+/// resolve to the right slot instead of being dropped.
+fn builtin_param_names(name: &str) -> &'static [&'static str] {
+    match name {
+        "atan2" => &["y", "x"],
+        "pow" => &["base", "exponent"],
+        "cross" => &["a", "b"],
+        "search" => &["match_value", "string_or_vector", "num_returns_per_match", "index_col_num"],
+        "lookup" => &["key", "table"],
+        "rands" => &["min_value", "max_value", "value_count", "seed_value"],
+        "parent_module" => &["index"],
+        _ => &[],
+    }
+}
+
 fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> Value {
     let _ = scope;
-    // Builtin functions bind positionally; $-named args were already
-    // layered dynamically by callers that need them.
-    let vals: Vec<Value> = ev
-        .iter()
-        .filter(|a| a.name.is_none())
-        .map(|a| a.value.clone())
-        .collect();
+    // Resolve arguments to positions using the shared rule: positionals
+    // fill declaration order, named ones land in their slot, unknown
+    // plain names warn and are dropped ($-names were layered dynamically
+    // by callers already). Builtins without a name table (the pure
+    // one/two-number math fns) just take positionals in order.
+    let names = builtin_param_names(name);
+    let vals: Vec<Value> = if names.is_empty() {
+        ev.iter().filter(|a| a.name.is_none()).map(|a| a.value.clone()).collect()
+    } else {
+        let mut slots: Vec<Option<Value>> = vec![None; names.len()];
+        let mut extra: Vec<Value> = Vec::new();
+        let mut pos = 0usize;
+        for a in ev {
+            match &a.name {
+                Some(n) if n.starts_with('$') => {}
+                Some(n) => match names.iter().position(|p| p == n) {
+                    Some(i) => slots[i] = Some(a.value.clone()),
+                    None => ctx
+                        .out
+                        .warnings
+                        .push(format!("{}: unknown parameter '{}' ignored", name, n)),
+                },
+                None => {
+                    while pos < names.len() && slots[pos].is_some() {
+                        pos += 1;
+                    }
+                    if pos < names.len() {
+                        slots[pos] = Some(a.value.clone());
+                        pos += 1;
+                    } else {
+                        extra.push(a.value.clone());
+                    }
+                }
+            }
+        }
+        // Trailing unset slots stay absent; a hole before a set slot
+        // becomes undef so later positionals keep their index.
+        let last = slots.iter().rposition(Option::is_some);
+        let mut vals: Vec<Value> = match last {
+            Some(i) => slots[..=i]
+                .iter()
+                .map(|s| s.clone().unwrap_or(Value::Undef))
+                .collect(),
+            None => Vec::new(),
+        };
+        vals.extend(extra);
+        vals
+    };
     let num = |i: usize| -> Option<f64> { vals.get(i).and_then(Value::as_num) };
     let one_num = |ctx: &mut Ctx, f: &dyn Fn(f64) -> f64| -> Value {
         match num(0) {
@@ -2338,8 +2493,12 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
 fn chr_append(v: &Value, s: &mut String, ctx: &mut Ctx) {
     match v {
         Value::Num(n) => {
-            if n.is_finite() && *n >= 1.0 {
-                if let Some(c) = char::from_u32(n.trunc() as i64 as u32) {
+            // Bounds-check BEFORE the cast: n as u32 wraps modulo 2^32,
+            // which would resurrect valid characters from huge inputs
+            // (2^32 + 65 must contribute nothing, not "A").
+            let t = n.trunc();
+            if n.is_finite() && (1.0..=0x10FFFF as f64).contains(&t) {
+                if let Some(c) = char::from_u32(t as u32) {
                     s.push(c);
                 }
             }
@@ -3295,6 +3454,31 @@ mod tests {
     }
 
     #[test]
+    fn tco_is_transparent_to_dynamic_scoping() {
+        // Tail-call elimination must not drop the $-bindings of the
+        // frames it collapses.
+        // (1) plain forwarding: a $-arg to the wrapper reaches the leaf,
+        // even though each body is a bare tail call.
+        let out = run(
+            "function leaf() = $x; function mid() = leaf(); function f() = mid(); echo(f($x = 9));",
+        );
+        assert_eq!(out.echoes, vec!["ECHO: 9"]);
+        // (2) let($q) established in tail position is visible in the call
+        // it wraps.
+        let out = run("function f(n) = n <= 0 ? $q : let($q = n) f(n - 1); echo(f(1));");
+        assert_eq!(out.echoes, vec!["ECHO: 1"]);
+        // (3) a $-arg on the first hop survives every later tail hop.
+        let out = run("function g(n) = n <= 0 ? $x : g(n - 1); echo(g(3, $x = 9));");
+        assert_eq!(out.echoes, vec!["ECHO: 9"]);
+        // ...and a plain deep tail loop still runs (O(1) dynamic chain).
+        let out = run(
+            "function c(n, a = 0) = n <= 0 ? a : c(n - 1, a + 1); echo(c(200000));",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.echoes, vec!["ECHO: 200000"]);
+    }
+
+    #[test]
     fn dollar_variables_scope_dynamically() {
         // Through function calls.
         let out = run("function probe() = $flag; module m() { $flag = 7; echo(probe()); } m();");
@@ -3309,5 +3493,149 @@ mod tests {
         // Unknown PLAIN named args warn; $-named ones never do.
         let out = run("module m(a) cube(a); m(1, $anything = 3);");
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    // -- panel regressions --------------------------------------------------
+
+    #[test]
+    fn children_forwarding_does_not_infinitely_recurse() {
+        // A children() inside a stamped block refers to the CALLER's
+        // children (the wrapper idiom), not its own block — must not
+        // stack-overflow the process.
+        let out = run(
+            "module inner() { children(); } \
+             module outer() { inner() children(); } \
+             outer() cube(1);",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.shapes.len(), 1);
+        // A children() reaching past the top-level block warns, not crashes.
+        let out = run("module m() { children(); } m() children();");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(out.warnings.iter().any(|w| w.contains("outside a module")));
+    }
+
+    #[test]
+    fn parser_guards_deep_statement_nesting() {
+        let src = "if (true) ".repeat(100_000) + "cube(1);";
+        let err = crate::parser::parse(&src).unwrap_err();
+        assert!(err.contains("nesting"), "got: {}", err);
+        let src = "translate([0,0,0]) ".repeat(100_000) + "cube(1);";
+        assert!(crate::parser::parse(&src).is_err());
+    }
+
+    #[test]
+    fn reserved_words_are_not_identifiers() {
+        for bad in [
+            "echo = 1;",
+            "assert = 1;",
+            "module echo() cube(1);",
+            "function assert(x) = x;",
+            "let (each = 1) cube(1);",
+            "x = if(true);",
+            "y = each;",
+        ] {
+            assert!(crate::parser::parse(bad).is_err(), "must reject: {}", bad);
+        }
+        // assign is NOT reserved.
+        assert!(crate::parser::parse("assign = 1;").is_ok());
+        // Statement echo/assert calls still work.
+        let out = run("echo(\"hi\"); assert(true) cube(1);");
+        assert_eq!(out.echoes, vec!["ECHO: \"hi\""]);
+        assert_eq!(out.shapes.len(), 1);
+    }
+
+    #[test]
+    fn parenthesized_callee_takes_the_value_path() {
+        // (f) forces variable-namespace resolution: the function VALUE
+        // wins over the same-named function definition.
+        let out = run("function f(x) = 1; f = function (x) 2; y = (f)(0); echo(y);");
+        assert_eq!(out.echoes, vec!["ECHO: 2"]);
+        // A bare f(0) still hits the function namespace.
+        let out = run("function f(x) = 1; f = function (x) 2; echo(f(0));");
+        assert_eq!(out.echoes, vec!["ECHO: 1"]);
+    }
+
+    #[test]
+    fn user_functions_shadow_is_undef_consistently() {
+        // Same result in tail and non-tail position.
+        let out = run(
+            "function is_undef(x) = 99; a = undef; \
+             function g(z) = is_undef(z); \
+             echo(is_undef(a), g(a));",
+        );
+        assert_eq!(out.echoes, vec!["ECHO: 99, 99"]);
+        // Without a shadow, the defined-guard still suppresses the warning.
+        let (v, w) = ev("is_undef(nothing_here)");
+        assert_eq!(v, Value::Bool(true));
+        assert!(w.is_empty(), "{:?}", w);
+    }
+
+    #[test]
+    fn cstyle_generator_dollar_bindings_do_not_leak() {
+        let out = run(
+            "x = [for ($i = 0; $i < 3; $i = $i + 1) $i]; echo(x, is_undef($i));",
+        );
+        assert_eq!(out.echoes, vec!["ECHO: [0, 1, 2], true"]);
+    }
+
+    #[test]
+    fn range_iteration_matches_the_count_formula() {
+        // No stray epsilon element: [0:0.1:0.3] is 3 elements, agreeing
+        // with range_count (used by comparison).
+        assert_eq!(n("len([for (i = [0:0.1:0.3]) i])"), 3.0);
+        assert_eq!(n("len([each [1:0.5:3]])"), 5.0);
+        assert_eq!(n("len([each [0:1000000]])"), 1000001.0); // contract bar
+    }
+
+    #[test]
+    fn chr_rejects_out_of_range_code_points() {
+        assert_eq!(s("chr(4294967361)"), ""); // 2^32 + 65 must NOT be "A"
+        assert_eq!(s("chr(1114112)"), ""); // just past U+10FFFF
+        assert_eq!(s("chr(1114111)"), "\u{10FFFF}");
+    }
+
+    #[test]
+    fn builtin_functions_accept_named_arguments() {
+        // search mode by name.
+        assert_eq!(
+            ev("search(\"a\", \"aaaa\", num_returns_per_match = 0)").0,
+            ev("[[0, 1, 2, 3]]").0
+        );
+        // rands seed by name is reproducible and matches positional.
+        let out = run(
+            "a = rands(0, 1, 3, seed_value = 7); b = rands(0, 1, 3, 7); echo(a == b);",
+        );
+        assert_eq!(out.echoes, vec!["ECHO: true"]);
+        // atan2 by name.
+        assert_eq!(n("atan2(y = 1, x = 1)"), 45.0);
+        // lookup by name.
+        assert_eq!(n("lookup(key = 0.25, table = [[0, 0], [0.5, 1]])"), 0.5);
+        // Unknown named arg warns and is dropped, the call proceeds.
+        let (v, w) = ev("lookup(0.5, [[0, 0], [1, 1]], bogus = 9)");
+        assert_eq!(v, Value::Num(0.5));
+        assert!(w.iter().any(|m| m.contains("bogus")));
+    }
+
+    #[test]
+    fn function_value_renders_without_outer_parens() {
+        assert_eq!(s("str(function (x, y = 1) x + y)"), "function(x, y = 1) x + y");
+        // assert condition text keeps its disambiguating parens.
+        let out = run("assert(1 + 1 == 3);");
+        assert!(out.error.unwrap().contains("((1 + 1) == 3)"));
+    }
+
+    #[test]
+    fn higher_order_tail_fold_stays_bounded() {
+        // The callback is passed as a param but its closure is defined at
+        // top level, so it closes no cycle with the per-iteration param
+        // scope — those scopes must not be retained.
+        let out = run(
+            "id = function (x) x; \
+             function fold(f, n, acc) = n <= 0 ? acc : fold(f, n - 1, f(acc) + 1); \
+             echo(fold(id, 300000, 0));",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.echoes, vec!["ECHO: 300000"]);
     }
 }

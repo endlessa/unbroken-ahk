@@ -20,13 +20,30 @@
 use crate::ast::{Arg, BinOp, Expr, Param, Stmt, VecItem};
 use crate::lexer::{lex, Tok, Token};
 
-/// Words with special statement or clause meaning; they are not usable as
-/// module/function/variable names.
+/// The 2021.01 reserved set: not usable as identifiers in ANY namespace.
+/// echo and assert joined it with their 2019.05 expression forms; assign
+/// deliberately did NOT (assign = 1; stays legal).
 const KEYWORDS: &[&str] = &[
-    "module", "function", "if", "else", "for", "let", "each", "true", "false", "undef",
+    "module", "function", "if", "else", "for", "let", "each", "echo", "assert",
+    "include", "use", "true", "false", "undef",
 ];
 
+/// Parse on a dedicated large-stack thread so deeply nested input reaches
+/// the depth guard (a graceful Err) instead of overflowing the caller's
+/// stack — the HTTP handler runs on a small default-stack thread.
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
+    let src = src.to_string();
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn_scoped(s, move || parse_inner(&src))
+            .expect("failed to spawn the parser thread")
+            .join()
+            .unwrap_or_else(|_| Err("parser crashed on pathological input".into()))
+    })
+}
+
+fn parse_inner(src: &str) -> Result<Vec<Stmt>, String> {
     let tokens = lex(src)?;
     let mut p = Parser { tokens, pos: 0, depth: 0 };
     let mut stmts = Vec::new();
@@ -36,9 +53,9 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
     Ok(stmts)
 }
 
-/// Guard against pathological nesting exhausting the parser's stack: the
-/// reference implementation crashes there; we error gracefully.
-const MAX_PARSE_DEPTH: usize = 300;
+/// Graceful bound on nesting depth; far above any real script, well below
+/// what the large parser stack can hold.
+const MAX_PARSE_DEPTH: usize = 2000;
 
 struct Parser {
     tokens: Vec<Token>,
@@ -110,7 +127,17 @@ impl Parser {
         self.depth -= 1;
     }
 
+    /// Statement nesting shares the depth guard with expressions —
+    /// chained bare children (translate() translate() ... cube();) and
+    /// nested blocks must error gracefully, not overflow the stack.
     fn stmt(&mut self) -> Result<Stmt, String> {
+        self.enter()?;
+        let r = self.stmt_inner();
+        self.leave();
+        r
+    }
+
+    fn stmt_inner(&mut self) -> Result<Stmt, String> {
         if self.peek() == Some(&Tok::LBrace) {
             self.pos += 1;
             return Ok(Stmt::Block(self.block_body()?));
@@ -159,6 +186,15 @@ impl Parser {
                     Vec::new()
                 };
                 return Ok(Stmt::If { cond, then, els });
+            }
+            // echo/assert are reserved words, but their statement CALL
+            // forms are of course legal.
+            "echo" | "assert" if self.peek() == Some(&Tok::LParen) => {
+                self.pos += 1;
+                let args = self.args()?;
+                self.expect(&Tok::RParen, "to close the argument list")?;
+                let children = self.child()?;
+                return Ok(Stmt::Call { name, args, children });
             }
             "let" | "assign" if self.peek() == Some(&Tok::LParen) => {
                 // assign(...) with a child is the deprecated statement;
@@ -213,6 +249,7 @@ impl Parser {
         }
         loop {
             let name = self.ident(ctx)?;
+            self.no_keyword(&name)?;
             self.expect(&Tok::Assign, ctx)?;
             let value = self.expr()?;
             out.push((name, value));
@@ -260,6 +297,7 @@ impl Parser {
         }
         loop {
             let name = self.ident("in the parameter list")?;
+            self.no_keyword(&name)?;
             let default = if self.peek() == Some(&Tok::Assign) {
                 self.pos += 1;
                 Some(self.expr()?)
@@ -292,6 +330,7 @@ impl Parser {
                     Some(Tok::Ident(s)) => s,
                     _ => unreachable!("guarded by the named check"),
                 };
+                self.no_keyword(&name)?;
                 self.pos += 1; // '='
                 let value = self.expr()?;
                 args.push(Arg { name: Some(name), value });
@@ -532,16 +571,26 @@ impl Parser {
         match self.bump() {
             Some(Tok::Num(n)) => Ok(Expr::Num(n)),
             Some(Tok::Str(s)) => Ok(Expr::Str(s)),
-            Some(Tok::Ident(s)) => Ok(match s.as_str() {
-                "true" => Expr::Bool(true),
-                "false" => Expr::Bool(false),
-                "undef" => Expr::Undef,
-                _ => Expr::Ident(s),
-            }),
+            Some(Tok::Ident(s)) => match s.as_str() {
+                "true" => Ok(Expr::Bool(true)),
+                "false" => Ok(Expr::Bool(false)),
+                "undef" => Ok(Expr::Undef),
+                // Reserved words are not expression identifiers ('x = each;'
+                // and 'x = if(c);' are syntax errors, not undef).
+                kw if KEYWORDS.contains(&kw) => {
+                    Err(format!("'{}' is a reserved word", kw))
+                }
+                _ => Ok(Expr::Ident(s)),
+            },
             Some(Tok::LParen) => {
                 let e = self.expr()?;
                 self.expect(&Tok::RParen, "to close '('")?;
-                Ok(e)
+                // A parenthesized bare identifier forces the VALUE path
+                // when called: (f)(x) never hits the function namespace.
+                Ok(match e {
+                    id @ Expr::Ident(_) => Expr::Paren(Box::new(id)),
+                    other => other,
+                })
             }
             Some(Tok::LBracket) => self.vector_or_range(),
             _ => {
