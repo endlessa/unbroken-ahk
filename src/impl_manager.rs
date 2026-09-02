@@ -527,11 +527,21 @@ impl PlatformManager {
             Some(i) => selected_ids[..i].iter().map(|s| s.as_str()).collect(),
             None => selected_set,
         };
-        let runnables: Vec<&dyn RunnableTest> = self
+        // Execute in SELECTION order, not runnable-attach order: the two
+        // can diverge (definitions restored from storage, runnables
+        // attached later in any order), and under fail_fast the attach
+        // order would decide which tests get skipped — contradicting the
+        // selection-order contract the ghost stop position and the
+        // in-place registry upgrades are built around.
+        let runnable_by_id: std::collections::HashMap<&str, &dyn RunnableTest> = self
             .runnables
             .iter()
-            .filter(|r| execute_ids.contains(r.id()))
-            .map(|r| r.as_ref())
+            .map(|r| (r.id(), r.as_ref()))
+            .collect();
+        let runnables: Vec<&dyn RunnableTest> = selected_ids
+            .iter()
+            .filter(|id| execute_ids.contains(id.as_str()))
+            .filter_map(|id| runnable_by_id.get(id.as_str()).copied())
             .collect();
 
         let started_at = storage::now_ms();
@@ -1371,6 +1381,32 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["t1", "t2"]);
         assert_eq!(b.discover(&DiscoveryQuery::default()).tests[0].tags, vec!["new".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execution_follows_selection_order_not_attach_order() {
+        // Definitions registered [t1, t2]; runnables attached in REVERSE.
+        // Under fail_fast, selection order must decide who runs first:
+        // t1 executes (and passes) before t2's failure stops the run —
+        // attach order would have failed on t2 first and skipped t1.
+        use crate::test_util::def;
+        let dir = crate::test_util::temp_storage_dir("mgr-exec-order");
+        let mut mgr = PlatformManager::new(&dir);
+        mgr.register_test(def("t1")).unwrap();
+        mgr.register_test(def("t2")).unwrap();
+        mgr.register_runnable(def("t2"), Box::new(EchoTest { id: "t2".into(), pass: false }))
+            .unwrap();
+        mgr.register_runnable(def("t1"), Box::new(EchoTest { id: "t1".into(), pass: true }))
+            .unwrap();
+        let summary = mgr
+            .run_to_completion(RunConfig { fail_fast: true, ..Default::default() })
+            .unwrap();
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.results[0].test_id, "t1");
+        assert_eq!(summary.results[1].test_id, "t2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
