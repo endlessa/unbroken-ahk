@@ -80,6 +80,14 @@ pub enum ManagerError {
     /// include_ids named tests that are not registered — a typo must
     /// error, never silently shrink the run.
     UnknownTestIds(Vec<TestId>),
+    /// A tag criterion matched no registered test. exclude=false is an
+    /// include_tags typo (would silently shrink the run); exclude=true
+    /// is an exclude_tags typo (would silently WIDEN it). Typed, so each
+    /// surface can render its own vocabulary (--tag/--exclude at the
+    /// console) without rewriting Display strings.
+    ZeroMatchTags { exclude: bool, tags: Vec<String> },
+    /// name_pattern matched no registered test — same typo class.
+    ZeroMatchPattern(String),
     /// A test registration failed.
     RegistrationFailed(String),
     /// The configuration requests something this build cannot do.
@@ -135,6 +143,19 @@ impl std::fmt::Display for ManagerError {
             }
             ManagerError::UnknownTestIds(ids) => {
                 write!(f, "include_ids named tests that are not registered: {:?}", ids)
+            }
+            ManagerError::ZeroMatchTags { exclude: false, tags } => {
+                write!(f, "include_tags {:?} match no registered test", tags)
+            }
+            ManagerError::ZeroMatchTags { exclude: true, tags } => write!(
+                f,
+                "exclude_tags {:?} match no registered test — a typo here \
+                 would silently run the tests it meant to exclude; if the \
+                 tag was intentionally retired, remove it from exclude_tags",
+                tags
+            ),
+            ManagerError::ZeroMatchPattern(pattern) => {
+                write!(f, "name_pattern {:?} matches no registered test", pattern)
             }
             ManagerError::RegistrationFailed(msg) => {
                 write!(f, "test registration failed: {}", msg)

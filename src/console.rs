@@ -290,10 +290,11 @@ fn cmd_run(manager: &mut PlatformManager, args: &[&str], rest: &str) -> ConsoleO
             run_id, msg, run_id
         )),
         Err(e) => {
-            let mut msg = format!("{}", e);
-            if from_flags {
-                msg = console_vocabulary(&msg);
-            }
+            let msg = if from_flags {
+                flag_error_message(&e)
+            } else {
+                format!("{}", e)
+            };
             error_output(&format!("Run failed: {}", msg))
         }
     }
@@ -518,74 +519,33 @@ fn split_args(input: &str) -> Vec<&str> {
     input.split_whitespace().collect()
 }
 
-/// The manager's errors speak the JSON-config vocabulary. When the
-/// command came from FLAGS, rename those fields to the flags the console
-/// actually accepts, so the stated remedy is typeable at this surface —
-/// telling a flag user to edit "exclude_tags" points at a field that
-/// does not exist for them.
-///
-/// Replacement skips QUOTED spans: quoted text is user data echoed back
-/// (tags are unvalidated, so a tag literally named "include_tags" is
-/// legal) and must never be rewritten into a flag name.
-fn console_vocabulary(msg: &str) -> String {
-    fn replace_fields(s: &str) -> String {
-        s.replace("include_ids", "--id")
-            .replace("include_tags", "--tag")
-            .replace("exclude_tags", "--exclude")
-            .replace("name_pattern", "--pattern")
-            .replace("run_all: true", "--all")
-            .replace("run_all", "--all")
-    }
-    // Values are echoed back BOTH ways: Debug lists use double quotes
-    // (with interior quotes escaped as \"), single scalars use single
-    // quotes ('pattern'). Both span kinds are protected — the close scan
-    // must match the opening quote kind and skip backslash escapes, or a
-    // value's tail would spill into the "unquoted" region and get
-    // rewritten.
-    fn find_close(s: &str, quote: u8) -> Option<usize> {
-        let bytes = s.as_bytes();
-        let mut escaped = false;
-        for (i, &b) in bytes.iter().enumerate() {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == quote {
-                return Some(i);
-            }
+/// Flag-vocabulary rendering of run errors: match the TYPED variants
+/// and speak in the flags the console accepts, instead of rewriting the
+/// JSON-vocabulary Display strings by substring surgery (which coupled
+/// this surface to the exact wording of every manager message). User
+/// data is echoed via Debug formatting, so quoting stays correct by
+/// construction whatever the value contains.
+fn flag_error_message(e: &crate::manager::ManagerError) -> String {
+    use crate::manager::ManagerError;
+    match e {
+        ManagerError::UnknownTestIds(ids) => {
+            format!("--id named tests that are not registered: {:?}", ids)
         }
-        None
-    }
-    let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
-    loop {
-        let open = rest
-            .bytes()
-            .position(|b| b == b'"' || b == b'\'');
-        match open {
-            None => {
-                out.push_str(&replace_fields(rest));
-                return out;
-            }
-            Some(open) => {
-                let quote = rest.as_bytes()[open];
-                out.push_str(&replace_fields(&rest[..open]));
-                let quoted = &rest[open + 1..];
-                match find_close(quoted, quote) {
-                    Some(close) => {
-                        out.push(quote as char);
-                        out.push_str(&quoted[..=close]);
-                        rest = &quoted[close + 1..];
-                    }
-                    None => {
-                        // Unbalanced quote: copy the tail verbatim.
-                        out.push(quote as char);
-                        out.push_str(quoted);
-                        return out;
-                    }
-                }
-            }
+        ManagerError::ZeroMatchTags { exclude: false, tags } => {
+            format!("--tag {:?} match no registered test", tags)
         }
+        ManagerError::ZeroMatchTags { exclude: true, tags } => format!(
+            "--exclude {:?} match no registered test — a typo here would \
+             silently run the tests it meant to exclude; if the tag was \
+             intentionally retired, drop the --exclude",
+            tags
+        ),
+        ManagerError::ZeroMatchPattern(pattern) => {
+            format!("--pattern {:?} matches no registered test", pattern)
+        }
+        // Every other variant's message carries no JSON field names a
+        // flag user could not act on.
+        other => format!("{}", other),
     }
 }
 

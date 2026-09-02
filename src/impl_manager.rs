@@ -41,6 +41,14 @@ pub struct PlatformManager {
     /// definition upgrade (storage-sourced) or a programming error
     /// (session-sourced).
     session_defined: std::collections::HashSet<TestId>,
+    /// Snapshots served by check_progress's storage fallback, keyed by
+    /// run id. A persisted summary is immutable, so its derived progress
+    /// never changes — without this, every poll of a finished run
+    /// re-read and re-parsed the whole summary (results, stdout/stderr
+    /// included) to produce eleven small fields. RefCell because
+    /// check_progress is &self; only Ok snapshots are cached, so a
+    /// reserved-only file that later persists is never stale.
+    fallback_progress: std::cell::RefCell<std::collections::HashMap<String, RunProgress>>,
 }
 
 impl PlatformManager {
@@ -60,6 +68,7 @@ impl PlatformManager {
             completed_runs: Vec::new(),
             run_counter,
             session_defined: std::collections::HashSet::new(),
+            fallback_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -451,12 +460,10 @@ impl PlatformManager {
                 .filter(|tag| !all_defs.iter().any(|t| t.tags.contains(*tag)))
                 .collect();
             if !unmatched.is_empty() {
-                return Err(ManagerError::UnsupportedConfig(format!(
-                    "exclude_tags {:?} match no registered test — a typo here \
-                     would silently run the tests it meant to exclude; if the \
-                     tag was intentionally retired, remove it from exclude_tags",
-                    unmatched
-                )));
+                return Err(ManagerError::ZeroMatchTags {
+                    exclude: true,
+                    tags: unmatched.into_iter().cloned().collect(),
+                });
             }
         }
 
@@ -487,10 +494,10 @@ impl PlatformManager {
                     .iter()
                     .any(|t| crate::filter::matches_all_tags(&config.include_tags, t))
             {
-                return Err(ManagerError::UnsupportedConfig(format!(
-                    "include_tags {:?} match no registered test",
-                    config.include_tags
-                )));
+                return Err(ManagerError::ZeroMatchTags {
+                    exclude: false,
+                    tags: config.include_tags.clone(),
+                });
             }
             if let Some(ref pattern) = config.name_pattern {
                 let pattern_lower = pattern.to_lowercase();
@@ -498,13 +505,7 @@ impl PlatformManager {
                     .iter()
                     .any(|t| crate::filter::name_matches_lower(&pattern_lower, &t.name))
                 {
-                    return Err(ManagerError::UnsupportedConfig(format!(
-                        // {:?}, not '{}': Debug escapes interior quotes,
-                        // so the echo survives the console's quoted-span
-                        // protection whatever the pattern contains.
-                        "name_pattern {:?} matches no registered test",
-                        pattern
-                    )));
+                    return Err(ManagerError::ZeroMatchPattern(pattern.clone()));
                 }
             }
         }
@@ -773,7 +774,11 @@ impl TestManager for PlatformManager {
         // it, so progress must agree rather than claim the id does not
         // exist. Serve the completed-run snapshot; the error cases
         // (unknown, reserved-only, unreadable, corrupt) pass through
-        // with their own truthful messages.
+        // with their own truthful messages. Cached: the summary on disk
+        // is immutable, so repeat polls must not re-parse it.
+        if let Some(cached) = self.fallback_progress.borrow().get(run_id) {
+            return Ok(cached.clone());
+        }
         let summary = self.get_results(run_id)?;
         // completed comes from the RESULTS, not from total: a legacy file
         // (written before ghost-Error reconciliation) can hold fewer
@@ -797,7 +802,7 @@ impl TestManager for PlatformManager {
         // diagnostic channel for damaged ones.
         let (passed, failed, errored, skipped) =
             count_statuses(&summary.results[..completed as usize]);
-        Ok(RunProgress {
+        let snapshot = RunProgress {
             run_id: summary.run_id.clone(),
             total: summary.total,
             completed,
@@ -813,7 +818,11 @@ impl TestManager for PlatformManager {
             // with fewer results than total truthfully reports <100%
             // and would otherwise look permanently in-progress.
             finished: true,
-        })
+        };
+        self.fallback_progress
+            .borrow_mut()
+            .insert(run_id.to_string(), snapshot.clone());
+        Ok(snapshot)
     }
 
     fn active_runs(&self) -> Vec<RunId> {
@@ -1772,8 +1781,10 @@ mod tests {
             ..Default::default()
         };
         match mgr.start_run(config) {
-            Err(ManagerError::UnsupportedConfig(msg)) => assert!(msg.contains("destrutive")),
-            other => panic!("expected UnsupportedConfig, got {:?}", other.map(|_| ())),
+            Err(ManagerError::ZeroMatchTags { exclude: true, tags }) => {
+                assert_eq!(tags, vec!["destrutive".to_string()]);
+            }
+            other => panic!("expected ZeroMatchTags, got {:?}", other.map(|_| ())),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1940,8 +1951,10 @@ mod tests {
             ..Default::default()
         };
         match mgr.start_run(config) {
-            Err(ManagerError::UnsupportedConfig(msg)) => assert!(msg.contains("fastt")),
-            other => panic!("expected UnsupportedConfig, got {:?}", other.map(|_| ())),
+            Err(ManagerError::ZeroMatchTags { exclude: false, tags }) => {
+                assert_eq!(tags, vec!["fastt".to_string()]);
+            }
+            other => panic!("expected ZeroMatchTags, got {:?}", other.map(|_| ())),
         }
         // Same for a pattern matching nothing.
         let config = RunConfig {
@@ -1949,7 +1962,7 @@ mod tests {
             name_pattern: Some("nonexistent_zzz".into()),
             ..Default::default()
         };
-        assert!(matches!(mgr.start_run(config), Err(ManagerError::UnsupportedConfig(_))));
+        assert!(matches!(mgr.start_run(config), Err(ManagerError::ZeroMatchPattern(_))));
         // Exclude-only-looking programmatic configs get the truthful
         // NoTestsMatched, never advice to set run_all: true — the struct
         // cannot distinguish "forgot run_all" from "my computed include
