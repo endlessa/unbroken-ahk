@@ -175,6 +175,13 @@ fn cmd_discover(manager: &PlatformManager, args: &[&str]) -> ConsoleOutput {
                         query.limit = Some(n);
                         i += used;
                     }
+                    // All-digits input that still fails to parse IS a
+                    // number — an overflowing one. "is not a number"
+                    // would steer the user toward retyping the digits
+                    // instead of shrinking the value.
+                    Err(_) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => {
+                        return error_output(&format!("--limit: '{}' is out of range", v))
+                    }
                     Err(_) => {
                         return error_output(&format!("--limit: '{}' is not a number", v))
                     }
@@ -451,9 +458,18 @@ fn parse_run_args(args: &[&str]) -> Result<RunConfig, String> {
                 if config.timeout_ms.is_some() {
                     return Err("--timeout given more than once".into());
                 }
-                let ms: u64 = v
-                    .parse()
-                    .map_err(|_| format!("--timeout: '{}' is not a number", v))?;
+                let ms: u64 = match v.parse() {
+                    Ok(n) => n,
+                    // Overflowing digits get the same range message the
+                    // 2^53 guard below gives — not a false "not a number".
+                    Err(_) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => {
+                        return Err(format!(
+                            "--timeout: '{}' exceeds the exact JSON integer range (2^53 - 1)",
+                            v
+                        ))
+                    }
+                    Err(_) => return Err(format!("--timeout: '{}' is not a number", v)),
+                };
                 // Same bound the JSON config path enforces: a value above
                 // 2^53 would persist clamped — a timeout the caller never
                 // asked for.
@@ -1052,6 +1068,10 @@ mod tests {
         let out = execute_command(&mut mgr, "discover --limit abc");
         assert!(out.text.contains("Error"));
         assert!(out.text.contains("not a number"));
+        // Overflowing digits ARE a number — say "out of range", not a
+        // false "not a number" that suggests retyping the digits.
+        let out = execute_command(&mut mgr, "discover --limit 99999999999999999999");
+        assert!(out.text.contains("out of range"), "got: {}", out.text);
     }
 
     #[test]

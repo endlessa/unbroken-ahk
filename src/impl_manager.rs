@@ -321,20 +321,34 @@ impl PlatformManager {
         } else {
             Vec::new()
         };
-        let mut all: Vec<TestDefinition> =
-            self.registry.list_all().into_iter().cloned().collect();
-        // One set covers both filters: skip stored entries shadowed by
-        // memory AND collapse in-file duplicate ids (first wins, matching
-        // load_from_storage) so the corruption converges instead of being
-        // written back verbatim forever.
-        let mut written: std::collections::HashSet<String> =
-            all.iter().map(|t| t.id.clone()).collect();
-        all.extend(
-            stored
-                .into_iter()
-                .filter(|t| written.insert(t.id.clone())),
-        );
-        let refs: Vec<&TestDefinition> = all.iter().collect();
+        // FILE order leads the merge: the file's order is the platform's
+        // discovery/pagination/fail_fast order across restarts, and it
+        // must not change just because this session registered before
+        // loading. In-memory definitions still win on CONTENT for ids in
+        // both; genuinely new ids are appended in registration order.
+        // The written set also collapses in-file duplicate ids (first
+        // wins, matching load_from_storage) so that corruption converges
+        // instead of being written back verbatim forever.
+        let memory = self.registry.list_all();
+        let in_memory: std::collections::HashMap<&str, &TestDefinition> =
+            memory.iter().map(|t| (t.id.as_str(), *t)).collect();
+        let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut merged: Vec<TestDefinition> = Vec::new();
+        for t in stored {
+            if !written.insert(t.id.clone()) {
+                continue;
+            }
+            merged.push(match in_memory.get(t.id.as_str()) {
+                Some(m) => (*m).clone(),
+                None => t,
+            });
+        }
+        for t in memory {
+            if written.insert(t.id.clone()) {
+                merged.push(t.clone());
+            }
+        }
+        let refs: Vec<&TestDefinition> = merged.iter().collect();
         storage::save_registry(&self.storage, &refs)
     }
 
@@ -1428,6 +1442,36 @@ mod tests {
         assert_eq!(summary.skipped, 0);
         assert_eq!(summary.results[0].test_id, "t1");
         assert_eq!(summary.results[1].test_id, "t2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_before_load_preserves_file_order() {
+        // Session 1 persists [t1, t2]. Session 2 re-registers t2 BEFORE
+        // loading — the file's order must survive the merge: file order
+        // is the discovery/fail_fast order across restarts, and it must
+        // not change because of the restart sequence.
+        use crate::test_util::def;
+        let dir = crate::test_util::temp_storage_dir("mgr-prefile-order");
+        let mut a = PlatformManager::new(&dir);
+        a.register_test(def("t1")).unwrap();
+        a.register_test(def("t2")).unwrap();
+
+        let mut b = PlatformManager::new(&dir);
+        b.register_runnable(def("t2"), Box::new(EchoTest { id: "t2".into(), pass: true }))
+            .unwrap();
+        b.load_from_storage().unwrap();
+
+        // A third session loading fresh sees the ORIGINAL order.
+        let mut c = PlatformManager::new(&dir);
+        assert!(c.load_from_storage().unwrap().is_empty());
+        let ids: Vec<String> = c
+            .discover(&DiscoveryQuery::default())
+            .tests
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["t1", "t2"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
