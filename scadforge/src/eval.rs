@@ -10,6 +10,7 @@
 //! CSG booleans are phase 3.
 
 use crate::ast::{Arg, BinOp, Expr, Param, Stmt, VecItem};
+use crate::csg;
 use crate::geom::{self, Mesh};
 use crate::value::{FuncVal, Value};
 use std::cell::RefCell;
@@ -413,6 +414,38 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
                 ctx.dynv = saved_dyn;
             }, ctx);
             shapes
+        }
+        Stmt::IntersectionFor { bindings, body } => {
+            // Same header as `for`, but each iteration's geometry is one
+            // operand and the operands are intersected (not unioned).
+            let iterables: Vec<(String, Vec<Value>)> = bindings
+                .iter()
+                .map(|(name, expr)| {
+                    let v = eval_expr(expr, scope, ctx);
+                    (name.clone(), iterate(&v, ctx))
+                })
+                .collect();
+            let mut operands: Vec<Mesh> = Vec::new();
+            let mut color = None;
+            cross_product(&iterables, 0, &mut Vec::new(), &mut |vals, ctx| {
+                let saved_dyn = ctx.dynv.clone();
+                ctx.dynv = DynScope::layer(&saved_dyn);
+                let iter_scope = Scope::child(scope);
+                for (name, v) in vals {
+                    set_var(&iter_scope, ctx, name, v.clone());
+                }
+                let shapes = exec_scope(body, &iter_scope, ctx);
+                if color.is_none() {
+                    color = shapes.iter().find_map(|s| s.color);
+                }
+                operands.push(combine_group(&shapes).0);
+                ctx.dynv = saved_dyn;
+            }, ctx);
+            if operands.is_empty() {
+                Vec::new()
+            } else {
+                leaf_colored(csg::intersection_all(&operands), color)
+            }
         }
         Stmt::Call { name, args, children } => exec_call(name, args, children, scope, ctx),
     }
@@ -862,11 +895,36 @@ fn call_builtin_module(
             }
             shapes
         }
+        // union/group stay preview concatenation: the reference's F5
+        // preview does not compute the exact union either, and it is
+        // visually identical for non-overlapping or opaque solids.
         "union" | "group" => exec_scope(children, scope, ctx),
-        "difference" | "intersection" | "hull" | "minkowski" | "intersection_for" => {
+        "difference" => {
+            let groups = eval_children_grouped(children, scope, ctx);
+            if groups.is_empty() {
+                return Vec::new();
+            }
+            let (minuend, color) = combine_group(&groups[0]);
+            // Empty minuend → empty result, regardless of later children.
+            if minuend.positions.is_empty() {
+                return Vec::new();
+            }
+            let cutters: Vec<Mesh> =
+                groups[1..].iter().map(|g| combine_group(g).0).collect();
+            leaf_colored(csg::difference(&minuend, &cutters), color)
+        }
+        "intersection" => {
+            let groups = eval_children_grouped(children, scope, ctx);
+            if groups.is_empty() {
+                return Vec::new();
+            }
+            let color = groups[0].iter().find_map(|s| s.color);
+            let meshes: Vec<Mesh> = groups.iter().map(|g| combine_group(g).0).collect();
+            leaf_colored(csg::intersection_all(&meshes), color)
+        }
+        "hull" | "minkowski" => {
             ctx.out.warnings.push(format!(
-                "{}() is not implemented in this slice yet (CSG booleans are \
-                 the next kernel phase) — children are shown un-combined",
+                "{}() is not implemented yet — children are shown un-combined",
                 name
             ));
             exec_scope(children, scope, ctx)
@@ -962,6 +1020,51 @@ fn leaf(mesh: Mesh) -> Vec<Shape> {
     } else {
         vec![Shape { mesh, color: None }]
     }
+}
+
+fn leaf_colored(mesh: Mesh, color: Option<[f64; 4]>) -> Vec<Shape> {
+    if mesh.positions.is_empty() {
+        Vec::new()
+    } else {
+        vec![Shape { mesh, color }]
+    }
+}
+
+/// Reduce one CSG child (a group of shapes) to a single operand mesh plus
+/// the color that should represent it: the nearest color set within the
+/// child. A child that is itself several shapes is unioned so the operand
+/// is one clean solid.
+fn combine_group(shapes: &[Shape]) -> (Mesh, Option<[f64; 4]>) {
+    let color = shapes.iter().find_map(|s| s.color);
+    let meshes: Vec<Mesh> = shapes.iter().map(|s| s.mesh.clone()).collect();
+    let mesh = match meshes.len() {
+        0 => Mesh::empty(),
+        1 => meshes.into_iter().next().unwrap(),
+        _ => csg::union_all(&meshes),
+    };
+    (mesh, color)
+}
+
+/// Evaluate a call's children as one lexical scope, but keep each
+/// geometry statement's shapes in its OWN group — CSG operators need to
+/// tell the first child (the minuend) from the rest.
+fn eval_children_grouped(children: &[Stmt], parent: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Vec<Shape>> {
+    let scope = build_scope(children, parent, ctx);
+    let saved_dyn = ctx.dynv.clone();
+    ctx.dynv = DynScope::layer(&saved_dyn);
+    eval_slots(children, &scope, ctx);
+    let mut groups = Vec::new();
+    for stmt in children {
+        if ctx.halted() {
+            break;
+        }
+        match stmt {
+            Stmt::Assign { .. } | Stmt::ModuleDef { .. } | Stmt::FunctionDef { .. } => {}
+            _ => groups.push(exec_stmt(stmt, &scope, ctx)),
+        }
+    }
+    ctx.dynv = saved_dyn;
+    groups
 }
 
 fn transform_children(
@@ -2859,12 +2962,64 @@ mod tests {
         let out = run("frobnicate(1); cube(1);");
         assert_eq!(out.shapes.len(), 1);
         assert!(out.warnings.iter().any(|w| w.contains("frobnicate")));
-        let out = run("difference() { cube(2); sphere(1); }");
-        assert_eq!(out.shapes.len(), 2);
-        assert!(out.warnings.iter().any(|w| w.contains("not implemented")));
         // An unknown module's children are skipped, not evaluated.
         let out = run("mystery() { cube(1); }");
         assert!(out.shapes.is_empty());
+    }
+
+    fn total_volume(out: &EvalOutput) -> f64 {
+        // Winding-aware signed volume summed over every shape.
+        let mut v = 0.0;
+        for s in &out.shapes {
+            for t in &s.mesh.tris {
+                let a = s.mesh.positions[t[0] as usize];
+                let b = s.mesh.positions[t[1] as usize];
+                let c = s.mesh.positions[t[2] as usize];
+                v += (a[0] * (b[1] * c[2] - b[2] * c[1])
+                    + a[1] * (b[2] * c[0] - b[0] * c[2])
+                    + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                    / 6.0;
+            }
+        }
+        v.abs()
+    }
+
+    #[test]
+    fn csg_operators_combine_real_geometry() {
+        // difference carves a hole: 2^3 cube minus a 1^3 cube = 7.
+        let out = run("difference() { cube(2, center = true); cube(1, center = true); }");
+        assert_eq!(out.shapes.len(), 1);
+        assert!((total_volume(&out) - 7.0).abs() < 1e-5, "vol {}", total_volume(&out));
+        // intersection of two offset unit cubes = a 0.5-thick slab.
+        let out = run("intersection() { cube(1); translate([0.5,0,0]) cube(1); }");
+        assert!((total_volume(&out) - 0.5).abs() < 1e-5, "vol {}", total_volume(&out));
+        // difference keeps the minuend's (first child's) color.
+        let out = run("difference() { color(\"red\") cube(2, center=true); cube(1, center=true); }");
+        assert_eq!(out.shapes[0].color, Some([1.0, 0.0, 0.0, 1.0]));
+        // The subtrahends are implicitly unioned before subtracting.
+        let out = run(
+            "difference() { cube(3, center=true); \
+             translate([-1,0,0]) cube(1, center=true); \
+             translate([1,0,0]) cube(1, center=true); }",
+        );
+        assert!((total_volume(&out) - (27.0 - 2.0)).abs() < 1e-5, "vol {}", total_volume(&out));
+        // Empty minuend → empty result.
+        let out = run("difference() { if (false) cube(1); cube(5); }");
+        assert!(out.shapes.is_empty());
+    }
+
+    #[test]
+    fn intersection_for_folds_with_intersection() {
+        // Two rotated long bars: intersection_for keeps only their common
+        // core, where a plain for() would union them.
+        let common = run(
+            "intersection_for (a = [0, 90]) rotate([0,0,a]) cube([10,2,2], center=true);",
+        );
+        let unioned = run("for (a = [0, 90]) rotate([0,0,a]) cube([10,2,2], center=true);");
+        assert_eq!(common.shapes.len(), 1);
+        assert!(total_volume(&common) < total_volume(&unioned));
+        // The common core is the 2x2x2 overlap at the center.
+        assert!((total_volume(&common) - 8.0).abs() < 1e-4, "vol {}", total_volume(&common));
     }
 
     #[test]

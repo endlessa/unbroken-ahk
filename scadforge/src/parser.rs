@@ -174,6 +174,16 @@ impl Parser {
                 let body = self.child()?;
                 return Ok(Stmt::For { bindings, body });
             }
+            // intersection_for is a builtin module, not a reserved word,
+            // so only its call form is special; intersection_for = 1; is
+            // still a legal assignment.
+            "intersection_for" if self.peek() == Some(&Tok::LParen) => {
+                self.pos += 1;
+                let bindings = self.bindings("in intersection_for(...)")?;
+                self.expect(&Tok::RParen, "to close intersection_for(...)")?;
+                let body = self.child()?;
+                return Ok(Stmt::IntersectionFor { bindings, body });
+            }
             "if" => {
                 self.expect(&Tok::LParen, "after 'if'")?;
                 let cond = self.expr()?;

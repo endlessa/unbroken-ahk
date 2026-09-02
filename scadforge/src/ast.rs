@@ -111,6 +111,10 @@ pub enum Stmt {
     /// for (a = v, b = w) body — multiple bindings are a cross product,
     /// a-major.
     For { bindings: Vec<(String, Expr)>, body: Vec<Stmt> },
+    /// intersection_for (a = v, ...) body — same header as `for`, but the
+    /// per-iteration results are folded with INTERSECTION instead of the
+    /// implicit union.
+    IntersectionFor { bindings: Vec<(String, Expr)>, body: Vec<Stmt> },
     /// if (cond) then else els — only the taken branch instantiates.
     If { cond: Expr, then: Vec<Stmt>, els: Vec<Stmt> },
     /// let (bindings) body — sequential bindings scoping the subtree.

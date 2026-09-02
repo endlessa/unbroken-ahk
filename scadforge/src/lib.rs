@@ -8,6 +8,7 @@
 //! docs/OPENSCAD_BLUEPRINT.html.
 
 pub mod ast;
+pub mod csg;
 pub mod eval;
 pub mod geom;
 pub mod http;
