@@ -246,6 +246,7 @@ impl PlatformManager {
         // (skip silently); a second occurrence of an id WITHIN the file
         // is corruption whose data would silently vanish — report it.
         let mut seen_in_file: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut file_order: Vec<String> = Vec::new();
         for test in tests {
             let id = test.id.clone();
             if !seen_in_file.insert(id.clone()) {
@@ -255,6 +256,7 @@ impl PlatformManager {
                 ));
                 continue;
             }
+            file_order.push(id.clone());
             if self.registry.get(&id).is_some() {
                 continue;
             }
@@ -262,6 +264,12 @@ impl PlatformManager {
                 failures.push(format!("{}: {:?}", id, e));
             }
         }
+        // The FILE order is the discovery/fail_fast order every session
+        // over this storage must agree on — including ids this session
+        // registered BEFORE loading, which would otherwise sit first in
+        // memory here while sitting at their file positions everywhere
+        // else. Session-only ids (not yet in the file) follow after.
+        self.registry.reorder_to(&file_order);
         Ok(failures)
     }
 
@@ -1461,6 +1469,18 @@ mod tests {
         b.register_runnable(def("t2"), Box::new(EchoTest { id: "t2".into(), pass: true }))
             .unwrap();
         b.load_from_storage().unwrap();
+
+        // Session B itself must ALSO see the file order after loading —
+        // not its own registration order — or its discovery pages and
+        // fail_fast outcomes would disagree with every other session
+        // over the same storage.
+        let b_ids: Vec<String> = b
+            .discover(&DiscoveryQuery::default())
+            .tests
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        assert_eq!(b_ids, vec!["t1", "t2"]);
 
         // A third session loading fresh sees the ORIGINAL order.
         let mut c = PlatformManager::new(&dir);

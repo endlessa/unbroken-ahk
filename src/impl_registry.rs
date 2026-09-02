@@ -49,6 +49,22 @@ impl InMemoryRegistry {
         Ok(())
     }
 
+    /// Reorder to match `order` (by id). Ids not listed keep their
+    /// existing relative order AFTER the listed ones. Used by
+    /// load_from_storage so the FILE order — the discovery/fail_fast
+    /// order every other session sees — is authoritative in memory too,
+    /// whatever order this session happened to register in.
+    pub fn reorder_to(&mut self, order: &[String]) {
+        let rank: std::collections::HashMap<&str, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+        // sort_by_key is stable: unlisted ids keep relative order at MAX.
+        self.tests
+            .sort_by_key(|t| rank.get(t.id.as_str()).copied().unwrap_or(usize::MAX));
+    }
+
     /// Replace an EXISTING definition IN PLACE, preserving registry
     /// order — a definition upgrade must not move the test to the end,
     /// silently shifting discovery pages and which tests execute first

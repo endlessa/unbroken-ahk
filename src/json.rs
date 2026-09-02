@@ -626,19 +626,27 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                 Some(&b) => return Err(JsonError::UnexpectedChar(pos, b as char)),
             }
             let start = pos;
-            // Scan one element: bracket depth plus string state is enough
-            // to find the ',' or ']' that ends it — brackets inside
-            // strings don't count, and escaped quotes don't end strings.
-            let mut depth = 0usize;
+            // Scan one element: a bracket STACK plus string state finds
+            // the ',' or ']' that ends it — brackets inside strings don't
+            // count, escaped quotes don't end strings, and the stack
+            // (not a bare depth counter) catches a closer of the wrong
+            // KIND (']' terminating '{'), which parse_json rejects
+            // file-level and the splitter must too. The stack is also
+            // capped so nesting parse_json would refuse as TooDeep is
+            // refused here, never classified as a healthy file.
+            // (The whole document sits one level inside the outer array:
+            // parse_json allows MAX_DEPTH nested values total, so an
+            // element's own bracket nesting may reach MAX_DEPTH - 1.)
+            let mut stack: Vec<u8> = Vec::new();
             let mut in_string = false;
             let mut escaped = false;
-            // Once the element's value has closed at depth 0 — a string's
-            // closing quote, a bracket returning to depth 0, or a scalar
-            // ending at whitespace — only whitespace may follow before
-            // the ',' or ']'. Anything else means the comma BETWEEN
-            // elements is missing: skeleton damage, which must not merge
-            // two healthy entries into one unparseable "entry" that gets
-            // dropped.
+            // Once the element's value has closed at stack depth 0 — a
+            // string's closing quote, a bracket returning to depth 0, or
+            // a scalar ending at whitespace — only whitespace may follow
+            // before the ',' or ']'. Anything else means the comma
+            // BETWEEN elements is missing: skeleton damage, which must
+            // not merge two healthy entries into one unparseable "entry"
+            // that gets dropped.
             let mut value_closed = false;
             let mut in_scalar = false;
             let end;
@@ -654,11 +662,11 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                         escaped = true;
                     } else if b == b'"' {
                         in_string = false;
-                        if depth == 0 {
+                        if stack.is_empty() {
                             value_closed = true;
                         }
                     }
-                } else if depth == 0 && value_closed {
+                } else if stack.is_empty() && value_closed {
                     match b {
                         b',' | b']' => {
                             end = pos;
@@ -667,7 +675,7 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                         _ if is_json_whitespace(b) => {}
                         _ => return Err(JsonError::UnexpectedChar(pos, b as char)),
                     }
-                } else if depth == 0 && in_scalar {
+                } else if stack.is_empty() && in_scalar {
                     match b {
                         b',' | b']' => {
                             end = pos;
@@ -684,10 +692,10 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                         }
                         _ => {}
                     }
-                } else if depth == 0 {
+                } else if stack.is_empty() {
                     match b {
                         b'"' => in_string = true,
-                        b'[' | b'{' => depth += 1,
+                        b'[' | b'{' => stack.push(b),
                         b',' | b']' => {
                             end = pos;
                             break;
@@ -700,10 +708,20 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                 } else {
                     match b {
                         b'"' => in_string = true,
-                        b'[' | b'{' => depth += 1,
+                        b'[' | b'{' => {
+                            if stack.len() >= MAX_DEPTH - 1 {
+                                return Err(JsonError::TooDeep(pos));
+                            }
+                            stack.push(b);
+                        }
                         b']' | b'}' => {
-                            depth -= 1;
-                            if depth == 0 {
+                            let opener = stack.pop().unwrap_or(0);
+                            let kind_matches = (opener == b'[' && b == b']')
+                                || (opener == b'{' && b == b'}');
+                            if !kind_matches {
+                                return Err(JsonError::UnexpectedChar(pos, b as char));
+                            }
+                            if stack.is_empty() {
                                 value_closed = true;
                             }
                         }
@@ -835,6 +853,21 @@ mod tests {
             split_top_level_array("[1,\u{0C}2]"),
             Err(JsonError::UnexpectedChar(_, _))
         ));
+        // A closer of the wrong KIND (']' terminating '{') is the same
+        // file-level damage parse_json reports — never a healthy file
+        // with one bad entry.
+        assert!(matches!(
+            split_top_level_array("[{]]"),
+            Err(JsonError::UnexpectedChar(_, _))
+        ));
+        assert!(matches!(
+            split_top_level_array(r#"[{"a": [1}]"#),
+            Err(JsonError::UnexpectedChar(_, _))
+        ));
+        // Nesting parse_json refuses as TooDeep is refused here too.
+        let deep = format!("[{}1{}]", "[".repeat(200), "]".repeat(200));
+        assert!(parse_json(&deep).is_err());
+        assert!(matches!(split_top_level_array(&deep), Err(JsonError::TooDeep(_))));
         // Scalar elements get the same missing-comma detection as
         // strings and objects.
         assert!(matches!(split_top_level_array("[1 2]"), Err(JsonError::UnexpectedChar(_, _))));
