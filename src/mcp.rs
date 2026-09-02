@@ -259,12 +259,16 @@ pub fn handle_request(manager: &mut PlatformManager, request: &McpRequest) -> Mc
     // list reads as a filtered result.
     // Null counts as "not set" here exactly as parse_request and
     // run_id_param treat it — a direct handle_request caller passing
-    // Null must not be told the tool "takes no parameters".
-    let params_absent = match &request.params {
-        JsonValue::Null => true,
-        JsonValue::Object(pairs) => pairs.is_empty(),
-        _ => false,
+    // Null must not be told the tool "takes no parameters" — and the
+    // parameter-taking tools must treat a direct caller's Null exactly
+    // as the wire path does (parse_request maps null to {}), so
+    // normalize ONCE for every tool.
+    let empty = JsonValue::Object(vec![]);
+    let params = match &request.params {
+        JsonValue::Null => &empty,
+        other => other,
     };
+    let params_absent = matches!(params, JsonValue::Object(pairs) if pairs.is_empty());
     if matches!(
         request.tool.as_str(),
         "tool_list" | "test_summary" | "test_list_tags" | "test_list_groups"
@@ -278,10 +282,10 @@ pub fn handle_request(manager: &mut PlatformManager, request: &McpRequest) -> Mc
     match request.tool.as_str() {
         "tool_list" => handle_tool_list(),
         "test_summary" => handle_summary(manager),
-        "test_discover" => handle_discover(manager, &request.params),
-        "test_run" => handle_run(manager, &request.params),
-        "test_progress" => handle_progress(manager, &request.params),
-        "test_results" => handle_results(manager, &request.params),
+        "test_discover" => handle_discover(manager, params),
+        "test_run" => handle_run(manager, params),
+        "test_progress" => handle_progress(manager, params),
+        "test_results" => handle_results(manager, params),
         "test_list_tags" => handle_list_tags(manager),
         "test_list_groups" => handle_list_groups(manager),
         _ => McpResponse::err(&format!("Unknown tool: '{}'", request.tool)),
@@ -866,12 +870,23 @@ mod tests {
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(true));
         // ...including a DIRECT handle_request call with Null params —
-        // the two public entry points must agree that null means unset.
+        // the two public entry points must agree that null means unset,
+        // for parameter-less AND parameter-taking tools alike.
         let direct = handle_request(
             &mut mgr,
             &McpRequest { tool: "test_summary".into(), params: JsonValue::Null },
         );
         assert!(direct.success);
+        let direct = handle_request(
+            &mut mgr,
+            &McpRequest { tool: "test_progress".into(), params: JsonValue::Null },
+        );
+        assert!(direct.success, "null params must list active runs, not error");
+        let direct = handle_request(
+            &mut mgr,
+            &McpRequest { tool: "test_run".into(), params: JsonValue::Null },
+        );
+        assert!(direct.success, "null params must run the default config");
     }
 
     #[test]

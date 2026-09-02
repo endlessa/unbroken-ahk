@@ -121,9 +121,12 @@ impl TestRegistry for InMemoryRegistry {
     }
 
     fn filter_by_tags(&self, tags: &[String]) -> Vec<&TestDefinition> {
+        // The ONE shared all-tags predicate — a private copy here could
+        // silently drift from what run selection and its zero-match
+        // validation use.
         self.tests
             .iter()
-            .filter(|t| tags.iter().all(|tag| t.tags.contains(tag)))
+            .filter(|t| crate::filter::matches_all_tags(tags, t))
             .collect()
     }
 

@@ -94,7 +94,7 @@ Commands (aliases in parentheses; every value-taking flag also accepts
   discover (search, find)          List all tests
   discover <pattern>               Search tests by name pattern (globs: a*, *b, a*b)
   discover --pattern <p> (-p)      Same; use --pattern=<p> if it starts with '-'
-  discover --tag <tag> (-t)        Filter tests by tag (repeatable)
+  discover --tag <tag> (-t)        Filter by tag (repeat = must carry ALL)
   discover --group <group> (-g)    Filter tests by group
   discover --limit <n> (-l)        Show at most n matches
   tags                             List all available tags
@@ -102,7 +102,7 @@ Commands (aliases in parentheses; every value-taking flag also accepts
   run (execute, start)             Run all tests
   run --all (-a)                   Run everything explicitly (the default when
                                    no include flags are given)
-  run --tag <tag> (-t)             Run tests matching a tag (repeatable)
+  run --tag <tag> (-t)             Run by tag (repeat = must carry ALL)
   run --id <id1> <id2> ...         Run specific tests by ID
   run --exclude <tag> (-e)         Skip tests with a tag (combines with above)
   run --pattern <pattern> (-p)     Run tests matching a name pattern
