@@ -257,10 +257,18 @@ pub fn handle_request(manager: &mut PlatformManager, request: &McpRequest) -> Mc
     // handler rejects unknown keys: {"tool": "test_list_tags",
     // "params": {"group": "auth"}} answered with the FULL unfiltered
     // list reads as a filtered result.
+    // Null counts as "not set" here exactly as parse_request and
+    // run_id_param treat it — a direct handle_request caller passing
+    // Null must not be told the tool "takes no parameters".
+    let params_absent = match &request.params {
+        JsonValue::Null => true,
+        JsonValue::Object(pairs) => pairs.is_empty(),
+        _ => false,
+    };
     if matches!(
         request.tool.as_str(),
         "tool_list" | "test_summary" | "test_list_tags" | "test_list_groups"
-    ) && !matches!(&request.params, JsonValue::Object(pairs) if pairs.is_empty())
+    ) && !params_absent
     {
         return McpResponse::err(&format!(
             "'{}' takes no parameters (use test_discover to filter tests)",
@@ -857,6 +865,13 @@ mod tests {
         let resp = execute_mcp(&mut mgr, r#"{"tool": "test_list_tags", "params": null}"#);
         let val = parse_json(&resp).unwrap();
         assert_eq!(val.get_bool("success"), Some(true));
+        // ...including a DIRECT handle_request call with Null params —
+        // the two public entry points must agree that null means unset.
+        let direct = handle_request(
+            &mut mgr,
+            &McpRequest { tool: "test_summary".into(), params: JsonValue::Null },
+        );
+        assert!(direct.success);
     }
 
     #[test]

@@ -709,7 +709,18 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
                     match b {
                         b'"' => in_string = true,
                         b'[' | b'{' => {
-                            if stack.len() >= MAX_DEPTH - 1 {
+                            // MAX_DEPTH - 2: the outer array is one
+                            // parse_value level and the innermost VALUE
+                            // inside the deepest bracket is another, so
+                            // an element's bracket chain must stop two
+                            // short of the parser's limit. Conservative
+                            // in the safe direction: a content-free
+                            // bracket chain at the exact boundary is
+                            // refused here even though parse_json would
+                            // squeak it through — file-level TooDeep for
+                            // a pathological file beats calling healthy
+                            // a file the parser rejects.
+                            if stack.len() >= MAX_DEPTH - 2 {
                                 return Err(JsonError::TooDeep(pos));
                             }
                             stack.push(b);
@@ -733,8 +744,8 @@ pub fn split_top_level_array(input: &str) -> Result<Vec<&str>, JsonError> {
             // Never empty: start points at a verified value-starter byte
             // (trailing/doubled commas already errored at the check
             // above), so only trailing whitespace needs trimming.
-            let piece =
-                input[start..end].trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+            let piece = input[start..end]
+                .trim_matches(|c: char| c.is_ascii() && is_json_whitespace(c as u8));
             elements.push(piece);
             let closed = bytes[end] == b']';
             pos = end + 1;
@@ -864,10 +875,18 @@ mod tests {
             split_top_level_array(r#"[{"a": [1}]"#),
             Err(JsonError::UnexpectedChar(_, _))
         ));
-        // Nesting parse_json refuses as TooDeep is refused here too.
+        // Nesting parse_json refuses as TooDeep is refused here too —
+        // including exactly at the boundary the parser enforces.
         let deep = format!("[{}1{}]", "[".repeat(200), "]".repeat(200));
         assert!(parse_json(&deep).is_err());
         assert!(matches!(split_top_level_array(&deep), Err(JsonError::TooDeep(_))));
+        let boundary = format!("[{}1{}]", "[".repeat(127), "]".repeat(127));
+        assert!(parse_json(&boundary).is_err(), "parser should reject depth-127 element");
+        assert!(split_top_level_array(&boundary).is_err());
+        // Comfortably inside the limit, both accept.
+        let fine = format!("[{}1{}]", "[".repeat(100), "]".repeat(100));
+        assert!(parse_json(&fine).is_ok());
+        assert!(split_top_level_array(&fine).is_ok());
         // Scalar elements get the same missing-comma detection as
         // strings and objects.
         assert!(matches!(split_top_level_array("[1 2]"), Err(JsonError::UnexpectedChar(_, _))));
