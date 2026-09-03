@@ -922,11 +922,22 @@ fn call_builtin_module(
             let meshes: Vec<Mesh> = groups.iter().map(|g| combine_group(g).0).collect();
             leaf_colored(csg::intersection_all(&meshes), color)
         }
-        "hull" | "minkowski" => {
-            ctx.out.warnings.push(format!(
-                "{}() is not implemented yet — children are shown un-combined",
-                name
-            ));
+        "hull" => {
+            let groups = eval_children_grouped(children, scope, ctx);
+            if groups.is_empty() {
+                return Vec::new();
+            }
+            // hull() discards children colors; a color() wrapping the hull
+            // itself still applies via the nearest-color rule. Keep the
+            // first child's color as a sensible representative.
+            let color = groups.iter().flatten().find_map(|s| s.color);
+            let meshes: Vec<Mesh> = groups.into_iter().flatten().map(|s| s.mesh).collect();
+            leaf_colored(csg::hull(&meshes), color)
+        }
+        "minkowski" => {
+            ctx.out.warnings.push(
+                "minkowski() is not implemented yet — children are shown un-combined".into(),
+            );
             exec_scope(children, scope, ctx)
         }
         "children" => instantiate_children(bound.get("index"), ctx),
@@ -3010,6 +3021,10 @@ mod tests {
         // (commutative), matching strict set semantics.
         assert!(run("intersection() { cube(5); if (false) sphere(1); }").shapes.is_empty());
         assert!(run("intersection() { if (false) sphere(1); cube(5); }").shapes.is_empty());
+        // hull() convexifies the combined children into one solid.
+        let out = run("hull() { translate([-8,0,0]) sphere(2, $fn=12); translate([8,0,0]) sphere(2, $fn=12); }");
+        assert_eq!(out.shapes.len(), 1);
+        assert!(total_volume(&out) > 0.0);
     }
 
     #[test]

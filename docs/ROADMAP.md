@@ -4,7 +4,7 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 3 core (2026-09-02): **117 full / 9 partial / 57
+Standing after phase 3 + hull (2026-09-03): **118 full / 9 partial / 56
 untouched — 64% full, 69% touched.**
 
 Ground rules (from the project owner, non-negotiable):
@@ -50,8 +50,10 @@ csg.rs`; Thibault & Naylor 1987 — clean-room, no CGAL). `union`/`group`
 stay preview concatenation (faithful to the reference's F5 preview),
 with the exact union used internally to combine multi-shape operands.
 
+Also done: `hull` — a from-scratch incremental 3D convex hull
+(`convex_hull` in csg.rs), degenerate point sets → empty.
+
 Still open in this phase:
-- `hull` (3D convex hull — quickhull/incremental)
 - `minkowski` (convex decomposition; hull-of-sums for convex operands)
 - Preview-vs-render niceties (`render()`, `convexity`, 2-manifold
   export warnings) — mostly observable-surface, low priority

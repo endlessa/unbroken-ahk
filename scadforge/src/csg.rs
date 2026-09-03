@@ -518,6 +518,170 @@ pub fn intersection_all(meshes: &[Mesh]) -> Mesh {
     reduce_pairwise(meshes.to_vec(), || Op::Intersection)
 }
 
+// ---------------------------------------------------------------------------
+// Convex hull (hull())
+
+/// The convex hull of every vertex of every child mesh (the reference's
+/// hull() over the children's TESSELLATED vertices — so $fn on curved
+/// children shapes the hull). Holes, concavities, and colors of the
+/// children are discarded by construction. A degenerate point set (fewer
+/// than 4 non-coplanar points) has no 3D volume and yields an empty mesh.
+pub fn hull(meshes: &[Mesh]) -> Mesh {
+    let mut pts: Vec<V3> = Vec::new();
+    for m in meshes {
+        pts.extend(m.positions.iter().cloned());
+    }
+    convex_hull(&pts)
+}
+
+/// A hull face: point indices in outward-CCW order, plus its plane.
+struct Face {
+    v: [usize; 3],
+    normal: V3,
+    w: f64,
+}
+
+/// Incremental 3D convex hull. Correct-by-construction for clean point
+/// sets; preview-grade (fixed epsilon) for near-degenerate ones.
+fn convex_hull(pts: &[V3]) -> Mesh {
+    if pts.len() < 4 {
+        return Mesh::empty();
+    }
+    // Seed tetrahedron: extremes that are pairwise non-degenerate.
+    let i0 = 0;
+    // farthest from p0
+    let i1 = match (0..pts.len())
+        .max_by(|&a, &b| {
+            dist2(pts[i0], pts[a]).partial_cmp(&dist2(pts[i0], pts[b])).unwrap()
+        }) {
+        Some(i) if dist2(pts[i0], pts[i]) > EPS * EPS => i,
+        _ => return Mesh::empty(), // all coincident
+    };
+    // farthest from the line p0-p1
+    let i2 = match (0..pts.len())
+        .max_by(|&a, &b| {
+            line_dist2(pts[i0], pts[i1], pts[a])
+                .partial_cmp(&line_dist2(pts[i0], pts[i1], pts[b]))
+                .unwrap()
+        }) {
+        Some(i) if line_dist2(pts[i0], pts[i1], pts[i]) > EPS * EPS => i,
+        _ => return Mesh::empty(), // all collinear
+    };
+    // farthest from the plane p0-p1-p2
+    let base = Plane::from_points(pts[i0], pts[i1], pts[i2]);
+    let base = match base {
+        Some(p) => p,
+        None => return Mesh::empty(),
+    };
+    let i3 = match (0..pts.len())
+        .max_by(|&a, &b| {
+            (dot(base.normal, pts[a]) - base.w)
+                .abs()
+                .partial_cmp(&(dot(base.normal, pts[b]) - base.w).abs())
+                .unwrap()
+        }) {
+        Some(i) if (dot(base.normal, pts[i]) - base.w).abs() > EPS => i,
+        _ => return Mesh::empty(), // all coplanar → no 3D volume
+    };
+
+    // Interior reference point: the seed tetra's centroid stays inside
+    // the growing hull, so every face is oriented to point away from it.
+    let interior = [
+        (pts[i0][0] + pts[i1][0] + pts[i2][0] + pts[i3][0]) / 4.0,
+        (pts[i0][1] + pts[i1][1] + pts[i2][1] + pts[i3][1]) / 4.0,
+        (pts[i0][2] + pts[i1][2] + pts[i2][2] + pts[i3][2]) / 4.0,
+    ];
+    let mut faces: Vec<Face> = Vec::new();
+    for tri in [[i0, i1, i2], [i0, i1, i3], [i0, i2, i3], [i1, i2, i3]] {
+        faces.push(make_face(pts, tri, interior));
+    }
+
+    for (pi, &p) in pts.iter().enumerate() {
+        if pi == i0 || pi == i1 || pi == i2 || pi == i3 {
+            continue;
+        }
+        // Faces this point can "see" (lies in front of).
+        let visible: Vec<bool> =
+            faces.iter().map(|f| dot(f.normal, p) - f.w > EPS).collect();
+        if !visible.iter().any(|&v| v) {
+            continue; // inside the current hull
+        }
+        // Horizon = directed edges of visible faces whose reverse is not
+        // also a visible-face edge (i.e. the boundary with the kept part).
+        let mut vis_edges: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+        for (fi, f) in faces.iter().enumerate() {
+            if visible[fi] {
+                vis_edges.insert((f.v[0], f.v[1]));
+                vis_edges.insert((f.v[1], f.v[2]));
+                vis_edges.insert((f.v[2], f.v[0]));
+            }
+        }
+        let horizon: Vec<(usize, usize)> = vis_edges
+            .iter()
+            .filter(|&&(a, b)| !vis_edges.contains(&(b, a)))
+            .cloned()
+            .collect();
+        // Drop visible faces, then cap the horizon with the new point.
+        let mut kept: Vec<Face> = Vec::new();
+        for (fi, f) in faces.drain(..).enumerate() {
+            if !visible[fi] {
+                kept.push(f);
+            }
+        }
+        faces = kept;
+        for (a, b) in horizon {
+            faces.push(make_face(pts, [a, b, pi], interior));
+        }
+    }
+
+    // Emit the faces, compacting to the used vertices.
+    let mut positions = Vec::new();
+    let mut remap: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut tris = Vec::new();
+    for f in &faces {
+        let mut idx = [0u32; 3];
+        for (k, &vi) in f.v.iter().enumerate() {
+            idx[k] = *remap.entry(vi).or_insert_with(|| {
+                positions.push(pts[vi]);
+                (positions.len() - 1) as u32
+            });
+        }
+        tris.push(idx);
+    }
+    Mesh { positions, tris }
+}
+
+fn make_face(pts: &[V3], tri: [usize; 3], interior: V3) -> Face {
+    let n = cross(sub(pts[tri[1]], pts[tri[0]]), sub(pts[tri[2]], pts[tri[0]]));
+    let n = norm(n);
+    let w = dot(n, pts[tri[0]]);
+    // Orient outward: the interior point must be behind the plane.
+    if dot(n, interior) - w > 0.0 {
+        Face { v: [tri[0], tri[2], tri[1]], normal: [-n[0], -n[1], -n[2]], w: -w }
+    } else {
+        Face { v: tri, normal: n, w }
+    }
+}
+
+fn dist2(a: V3, b: V3) -> f64 {
+    let d = sub(a, b);
+    dot(d, d)
+}
+
+/// Squared distance from point p to the line through a and b.
+fn line_dist2(a: V3, b: V3, p: V3) -> f64 {
+    let ab = sub(b, a);
+    let ap = sub(p, a);
+    let c = cross(ab, ap);
+    let denom = dot(ab, ab);
+    if denom < EPS * EPS {
+        dot(ap, ap)
+    } else {
+        dot(c, c) / denom
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +784,54 @@ mod tests {
         assert!(intersection_all(&[a.clone(), empty.clone()]).positions.is_empty());
         assert!(intersection_all(&[empty.clone(), a.clone()]).positions.is_empty());
         assert!(intersection_all(&[a.clone(), empty, a.clone()]).positions.is_empty());
+    }
+
+    #[test]
+    fn convex_hull_matches_known_solids() {
+        // Hull of the 8 cube corners is the cube itself: volume = side^3.
+        let cube = geom::cube([2.0, 2.0, 2.0], true);
+        let h = hull(&[cube]);
+        assert!((signed_volume(&h).abs() - 8.0).abs() < 1e-6, "vol {}", signed_volume(&h));
+        // Hull is convex: every original vertex lies on or behind every
+        // output face plane (no point pokes outside).
+        let (lo, hi) = bounds(&h);
+        assert!((lo[0] + 1.0).abs() < 1e-9 && (hi[0] - 1.0).abs() < 1e-9);
+
+        // Hull of two separated spheres is bigger than one sphere and
+        // spans both (a convex "capsule"-ish blob).
+        let s1 = geom::sphere(3.0, 16);
+        let mut s2 = geom::sphere(3.0, 16);
+        for p in &mut s2.positions {
+            p[0] += 12.0;
+        }
+        let h = hull(&[s1.clone(), s2]);
+        assert!(signed_volume(&h).abs() > signed_volume(&s1).abs());
+        let (lo, hi) = bounds(&h);
+        assert!(lo[0] < -2.9 && hi[0] > 14.9, "spans both: {:?}..{:?}", lo, hi);
+
+        // Hull of a concave L (two boxes sharing a corner at the origin)
+        // fills the notch → convex, so its volume exceeds the L's own.
+        let arm = geom::cube([6.0, 2.0, 2.0], false);
+        let leg = geom::cube([2.0, 6.0, 2.0], false);
+        let filled = hull(&[arm, leg]);
+        let l_volume = 6.0 * 2.0 * 2.0 + 2.0 * 6.0 * 2.0 - 2.0 * 2.0 * 2.0; // minus shared corner
+        assert!(signed_volume(&filled).abs() > l_volume);
+    }
+
+    #[test]
+    fn degenerate_hull_is_empty() {
+        // Four coplanar points (a flat square, z=0) have no 3D volume.
+        let flat = Mesh {
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            tris: vec![[0, 1, 2], [0, 2, 3]],
+        };
+        assert!(hull(&[flat]).positions.is_empty());
+        assert!(hull(&[]).positions.is_empty());
     }
 
     #[test]

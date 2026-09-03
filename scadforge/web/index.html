@@ -76,6 +76,14 @@ difference() {
   cylinder(h = 6, r = 8, center = true);
   cylinder(h = 7, r = 5, center = true);
 }
+
+// hull: the convex wrap of four spheres becomes a rounded slab
+color("orange")
+translate([-24, 26, 2])
+hull() {
+  for (p = [[-6,-4], [6,-4], [6,4], [-6,4]])
+    translate([p[0], p[1], 0]) sphere(r = 2.5);
+}
 </textarea>
     <div id="messages"><span class="ok">ready.</span></div>
   </div>
