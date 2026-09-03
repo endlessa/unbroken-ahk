@@ -133,6 +133,80 @@ pub fn rotation_axis(deg: f64, v: Vec3) -> Mat4 {
     ]
 }
 
+/// mirror(v): Householder reflection M = I - 2·n·nᵀ/|n|² across the plane
+/// through the origin with normal v. A zero/non-finite normal cannot be
+/// normalized and yields identity (the caller warns), so children pass
+/// through unreflected. Determinant is -1, so apply() rewinds faces.
+pub fn mirror(v: Vec3) -> Mat4 {
+    let n2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    if !(n2 > 0.0) || !n2.is_finite() {
+        return identity();
+    }
+    let mut m = identity();
+    for i in 0..3 {
+        for j in 0..3 {
+            let kron = if i == j { 1.0 } else { 0.0 };
+            m[i][j] = kron - 2.0 * v[i] * v[j] / n2;
+        }
+    }
+    m
+}
+
+/// multmatrix(m): build the affine matrix from row-major nested lists.
+/// Only the top three rows matter (column-vector convention, translation
+/// in the last column); a supplied 4th row is ignored (no projective
+/// divide), and missing/short rows are filled from the identity.
+pub fn matrix_from_rows(rows: &[Vec<f64>]) -> Mat4 {
+    let mut m = identity();
+    for (i, row) in rows.iter().enumerate().take(3) {
+        for (j, &val) in row.iter().enumerate().take(4) {
+            m[i][j] = val;
+        }
+    }
+    m
+}
+
+/// polyhedron(points, faces): build the mesh exactly as given — no vertex
+/// merging or validation beyond index checks. Faces with >3 vertices are
+/// fan-triangulated. The reference winds faces CW-from-outside; our meshes
+/// are CCW-from-outside, so each fan triangle is reversed. Returns the
+/// mesh plus any per-face warnings.
+pub fn polyhedron(points: &[Vec3], faces: &[Vec<usize>]) -> (Mesh, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut tris = Vec::new();
+    for face in faces {
+        if face.len() < 3 {
+            warnings.push("polyhedron: face with fewer than 3 vertices ignored".into());
+            continue;
+        }
+        if let Some(&bad) = face.iter().find(|&&i| i >= points.len()) {
+            warnings.push(format!("polyhedron: point index {} out of bounds; face dropped", bad));
+            continue;
+        }
+        for k in 1..face.len() - 1 {
+            // Reversed fan (face[0], face[k+1], face[k]) → CCW outward.
+            tris.push([face[0] as u32, face[k + 1] as u32, face[k] as u32]);
+        }
+    }
+    (Mesh { positions: points.to_vec(), tris }, warnings)
+}
+
+/// Axis-aligned bounding box of a mesh's vertices (None if empty).
+pub fn bounds(mesh: &Mesh) -> Option<([f64; 3], [f64; 3])> {
+    if mesh.positions.is_empty() {
+        return None;
+    }
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in &mesh.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    Some((lo, hi))
+}
+
 pub fn apply(m: &Mat4, mesh: &mut Mesh) {
     for p in &mut mesh.positions {
         let (x, y, z) = (p[0], p[1], p[2]);

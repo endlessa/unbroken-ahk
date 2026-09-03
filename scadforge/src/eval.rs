@@ -881,6 +881,88 @@ fn call_builtin_module(
             };
             transform_children(children, scope, ctx, matrix)
         }
+        "mirror" => {
+            let matrix = match bound.get("v").and_then(Value::as_vec3) {
+                Some([0.0, 0.0, 0.0]) => {
+                    ctx.out.warnings.push("mirror: v must not be the zero vector".into());
+                    Some(geom::identity()) // pass children through
+                }
+                Some(v) => Some(geom::mirror(v)),
+                None => {
+                    ctx.out.warnings.push("mirror: v must be a vector like [x, y, z]".into());
+                    None
+                }
+            };
+            transform_children(children, scope, ctx, matrix)
+        }
+        "multmatrix" => {
+            let matrix = match bound.get("m") {
+                Some(Value::Vector(rows)) => match matrix_rows_f64(rows) {
+                    Some(rows) => {
+                        let m = geom::matrix_from_rows(&rows);
+                        // Non-finite matrices drop the subtree (reference).
+                        if m.iter().flatten().all(|v| v.is_finite()) {
+                            Some(m)
+                        } else {
+                            ctx.out.warnings.push(
+                                "multmatrix: matrix contains NaN/Infinity — subtree removed"
+                                    .into(),
+                            );
+                            None
+                        }
+                    }
+                    None => {
+                        ctx.out
+                            .warnings
+                            .push("multmatrix: m must be a list of numeric rows".into());
+                        None
+                    }
+                },
+                _ => {
+                    ctx.out.warnings.push("multmatrix: m must be a 4x4 (or 3x4) matrix".into());
+                    None
+                }
+            };
+            transform_children(children, scope, ctx, matrix)
+        }
+        "resize" => {
+            let mut shapes = exec_scope(children, scope, ctx);
+            let newsize = bound.get("newsize").and_then(Value::as_vec3);
+            match newsize {
+                Some(newsize) => {
+                    if let Some(m) = resize_matrix(&shapes, newsize, bound.get("auto")) {
+                        for s in &mut shapes {
+                            geom::apply(&m, &mut s.mesh);
+                        }
+                    }
+                    shapes
+                }
+                None => {
+                    ctx.out
+                        .warnings
+                        .push("resize: newsize must be a vector like [x, y, z]".into());
+                    shapes
+                }
+            }
+        }
+        "polyhedron" => {
+            let points = bound.get("points").and_then(vec3_list);
+            let faces = bound.get("faces").and_then(index_lists);
+            match (points, faces) {
+                (Some(points), Some(faces)) => {
+                    let (mesh, warnings) = geom::polyhedron(&points, &faces);
+                    ctx.out.warnings.extend(warnings);
+                    no_children(name, children, ctx);
+                    leaf(mesh)
+                }
+                _ => {
+                    ctx.out
+                        .warnings
+                        .push("polyhedron: expected points=[[x,y,z],...] and faces=[[i,...],...]".into());
+                    Vec::new()
+                }
+            }
+        }
         "color" => {
             let rgba = parse_color(bound.get("c"), bound.get("alpha"), ctx);
             let mut shapes = exec_scope(children, scope, ctx);
@@ -1108,6 +1190,104 @@ fn eval_children_grouped(children: &[Stmt], parent: &Rc<Scope>, ctx: &mut Ctx) -
     groups
 }
 
+/// A matrix's rows as f64 (each row a Value::Vector of numbers).
+fn matrix_rows_f64(rows: &[Value]) -> Option<Vec<Vec<f64>>> {
+    rows.iter()
+        .map(|r| match r {
+            Value::Vector(cells) => cells.iter().map(Value::as_num).collect::<Option<Vec<f64>>>(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A list of 3-vectors (polyhedron points); shorter vectors zero-fill.
+fn vec3_list(v: &Value) -> Option<Vec<geom::Vec3>> {
+    match v {
+        Value::Vector(items) => items.iter().map(|p| p.as_vec3()).collect(),
+        _ => None,
+    }
+}
+
+/// A list of index lists (polyhedron faces). Invalid indices (negative,
+/// non-finite, non-numeric) become usize::MAX so polyhedron's bounds
+/// check drops just that face; a non-vector face becomes empty (dropped).
+fn index_lists(v: &Value) -> Option<Vec<Vec<usize>>> {
+    match v {
+        Value::Vector(faces) => Some(
+            faces
+                .iter()
+                .map(|f| match f {
+                    Value::Vector(idxs) => idxs
+                        .iter()
+                        .map(|i| match i.as_num() {
+                            Some(n) if n.is_finite() && n >= 0.0 => n.trunc() as usize,
+                            _ => usize::MAX,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// resize's per-axis `auto` flags: a bool applies to all three axes, a
+/// vector gives them per-axis.
+fn resize_auto_flags(auto: Option<&Value>) -> [bool; 3] {
+    match auto {
+        Some(Value::Bool(b)) => [*b; 3],
+        Some(Value::Vector(items)) => {
+            let mut f = [false; 3];
+            for (k, it) in items.iter().take(3).enumerate() {
+                f[k] = matches!(it, Value::Bool(true));
+            }
+            f
+        }
+        _ => [false; 3],
+    }
+}
+
+/// resize(newsize, auto): measure the evaluated child bounding box, derive
+/// per-axis factors (newsize/bbox where newsize != 0 and the box is
+/// non-degenerate), fill 1 elsewhere, and share the first specified factor
+/// into auto axes. The result is a plain scale about the origin.
+fn resize_matrix(shapes: &[Shape], newsize: [f64; 3], auto: Option<&Value>) -> Option<geom::Mat4> {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for s in shapes {
+        if let Some((l, h)) = geom::bounds(&s.mesh) {
+            for k in 0..3 {
+                lo[k] = lo[k].min(l[k]);
+                hi[k] = hi[k].max(h[k]);
+            }
+        }
+    }
+    if !lo[0].is_finite() {
+        return None; // no geometry to measure
+    }
+    let size = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    let mut factor = [1.0f64; 3];
+    for k in 0..3 {
+        // A zero-size axis is left unchanged (guarded division, no inf).
+        if newsize[k] != 0.0 && size[k] > 0.0 {
+            factor[k] = newsize[k] / size[k];
+        }
+    }
+    let auto3 = resize_auto_flags(auto);
+    let specified: Vec<usize> = (0..3).filter(|&k| newsize[k] != 0.0 && size[k] > 0.0).collect();
+    // Auto axes share the first explicitly-specified factor (a documented
+    // choice for the reference's unpinned multi-axis auto rule).
+    if let Some(&first) = specified.first() {
+        for k in 0..3 {
+            if auto3[k] && !specified.contains(&k) {
+                factor[k] = factor[first];
+            }
+        }
+    }
+    Some(geom::scaling(factor))
+}
+
 fn transform_children(
     children: &[Stmt],
     scope: &Rc<Scope>,
@@ -1134,8 +1314,11 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         "cube" => &["size", "center"],
         "sphere" => &["r"],
         "cylinder" => &["h", "r1", "r2", "center"],
-        "translate" | "scale" => &["v"],
+        "translate" | "scale" | "mirror" => &["v"],
         "rotate" => &["a", "v"],
+        "multmatrix" => &["m"],
+        "resize" => &["newsize", "auto"],
+        "polyhedron" => &["points", "faces", "convexity"],
         "color" => &["c", "alpha"],
         "children" | "child" => &["index"],
         _ => &[],
@@ -3067,6 +3250,52 @@ mod tests {
         // A bare hull() with a colored child stays uncolored (color dropped).
         let out = run("hull() { color(\"blue\") cube(1); translate([3,0,0]) cube(1); }");
         assert_eq!(out.shapes[0].color, None);
+    }
+
+    #[test]
+    fn phase4_3d_transforms_and_polyhedron() {
+        // mirror across X: a box at +X lands at -X (winding stays outward,
+        // so signed volume stays positive).
+        let out = run("mirror([1,0,0]) translate([5,0,0]) cube(2);");
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes[0].mesh.positions.iter().all(|p| p[0] <= 0.001));
+        assert!(total_volume(&out) > 0.0, "mirror must keep outward winding");
+        // Two nested mirrors with the same normal are identity.
+        let a = run("mirror([1,0,0]) mirror([1,0,0]) translate([5,0,0]) cube(1);");
+        assert!(a.shapes[0].mesh.positions.iter().all(|p| p[0] >= 4.999));
+        // zero normal → warn + identity (children pass through).
+        let z = run("mirror([0,0,0]) cube(1);");
+        assert_eq!(z.shapes.len(), 1);
+        assert!(z.warnings.iter().any(|w| w.contains("mirror")));
+
+        // multmatrix as a plain translate (translation in last column).
+        let out = run("multmatrix([[1,0,0,10],[0,1,0,0],[0,0,1,0],[0,0,0,1]]) cube(2);");
+        assert!(out.shapes[0].mesh.positions.iter().all(|p| p[0] >= 9.999));
+        // 3-row form is accepted (bottom row implied); a bogus 4th "perspective"
+        // row must have no effect.
+        let three = run("multmatrix([[2,0,0,0],[0,1,0,0],[0,0,1,0]]) cube(1);");
+        assert!(three.shapes[0].mesh.positions.iter().any(|p| (p[0] - 2.0).abs() < 1e-9));
+
+        // resize to a target bounding box.
+        let out = run("resize([10,0,0]) cube(2);"); // x:2→10, y/z unchanged
+        let (lo, hi) = geom::bounds(&out.shapes[0].mesh).unwrap();
+        assert!((hi[0] - lo[0] - 10.0).abs() < 1e-9);
+        assert!((hi[1] - lo[1] - 2.0).abs() < 1e-9);
+        // auto shares the first specified factor into zero axes.
+        let out = run("resize([10,0,0], auto=true) cube(2);");
+        let (lo, hi) = geom::bounds(&out.shapes[0].mesh).unwrap();
+        assert!((hi[1] - lo[1] - 10.0).abs() < 1e-6, "auto should scale y by 5x too");
+
+        // polyhedron: a unit tetrahedron built by hand.
+        let tet = run(
+            "polyhedron(points=[[0,0,0],[1,0,0],[0,1,0],[0,0,1]], \
+             faces=[[0,1,2],[0,3,1],[0,2,3],[1,3,2]]);",
+        );
+        assert_eq!(tet.shapes.len(), 1);
+        assert!((total_volume(&tet) - 1.0 / 6.0).abs() < 1e-9, "vol {}", total_volume(&tet));
+        // Out-of-bounds face index drops that face with a warning.
+        let bad = run("polyhedron(points=[[0,0,0],[1,0,0],[0,1,0]], faces=[[0,1,2],[0,1,9]]);");
+        assert!(bad.warnings.iter().any(|w| w.contains("out of bounds")));
     }
 
     #[test]
