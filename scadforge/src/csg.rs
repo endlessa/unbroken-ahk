@@ -169,6 +169,55 @@ fn split_polygon(
     }
 }
 
+/// Classify one polygon against a plane for balance scoring (front,
+/// back, and whether it spans).
+fn classify(plane: &Plane, poly: &Polygon) -> u8 {
+    let mut t = 0u8;
+    for v in &poly.verts {
+        let d = dot(plane.normal, *v) - plane.w;
+        t |= if d < -EPS {
+            BACK
+        } else if d > EPS {
+            FRONT
+        } else {
+            COPLANAR
+        };
+    }
+    t
+}
+
+/// Pick a split plane that balances the polygon set and minimizes splits.
+/// Any plane is correct for the BSP-merge algorithm; this only governs
+/// depth and cost, so a bounded sample of candidate planes is enough.
+fn choose_plane(polygons: &[Polygon]) -> Plane {
+    const MAX_CANDIDATES: usize = 24;
+    const SPLIT_WEIGHT: f64 = 8.0; // a split is costlier than mild imbalance
+    let n = polygons.len();
+    let step = (n / MAX_CANDIDATES).max(1);
+    let mut best = polygons[0].plane.clone();
+    let mut best_score = f64::INFINITY;
+    let mut i = 0;
+    while i < n {
+        let plane = &polygons[i].plane;
+        let (mut front, mut back, mut splits) = (0i64, 0i64, 0i64);
+        for p in polygons {
+            match classify(plane, p) {
+                FRONT => front += 1,
+                BACK => back += 1,
+                SPANNING => splits += 1,
+                _ => {} // coplanar: stays at this node, no imbalance
+            }
+        }
+        let score = splits as f64 * SPLIT_WEIGHT + (front - back).abs() as f64;
+        if score < best_score {
+            best_score = score;
+            best = plane.clone();
+        }
+        i += step;
+    }
+    best
+}
+
 /// A BSP tree node. `plane` splits space; `polygons` are the coplanar
 /// facets stored at this node.
 struct Node {
@@ -195,7 +244,12 @@ impl Node {
             return;
         }
         if self.plane.is_none() {
-            self.plane = Some(polygons[0].plane.clone());
+            // Choosing polygons[0].plane unconditionally makes the tree
+            // degenerate to a triangle-count-deep list on a convex solid
+            // (every other face lies behind face 0) — Θ(n) depth, Θ(n²)
+            // build, and native-stack risk on curved primitives. A
+            // balancing heuristic keeps the depth ~O(log n).
+            self.plane = Some(choose_plane(&polygons));
         }
         let plane = self.plane.clone().unwrap();
         let mut coplanar_front = Vec::new();
@@ -344,16 +398,28 @@ enum Op {
 fn boolean(a: &Mesh, b: &Mesh, op: Op) -> Mesh {
     let pa = mesh_to_polygons(a);
     let pb = mesh_to_polygons(b);
-    if pa.is_empty() {
-        // Union/difference of empty-with-B: identity rules handled by the
-        // caller for difference; here union → b, intersection → empty.
+    // Empty-operand identities are per-op: A∪∅=A and ∅∪B=B; A−∅=A and
+    // ∅−B=∅; but A∩∅=∅ AND ∅∩B=∅ (an empty operand annihilates the
+    // intersection — the earlier code wrongly returned A here, making
+    // intersection order-dependent).
+    if pa.is_empty() || pb.is_empty() {
         return match op {
-            Op::Union => b.clone(),
-            _ => Mesh::empty(),
+            Op::Union => {
+                if pa.is_empty() {
+                    b.clone()
+                } else {
+                    a.clone()
+                }
+            }
+            Op::Difference => {
+                if pa.is_empty() {
+                    Mesh::empty()
+                } else {
+                    a.clone()
+                }
+            }
+            Op::Intersection => Mesh::empty(),
         };
-    }
-    if pb.is_empty() {
-        return a.clone();
     }
     let mut a = Node::from(pa);
     let mut b = Node::from(pb);
@@ -397,17 +463,34 @@ fn boolean(a: &Mesh, b: &Mesh, op: Op) -> Mesh {
     polygons_to_mesh(&out)
 }
 
+/// Fold a list of meshes with a boolean op using a BALANCED pairwise
+/// reduction rather than a left fold: a left fold rebuilds the whole
+/// growing accumulator's BSP every step (O(k²) over k operands), whereas
+/// halving keeps each merge between similarly-sized operands.
+fn reduce_pairwise(mut items: Vec<Mesh>, op: fn() -> Op) -> Mesh {
+    if items.is_empty() {
+        return Mesh::empty();
+    }
+    while items.len() > 1 {
+        let mut next = Vec::with_capacity(items.len().div_ceil(2));
+        let mut i = 0;
+        while i + 1 < items.len() {
+            next.push(boolean(&items[i], &items[i + 1], op()));
+            i += 2;
+        }
+        if i < items.len() {
+            next.push(items[i].clone());
+        }
+        items = next;
+    }
+    items.into_iter().next().unwrap()
+}
+
 /// n-ary union of a list of meshes (empty meshes are skipped).
 pub fn union_all(meshes: &[Mesh]) -> Mesh {
-    let mut iter = meshes.iter().filter(|m| !m.positions.is_empty());
-    let mut acc = match iter.next() {
-        Some(m) => m.clone(),
-        None => return Mesh::empty(),
-    };
-    for m in iter {
-        acc = boolean(&acc, m, Op::Union);
-    }
-    acc
+    let items: Vec<Mesh> =
+        meshes.iter().filter(|m| !m.positions.is_empty()).cloned().collect();
+    reduce_pairwise(items, || Op::Union)
 }
 
 /// difference: the first mesh minus the union of the rest.
@@ -422,20 +505,17 @@ pub fn difference(first: &Mesh, rest: &[Mesh]) -> Mesh {
     boolean(first, &cutters, Op::Difference)
 }
 
-/// n-ary intersection: the region common to every mesh.
+/// n-ary intersection: the region common to every mesh. An empty operand
+/// annihilates the result (A ∩ ∅ = ∅), so intersection is commutative.
 pub fn intersection_all(meshes: &[Mesh]) -> Mesh {
-    let mut iter = meshes.iter();
-    let mut acc = match iter.next() {
-        Some(m) => m.clone(),
-        None => return Mesh::empty(),
-    };
-    for m in iter {
-        if acc.positions.is_empty() {
-            return Mesh::empty();
-        }
-        acc = boolean(&acc, m, Op::Intersection);
+    if meshes.is_empty() {
+        return Mesh::empty();
     }
-    acc
+    // Any empty operand makes the whole intersection empty.
+    if meshes.iter().any(|m| m.positions.is_empty()) {
+        return Mesh::empty();
+    }
+    reduce_pairwise(meshes.to_vec(), || Op::Intersection)
 }
 
 #[cfg(test)]
@@ -528,5 +608,46 @@ mod tests {
         assert!((signed_volume(&difference(&a, &[empty.clone()])).abs() - 1.0).abs() < 1e-9);
         // empty minuend → empty
         assert!(difference(&empty, &[a.clone()]).positions.is_empty());
+    }
+
+    #[test]
+    fn intersection_with_empty_is_empty_in_any_order() {
+        // A ∩ ∅ = ∅ regardless of operand order (the panel's confirmed
+        // non-commutativity bug: a non-first empty operand used to be
+        // silently skipped, returning the full first operand).
+        let a = geom::cube([2.0, 2.0, 2.0], true);
+        let empty = Mesh::empty();
+        assert!(intersection_all(&[a.clone(), empty.clone()]).positions.is_empty());
+        assert!(intersection_all(&[empty.clone(), a.clone()]).positions.is_empty());
+        assert!(intersection_all(&[a.clone(), empty, a.clone()]).positions.is_empty());
+    }
+
+    #[test]
+    fn curved_primitive_booleans_stay_shallow_and_correct() {
+        // A hole drilled through a smooth sphere: with the unbalanced BSP
+        // this was a triangle-count-deep tree (Θ(n²) build, stack risk);
+        // with plane balancing it completes quickly and the volume drops.
+        // A sphere with enough facets that the old unbalanced tree would
+        // be hundreds deep; balancing keeps it shallow so this returns
+        // in well under a second instead of the quadratic blow-up.
+        let ball = geom::sphere(10.0, 32);
+        let full = signed_volume(&ball).abs();
+        let drill = geom::cylinder(30.0, 3.0, 3.0, true, 24);
+        let holed = difference(&ball, &[drill]);
+        let holed_vol = signed_volume(&holed).abs();
+        assert!(holed_vol > 0.0 && holed_vol < full, "full {} holed {}", full, holed_vol);
+        // A pairwise-reduced union of several offset spheres completes and
+        // is larger than a single sphere.
+        let many: Vec<Mesh> = (0..6)
+            .map(|i| {
+                let mut s = geom::sphere(2.0, 12);
+                for p in &mut s.positions {
+                    p[0] += i as f64 * 1.2;
+                }
+                s
+            })
+            .collect();
+        let u = union_all(&many);
+        assert!(signed_volume(&u).abs() > signed_volume(&geom::sphere(2.0, 12)).abs());
     }
 }

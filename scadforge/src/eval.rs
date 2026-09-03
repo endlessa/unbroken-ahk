@@ -3006,6 +3006,10 @@ mod tests {
         // Empty minuend → empty result.
         let out = run("difference() { if (false) cube(1); cube(5); }");
         assert!(out.shapes.is_empty());
+        // intersection with an empty child annihilates, in any order
+        // (commutative), matching strict set semantics.
+        assert!(run("intersection() { cube(5); if (false) sphere(1); }").shapes.is_empty());
+        assert!(run("intersection() { if (false) sphere(1); cube(5); }").shapes.is_empty());
     }
 
     #[test]
