@@ -4,11 +4,11 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 4d 2D booleans (2026-09-03): **128 full / 10
-partial / 45 untouched — 70% full, 75% touched.** (Entry count unchanged:
-2D booleans deepen the already-full `difference`/`intersection`/`hull`/
-`minkowski` entries to full 2D+3D fidelity rather than touching new
-entries; `offset` and `projection` remain the untouched 2D pair.)
+Standing after phase 4e offset + projection (2026-09-03): **130 full / 10
+partial / 43 untouched — 71% full, 76% touched.** (offset and projection
+were the last two untouched 2D entries; phase 4d's 2D booleans deepened
+the already-full `difference`/`intersection`/`hull`/`minkowski` entries to
+full 2D+3D fidelity. Only `text()` + its 5 sub-entries remain in phase 4.)
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -86,9 +86,19 @@ Landed (2026-09-03):
   children (so crossing squares extrude to a plus, not a plus with a hole).
   Mixing 2D and 3D children in one boolean warns.
 
+- ✅ `offset` (2D): round (`r`, arc corners from $fn/$fa/$fs), miter and
+  chamfer (`delta`), both signs. Clean-room via Minkowski dilation
+  (region ∪ edge-slabs ∪ convex-corner caps) for positive and the
+  complement identity `erode(P) = B − dilate(B − P)` for negative — so
+  hole-shrink, split-into-islands, and silent annihilation on over-inset
+  all fall out of the union2/difference2 kernel (`csg2::offset2`).
+- ✅ `projection` (3D→2D): `cut = false` silhouette (union of every
+  non-vertical facet's XY shadow, Z ignored) and `cut = true` planar
+  section at z=0 (triangle-plane crossings stitched into contours), with
+  the flatten→re-extrude idiom round-tripping (`csg2::project`).
+
 Remaining:
 
-- `offset` (2D, radial + delta/chamfer), `projection` (3D→2D, cut mode).
 - `text()` and its 5 sub-entries need a from-scratch font rasterizer —
   likely the very last item in the project.
 

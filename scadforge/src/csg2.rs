@@ -18,6 +18,7 @@
 //! is stitched back into even-odd `Poly2` contours by endpoint chaining
 //! with tolerance snapping.
 
+use crate::geom::Mesh;
 use crate::poly2::{self, Poly2};
 use std::collections::HashMap;
 
@@ -686,6 +687,252 @@ pub fn minkowski2(regions: &[Poly2]) -> Minkowski2 {
     }
 }
 
+// -- 2D offset (offset()) ---------------------------------------------------
+
+/// Convex-corner treatment for `offset2`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Join {
+    /// Round (arc) corners — the `r` mode; arcs tessellated by `frags_full`.
+    Round,
+    /// Straight miter corners — the `delta` mode; corners extend to their
+    /// sharp intersection (capped by a generous miter limit).
+    Miter,
+    /// Flat-cut corners — `delta` with `chamfer = true`.
+    Chamfer,
+}
+
+/// Offset (grow / shrink) a 2D region by `dist`. Positive grows the outer
+/// boundary outward and shrinks holes; negative does the reverse and can
+/// annihilate the region or split it into islands (both silently, per the
+/// reference). `join` selects the convex-corner treatment; `frags_full` is
+/// the full-circle fragment count for round arcs (from $fn/$fa/$fs on
+/// |dist|).
+///
+/// Clean-room: positive offset is the Minkowski dilation of the filled
+/// region — assembled as the union of the region, its outward edge slabs,
+/// and a convex-corner cap per vertex — so concavity, holes and splits fall
+/// out of the union2 kernel. Negative offset is the erosion via the
+/// complement identity  erode(P) = B − dilate(B − P)  over a padded box B.
+pub fn offset2(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 {
+    if region.is_empty() {
+        return Poly2::new(Vec::new());
+    }
+    if dist == 0.0 || !dist.is_finite() {
+        return region.clone(); // identity (a zero/invalid offset is a no-op)
+    }
+    if dist > 0.0 {
+        dilate(region, dist, join, frags_full)
+    } else {
+        // Erosion: complement P inside a box padded well beyond reach, dilate
+        // the complement inward by |dist|, then subtract it back from the box.
+        let (lo, hi) = region_bbox(region);
+        let grow = -dist;
+        let pad = grow * 2.0 + 1.0;
+        let bcont = box_contour([lo[0] - pad, lo[1] - pad], [hi[0] + pad, hi[1] + pad]);
+        let mut comp_contours = vec![bcont.clone()];
+        comp_contours.extend(region.contours.iter().cloned());
+        let comp = Poly2::new(comp_contours); // even-odd: box minus P
+        let grown = dilate(&comp, grow, join, frags_full);
+        difference2(&Poly2::new(vec![bcont]), &[grown])
+    }
+}
+
+fn region_bbox(poly: &Poly2) -> (V2, V2) {
+    let mut lo = [f64::INFINITY; 2];
+    let mut hi = [f64::NEG_INFINITY; 2];
+    for c in &poly.contours {
+        for p in c {
+            lo[0] = lo[0].min(p[0]);
+            lo[1] = lo[1].min(p[1]);
+            hi[0] = hi[0].max(p[0]);
+            hi[1] = hi[1].max(p[1]);
+        }
+    }
+    (lo, hi)
+}
+
+fn box_contour(lo: V2, hi: V2) -> Vec<V2> {
+    vec![[lo[0], lo[1]], [hi[0], lo[1]], [hi[0], hi[1]], [lo[0], hi[1]]]
+}
+
+/// Intersection of the line through `p0` with direction `d0` and the line
+/// through `p1` with direction `d1`. None if (near-)parallel.
+fn line_intersect(p0: V2, d0: V2, p1: V2, d1: V2) -> Option<V2> {
+    let denom = d0[0] * d1[1] - d0[1] * d1[0];
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    let s = ((p1[0] - p0[0]) * d1[1] - (p1[1] - p0[1]) * d1[0]) / denom;
+    Some([p0[0] + s * d0[0], p0[1] + s * d0[1]])
+}
+
+/// Dilate (grow) a region by `dist > 0` with the given corner join, as the
+/// union of the region, its outward edge slabs, and a cap at each convex
+/// (gap-opening) vertex.
+fn dilate(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 {
+    use std::f64::consts::{PI, TAU};
+    let mut parts: Vec<Poly2> = vec![region.clone()];
+    for contour in poly2::oriented_contours(region) {
+        let n = contour.len();
+        if n < 3 {
+            continue;
+        }
+        // Outward unit normal (right of each directed edge; filled on left).
+        let nrm: Vec<V2> = (0..n)
+            .map(|i| {
+                let d = sub(contour[(i + 1) % n], contour[i]);
+                let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                if l < EPS { [0.0, 0.0] } else { [d[1] / l, -d[0] / l] }
+            })
+            .collect();
+        // Edge slabs: each edge swept outward by `dist`.
+        for i in 0..n {
+            if nrm[i] == [0.0, 0.0] {
+                continue;
+            }
+            let a = contour[i];
+            let b = contour[(i + 1) % n];
+            let ao = [a[0] + dist * nrm[i][0], a[1] + dist * nrm[i][1]];
+            let bo = [b[0] + dist * nrm[i][0], b[1] + dist * nrm[i][1]];
+            parts.push(Poly2::new(vec![vec![a, b, bo, ao]]));
+        }
+        // Convex-corner caps. A gap opens where turn·dist > 0 (dist > 0 here).
+        for i in 0..n {
+            let prev = (i + n - 1) % n;
+            let v = contour[i];
+            if nrm[prev] == [0.0, 0.0] || nrm[i] == [0.0, 0.0] {
+                continue;
+            }
+            let din = sub(v, contour[prev]);
+            let dout = sub(contour[(i + 1) % n], v);
+            let turn = din[0] * dout[1] - din[1] * dout[0];
+            if turn <= 0.0 {
+                continue; // reflex or straight: the slabs already cover it
+            }
+            let p = [v[0] + dist * nrm[prev][0], v[1] + dist * nrm[prev][1]];
+            let q = [v[0] + dist * nrm[i][0], v[1] + dist * nrm[i][1]];
+            match join {
+                Join::Chamfer => parts.push(Poly2::new(vec![vec![v, p, q]])),
+                Join::Miter => {
+                    let cap = match line_intersect(p, din, q, dout) {
+                        Some(m)
+                            if {
+                                let d2 = (m[0] - v[0]).powi(2) + (m[1] - v[1]).powi(2);
+                                d2.is_finite() && d2 <= dist * dist * 1.0e6
+                            } =>
+                        {
+                            vec![v, p, m, q] // sharp miter within the limit
+                        }
+                        _ => vec![v, p, q], // near-flat/over-limit: bevel it
+                    };
+                    parts.push(Poly2::new(vec![cap]));
+                }
+                Join::Round => {
+                    let a0 = (p[1] - v[1]).atan2(p[0] - v[0]);
+                    let a1 = (q[1] - v[1]).atan2(q[0] - v[0]);
+                    let mut sweep = a1 - a0;
+                    while sweep <= -PI {
+                        sweep += TAU;
+                    }
+                    while sweep > PI {
+                        sweep -= TAU;
+                    }
+                    let seg = ((frags_full as f64) * sweep.abs() / TAU).ceil().max(1.0) as usize;
+                    let mut poly = vec![v, p];
+                    for k in 1..seg {
+                        let t = a0 + sweep * (k as f64) / (seg as f64);
+                        poly.push([v[0] + dist * t.cos(), v[1] + dist * t.sin()]);
+                    }
+                    poly.push(q);
+                    parts.push(Poly2::new(vec![poly]));
+                }
+            }
+        }
+    }
+    union2(&parts)
+}
+
+// -- Projection (projection()) ----------------------------------------------
+
+/// Above this projected-triangle count the silhouette union is skipped (the
+/// per-facet 2D union is the slow path — a public preview must not hang).
+pub const PROJECT_MAX_TRIS: usize = 4_000;
+
+/// Project a 3D mesh to 2D at z=0. `cut = false`: the full silhouette
+/// (shadow) — the union of every non-vertical facet's XY projection,
+/// ignoring Z entirely. `cut = true`: the planar cross-section where the
+/// solid crosses z=0 — the section segments of every straddling triangle,
+/// stitched into contours (empty if the solid does not reach z=0).
+pub fn project(mesh: &Mesh, cut: bool) -> Poly2 {
+    if cut {
+        project_cut(mesh)
+    } else {
+        project_silhouette(mesh)
+    }
+}
+
+fn project_silhouette(mesh: &Mesh) -> Poly2 {
+    let mut tris: Vec<Poly2> = Vec::new();
+    for t in &mesh.tris {
+        let a = mesh.positions[t[0] as usize];
+        let b = mesh.positions[t[1] as usize];
+        let c = mesh.positions[t[2] as usize];
+        let (a2, b2, c2) = ([a[0], a[1]], [b[0], b[1]], [c[0], c[1]]);
+        let area2 = (b2[0] - a2[0]) * (c2[1] - a2[1]) - (b2[1] - a2[1]) * (c2[0] - a2[0]);
+        if !area2.is_finite() || area2.abs() < 1e-9 {
+            continue; // a vertical (edge-on) or degenerate facet casts no shadow
+        }
+        // Store each projected facet CCW; even-odd is irrelevant since union2
+        // merges them, but a consistent winding keeps the operands clean.
+        let contour = if area2 > 0.0 { vec![a2, b2, c2] } else { vec![a2, c2, b2] };
+        tris.push(Poly2::new(vec![contour]));
+    }
+    union2(&tris)
+}
+
+fn project_cut(mesh: &Mesh) -> Poly2 {
+    let mut segs: Vec<Seg> = Vec::new();
+    for t in &mesh.tris {
+        let v = [
+            mesh.positions[t[0] as usize],
+            mesh.positions[t[1] as usize],
+            mesh.positions[t[2] as usize],
+        ];
+        // Points where the triangle's edges cross the z=0 plane (a vertex
+        // exactly on the plane counts as not-above, so a face lying in z=0
+        // yields no segment — the documented tangency choice).
+        let mut pts: Vec<V2> = Vec::new();
+        for e in 0..3 {
+            let p0 = v[e];
+            let p1 = v[(e + 1) % 3];
+            if (p0[2] > 0.0) != (p1[2] > 0.0) {
+                let tt = p0[2] / (p0[2] - p1[2]);
+                pts.push([p0[0] + (p1[0] - p0[0]) * tt, p0[1] + (p1[1] - p0[1]) * tt]);
+            }
+        }
+        if pts.len() != 2 {
+            continue;
+        }
+        // Orient the section segment by the triangle's (outward) normal so the
+        // stitched loops wind consistently: dir = N × ẑ = (Ny, −Nx).
+        let e1 = [v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2]];
+        let e2 = [v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2]];
+        let n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        let dir = [n[1], -n[0]];
+        let (pa, pb) = (pts[0], pts[1]);
+        let along = (pb[0] - pa[0]) * dir[0] + (pb[1] - pa[1]) * dir[1];
+        let (a, b) = if along >= 0.0 { (pa, pb) } else { (pb, pa) };
+        if let Some(s) = Seg::new(a, b) {
+            segs.push(s);
+        }
+    }
+    segments_to_poly(&segs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,6 +1055,67 @@ mod tests {
             Minkowski2::Ok(m) => assert!((area(&m) - 9.0).abs() < 1e-9),
             Minkowski2::TooLarge { .. } => panic!(),
         }
+    }
+
+    #[test]
+    fn offset_grows_shrinks_and_joins_a_square() {
+        let s = sq(0.0, 0.0, 10.0);
+        // Round r=2: 100 (square) + 80 (four 10×2 edge strips) + π·2² (four
+        // quarter-circle corners).
+        let r = offset2(&s, 2.0, Join::Round, 64);
+        let want = 100.0 + 80.0 + std::f64::consts::PI * 4.0;
+        assert!((area(&r) - want).abs() < 1.0, "round area {} want {}", area(&r), want);
+        // Miter delta=2: square corners → full 2×2 corner squares → 196.
+        let m = offset2(&s, 2.0, Join::Miter, 0);
+        assert!((area(&m) - 196.0).abs() < 0.5, "miter area {}", area(&m));
+        // Chamfer delta=2: corners cut flat → half of each 2×2 → 188.
+        let c = offset2(&s, 2.0, Join::Chamfer, 0);
+        assert!((area(&c) - 188.0).abs() < 0.5, "chamfer area {}", area(&c));
+        // Negative delta=-2: erode to a 6×6 square → 36.
+        let e = offset2(&s, -2.0, Join::Miter, 0);
+        assert!((area(&e) - 36.0).abs() < 0.5, "erode area {}", area(&e));
+        assert_eq!(e.contours.len(), 1, "eroded square is one loop");
+        // Over-erosion annihilates silently: a 3×3 eroded by 2 vanishes.
+        let gone = offset2(&sq(0.0, 0.0, 3.0), -2.0, Join::Miter, 0);
+        assert!(gone.is_empty() || area(&gone) < 1e-6, "should annihilate, area {}", area(&gone));
+    }
+
+    #[test]
+    fn offset_grows_outer_and_shrinks_holes() {
+        // A 10×10 ring with a 4×4 hole (area 84). A positive offset grows the
+        // outer boundary and shrinks the hole, so the filled area rises and
+        // the hole survives (outer + hole = two contours).
+        let ring = difference2(&sq(0.0, 0.0, 10.0), &[sq(3.0, 3.0, 4.0)]);
+        assert!((area(&ring) - 84.0).abs() < 1e-6);
+        let grown = offset2(&ring, 1.0, Join::Round, 48);
+        assert!(area(&grown) > 84.0, "offset ring area {} should exceed 84", area(&grown));
+        assert_eq!(grown.contours.len(), 2, "outer + shrunken hole");
+    }
+
+    #[test]
+    fn projection_silhouette_and_cut() {
+        let cube = crate::geom::cube([10.0, 10.0, 10.0], true);
+        // Silhouette (shadow) of a centered cube → a 10×10 square.
+        let sil = project(&cube, false);
+        assert!((area(&sil) - 100.0).abs() < 1e-6, "silhouette area {}", area(&sil));
+        // cut=true at z=0 (the cube straddles the plane) → the 10×10 section.
+        let cut = project(&cube, true);
+        assert!((area(&cut) - 100.0).abs() < 1e-6, "cut area {}", area(&cut));
+        // cut=false ignores Z entirely: lift the cube to z∈[45,55], same shadow.
+        let mut high = cube.clone();
+        for p in &mut high.positions {
+            p[2] += 50.0;
+        }
+        assert!((area(&project(&high, false)) - 100.0).abs() < 1e-6, "Z must be ignored");
+        // cut=true of the lifted cube (entirely above z=0) → empty, silently.
+        assert!(project(&high, true).is_empty(), "cut above the plane is empty");
+    }
+
+    #[test]
+    fn offset_zero_and_empty_are_identity() {
+        let s = sq(0.0, 0.0, 5.0);
+        assert!((area(&offset2(&s, 0.0, Join::Round, 16)) - 25.0).abs() < 1e-9);
+        assert!(offset2(&Poly2::new(Vec::new()), 3.0, Join::Round, 16).is_empty());
     }
 
     #[test]

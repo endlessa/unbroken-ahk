@@ -1099,6 +1099,72 @@ fn call_builtin_module(
                 }
             }
         }
+        "offset" => {
+            // The union of all 2D children is offset once (collect_2d unions;
+            // 3D children warn and are skipped).
+            let poly = collect_2d(children, scope, ctx);
+            if poly.is_empty() {
+                return Vec::new();
+            }
+            let r = bound.get("r").and_then(Value::as_num).filter(|v| v.is_finite());
+            let delta = bound.get("delta").and_then(Value::as_num).filter(|v| v.is_finite());
+            let chamfer = bound.get("chamfer").and_then(Value::as_bool).unwrap_or(false);
+            // r wins over delta; with neither, the reference default is a
+            // 1-unit round-join offset (offset() ≡ offset(r = 1)).
+            let (dist, join) = match (r, delta) {
+                (Some(r), _) => (r, csg2::Join::Round),
+                (None, Some(d)) => (d, if chamfer { csg2::Join::Chamfer } else { csg2::Join::Miter }),
+                (None, None) => (1.0, csg2::Join::Round),
+            };
+            let frags_full = resolve_fragments(dist.abs(), ctx);
+            let result = csg2::offset2(&poly, dist, join, frags_full);
+            // A negative offset can annihilate the region — empty, no warning.
+            Shape::flat(result).into_iter().collect()
+        }
+        "projection" => {
+            let groups = eval_children_grouped(children, scope, ctx);
+            if groups.is_empty() {
+                return Vec::new();
+            }
+            let cut = bound.get("cut").and_then(Value::as_bool).unwrap_or(false);
+            // 2021.01 warns on and skips 2D children (the reverse of the 2D
+            // arms' 3D-child skip); only 3D geometry projects.
+            let mut combined = Mesh::empty();
+            let mut saw_2d = false;
+            for s in groups.iter().flatten() {
+                if s.outline.is_some() {
+                    saw_2d = true;
+                } else if !s.mesh.positions.is_empty() {
+                    // Concatenate facets (an exact 3D union is unnecessary — the
+                    // silhouette re-unions them and the cut collects all
+                    // crossings); implicit-union-before-projection is preserved
+                    // for the common single/nested-solid cases.
+                    let base = combined.positions.len() as u32;
+                    combined.positions.extend_from_slice(&s.mesh.positions);
+                    for t in &s.mesh.tris {
+                        combined.tris.push([t[0] + base, t[1] + base, t[2] + base]);
+                    }
+                }
+            }
+            if saw_2d {
+                ctx.out
+                    .warnings
+                    .push("Ignoring 2D child object for 3D operation".into());
+            }
+            if combined.tris.is_empty() {
+                return Vec::new();
+            }
+            if !cut && combined.tris.len() > csg2::PROJECT_MAX_TRIS {
+                ctx.out.warnings.push(format!(
+                    "projection(): {} facets exceed the silhouette preview cap ({}); \
+                     reduce $fn on the children or use cut = true",
+                    combined.tris.len(),
+                    csg2::PROJECT_MAX_TRIS
+                ));
+                return Vec::new();
+            }
+            Shape::flat(csg2::project(&combined, cut)).into_iter().collect()
+        }
         "color" => {
             let rgba = parse_color(bound.get("c"), bound.get("alpha"), ctx);
             let mut shapes = exec_scope(children, scope, ctx);
@@ -1638,6 +1704,8 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         "polygon" => &["points", "paths", "convexity"],
         "linear_extrude" => &["height"],
         "rotate_extrude" => &["angle"],
+        "offset" => &["r"],
+        "projection" => &["cut"],
         "color" => &["c", "alpha"],
         "children" | "child" => &["index"],
         _ => &[],
@@ -3680,6 +3748,48 @@ mod tests {
         // Color carries from the first child of a 2D difference.
         let out = run("difference() { color(\"red\") square(4); square(2); }");
         assert_eq!(out.shapes[0].color, Some([1.0, 0.0, 0.0, 1.0]));
+    }
+
+    #[test]
+    fn offset_and_projection() {
+        // offset(r) rounds+grows a square: 10×10 + four 10×2 strips + π·2².
+        let out = run("offset(r = 2) square(10);");
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes[0].outline.is_some(), "offset output is 2D");
+        let want = 100.0 + 80.0 + std::f64::consts::PI * 4.0;
+        assert!((flat_area(&out) - want).abs() < 1.5, "offset(r) area {}", flat_area(&out));
+        // offset(delta) miters the corners → 196; chamfer cuts them → 188.
+        assert!((flat_area(&run("offset(delta = 2) square(10);")) - 196.0).abs() < 0.5);
+        assert!((flat_area(&run("offset(delta = 2, chamfer = true) square(10);")) - 188.0).abs() < 0.5);
+        // Bare offset() defaults to a 1-unit round offset (offset(r=1)).
+        let bare = flat_area(&run("offset() square(10);"));
+        let r1 = flat_area(&run("offset(r = 1) square(10);"));
+        assert!((bare - r1).abs() < 1e-6, "offset() must equal offset(r=1)");
+        // A negative offset can annihilate the shape silently (no warning).
+        let out = run("offset(delta = -2) square(3);");
+        assert!(out.shapes.is_empty());
+        assert!(out.warnings.is_empty(), "silent annihilation");
+        // offset feeds an extrusion (2D→2D→3D): rounded square, 1 tall.
+        let out = run("linear_extrude(height = 1) offset(r = 2) square(10);");
+        assert!((total_volume(&out) - want).abs() < 1.5, "extruded offset vol {}", total_volume(&out));
+
+        // projection(cut=false): the shadow of a centered cube → 10×10 = 100.
+        let out = run("projection() cube(10, center = true);");
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes[0].outline.is_some(), "projection output is 2D");
+        assert!((flat_area(&out) - 100.0).abs() < 1e-4, "silhouette area {}", flat_area(&out));
+        // cut=false ignores Z: a cube lifted to z∈[45,55] casts the same shadow.
+        let out = run("projection() translate([0,0,50]) cube(10, center = true);");
+        assert!((flat_area(&out) - 100.0).abs() < 1e-4, "Z-ignored area {}", flat_area(&out));
+        // cut=true slices at z=0: a straddling cube → the 100-area section.
+        let out = run("projection(cut = true) cube(10, center = true);");
+        assert!((flat_area(&out) - 100.0).abs() < 1e-4, "cut area {}", flat_area(&out));
+        // cut=true of a solid entirely above z=0 → empty, silently.
+        let out = run("projection(cut = true) translate([0,0,10]) cube(10, center = true);");
+        assert!(out.shapes.is_empty());
+        // The projected silhouette re-extrudes (the flatten→re-extrude idiom).
+        let out = run("linear_extrude(height = 3) projection() cube(10, center = true);");
+        assert!((total_volume(&out) - 300.0).abs() < 1e-3, "re-extrude vol {}", total_volume(&out));
     }
 
     #[test]
