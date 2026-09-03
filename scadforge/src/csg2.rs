@@ -57,8 +57,8 @@ impl Line {
         let d = sub(b, a);
         let n = [d[1], -d[0]];
         let len = dot(n, n).sqrt();
-        if len < EPS {
-            return None; // zero-length segment
+        if !len.is_finite() || len < EPS {
+            return None; // zero-length or non-finite (NaN/inf coord) segment
         }
         let normal = [n[0] / len, n[1] / len];
         Some(Line { w: dot(normal, a), normal })
@@ -305,6 +305,19 @@ enum Op {
 }
 
 fn boolean(a: Vec<Seg>, b: Vec<Seg>, op: Op) -> Vec<Seg> {
+    // Empty-operand identities, per op (mirrors csg::boolean). An empty BSP's
+    // clip is a no-op (Node::clip_segments returns its input when line is
+    // None), so without this guard clipping against an empty operand would
+    // RESURRECT the other operand — e.g. an empty intermediate from a
+    // disjoint pairwise-fold sub-result would make n-ary intersection2 return
+    // a non-empty, order-dependent wrong answer (A∩B=∅ then (∅)∩C ⇒ C).
+    if a.is_empty() || b.is_empty() {
+        return match op {
+            Op::Union => if a.is_empty() { b } else { a },
+            Op::Difference => if a.is_empty() { Vec::new() } else { a },
+            Op::Intersection => Vec::new(),
+        };
+    }
     let mut a = Node::from(a);
     let mut b = Node::from(b);
     match op {
@@ -351,6 +364,11 @@ fn boolean(a: Vec<Seg>, b: Vec<Seg>, op: Op) -> Vec<Seg> {
 fn region_segments(poly: &Poly2) -> Vec<Seg> {
     let mut segs = Vec::new();
     for contour in poly2::oriented_contours(poly) {
+        // Drop any contour carrying a non-finite coordinate (e.g. a user
+        // 1/0 reaching a vertex) so a NaN/inf can't poison the BSP.
+        if contour.iter().any(|p| !p[0].is_finite() || !p[1].is_finite()) {
+            continue;
+        }
         let n = contour.len();
         for i in 0..n {
             if let Some(s) = Seg::new(contour[i], contour[(i + 1) % n]) {
@@ -362,7 +380,14 @@ fn region_segments(poly: &Poly2) -> Vec<Seg> {
 }
 
 /// Snap/merge tolerance for stitching the boolean output back into
-/// contours — an order above EPS so a split point and its twin coincide.
+/// contours. Deliberately an order above the classification EPS (1e-7): the
+/// same geometric crossing computed two ways (A's segment split by B's line
+/// vs B's segment split by A's line) can disagree by ~1e-9·|coord|, which is
+/// ~1e-7 at the hundreds-scale coordinates this kernel targets — so a
+/// tolerance below that would fail to weld coincident endpoints and leave
+/// loops open. The cost is that a genuine sub-1e-6 sliver is collapsed; that
+/// is below the BSP's own EPS resolution anyway (exact arithmetic, not a
+/// wider snap, would be the real fix — out of scope for a preview kernel).
 const SNAP: f64 = 1e-6;
 
 /// Stitch a directed-segment soup (filled on the left) back into even-odd
@@ -401,23 +426,29 @@ fn segments_to_poly(segs: &[Seg]) -> Poly2 {
         let mut cur = start;
         let mut contour: Vec<V2> = Vec::new();
         let mut steps = 0;
+        let mut closed = false;
         loop {
             used[cur] = true;
             let (u, v) = edges[cur];
             contour.push(verts[u]);
             steps += 1;
             if v == start_v {
-                break; // closed
+                closed = true; // returned to the loop's start vertex
+                break;
             }
             match next_edge(v, u, &edges, &out, &used, &verts) {
                 Some(nx) => cur = nx,
-                None => break, // open chain — discard below
+                None => break, // dead end: an open chain, discarded below
             }
             if steps > edges.len() + 4 {
                 break; // safety against a pathological cycle
             }
         }
-        if contour.len() >= 3 {
+        // Only CLOSED loops are real contours. An open chain (dead end, or the
+        // safety break) must be dropped, not pushed — pushing it would forge a
+        // closing edge from its tail back to its head that exists in neither
+        // operand.
+        if closed && contour.len() >= 3 {
             contours.push(contour);
         }
     }
@@ -719,6 +750,35 @@ mod tests {
         assert!(difference2(&empty, &[a.clone()]).is_empty());
         assert!(intersection2(&[a.clone(), empty.clone()]).is_empty());
         assert!(intersection2(&[empty, a]).is_empty());
+    }
+
+    #[test]
+    fn nary_intersection_with_a_disjoint_pair_is_empty_in_any_order() {
+        // Review Finding 1: a disjoint sub-pair produces an empty INTERMEDIATE
+        // in the pairwise fold; without the empty-operand guard in boolean()
+        // that empty resurrected the other operand, making the result
+        // non-empty AND order-dependent.
+        let a = sq(0.0, 0.0, 1.0);
+        let b = sq(2.0, 0.0, 1.0); // disjoint from a
+        let c = sq(0.0, 0.0, 1.0); // == a
+        // A∩B already empty ⇒ A∩B∩C = ∅, whatever the operand order.
+        assert!(intersection2(&[a.clone(), b.clone(), c.clone()]).is_empty());
+        assert!(intersection2(&[a.clone(), c.clone(), b.clone()]).is_empty());
+        assert!(intersection2(&[b, a, c]).is_empty());
+    }
+
+    #[test]
+    fn non_finite_coordinates_do_not_panic() {
+        // A contour with a NaN/inf vertex is dropped rather than poisoning the
+        // BSP or panicking (robustness lens; this is a public /render path).
+        let bad = Poly2::new(vec![vec![[0.0, 0.0], [f64::NAN, 1.0], [1.0, 1.0]]]);
+        let good = sq(0.0, 0.0, 4.0);
+        // union with a garbage region falls back to the clean one.
+        let u = union2(&[bad.clone(), good.clone()]);
+        assert!((area(&u) - 16.0).abs() < 1e-6);
+        // difference by garbage leaves the minuend intact.
+        let d = difference2(&good, &[bad]);
+        assert!((area(&d) - 16.0).abs() < 1e-6);
     }
 
     #[test]
