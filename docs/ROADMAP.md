@@ -4,8 +4,11 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 4 extrusions (2026-09-03): **128 full / 10 partial
-/ 45 untouched — 70% full, 75% touched.**
+Standing after phase 4d 2D booleans (2026-09-03): **128 full / 10
+partial / 45 untouched — 70% full, 75% touched.** (Entry count unchanged:
+2D booleans deepen the already-full `difference`/`intersection`/`hull`/
+`minkowski` entries to full 2D+3D fidelity rather than touching new
+entries; `offset` and `projection` remain the untouched 2D pair.)
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -74,12 +77,18 @@ Landed (2026-09-03):
 - ✅ Remaining transforms: `mirror` (Householder), `multmatrix`
   (non-finite subtree drop), `resize` (bbox measure + auto factors).
 - ✅ `polyhedron` (winding fix, fan-triangulation, index bounds check).
+- ✅ 2D booleans: `difference` / `intersection` / `union` / `hull` /
+  `minkowski` on 2D operands now compute real geometry via a from-scratch
+  2D segment-BSP kernel (`scadforge/src/csg2.rs`), the exact planar
+  analogue of `csg.rs` (lines split segments instead of planes splitting
+  polygons); the surviving segment soup is stitched back into even-odd
+  contours. `union` is applied when an extrusion collects multiple 2D
+  children (so crossing squares extrude to a plus, not a plus with a hole).
+  Mixing 2D and 3D children in one boolean warns.
 
 Remaining:
 
 - `offset` (2D, radial + delta/chamfer), `projection` (3D→2D, cut mode).
-- 2D booleans: `difference`/`intersection` on 2D operands (currently
-  pass through with a warning) — needed for richer 2D compositions.
 - `text()` and its 5 sub-entries need a from-scratch font rasterizer —
   likely the very last item in the project.
 

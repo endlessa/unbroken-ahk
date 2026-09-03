@@ -11,6 +11,7 @@
 
 use crate::ast::{Arg, BinOp, Expr, Param, Stmt, VecItem};
 use crate::csg;
+use crate::csg2;
 use crate::geom::{self, Mesh};
 use crate::poly2::{self, Poly2};
 use crate::value::{FuncVal, Value};
@@ -1121,10 +1122,21 @@ fn call_builtin_module(
             if groups.is_empty() {
                 return Vec::new();
             }
+            if all_2d(&groups) {
+                let color = groups[0].iter().find_map(|s| s.color);
+                let first = group_region(&groups[0]);
+                let rest: Vec<Poly2> = groups[1..].iter().map(|g| group_region(g)).collect();
+                let mut shapes = Shape::flat(csg2::difference2(&first, &rest))
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                for s in &mut shapes {
+                    s.color = color;
+                }
+                return shapes;
+            }
             if any_2d(&groups) {
                 ctx.out.warnings.push(
-                    "difference(): 2D booleans are not implemented yet — children shown \
-                     un-combined"
+                    "difference(): mixing 2D and 3D children is unsupported — shown un-combined"
                         .into(),
                 );
                 return groups.into_iter().flatten().collect();
@@ -1143,10 +1155,20 @@ fn call_builtin_module(
             if groups.is_empty() {
                 return Vec::new();
             }
+            if all_2d(&groups) {
+                let color = groups[0].iter().find_map(|s| s.color);
+                let regions: Vec<Poly2> = groups.iter().map(|g| group_region(g)).collect();
+                let mut shapes = Shape::flat(csg2::intersection2(&regions))
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                for s in &mut shapes {
+                    s.color = color;
+                }
+                return shapes;
+            }
             if any_2d(&groups) {
                 ctx.out.warnings.push(
-                    "intersection(): 2D booleans are not implemented yet — children shown \
-                     un-combined"
+                    "intersection(): mixing 2D and 3D children is unsupported — shown un-combined"
                         .into(),
                 );
                 return groups.into_iter().flatten().collect();
@@ -1160,9 +1182,16 @@ fn call_builtin_module(
             if groups.is_empty() {
                 return Vec::new();
             }
+            if all_2d(&groups) {
+                // 2D hull of every child's outline points (colors dropped,
+                // per hull's reference semantics).
+                let regions: Vec<Poly2> =
+                    groups.iter().flatten().filter_map(|s| s.outline.clone()).collect();
+                return Shape::flat(csg2::hull2(&regions)).into_iter().collect();
+            }
             if any_2d(&groups) {
                 ctx.out.warnings.push(
-                    "hull(): 2D hull is not implemented yet — children shown un-combined".into(),
+                    "hull(): mixing 2D and 3D children is unsupported — shown un-combined".into(),
                 );
                 return groups.into_iter().flatten().collect();
             }
@@ -1186,10 +1215,33 @@ fn call_builtin_module(
             if groups.is_empty() {
                 return Vec::new();
             }
+            if all_2d(&groups) {
+                let regions: Vec<Poly2> =
+                    groups.iter().flatten().filter_map(|s| s.outline.clone()).collect();
+                let nonempty = regions.iter().filter(|r| !r.is_empty()).count();
+                if nonempty >= 2 {
+                    ctx.out.warnings.push(
+                        "minkowski(): result is exact for convex operands; concave operands \
+                         are approximated by their convex sum"
+                            .into(),
+                    );
+                }
+                return match csg2::minkowski2(&regions) {
+                    csg2::Minkowski2::Ok(poly) => Shape::flat(poly).into_iter().collect(),
+                    csg2::Minkowski2::TooLarge { count, partial } => {
+                        ctx.out.warnings.push(format!(
+                            "minkowski(): {} pairwise points exceed the preview cap ({}); \
+                             reduce $fn on the operands — showing the partial fold",
+                            count,
+                            csg2::MINKOWSKI2_MAX_POINTS
+                        ));
+                        Shape::flat(partial).into_iter().collect()
+                    }
+                };
+            }
             if any_2d(&groups) {
                 ctx.out.warnings.push(
-                    "minkowski(): 2D minkowski is not implemented yet — children shown \
-                     un-combined"
+                    "minkowski(): mixing 2D and 3D children is unsupported — shown un-combined"
                         .into(),
                 );
                 return groups.into_iter().flatten().collect();
@@ -1470,22 +1522,41 @@ fn resize_matrix(shapes: &[Shape], newsize: [f64; 3], auto: Option<&Value>) -> O
     Some(geom::scaling(factor))
 }
 
-/// True if any child group holds a 2D shape — used to reject 2D operands
-/// in the 3D CSG/hull/minkowski arms until the 2D kernel lands.
+/// True if any child group holds a 2D shape — flags a 2D/3D mix in the CSG
+/// arms so it can warn rather than combine incompatible geometry.
 fn any_2d(groups: &[Vec<Shape>]) -> bool {
     groups.iter().flatten().any(|s| s.outline.is_some())
 }
 
-/// Collect the child 2D geometry for an extrusion into one region (the
-/// union of every 2D child's contours; even-odd resolves overlaps at
-/// triangulation). 3D children are skipped with a warning.
+/// True if EVERY non-empty child shape is 2D — the CSG arms then run the 2D
+/// kernel instead of the 3D mesh kernel. An all-empty tree counts as 2D
+/// (nothing to combine either way).
+fn all_2d(groups: &[Vec<Shape>]) -> bool {
+    groups
+        .iter()
+        .flatten()
+        .all(|s| s.outline.is_some() || s.mesh.positions.is_empty())
+}
+
+/// The unioned 2D region of one child group (each shape contributes its
+/// outline; overlaps merge). A group with no 2D content yields an empty
+/// region.
+fn group_region(shapes: &[Shape]) -> Poly2 {
+    let regions: Vec<Poly2> = shapes.iter().filter_map(|s| s.outline.clone()).collect();
+    csg2::union2(&regions)
+}
+
+/// Collect the child 2D geometry for an extrusion into one region: the true
+/// 2D UNION of every 2D child (overlapping children merge, so an extrusion
+/// of two crossing squares is a plus, not a plus with a hole in the
+/// overlap). 3D children are skipped with a warning.
 fn collect_2d(children: &[Stmt], scope: &Rc<Scope>, ctx: &mut Ctx) -> Poly2 {
     let shapes = exec_scope(children, scope, ctx);
-    let mut contours = Vec::new();
+    let mut regions = Vec::new();
     let mut saw_3d = false;
     for s in shapes {
         match s.outline {
-            Some(poly) => contours.extend(poly.contours),
+            Some(poly) => regions.push(poly),
             None => {
                 if !s.mesh.positions.is_empty() {
                     saw_3d = true;
@@ -1498,7 +1569,7 @@ fn collect_2d(children: &[Stmt], scope: &Rc<Scope>, ctx: &mut Ctx) -> Poly2 {
             .warnings
             .push("Ignoring 3D child object for 2D operation".into());
     }
-    Poly2::new(contours)
+    csg2::union2(&regions)
 }
 
 fn transform_children(
@@ -3561,6 +3632,54 @@ mod tests {
         let out = run("rotate_extrude() translate([-1,0]) square([2,1]);");
         assert!(out.shapes.is_empty());
         assert!(out.warnings.iter().any(|w| w.contains("same X")));
+    }
+
+    #[test]
+    fn two_d_booleans() {
+        // 2D difference: a 10×10 square minus a centered 4×4 → area 84, and
+        // the result is still 2D (carries an outline) so it can extrude.
+        let out = run(
+            "difference() { square(10); translate([3,3]) square(4); }",
+        );
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes[0].outline.is_some(), "2D difference stays 2D");
+        assert!((flat_area(&out) - 84.0).abs() < 1e-5, "area {}", flat_area(&out));
+        assert!(out.warnings.is_empty(), "clean 2D difference must not warn");
+
+        // 2D intersection of two overlapping squares → their overlap.
+        let out = run("intersection() { square(10); translate([6,6]) square(10); }");
+        assert!((flat_area(&out) - 16.0).abs() < 1e-5, "overlap area {}", flat_area(&out));
+
+        // 2D union (via linear_extrude collecting crossing squares): a plus
+        // sign, NOT a plus with a hole — area = two 2×10 bars minus the 2×2
+        // overlap = 36, and it extrudes to a volume of 36.
+        let out = run(
+            "linear_extrude(height=1) { translate([-5,-1]) square([10,2]); \
+             translate([-1,-5]) square([2,10]); }",
+        );
+        assert!((total_volume(&out) - 36.0).abs() < 1e-5, "plus volume {}", total_volume(&out));
+
+        // 2D difference feeds an extrusion: the ring above, 2 tall → 168.
+        let out = run(
+            "linear_extrude(height=2) difference() { square(10); translate([3,3]) square(4); }",
+        );
+        assert!((total_volume(&out) - 168.0).abs() < 1e-4, "ring prism vol {}", total_volume(&out));
+
+        // 2D hull of two separated squares fills the gap (area exceeds the 2
+        // squares' 2·1 and it stays 2D).
+        let out = run("hull() { square(1); translate([4,0]) square(1); }");
+        assert!(out.shapes[0].outline.is_some(), "2D hull stays 2D");
+        assert!(flat_area(&out) > 2.0, "hull area {}", flat_area(&out));
+
+        // 2D minkowski grows a square by a circle (rounded square), strictly
+        // larger than the 4-unit square alone.
+        let plain = run("square([2,2]);");
+        let out = run("minkowski() { square([2,2]); circle(1, $fn=32); }");
+        assert!(flat_area(&out) > flat_area(&plain), "minkowski must grow the square");
+
+        // Color carries from the first child of a 2D difference.
+        let out = run("difference() { color(\"red\") square(4); square(2); }");
+        assert_eq!(out.shapes[0].color, Some([1.0, 0.0, 0.0, 1.0]));
     }
 
     #[test]

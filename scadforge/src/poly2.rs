@@ -308,8 +308,10 @@ type Mesh3 = (Vec<[f64; 3]>, Vec<[u32; 3]>);
 
 /// Contours re-wound by even-odd nesting depth: even depth (a solid
 /// outline) → CCW, odd depth (a hole) → CW. Extrusion walls built from
-/// these face outward on solids and inward on holes.
-fn oriented_contours(poly: &Poly2) -> Vec<Vec<Vec2>> {
+/// these face outward on solids and inward on holes; the 2D boolean
+/// kernel reads the same orientation (filled region always on the left of
+/// each directed edge) to build its boundary segments.
+pub fn oriented_contours(poly: &Poly2) -> Vec<Vec<Vec2>> {
     let contours: Vec<&Vec<Vec2>> = poly.contours.iter().filter(|c| c.len() >= 3).collect();
     let depth: Vec<usize> = contours
         .iter()

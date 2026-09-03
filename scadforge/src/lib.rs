@@ -9,6 +9,7 @@
 
 pub mod ast;
 pub mod csg;
+pub mod csg2;
 pub mod eval;
 pub mod geom;
 pub mod http;
