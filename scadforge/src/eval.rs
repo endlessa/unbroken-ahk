@@ -12,17 +12,37 @@
 use crate::ast::{Arg, BinOp, Expr, Param, Stmt, VecItem};
 use crate::csg;
 use crate::geom::{self, Mesh};
+use crate::poly2::{self, Poly2};
 use crate::value::{FuncVal, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// A mesh plus the display color assigned by the NEAREST enclosing
+/// A renderable mesh plus the display color from the NEAREST enclosing
 /// color() node (None = uncolored; ancestors must not override).
+///
+/// `outline` is Some(..) exactly for 2D shapes: it holds the boundary
+/// contours at z=0 (the `mesh` is then their triangulated flat fill). 3D
+/// shapes leave it None. Extrusion, offset and projection read/produce
+/// it; mixing a 2D shape into a 3D boolean is an error.
 #[derive(Debug, Clone)]
 pub struct Shape {
     pub mesh: Mesh,
     pub color: Option<[f64; 4]>,
+    pub outline: Option<Poly2>,
+}
+
+impl Shape {
+    /// A 2D shape: triangulate the region to a flat z=0 fill mesh and keep
+    /// the contours for downstream 2D operations.
+    fn flat(poly: Poly2) -> Option<Shape> {
+        let (verts, tris) = poly2::triangulate(&poly);
+        if tris.is_empty() {
+            return None;
+        }
+        let positions = verts.iter().map(|v| [v[0], v[1], 0.0]).collect();
+        Some(Shape { mesh: Mesh { positions, tris }, color: None, outline: Some(poly) })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -963,6 +983,63 @@ fn call_builtin_module(
                 }
             }
         }
+        "square" => {
+            let size = match bound.get("size") {
+                Some(Value::Num(s)) => [*s, *s],
+                Some(Value::Vector(items)) if items.len() == 2 => {
+                    match (items[0].as_num(), items[1].as_num()) {
+                        (Some(x), Some(y)) => [x, y],
+                        _ => {
+                            ctx.out.warnings.push("square: size must be numeric".into());
+                            return Vec::new();
+                        }
+                    }
+                }
+                Some(Value::Undef) | None => [1.0, 1.0],
+                _ => {
+                    ctx.out.warnings.push("square: size must be a number or [x, y]".into());
+                    return Vec::new();
+                }
+            };
+            let center = bound.get("center").and_then(Value::as_bool).unwrap_or(false);
+            no_children(name, children, ctx);
+            Shape::flat(poly2::square(size, center)).into_iter().collect()
+        }
+        "circle" => {
+            let r = match (bound.get("d"), bound.get("r")) {
+                (Some(Value::Num(d)), _) => d / 2.0,
+                (_, Some(Value::Num(r))) => *r,
+                _ => 1.0,
+            };
+            let n = resolve_fragments(r, ctx);
+            no_children(name, children, ctx);
+            Shape::flat(poly2::circle(r, n)).into_iter().collect()
+        }
+        "polygon" => {
+            let points = bound.get("points").and_then(vec2_list);
+            let paths = match bound.get("paths") {
+                Some(Value::Undef) | None => None,
+                Some(v) => match index_lists(v) {
+                    Some(p) => Some(p),
+                    None => {
+                        ctx.out.warnings.push("polygon: paths must be a list of index lists".into());
+                        return Vec::new();
+                    }
+                },
+            };
+            match points {
+                Some(points) => {
+                    let (poly, warnings) = poly2::polygon(&points, paths.as_deref());
+                    ctx.out.warnings.extend(warnings);
+                    no_children(name, children, ctx);
+                    Shape::flat(poly).into_iter().collect()
+                }
+                None => {
+                    ctx.out.warnings.push("polygon: points must be a list of [x, y]".into());
+                    Vec::new()
+                }
+            }
+        }
         "color" => {
             let rgba = parse_color(bound.get("c"), bound.get("alpha"), ctx);
             let mut shapes = exec_scope(children, scope, ctx);
@@ -986,6 +1063,14 @@ fn call_builtin_module(
             if groups.is_empty() {
                 return Vec::new();
             }
+            if any_2d(&groups) {
+                ctx.out.warnings.push(
+                    "difference(): 2D booleans are not implemented yet — children shown \
+                     un-combined"
+                        .into(),
+                );
+                return groups.into_iter().flatten().collect();
+            }
             let (minuend, color) = combine_group(&groups[0]);
             // Empty minuend → empty result, regardless of later children.
             if minuend.positions.is_empty() {
@@ -1000,6 +1085,14 @@ fn call_builtin_module(
             if groups.is_empty() {
                 return Vec::new();
             }
+            if any_2d(&groups) {
+                ctx.out.warnings.push(
+                    "intersection(): 2D booleans are not implemented yet — children shown \
+                     un-combined"
+                        .into(),
+                );
+                return groups.into_iter().flatten().collect();
+            }
             let color = groups[0].iter().find_map(|s| s.color);
             let meshes: Vec<Mesh> = groups.iter().map(|g| combine_group(g).0).collect();
             leaf_colored(csg::intersection_all(&meshes), color)
@@ -1008,6 +1101,12 @@ fn call_builtin_module(
             let groups = eval_children_grouped(children, scope, ctx);
             if groups.is_empty() {
                 return Vec::new();
+            }
+            if any_2d(&groups) {
+                ctx.out.warnings.push(
+                    "hull(): 2D hull is not implemented yet — children shown un-combined".into(),
+                );
+                return groups.into_iter().flatten().collect();
             }
             let meshes: Vec<Mesh> = groups.into_iter().flatten().map(|s| s.mesh).collect();
             let n: usize = meshes.iter().map(|m| m.positions.len()).sum();
@@ -1028,6 +1127,14 @@ fn call_builtin_module(
             let groups = eval_children_grouped(children, scope, ctx);
             if groups.is_empty() {
                 return Vec::new();
+            }
+            if any_2d(&groups) {
+                ctx.out.warnings.push(
+                    "minkowski(): 2D minkowski is not implemented yet — children shown \
+                     un-combined"
+                        .into(),
+                );
+                return groups.into_iter().flatten().collect();
             }
             let meshes: Vec<Mesh> = groups.iter().map(|g| combine_group(g).0).collect();
             let nonempty = meshes.iter().filter(|m| !m.positions.is_empty()).count();
@@ -1141,7 +1248,7 @@ fn leaf(mesh: Mesh) -> Vec<Shape> {
     if mesh.positions.is_empty() {
         Vec::new()
     } else {
-        vec![Shape { mesh, color: None }]
+        vec![Shape { mesh, color: None, outline: None }]
     }
 }
 
@@ -1149,7 +1256,7 @@ fn leaf_colored(mesh: Mesh, color: Option<[f64; 4]>) -> Vec<Shape> {
     if mesh.positions.is_empty() {
         Vec::new()
     } else {
-        vec![Shape { mesh, color }]
+        vec![Shape { mesh, color, outline: None }]
     }
 }
 
@@ -1204,6 +1311,23 @@ fn matrix_rows_f64(rows: &[Value]) -> Option<Vec<Vec<f64>>> {
 fn vec3_list(v: &Value) -> Option<Vec<geom::Vec3>> {
     match v {
         Value::Vector(items) => items.iter().map(|p| p.as_vec3()).collect(),
+        _ => None,
+    }
+}
+
+/// A list of 2-vectors (polygon points).
+fn vec2_list(v: &Value) -> Option<Vec<poly2::Vec2>> {
+    match v {
+        Value::Vector(items) => items
+            .iter()
+            .map(|p| match p {
+                Value::Vector(c) if c.len() == 2 => match (c[0].as_num(), c[1].as_num()) {
+                    (Some(x), Some(y)) => Some([x, y]),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect(),
         _ => None,
     }
 }
@@ -1288,6 +1412,12 @@ fn resize_matrix(shapes: &[Shape], newsize: [f64; 3], auto: Option<&Value>) -> O
     Some(geom::scaling(factor))
 }
 
+/// True if any child group holds a 2D shape — used to reject 2D operands
+/// in the 3D CSG/hull/minkowski arms until the 2D kernel lands.
+fn any_2d(groups: &[Vec<Shape>]) -> bool {
+    groups.iter().flatten().any(|s| s.outline.is_some())
+}
+
 fn transform_children(
     children: &[Stmt],
     scope: &Rc<Scope>,
@@ -1297,13 +1427,43 @@ fn transform_children(
     let mut shapes = exec_scope(children, scope, ctx);
     if let Some(m) = matrix {
         for s in &mut shapes {
-            geom::apply(&m, &mut s.mesh);
+            match &mut s.outline {
+                // 2D shapes use the matrix's 2D reduction (z row/column
+                // dropped), keeping outline and flat fill at z=0.
+                Some(poly) => apply_2d(&m, poly, &mut s.mesh),
+                None => geom::apply(&m, &mut s.mesh),
+            }
         }
         shapes
     } else {
         // Bad transform arguments: drop the subtree rather than render it
         // untransformed in the wrong place. The warning already fired.
         Vec::new()
+    }
+}
+
+/// Apply a transform's 2D reduction to a 2D shape: the upper-left 2×2 plus
+/// x/y translation act on the contours and the flat fill (which stays at
+/// z=0). A negative 2D determinant (reflection) rewinds the fill.
+fn apply_2d(m: &geom::Mat4, poly: &mut Poly2, mesh: &mut Mesh) {
+    let tx = |x: f64, y: f64| {
+        (m[0][0] * x + m[0][1] * y + m[0][3], m[1][0] * x + m[1][1] * y + m[1][3])
+    };
+    for c in &mut poly.contours {
+        for v in c {
+            let (x, y) = tx(v[0], v[1]);
+            *v = [x, y];
+        }
+    }
+    for p in &mut mesh.positions {
+        let (x, y) = tx(p[0], p[1]);
+        *p = [x, y, 0.0];
+    }
+    let det2 = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    if det2 < 0.0 {
+        for t in &mut mesh.tris {
+            t.swap(1, 2);
+        }
     }
 }
 
@@ -1319,6 +1479,9 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         "multmatrix" => &["m"],
         "resize" => &["newsize", "auto"],
         "polyhedron" => &["points", "faces", "convexity"],
+        "square" => &["size", "center"],
+        "circle" => &["r"],
+        "polygon" => &["points", "paths", "convexity"],
         "color" => &["c", "alpha"],
         "children" | "child" => &["index"],
         _ => &[],
@@ -3250,6 +3413,47 @@ mod tests {
         // A bare hull() with a colored child stays uncolored (color dropped).
         let out = run("hull() { color(\"blue\") cube(1); translate([3,0,0]) cube(1); }");
         assert_eq!(out.shapes[0].color, None);
+    }
+
+    /// Flat-area (z=0) sum over a 2D shape's fill mesh.
+    fn flat_area(out: &EvalOutput) -> f64 {
+        let mut a = 0.0;
+        for s in &out.shapes {
+            for t in &s.mesh.tris {
+                let p = &s.mesh.positions;
+                let (u, v, w) = (p[t[0] as usize], p[t[1] as usize], p[t[2] as usize]);
+                a += ((v[0] - u[0]) * (w[1] - u[1]) - (v[1] - u[1]) * (w[0] - u[0])).abs() / 2.0;
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn two_d_primitives_and_transforms() {
+        // square lives at z=0, area x*y, and is tagged 2D (outline present).
+        let out = run("square([4, 3]);");
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes[0].outline.is_some(), "square must be 2D");
+        assert!(out.shapes[0].mesh.positions.iter().all(|p| p[2] == 0.0));
+        assert!((flat_area(&out) - 12.0).abs() < 1e-9);
+        // circle($fn) is a regular n-gon; $fn=6 → hexagon area = 1.5·√3·r².
+        let out = run("circle(2, $fn=6);");
+        assert!((flat_area(&out) - 1.5 * 3f64.sqrt() * 4.0).abs() < 1e-9);
+        // polygon with an explicit hole path (even-odd) → outer minus hole.
+        let out = run(
+            "polygon(points=[[0,0],[10,0],[10,10],[0,10],[3,3],[7,3],[7,7],[3,7]], \
+             paths=[[0,1,2,3],[4,5,6,7]]);",
+        );
+        assert!((flat_area(&out) - 84.0).abs() < 1e-6, "area {}", flat_area(&out));
+        // A 2D translate keeps it flat and shifts it; a 3D rotate reduces
+        // to its 2D part (stays at z=0).
+        let out = run("translate([5, 0, 0]) square([2, 2]);");
+        assert!(out.shapes[0].mesh.positions.iter().all(|p| p[2] == 0.0 && p[0] >= 4.999));
+        let out = run("rotate([90, 0, 0]) square([2, 2]);");
+        assert!(out.shapes[0].mesh.positions.iter().all(|p| p[2] == 0.0), "2D reduction keeps z=0");
+        // Feeding a 2D shape to a 3D boolean warns rather than misbehaving.
+        let out = run("difference() { cube(4, center=true); square(2); }");
+        assert!(out.warnings.iter().any(|w| w.contains("2D")));
     }
 
     #[test]

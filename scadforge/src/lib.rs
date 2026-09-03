@@ -14,4 +14,5 @@ pub mod geom;
 pub mod http;
 pub mod lexer;
 pub mod parser;
+pub mod poly2;
 pub mod value;
