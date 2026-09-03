@@ -932,6 +932,16 @@ fn call_builtin_module(
             // first child's color as a sensible representative.
             let color = groups.iter().flatten().find_map(|s| s.color);
             let meshes: Vec<Mesh> = groups.into_iter().flatten().map(|s| s.mesh).collect();
+            let n: usize = meshes.iter().map(|m| m.positions.len()).sum();
+            if n > csg::HULL_MAX_POINTS {
+                ctx.out.warnings.push(format!(
+                    "hull(): {} vertices exceed the preview cap ({}); reduce $fn on the \
+                     children",
+                    n,
+                    csg::HULL_MAX_POINTS
+                ));
+                return Vec::new();
+            }
             leaf_colored(csg::hull(&meshes), color)
         }
         "minkowski" => {

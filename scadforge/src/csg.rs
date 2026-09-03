@@ -580,6 +580,11 @@ pub fn hull(meshes: &[Mesh]) -> Mesh {
     convex_hull(&pts)
 }
 
+/// The incremental hull re-tests each point against the whole face list
+/// (O(n²)); beyond this many input vertices the caller warns and skips so
+/// a high-$fn hull can't grind the preview endpoint for tens of seconds.
+pub const HULL_MAX_POINTS: usize = 20_000;
+
 /// A hull face: point indices in outward-CCW order, plus its plane.
 struct Face {
     v: [usize; 3],
@@ -589,46 +594,42 @@ struct Face {
 
 /// Incremental 3D convex hull. Correct-by-construction for clean point
 /// sets; preview-grade (fixed epsilon) for near-degenerate ones.
-fn convex_hull(pts: &[V3]) -> Mesh {
+fn convex_hull(input: &[V3]) -> Mesh {
+    // Drop non-finite points so a stray NaN/inf coordinate (e.g. a user
+    // 0/0 reaching a vertex) yields a degenerate/empty hull rather than
+    // panicking the seed search.
+    let pts: Vec<V3> = input
+        .iter()
+        .filter(|p| p.iter().all(|c| c.is_finite()))
+        .cloned()
+        .collect();
+    let pts = &pts[..];
     if pts.len() < 4 {
         return Mesh::empty();
     }
+    // Total ordering avoids partial_cmp().unwrap() panics if an overflow
+    // to inf/NaN slips through on extreme (non-physical) coordinates.
+    let by = |key: &dyn Fn(usize) -> f64| -> usize {
+        (0..pts.len()).max_by(|&a, &b| key(a).total_cmp(&key(b))).unwrap_or(0)
+    };
     // Seed tetrahedron: extremes that are pairwise non-degenerate.
     let i0 = 0;
-    // farthest from p0
-    let i1 = match (0..pts.len())
-        .max_by(|&a, &b| {
-            dist2(pts[i0], pts[a]).partial_cmp(&dist2(pts[i0], pts[b])).unwrap()
-        }) {
-        Some(i) if dist2(pts[i0], pts[i]) > EPS * EPS => i,
-        _ => return Mesh::empty(), // all coincident
-    };
-    // farthest from the line p0-p1
-    let i2 = match (0..pts.len())
-        .max_by(|&a, &b| {
-            line_dist2(pts[i0], pts[i1], pts[a])
-                .partial_cmp(&line_dist2(pts[i0], pts[i1], pts[b]))
-                .unwrap()
-        }) {
-        Some(i) if line_dist2(pts[i0], pts[i1], pts[i]) > EPS * EPS => i,
-        _ => return Mesh::empty(), // all collinear
-    };
-    // farthest from the plane p0-p1-p2
-    let base = Plane::from_points(pts[i0], pts[i1], pts[i2]);
-    let base = match base {
+    let i1 = by(&|a| dist2(pts[i0], pts[a]));
+    if dist2(pts[i0], pts[i1]) <= EPS * EPS {
+        return Mesh::empty(); // all coincident
+    }
+    let i2 = by(&|a| line_dist2(pts[i0], pts[i1], pts[a]));
+    if line_dist2(pts[i0], pts[i1], pts[i2]) <= EPS * EPS {
+        return Mesh::empty(); // all collinear
+    }
+    let base = match Plane::from_points(pts[i0], pts[i1], pts[i2]) {
         Some(p) => p,
         None => return Mesh::empty(),
     };
-    let i3 = match (0..pts.len())
-        .max_by(|&a, &b| {
-            (dot(base.normal, pts[a]) - base.w)
-                .abs()
-                .partial_cmp(&(dot(base.normal, pts[b]) - base.w).abs())
-                .unwrap()
-        }) {
-        Some(i) if (dot(base.normal, pts[i]) - base.w).abs() > EPS => i,
-        _ => return Mesh::empty(), // all coplanar → no 3D volume
-    };
+    let i3 = by(&|a| (dot(base.normal, pts[a]) - base.w).abs());
+    if (dot(base.normal, pts[i3]) - base.w).abs() <= EPS {
+        return Mesh::empty(); // all coplanar → no 3D volume
+    }
 
     // Interior reference point: the seed tetra's centroid stays inside
     // the growing hull, so every face is oriented to point away from it.
@@ -642,6 +643,8 @@ fn convex_hull(pts: &[V3]) -> Mesh {
         faces.push(make_face(pts, tri, interior));
     }
 
+    let mut vis_edges: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
     for (pi, &p) in pts.iter().enumerate() {
         if pi == i0 || pi == i1 || pi == i2 || pi == i3 {
             continue;
@@ -654,8 +657,7 @@ fn convex_hull(pts: &[V3]) -> Mesh {
         }
         // Horizon = directed edges of visible faces whose reverse is not
         // also a visible-face edge (i.e. the boundary with the kept part).
-        let mut vis_edges: std::collections::HashSet<(usize, usize)> =
-            std::collections::HashSet::new();
+        vis_edges.clear();
         for (fi, f) in faces.iter().enumerate() {
             if visible[fi] {
                 vis_edges.insert((f.v[0], f.v[1]));
@@ -668,8 +670,17 @@ fn convex_hull(pts: &[V3]) -> Mesh {
             .filter(|&&(a, b)| !vis_edges.contains(&(b, a)))
             .cloned()
             .collect();
+        // Robustness guard: near-coplanar facets can make floating drift
+        // flip the visibility test inconsistently, so the horizon is not
+        // a simple closed loop. Capping such a horizon would emit an
+        // overlapping, non-manifold shell — skip the point instead (it is
+        // near the existing surface anyway). A valid horizon visits each
+        // vertex exactly once as a start and once as an end.
+        if !is_simple_loop(&horizon) {
+            continue;
+        }
         // Drop visible faces, then cap the horizon with the new point.
-        let mut kept: Vec<Face> = Vec::new();
+        let mut kept: Vec<Face> = Vec::with_capacity(faces.len());
         for (fi, f) in faces.drain(..).enumerate() {
             if !visible[fi] {
                 kept.push(f);
@@ -696,6 +707,27 @@ fn convex_hull(pts: &[V3]) -> Mesh {
         tris.push(idx);
     }
     Mesh { positions, tris }
+}
+
+/// Does this directed-edge set form a single simple loop — every vertex
+/// exactly once as a start and once as an end? Used to reject a horizon
+/// corrupted by near-coplanar visibility flips before it caps into a
+/// non-manifold shell.
+fn is_simple_loop(edges: &[(usize, usize)]) -> bool {
+    if edges.len() < 3 {
+        return false;
+    }
+    use std::collections::HashMap;
+    let mut out: HashMap<usize, u32> = HashMap::new();
+    let mut inc: HashMap<usize, u32> = HashMap::new();
+    for &(a, b) in edges {
+        *out.entry(a).or_insert(0) += 1;
+        *inc.entry(b).or_insert(0) += 1;
+    }
+    out.len() == edges.len()
+        && inc.len() == edges.len()
+        && out.values().all(|&c| c == 1)
+        && inc.values().all(|&c| c == 1)
 }
 
 fn make_face(pts: &[V3], tri: [usize; 3], interior: V3) -> Face {
@@ -888,6 +920,38 @@ mod tests {
         // Oversized product is reported, not hung.
         let s = geom::sphere(5.0, 40);
         assert!(matches!(minkowski(&[s.clone(), s]), Minkowski::TooLarge(_)));
+    }
+
+    #[test]
+    fn hull_is_robust_to_bad_input() {
+        // Non-finite coordinates must NOT panic — they are dropped, and
+        // the remaining finite points still hull.
+        let cube = geom::cube([2.0, 2.0, 2.0], true);
+        let mut with_nan = cube.clone();
+        with_nan.positions.push([f64::NAN, 0.0, 0.0]);
+        with_nan.positions.push([1.0 / 0.0, 0.0, 0.0]);
+        let h = hull(&[with_nan]);
+        assert!((signed_volume(&h).abs() - 8.0).abs() < 1e-6);
+        // A near-coplanar thin lens (all coordinates normal magnitude)
+        // must not emit a non-manifold shell — the horizon guard keeps
+        // every output edge shared by exactly two faces (2-manifold).
+        let mut lens = geom::sphere(20.0, 24);
+        for p in &mut lens.positions {
+            p[2] *= 1e-4; // squash to a ~4e-3-thick disk
+        }
+        let h = hull(&[lens]);
+        // Count undirected-edge multiplicity; a closed manifold has every
+        // edge in exactly two triangles.
+        use std::collections::HashMap;
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in &h.tris {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let key = if a < b { (a, b) } else { (b, a) };
+                *edges.entry(key).or_insert(0) += 1;
+            }
+        }
+        // Either it degenerated to empty (acceptable) or it is closed.
+        assert!(h.tris.is_empty() || edges.values().all(|&c| c == 2), "non-manifold hull");
     }
 
     #[test]
