@@ -1040,6 +1040,64 @@ fn call_builtin_module(
                 }
             }
         }
+        "linear_extrude" => {
+            let poly = collect_2d(children, scope, ctx);
+            // Default height is 100; non-finite/non-numeric keeps the default.
+            let height = bound
+                .get("height")
+                .and_then(Value::as_num)
+                .filter(|h| h.is_finite())
+                .unwrap_or(100.0);
+            if height <= 0.0 || poly.is_empty() {
+                return Vec::new(); // height ≤ 0 clamps to empty, silently
+            }
+            let center = bound.get("center").and_then(Value::as_bool).unwrap_or(false);
+            let twist = bound.get("twist").and_then(Value::as_num).unwrap_or(0.0);
+            let scale = match bound.get("scale") {
+                Some(Value::Num(s)) => [*s, *s],
+                Some(v @ Value::Vector(_)) => {
+                    v.as_vec3().map(|a| [a[0], a[1]]).unwrap_or([1.0, 1.0])
+                }
+                _ => [1.0, 1.0],
+            };
+            let slices = match bound.get("slices").and_then(Value::as_num) {
+                Some(s) if s >= 1.0 => s.trunc() as usize,
+                _ if twist != 0.0 => {
+                    let fa = ctx.dynv.lookup("$fa").and_then(|v| v.as_num()).unwrap_or(12.0);
+                    (twist.abs() / fa.max(1.0)).ceil().max(1.0) as usize
+                }
+                _ => 1,
+            };
+            let (positions, tris) =
+                poly2::extrude_linear(&poly, height, center, twist, slices, scale);
+            leaf(Mesh { positions, tris })
+        }
+        "rotate_extrude" => {
+            let poly = collect_2d(children, scope, ctx);
+            if poly.is_empty() {
+                return Vec::new();
+            }
+            let angle = bound.get("angle").and_then(Value::as_num).unwrap_or(360.0);
+            if angle == 0.0 {
+                return Vec::new();
+            }
+            // Fragments from the largest profile radius, scaled by the sweep.
+            let max_r = poly
+                .contours
+                .iter()
+                .flatten()
+                .map(|p| p[0].abs())
+                .fold(0.0, f64::max);
+            let base = resolve_fragments(max_r, ctx) as f64;
+            let frags = ((base * angle.abs() / 360.0).trunc() as usize).max(1);
+            match poly2::extrude_rotate(&poly, angle, frags) {
+                Ok((positions, tris)) => leaf(Mesh { positions, tris }),
+                Err(e) => {
+                    ctx.out.warnings.push(format!("ERROR: {}", e));
+                    Vec::new()
+                }
+            }
+        }
         "color" => {
             let rgba = parse_color(bound.get("c"), bound.get("alpha"), ctx);
             let mut shapes = exec_scope(children, scope, ctx);
@@ -1418,6 +1476,31 @@ fn any_2d(groups: &[Vec<Shape>]) -> bool {
     groups.iter().flatten().any(|s| s.outline.is_some())
 }
 
+/// Collect the child 2D geometry for an extrusion into one region (the
+/// union of every 2D child's contours; even-odd resolves overlaps at
+/// triangulation). 3D children are skipped with a warning.
+fn collect_2d(children: &[Stmt], scope: &Rc<Scope>, ctx: &mut Ctx) -> Poly2 {
+    let shapes = exec_scope(children, scope, ctx);
+    let mut contours = Vec::new();
+    let mut saw_3d = false;
+    for s in shapes {
+        match s.outline {
+            Some(poly) => contours.extend(poly.contours),
+            None => {
+                if !s.mesh.positions.is_empty() {
+                    saw_3d = true;
+                }
+            }
+        }
+    }
+    if saw_3d {
+        ctx.out
+            .warnings
+            .push("Ignoring 3D child object for 2D operation".into());
+    }
+    Poly2::new(contours)
+}
+
 fn transform_children(
     children: &[Stmt],
     scope: &Rc<Scope>,
@@ -1482,6 +1565,8 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         "square" => &["size", "center"],
         "circle" => &["r"],
         "polygon" => &["points", "paths", "convexity"],
+        "linear_extrude" => &["height"],
+        "rotate_extrude" => &["angle"],
         "color" => &["c", "alpha"],
         "children" | "child" => &["index"],
         _ => &[],
@@ -3454,6 +3539,28 @@ mod tests {
         // Feeding a 2D shape to a 3D boolean warns rather than misbehaving.
         let out = run("difference() { cube(4, center=true); square(2); }");
         assert!(out.warnings.iter().any(|w| w.contains("2D")));
+    }
+
+    #[test]
+    fn extrusions_bridge_2d_to_3d() {
+        // linear_extrude a square → a box (now a real 3D shape, no outline).
+        let out = run("linear_extrude(height=5) square([3, 2]);");
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes[0].outline.is_none(), "extrusion output is 3D");
+        assert!((total_volume(&out) - 30.0).abs() < 1e-9);
+        // Default height is 100 (the famous trap).
+        let out = run("linear_extrude() square(1);");
+        assert!((total_volume(&out) - 100.0).abs() < 1e-9);
+        // A twisted extrusion still closes (positive volume).
+        let out = run("linear_extrude(height=10, twist=90, $fn=16) square([4,1], center=true);");
+        assert!(total_volume(&out) > 0.0 && out.shapes[0].outline.is_none());
+        // rotate_extrude a rectangle offset on X → a washer, volume 12π.
+        let out = run("rotate_extrude($fn=128) translate([2,0]) square([2,1]);");
+        assert!((total_volume(&out) - std::f64::consts::PI * 12.0).abs() < 0.3);
+        // A profile crossing X=0 errors (empty + warning), doesn't crash.
+        let out = run("rotate_extrude() translate([-1,0]) square([2,1]);");
+        assert!(out.shapes.is_empty());
+        assert!(out.warnings.iter().any(|w| w.contains("same X")));
     }
 
     #[test]

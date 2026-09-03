@@ -302,6 +302,157 @@ pub fn polygon(points: &[Vec2], paths: Option<&[Vec<usize>]>) -> (Poly2, Vec<Str
     (Poly2::new(contours), warnings)
 }
 
+// -- Extrusions (2D → 3D) ---------------------------------------------------
+
+type Mesh3 = (Vec<[f64; 3]>, Vec<[u32; 3]>);
+
+/// Contours re-wound by even-odd nesting depth: even depth (a solid
+/// outline) → CCW, odd depth (a hole) → CW. Extrusion walls built from
+/// these face outward on solids and inward on holes.
+fn oriented_contours(poly: &Poly2) -> Vec<Vec<Vec2>> {
+    let contours: Vec<&Vec<Vec2>> = poly.contours.iter().filter(|c| c.len() >= 3).collect();
+    let depth: Vec<usize> = contours
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let p = c[0];
+            contours
+                .iter()
+                .enumerate()
+                .filter(|&(j, o)| j != i && point_in_one(o, p))
+                .count()
+        })
+        .collect();
+    contours
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if depth[i] % 2 == 0 {
+                ccw((*c).clone())
+            } else {
+                cw((*c).clone())
+            }
+        })
+        .collect()
+}
+
+/// linear_extrude: stamp the region as slices+1 rings from z0 to z0+height,
+/// each ring scaled (lerp 1→scale) then rotated (-twist·t degrees) about
+/// the origin. Walls connect consecutive rings; the base triangulation
+/// forms the bottom (reversed) and top caps. Negative scale clamps to 0.
+pub fn extrude_linear(
+    poly: &Poly2,
+    height: f64,
+    center: bool,
+    twist: f64,
+    slices: usize,
+    scale: Vec2,
+) -> Mesh3 {
+    let slices = slices.max(1);
+    let scale = [scale[0].max(0.0), scale[1].max(0.0)];
+    let z0 = if center { -height / 2.0 } else { 0.0 };
+    let ring = |p: Vec2, t: f64| -> [f64; 3] {
+        let sx = 1.0 + (scale[0] - 1.0) * t;
+        let sy = 1.0 + (scale[1] - 1.0) * t;
+        let (x, y) = (p[0] * sx, p[1] * sy);
+        let ang = (-twist * t).to_radians();
+        let (c, s) = (ang.cos(), ang.sin());
+        [x * c - y * s, x * s + y * c, z0 + t * height]
+    };
+    let mut positions: Vec<[f64; 3]> = Vec::new();
+    let mut tris: Vec<[u32; 3]> = Vec::new();
+    let (cap2, cap_tris) = triangulate(poly);
+    // Bottom cap at t=0, reversed to face -z.
+    let base = positions.len() as u32;
+    positions.extend(cap2.iter().map(|v| ring(*v, 0.0)));
+    tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[2], base + t[1]]));
+    // Top cap at t=1, facing +z.
+    let base = positions.len() as u32;
+    positions.extend(cap2.iter().map(|v| ring(*v, 1.0)));
+    tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[1], base + t[2]]));
+    // Side walls, one quad per contour edge per slice (contours wound by
+    // nesting so hole walls face inward).
+    for contour in &oriented_contours(poly) {
+        let n = contour.len();
+        if n < 3 {
+            continue;
+        }
+        for i in 0..slices {
+            let (t0, t1) = (i as f64 / slices as f64, (i + 1) as f64 / slices as f64);
+            for j in 0..n {
+                let jn = (j + 1) % n;
+                let b = positions.len() as u32;
+                positions.push(ring(contour[j], t0));
+                positions.push(ring(contour[jn], t0));
+                positions.push(ring(contour[jn], t1));
+                positions.push(ring(contour[j], t1));
+                tris.push([b, b + 1, b + 2]);
+                tris.push([b, b + 2, b + 3]);
+            }
+        }
+    }
+    (positions, tris)
+}
+
+/// rotate_extrude: revolve the profile around Z — (x, y) maps to
+/// (x·cosθ, x·sinθ, y). All profile x must share one sign (else Err). A
+/// full sweep welds; a partial sweep adds flat caps at θ=0 and θ=angle.
+pub fn extrude_rotate(poly: &Poly2, angle_deg: f64, frags: usize) -> Result<Mesh3, String> {
+    let frags = frags.max(1);
+    let mut minx = f64::INFINITY;
+    let mut maxx = f64::NEG_INFINITY;
+    for c in &poly.contours {
+        for p in c {
+            minx = minx.min(p[0]);
+            maxx = maxx.max(p[0]);
+        }
+    }
+    if minx < -1e-9 && maxx > 1e-9 {
+        return Err(format!(
+            "all points for rotate_extrude() must have the same X coordinate sign \
+             (range is {:.2} -> {:.2})",
+            minx, maxx
+        ));
+    }
+    let full = angle_deg.abs() >= 360.0 - 1e-9;
+    let sweep = if full { 360.0 } else { angle_deg };
+    let angle_at = |k: usize| (sweep * k as f64 / frags as f64).to_radians();
+    let revolve = |p: Vec2, theta: f64| [p[0] * theta.cos(), p[0] * theta.sin(), p[1]];
+    let mut positions: Vec<[f64; 3]> = Vec::new();
+    let mut tris: Vec<[u32; 3]> = Vec::new();
+    for contour in &oriented_contours(poly) {
+        let n = contour.len();
+        if n < 3 {
+            continue;
+        }
+        for seg in 0..frags {
+            let (th0, th1) = (angle_at(seg), angle_at(seg + 1));
+            for j in 0..n {
+                let jn = (j + 1) % n;
+                let b = positions.len() as u32;
+                positions.push(revolve(contour[j], th0));
+                positions.push(revolve(contour[jn], th0));
+                positions.push(revolve(contour[jn], th1));
+                positions.push(revolve(contour[j], th1));
+                tris.push([b, b + 1, b + 2]);
+                tris.push([b, b + 2, b + 3]);
+            }
+        }
+    }
+    if !full {
+        let (cap2, cap_tris) = triangulate(poly);
+        // Cap at θ=0 (reversed to face the -θ side).
+        let base = positions.len() as u32;
+        positions.extend(cap2.iter().map(|v| revolve(*v, angle_at(0))));
+        tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[2], base + t[1]]));
+        // Cap at θ=angle.
+        let base = positions.len() as u32;
+        positions.extend(cap2.iter().map(|v| revolve(*v, angle_at(frags))));
+        tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[1], base + t[2]]));
+    }
+    Ok((positions, tris))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +493,46 @@ mod tests {
         let hole = vec![[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]];
         let (v, t) = triangulate(&Poly2::new(vec![outer, hole]));
         assert!((area(&t, &v) - 84.0).abs() < 1e-6, "area {}", area(&t, &v));
+    }
+
+    fn signed_volume(pos: &[[f64; 3]], tris: &[[u32; 3]]) -> f64 {
+        let mut v = 0.0;
+        for t in tris {
+            let a = pos[t[0] as usize];
+            let b = pos[t[1] as usize];
+            let c = pos[t[2] as usize];
+            v += (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                / 6.0;
+        }
+        v
+    }
+
+    #[test]
+    fn linear_extrude_makes_an_outward_prism() {
+        // A 3×2 square extruded 5 tall = a 30-unit box, outward-wound.
+        let (p, t) = extrude_linear(&square([3.0, 2.0], false), 5.0, false, 0.0, 1, [1.0, 1.0]);
+        assert!((signed_volume(&p, &t) - 30.0).abs() < 1e-9, "vol {}", signed_volume(&p, &t));
+        // A ring (square with a hole) extruded stays hollow: area 84 × h.
+        let ring = Poly2::new(vec![
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            vec![[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]],
+        ]);
+        let (p, t) = extrude_linear(&ring, 2.0, false, 0.0, 1, [1.0, 1.0]);
+        assert!((signed_volume(&p, &t).abs() - 84.0 * 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rotate_extrude_revolves_a_washer() {
+        // A unit-tall rectangle at radius [2,4], revolved 360° → a washer
+        // of volume π(4² − 2²)·1 = 12π.
+        let rect = Poly2::new(vec![vec![[2.0, 0.0], [4.0, 0.0], [4.0, 1.0], [2.0, 1.0]]]);
+        let (p, t) = extrude_rotate(&rect, 360.0, 128).unwrap();
+        let want = std::f64::consts::PI * 12.0;
+        assert!((signed_volume(&p, &t).abs() - want).abs() < 0.2, "vol {}", signed_volume(&p, &t));
+        // A profile straddling X=0 is an error.
+        let bad = Poly2::new(vec![vec![[-1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]]);
+        assert!(extrude_rotate(&bad, 360.0, 16).is_err());
     }
 
     #[test]

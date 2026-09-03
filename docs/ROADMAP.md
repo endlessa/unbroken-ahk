@@ -4,8 +4,8 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 3 complete (2026-09-03): **118 full / 10 partial /
-55 untouched — 64% full, 70% touched.**
+Standing after phase 4 extrusions (2026-09-03): **128 full / 10 partial
+/ 45 untouched — 70% full, 75% touched.**
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -59,14 +59,29 @@ convex decomposition lands.
 Low-priority remnants (observable-surface, deferrable): `render()`,
 `convexity`, the 2-manifold export warning.
 
-### Phase 4 — 2D + extrusions (~15 entries)
+### Phase 4 — 2D + extrusions (~15 entries, in progress)
 
-- `square`, `circle`, `polygon`, the z=0 2D geometry model
-- `linear_extrude`, `rotate_extrude`, `offset`, `projection`
-- Remaining transforms: `mirror`, `multmatrix`, `resize`
-- `polyhedron`
+Landed (2026-09-03):
+
+- ✅ `square`, `circle`, `polygon` + the z=0 2D geometry model
+  (`scadforge/src/poly2.rs`: even-odd contours, ear-clip triangulation
+  with hole bridging, nesting-depth re-winding). 2D shapes flow through
+  the pipeline via `Shape.outline: Option<Poly2>`; transforms reduce to
+  2D (drop z row/col, rewind on det2<0).
+- ✅ `linear_extrude` (height/center/twist/slices/scale) and
+  `rotate_extrude` (angle/$fn, X-sign straddle error) — clean-room
+  contour sweeps in `poly2.rs`, pinned by volume tests.
+- ✅ Remaining transforms: `mirror` (Householder), `multmatrix`
+  (non-finite subtree drop), `resize` (bbox measure + auto factors).
+- ✅ `polyhedron` (winding fix, fan-triangulation, index bounds check).
+
+Remaining:
+
+- `offset` (2D, radial + delta/chamfer), `projection` (3D→2D, cut mode).
+- 2D booleans: `difference`/`intersection` on 2D operands (currently
+  pass through with a warning) — needed for richer 2D compositions.
 - `text()` and its 5 sub-entries need a from-scratch font rasterizer —
-  likely the very last item in the project
+  likely the very last item in the project.
 
 ### Phase 5 — I/O + polish (~30 entries)
 
