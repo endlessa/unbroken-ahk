@@ -927,10 +927,6 @@ fn call_builtin_module(
             if groups.is_empty() {
                 return Vec::new();
             }
-            // hull() discards children colors; a color() wrapping the hull
-            // itself still applies via the nearest-color rule. Keep the
-            // first child's color as a sensible representative.
-            let color = groups.iter().flatten().find_map(|s| s.color);
             let meshes: Vec<Mesh> = groups.into_iter().flatten().map(|s| s.mesh).collect();
             let n: usize = meshes.iter().map(|m| m.positions.len()).sum();
             if n > csg::HULL_MAX_POINTS {
@@ -942,38 +938,35 @@ fn call_builtin_module(
                 ));
                 return Vec::new();
             }
-            leaf_colored(csg::hull(&meshes), color)
+            // Children colors are DROPPED (reference hull EDGE[6]); leaving
+            // the result uncolored lets an enclosing color() apply.
+            leaf(csg::hull(&meshes))
         }
         "minkowski" => {
             let groups = eval_children_grouped(children, scope, ctx);
             if groups.is_empty() {
                 return Vec::new();
             }
-            let color = groups.iter().flatten().find_map(|s| s.color);
             let meshes: Vec<Mesh> = groups.iter().map(|g| combine_group(g).0).collect();
             let nonempty = meshes.iter().filter(|m| !m.positions.is_empty()).count();
             if nonempty >= 2 {
                 ctx.out.warnings.push(
-                    "minkowski(): convex operands are exact; concave operands are \
-                     approximated by their convex sum"
+                    "minkowski(): result is exact for convex operands; concave operands \
+                     are approximated by their convex sum"
                         .into(),
                 );
             }
+            // Children colors are DROPPED (reference minkowski EDGE[9]).
             match csg::minkowski(&meshes) {
-                csg::Minkowski::Ok(mesh) => leaf_colored(mesh, color),
-                csg::Minkowski::TooLarge(n) => {
+                csg::Minkowski::Ok(mesh) => leaf(mesh),
+                csg::Minkowski::TooLarge { count, partial } => {
                     ctx.out.warnings.push(format!(
                         "minkowski(): {} pairwise points exceed the preview cap ({}); \
-                         reduce $fn on the operands — showing the first operand only",
-                        n,
+                         reduce $fn on the operands — showing the partial fold",
+                        count,
                         csg::MINKOWSKI_MAX_POINTS
                     ));
-                    // Degrade gracefully: show the first non-empty operand.
-                    let first = meshes.into_iter().find(|m| !m.positions.is_empty());
-                    match first {
-                        Some(m) => leaf_colored(m, color),
-                        None => Vec::new(),
-                    }
+                    leaf(partial)
                 }
             }
         }
@@ -3067,6 +3060,13 @@ mod tests {
         let out = run("minkowski() { cube(10, center=true); sphere(2, $fn=12); }");
         assert_eq!(out.shapes.len(), 1);
         assert!(total_volume(&out) > total_volume(&plain));
+        // hull()/minkowski() DROP children colors; an enclosing color()
+        // then applies (reference hull EDGE[6] / minkowski EDGE[9]).
+        let out = run("color(\"red\") hull() { color(\"blue\") cube(1); translate([3,0,0]) sphere(1,$fn=8); }");
+        assert_eq!(out.shapes[0].color, Some([1.0, 0.0, 0.0, 1.0]));
+        // A bare hull() with a colored child stays uncolored (color dropped).
+        let out = run("hull() { color(\"blue\") cube(1); translate([3,0,0]) cube(1); }");
+        assert_eq!(out.shapes[0].color, None);
     }
 
     #[test]

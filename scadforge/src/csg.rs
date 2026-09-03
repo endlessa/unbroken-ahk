@@ -530,8 +530,10 @@ pub const MINKOWSKI_MAX_POINTS: usize = 60_000;
 /// Outcome of a Minkowski attempt, so the caller can warn precisely.
 pub enum Minkowski {
     Ok(Mesh),
-    /// A step's V1·V2 exceeded the cap; carries the point count skipped.
-    TooLarge(usize),
+    /// A step's V1·V2 exceeded the cap: carries the offending point count
+    /// and the last successfully-folded accumulator (so the caller can
+    /// still show the completed prefix, not just the raw first operand).
+    TooLarge { count: usize, partial: Mesh },
 }
 
 /// Minkowski sum A ⊕ B = { a + b : a ∈ A, b ∈ B }, folded pairwise from
@@ -551,7 +553,7 @@ pub fn minkowski(meshes: &[Mesh]) -> Minkowski {
     for m in iter {
         let product = acc.positions.len() * m.positions.len();
         if product > MINKOWSKI_MAX_POINTS {
-            return Minkowski::TooLarge(product);
+            return Minkowski::TooLarge { count: product, partial: acc };
         }
         let mut pts = Vec::with_capacity(product);
         for &pa in &acc.positions {
@@ -709,25 +711,44 @@ fn convex_hull(input: &[V3]) -> Mesh {
     Mesh { positions, tris }
 }
 
-/// Does this directed-edge set form a single simple loop — every vertex
-/// exactly once as a start and once as an end? Used to reject a horizon
-/// corrupted by near-coplanar visibility flips before it caps into a
-/// non-manifold shell.
+/// Does this directed-edge set form ONE simple loop — every vertex once
+/// as a start and once as an end, AND all edges on a single cycle? Used
+/// to reject a horizon corrupted by near-coplanar visibility flips before
+/// it caps into a non-manifold shell. A degree check alone would also
+/// accept a disjoint union of cycles, so this additionally walks the
+/// successor map and requires the walk to cover every edge.
 fn is_simple_loop(edges: &[(usize, usize)]) -> bool {
     if edges.len() < 3 {
         return false;
     }
     use std::collections::HashMap;
-    let mut out: HashMap<usize, u32> = HashMap::new();
+    let mut succ: HashMap<usize, usize> = HashMap::new();
     let mut inc: HashMap<usize, u32> = HashMap::new();
     for &(a, b) in edges {
-        *out.entry(a).or_insert(0) += 1;
+        // A repeated start vertex means out-degree > 1 → not simple.
+        if succ.insert(a, b).is_some() {
+            return false;
+        }
         *inc.entry(b).or_insert(0) += 1;
     }
-    out.len() == edges.len()
-        && inc.len() == edges.len()
-        && out.values().all(|&c| c == 1)
-        && inc.values().all(|&c| c == 1)
+    if inc.len() != edges.len() || inc.values().any(|&c| c != 1) {
+        return false; // some vertex has in-degree != 1
+    }
+    // Walk from an arbitrary start; ONE cycle first returns to the start
+    // after exactly edges.len() hops. Returning early means a shorter
+    // sub-cycle exists (a disjoint union), so reject it.
+    let start = edges[0].0;
+    let mut cur = start;
+    for step in 0..edges.len() {
+        cur = match succ.get(&cur) {
+            Some(&n) => n,
+            None => return false,
+        };
+        if cur == start && step + 1 < edges.len() {
+            return false;
+        }
+    }
+    cur == start
 }
 
 fn make_face(pts: &[V3], tri: [usize; 3], interior: V3) -> Face {
@@ -775,6 +796,23 @@ mod tests {
             }
         }
         (lo, hi)
+    }
+
+    /// A closed 2-manifold has every undirected edge shared by exactly
+    /// two triangles.
+    fn is_closed_manifold(m: &Mesh) -> bool {
+        use std::collections::HashMap;
+        if m.tris.is_empty() {
+            return false;
+        }
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in &m.tris {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let key = if a < b { (a, b) } else { (b, a) };
+                *edges.entry(key).or_insert(0) += 1;
+            }
+        }
+        edges.values().all(|&c| c == 2)
     }
 
     /// Winding-aware signed volume via the divergence theorem: sum of
@@ -868,12 +906,28 @@ mod tests {
     fn convex_hull_matches_known_solids() {
         // Hull of the 8 cube corners is the cube itself: volume = side^3.
         let cube = geom::cube([2.0, 2.0, 2.0], true);
-        let h = hull(&[cube]);
+        let h = hull(&[cube.clone()]);
         assert!((signed_volume(&h).abs() - 8.0).abs() < 1e-6, "vol {}", signed_volume(&h));
+        // Raw sign (not abs): the hull is OUTWARD-wound — an inverted
+        // hull would pass every abs() check but be culled by the viewer.
+        assert!(signed_volume(&h) > 0.0, "hull output must be outward-wound");
+        assert!(is_closed_manifold(&h), "hull must be a closed 2-manifold");
         // Hull is convex: every original vertex lies on or behind every
         // output face plane (no point pokes outside).
         let (lo, hi) = bounds(&h);
         assert!((lo[0] + 1.0).abs() < 1e-9 && (hi[0] - 1.0).abs() < 1e-9);
+
+        // Coplanar-base cone (a pyramid): the flat base is one large facet
+        // reached over many coplanar rim points — a path the cube misses.
+        let cone = geom::cylinder(4.0, 3.0, 0.0, false, 16);
+        let h = hull(&[cone.clone()]);
+        assert!(signed_volume(&h) > 0.0 && is_closed_manifold(&h));
+        assert!((signed_volume(&h).abs() - signed_volume(&cone).abs()).abs() < 1e-6);
+
+        // Duplicate/coincident vertices (two identical cubes) must not
+        // corrupt the hull.
+        let h = hull(&[cube.clone(), cube.clone()]);
+        assert!((signed_volume(&h).abs() - 8.0).abs() < 1e-6 && is_closed_manifold(&h));
 
         // Hull of two separated spheres is bigger than one sphere and
         // spans both (a convex "capsule"-ish blob).
@@ -904,22 +958,41 @@ mod tests {
         let ball = geom::sphere(2.0, 12);
         let rounded = match minkowski(&[cube.clone(), ball]) {
             Minkowski::Ok(m) => m,
-            Minkowski::TooLarge(_) => panic!("cube⊕small-sphere must fit the cap"),
+            Minkowski::TooLarge { .. } => panic!("cube⊕small-sphere must fit the cap"),
         };
         let (lo, hi) = bounds(&rounded);
         // Grown from [-5,5] toward [-7,7] on X (sphere radius 2).
         assert!(lo[0] < -6.5 && hi[0] > 6.5, "grew: {:?}..{:?}", lo, hi);
         assert!(signed_volume(&rounded).abs() > signed_volume(&cube).abs());
+        // Raw sign (not abs): the result is OUTWARD-wound like every mesh.
+        assert!(signed_volume(&rounded) > 0.0, "minkowski output must be outward");
 
         // Single operand is identity (passes through unchanged, NOT hulled).
         match minkowski(&[geom::cube([2.0, 2.0, 2.0], true)]) {
             Minkowski::Ok(m) => assert!((signed_volume(&m).abs() - 8.0).abs() < 1e-9),
-            Minkowski::TooLarge(_) => panic!(),
+            Minkowski::TooLarge { .. } => panic!(),
         }
 
-        // Oversized product is reported, not hung.
+        // Oversized product is reported (with the completed partial), not hung.
         let s = geom::sphere(5.0, 40);
-        assert!(matches!(minkowski(&[s.clone(), s]), Minkowski::TooLarge(_)));
+        match minkowski(&[s.clone(), s]) {
+            Minkowski::TooLarge { count, partial } => {
+                assert!(count > MINKOWSKI_MAX_POINTS);
+                assert!(!partial.positions.is_empty()); // the first operand survived
+            }
+            Minkowski::Ok(_) => panic!("two dense spheres must exceed the cap"),
+        }
+    }
+
+    #[test]
+    fn is_simple_loop_rejects_disjoint_cycles() {
+        // One triangle loop — accepted.
+        assert!(is_simple_loop(&[(0, 1), (1, 2), (2, 0)]));
+        // Two disjoint triangles: every vertex degree 1 in/out, but NOT a
+        // single cycle — must be rejected (the tightened guard).
+        assert!(!is_simple_loop(&[(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3)]));
+        // A vertex with out-degree 2 — rejected.
+        assert!(!is_simple_loop(&[(0, 1), (0, 2), (1, 2)]));
     }
 
     #[test]
@@ -940,18 +1013,8 @@ mod tests {
             p[2] *= 1e-4; // squash to a ~4e-3-thick disk
         }
         let h = hull(&[lens]);
-        // Count undirected-edge multiplicity; a closed manifold has every
-        // edge in exactly two triangles.
-        use std::collections::HashMap;
-        let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
-        for t in &h.tris {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                let key = if a < b { (a, b) } else { (b, a) };
-                *edges.entry(key).or_insert(0) += 1;
-            }
-        }
         // Either it degenerated to empty (acceptable) or it is closed.
-        assert!(h.tris.is_empty() || edges.values().all(|&c| c == 2), "non-manifold hull");
+        assert!(h.tris.is_empty() || is_closed_manifold(&h), "non-manifold hull");
     }
 
     #[test]
@@ -997,5 +1060,265 @@ mod tests {
             .collect();
         let u = union_all(&many);
         assert!(signed_volume(&u).abs() > signed_volume(&geom::sphere(2.0, 12)).abs());
+    }
+
+    // ---- Refuter #1 adversarial probes for convex_hull correctness ----
+
+    /// Is `p` present in the hull's vertex set (within tolerance)?
+    fn retained(m: &Mesh, p: V3) -> bool {
+        m.positions.iter().any(|q| dist2(*q, p) < 1e-12)
+    }
+
+    /// Convex + closed-2-manifold checks on a hull output.
+    fn assert_clean_hull(m: &Mesh, all_pts: &[V3]) {
+        use std::collections::HashMap;
+        // Closed: every undirected edge shared by exactly two triangles.
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in &m.tris {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let key = if a < b { (a, b) } else { (b, a) };
+                *edges.entry(key).or_insert(0) += 1;
+            }
+        }
+        assert!(edges.values().all(|&c| c == 2), "non-manifold hull");
+        // Convex: no input point strictly in front of any output face plane.
+        for f in &m.tris {
+            let a = m.positions[f[0] as usize];
+            let b = m.positions[f[1] as usize];
+            let c = m.positions[f[2] as usize];
+            let n = norm(cross(sub(b, a), sub(c, a)));
+            let w = dot(n, a);
+            for p in all_pts {
+                assert!(dot(n, *p) - w < 1e-9, "point {:?} pokes out of a face", p);
+            }
+        }
+    }
+
+    #[test]
+    fn hull_retains_coplanar_cap_corners() {
+        // An octagonal PRISM: two big flat coplanar caps (z=0 and z=10) of
+        // 8 corners each. Every one of the 16 corners is a genuine hull
+        // vertex. This is the case a fixed-EPS visibility test is supposed
+        // to be able to miss: a cap corner is coplanar (dist 0) with its
+        // cap face and only pokes out past a cap edge, seen by a side face.
+        let n = 8usize;
+        let r = 5.0;
+        let mut pts: Vec<V3> = Vec::new();
+        for k in 0..n {
+            let a = std::f64::consts::TAU * (k as f64) / (n as f64);
+            pts.push([r * a.cos(), r * a.sin(), 0.0]);
+            pts.push([r * a.cos(), r * a.sin(), 10.0]);
+        }
+        let m = hull(&[Mesh { positions: pts.clone(), tris: vec![] }]);
+        for p in &pts {
+            assert!(retained(&m, *p), "prism corner {:?} was dropped from the hull", p);
+        }
+        assert_clean_hull(&m, &pts);
+    }
+
+    #[test]
+    fn hull_retains_square_bipyramid_equator() {
+        // Square-equator bipyramid: 4 coplanar equator corners (z=0) plus a
+        // top and bottom apex. All 6 are hull vertices; the equator corners
+        // are each coplanar with an equatorial-ish facet chord.
+        let pts: Vec<V3> = vec![
+            [2.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [-2.0, 0.0, 0.0],
+            [0.0, -2.0, 0.0],
+            [0.0, 0.0, 3.0],
+            [0.0, 0.0, -3.0],
+        ];
+        let m = hull(&[Mesh { positions: pts.clone(), tris: vec![] }]);
+        for p in &pts {
+            assert!(retained(&m, *p), "bipyramid vertex {:?} dropped", p);
+        }
+        assert_clean_hull(&m, &pts);
+        // Octahedron volume = (1/3) * base-diagonal-area * total-height.
+        // base is a square of diagonal 4 -> area 8; height 6 -> vol 16.
+        assert!((signed_volume(&m).abs() - 16.0).abs() < 1e-6, "vol {}", signed_volume(&m));
+    }
+
+    // Deterministic LCG so the battery is reproducible without extern crates.
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*state >> 11) as f64) / ((1u64 << 53) as f64) // in [0,1)
+    }
+
+    #[test]
+    fn refuter_adversarial_hull_battery() {
+        // (1) Icosahedron: 12 vertices, ALL extreme, highly symmetric facets.
+        let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
+        let mut ico: Vec<V3> = Vec::new();
+        for &s1 in &[-1.0, 1.0] {
+            for &s2 in &[-1.0, 1.0] {
+                ico.push([0.0, s1 * 1.0, s2 * phi]);
+                ico.push([s1 * 1.0, s2 * phi, 0.0]);
+                ico.push([s1 * phi, 0.0, s2 * 1.0]);
+            }
+        }
+        let m = hull(&[Mesh { positions: ico.clone(), tris: vec![] }]);
+        for p in &ico {
+            assert!(retained(&m, *p), "icosahedron vertex {:?} dropped", p);
+        }
+        assert_clean_hull(&m, &ico);
+        assert!(signed_volume(&m) > 0.0, "icosa vol {}", signed_volume(&m));
+
+        // (2) Rotated cube (non-axis-aligned coplanar faces) with midpoints on
+        // every face and edge -> lots of exactly-coplanar non-vertex points.
+        let mut cube: Vec<V3> = Vec::new();
+        for &x in &[-1.0, 0.0, 1.0] {
+            for &y in &[-1.0, 0.0, 1.0] {
+                for &z in &[-1.0, 0.0, 1.0] {
+                    cube.push([x, y, z]);
+                }
+            }
+        }
+        // Rotate by an irrational-ish angle about all three axes.
+        let (ca, sa) = (0.6, 0.8);
+        for p in &mut cube {
+            let [x, y, z] = *p;
+            let x2 = ca * x - sa * y;
+            let y2 = sa * x + ca * y;
+            let y3 = ca * y2 - sa * z;
+            let z3 = sa * y2 + ca * z;
+            *p = [x2 * 100.0, y3 * 100.0, z3 * 100.0];
+        }
+        let m = hull(&[Mesh { positions: cube.clone(), tris: vec![] }]);
+        assert_clean_hull(&m, &cube);
+        assert!(signed_volume(&m) > 0.0, "rot-cube vol {}", signed_volume(&m));
+        // The 8 rotated CORNERS (|x|=|y|=|z|=1 before rotation) must survive.
+        for p in &cube {
+            // corner iff pre-rotation it was a unit corner; detect by magnitude.
+            if (dot(*p, *p).sqrt() - (3.0_f64.sqrt() * 100.0)).abs() < 1e-6 {
+                assert!(retained(&m, *p), "rotated cube corner {:?} dropped", p);
+            }
+        }
+
+        // (3) Random clouds at several scales and orderings, with an interior
+        // point forced FIRST (pts[0] not extreme) and far outliers appended.
+        let mut st: u64 = 0x1234_5678_9abc_def0;
+        for &scale in &[0.5f64, 1.0, 100.0, 10000.0] {
+            for _trial in 0..40 {
+                let n = 30 + (lcg(&mut st) * 120.0) as usize;
+                let mut pts: Vec<V3> = Vec::new();
+                // interior-ish seed first
+                pts.push([0.0, 0.0, 0.0]);
+                for _ in 0..n {
+                    pts.push([
+                        (lcg(&mut st) - 0.5) * 2.0 * scale,
+                        (lcg(&mut st) - 0.5) * 2.0 * scale,
+                        (lcg(&mut st) - 0.5) * 2.0 * scale,
+                    ]);
+                }
+                // a couple of clear far outliers -> guaranteed hull vertices
+                let outliers = [
+                    [scale * 3.0, 0.1, -0.2],
+                    [-0.3, scale * 3.0, 0.4],
+                    [0.2, -0.1, scale * 3.0],
+                ];
+                for o in outliers {
+                    pts.push(o);
+                }
+                let m = hull(&[Mesh { positions: pts.clone(), tris: vec![] }]);
+                if m.tris.is_empty() {
+                    continue; // degenerate draw; skip
+                }
+                assert_clean_hull(&m, &pts);
+                assert!(
+                    signed_volume(&m) > 0.0,
+                    "random cloud negative/zero vol {} scale {}",
+                    signed_volume(&m),
+                    scale
+                );
+                for o in outliers {
+                    assert!(retained(&m, o), "far outlier {:?} dropped (scale {})", o, scale);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refuter_dodeca_and_dense_sphere() {
+        // Dodecahedron: 20 vertices, 12 PENTAGONAL faces (each 3 coplanar
+        // tris). Every vertex is extreme; pentagon interiors stress coplanar
+        // near-silhouette visibility.
+        let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
+        let ip = 1.0 / phi;
+        let mut d: Vec<V3> = Vec::new();
+        for &x in &[-1.0, 1.0] {
+            for &y in &[-1.0, 1.0] {
+                for &z in &[-1.0, 1.0] {
+                    d.push([x, y, z]);
+                }
+            }
+        }
+        for &a in &[-ip, ip] {
+            for &b in &[-phi, phi] {
+                d.push([0.0, a, b]);
+                d.push([a, b, 0.0]);
+                d.push([b, 0.0, a]);
+            }
+        }
+        let m = hull(&[Mesh { positions: d.clone(), tris: vec![] }]);
+        for p in &d {
+            assert!(retained(&m, *p), "dodecahedron vertex {:?} dropped", p);
+        }
+        assert_clean_hull(&m, &d);
+        assert!(signed_volume(&m) > 0.0);
+
+        // Dense sphere, points fed in a deliberately adversarial order (sorted
+        // by angle so consecutive points are near-coplanar-adjacent), plus an
+        // interior point first. Every sphere point is extreme -> all retained.
+        let n = 1200usize;
+        let ga = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+        let mut pts: Vec<V3> = vec![[0.0, 0.0, 0.0]];
+        for i in 0..n {
+            let z = 1.0 - 2.0 * (i as f64 + 0.5) / (n as f64);
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let t = ga * (i as f64);
+            pts.push([5.0 * r * t.cos(), 5.0 * r * t.sin(), 5.0 * z]);
+        }
+        // sort the sphere points (excluding the interior seed) by z then angle
+        let seed = pts[0];
+        let mut sph = pts[1..].to_vec();
+        sph.sort_by(|a, b| {
+            a[2].total_cmp(&b[2]).then(a[1].atan2(a[0]).total_cmp(&b[1].atan2(b[0])))
+        });
+        let mut ordered = vec![seed];
+        ordered.extend(sph.iter().cloned());
+        let m = hull(&[Mesh { positions: ordered.clone(), tris: vec![] }]);
+        let kept = sph.iter().filter(|p| retained(&m, **p)).count();
+        assert_eq!(kept, n, "sorted-order sphere dropped {} pts", n - kept);
+        assert_clean_hull(&m, &ordered);
+        // Euler characteristic of a closed genus-0 triangulation: V - E + F = 2.
+        use std::collections::HashSet;
+        let mut es: HashSet<(u32, u32)> = HashSet::new();
+        for t in &m.tris {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                es.insert(if a < b { (a, b) } else { (b, a) });
+            }
+        }
+        let (v, e, f) = (m.positions.len() as i64, es.len() as i64, m.tris.len() as i64);
+        assert_eq!(v - e + f, 2, "Euler char != 2 (V={} E={} F={})", v, e, f);
+    }
+
+    #[test]
+    fn hull_retains_all_points_on_sphere() {
+        // A Fibonacci-style point cloud entirely ON a sphere: EVERY point is
+        // a hull vertex, so a correct hull must retain all of them.
+        let n = 500usize;
+        let ga = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+        let mut pts: Vec<V3> = Vec::new();
+        for i in 0..n {
+            let z = 1.0 - 2.0 * (i as f64 + 0.5) / (n as f64);
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let t = ga * (i as f64);
+            pts.push([10.0 * r * t.cos(), 10.0 * r * t.sin(), 10.0 * z]);
+        }
+        let m = hull(&[Mesh { positions: pts.clone(), tris: vec![] }]);
+        let kept = pts.iter().filter(|p| retained(&m, **p)).count();
+        assert_eq!(kept, n, "only {}/{} sphere points retained", kept, n);
+        assert_clean_hull(&m, &pts);
     }
 }
