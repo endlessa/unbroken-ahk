@@ -4,8 +4,8 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 3 + hull (2026-09-03): **118 full / 9 partial / 56
-untouched — 64% full, 69% touched.**
+Standing after phase 3 complete (2026-09-03): **118 full / 10 partial /
+55 untouched — 64% full, 70% touched.**
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -42,21 +42,22 @@ serialized condition text), `search`, `lookup`, `rands`,
 Remaining partials here: assert lacks file/line + TRACE stack; string
 literal escapes are the basic four.
 
-### Phase 3 — CSG booleans (core DONE)
+### ✅ Phase 3 — CSG booleans (DONE)
 
-Done: `difference`, `intersection`, `intersection_for` compute real mesh
+`difference`, `intersection`, `intersection_for` compute real mesh
 geometry via a from-scratch BSP-tree-merging kernel (`scadforge/src/
-csg.rs`; Thibault & Naylor 1987 — clean-room, no CGAL). `union`/`group`
-stay preview concatenation (faithful to the reference's F5 preview),
-with the exact union used internally to combine multi-shape operands.
+csg.rs`; Thibault & Naylor 1987 — clean-room, no CGAL), with a balancing
+split-plane chooser (reviewed + hardened). `union`/`group` stay preview
+concatenation (faithful to the reference's F5 preview), with the exact
+union used internally to combine multi-shape operands. `hull` is a
+from-scratch incremental 3D convex hull. `minkowski` is exact for convex
+operands (hull of pairwise vertex sums, the dominant rounding use),
+over-approximates concave ones with a warning, and caps the pairwise
+product so a public preview can't hang — scored PARTIAL until real
+convex decomposition lands.
 
-Also done: `hull` — a from-scratch incremental 3D convex hull
-(`convex_hull` in csg.rs), degenerate point sets → empty.
-
-Still open in this phase:
-- `minkowski` (convex decomposition; hull-of-sums for convex operands)
-- Preview-vs-render niceties (`render()`, `convexity`, 2-manifold
-  export warnings) — mostly observable-surface, low priority
+Low-priority remnants (observable-surface, deferrable): `render()`,
+`convexity`, the 2-manifold export warning.
 
 ### Phase 4 — 2D + extrusions (~15 entries)
 

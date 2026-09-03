@@ -84,6 +84,14 @@ hull() {
   for (p = [[-6,-4], [6,-4], [6,4], [-6,4]])
     translate([p[0], p[1], 0]) sphere(r = 2.5);
 }
+
+// minkowski: round a plate's edges by summing it with a sphere
+color([0.75, 0.45, 0.85])
+translate([28, 26, 3])
+minkowski() {
+  cube([10, 10, 2], center = true);
+  sphere(r = 2, $fn = 16);
+}
 </textarea>
     <div id="messages"><span class="ok">ready.</span></div>
   </div>

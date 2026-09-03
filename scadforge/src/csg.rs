@@ -519,6 +519,52 @@ pub fn intersection_all(meshes: &[Mesh]) -> Mesh {
 }
 
 // ---------------------------------------------------------------------------
+// Minkowski sum (minkowski())
+
+/// The largest pairwise vertex-sum point set the preview kernel will hull
+/// for one Minkowski step. The sum of V1·V2 points is combinatorial;
+/// beyond this the operation is skipped with a warning (upstream is
+/// famously slow here too, but a public preview must not hang).
+pub const MINKOWSKI_MAX_POINTS: usize = 60_000;
+
+/// Outcome of a Minkowski attempt, so the caller can warn precisely.
+pub enum Minkowski {
+    Ok(Mesh),
+    /// A step's V1·V2 exceeded the cap; carries the point count skipped.
+    TooLarge(usize),
+}
+
+/// Minkowski sum A ⊕ B = { a + b : a ∈ A, b ∈ B }, folded pairwise from
+/// the left over the children. EXACT for convex operands (the dominant
+/// use — rounding a shape with a sphere/cylinder): the sum of two convex
+/// bodies is the convex hull of the pairwise vertex sums. For concave
+/// operands this over-approximates (it returns the sum of the operands'
+/// convex hulls); real convex decomposition is a later kernel. A single
+/// operand passes through unchanged (identity); empty operands are
+/// skipped.
+pub fn minkowski(meshes: &[Mesh]) -> Minkowski {
+    let mut iter = meshes.iter().filter(|m| !m.positions.is_empty());
+    let mut acc = match iter.next() {
+        Some(m) => m.clone(),
+        None => return Minkowski::Ok(Mesh::empty()),
+    };
+    for m in iter {
+        let product = acc.positions.len() * m.positions.len();
+        if product > MINKOWSKI_MAX_POINTS {
+            return Minkowski::TooLarge(product);
+        }
+        let mut pts = Vec::with_capacity(product);
+        for &pa in &acc.positions {
+            for &pb in &m.positions {
+                pts.push([pa[0] + pb[0], pa[1] + pb[1], pa[2] + pb[2]]);
+            }
+        }
+        acc = convex_hull(&pts);
+    }
+    Minkowski::Ok(acc)
+}
+
+// ---------------------------------------------------------------------------
 // Convex hull (hull())
 
 /// The convex hull of every vertex of every child mesh (the reference's
@@ -816,6 +862,32 @@ mod tests {
         let filled = hull(&[arm, leg]);
         let l_volume = 6.0 * 2.0 * 2.0 + 2.0 * 6.0 * 2.0 - 2.0 * 2.0 * 2.0; // minus shared corner
         assert!(signed_volume(&filled).abs() > l_volume);
+    }
+
+    #[test]
+    fn minkowski_rounds_and_grows_convex_operands() {
+        // A cube ⊕ a sphere rounds the cube: the result grows by ~r on
+        // every side and is strictly larger than the cube alone.
+        let cube = geom::cube([10.0, 10.0, 10.0], true);
+        let ball = geom::sphere(2.0, 12);
+        let rounded = match minkowski(&[cube.clone(), ball]) {
+            Minkowski::Ok(m) => m,
+            Minkowski::TooLarge(_) => panic!("cube⊕small-sphere must fit the cap"),
+        };
+        let (lo, hi) = bounds(&rounded);
+        // Grown from [-5,5] toward [-7,7] on X (sphere radius 2).
+        assert!(lo[0] < -6.5 && hi[0] > 6.5, "grew: {:?}..{:?}", lo, hi);
+        assert!(signed_volume(&rounded).abs() > signed_volume(&cube).abs());
+
+        // Single operand is identity (passes through unchanged, NOT hulled).
+        match minkowski(&[geom::cube([2.0, 2.0, 2.0], true)]) {
+            Minkowski::Ok(m) => assert!((signed_volume(&m).abs() - 8.0).abs() < 1e-9),
+            Minkowski::TooLarge(_) => panic!(),
+        }
+
+        // Oversized product is reported, not hung.
+        let s = geom::sphere(5.0, 40);
+        assert!(matches!(minkowski(&[s.clone(), s]), Minkowski::TooLarge(_)));
     }
 
     #[test]

@@ -935,10 +935,37 @@ fn call_builtin_module(
             leaf_colored(csg::hull(&meshes), color)
         }
         "minkowski" => {
-            ctx.out.warnings.push(
-                "minkowski() is not implemented yet — children are shown un-combined".into(),
-            );
-            exec_scope(children, scope, ctx)
+            let groups = eval_children_grouped(children, scope, ctx);
+            if groups.is_empty() {
+                return Vec::new();
+            }
+            let color = groups.iter().flatten().find_map(|s| s.color);
+            let meshes: Vec<Mesh> = groups.iter().map(|g| combine_group(g).0).collect();
+            let nonempty = meshes.iter().filter(|m| !m.positions.is_empty()).count();
+            if nonempty >= 2 {
+                ctx.out.warnings.push(
+                    "minkowski(): convex operands are exact; concave operands are \
+                     approximated by their convex sum"
+                        .into(),
+                );
+            }
+            match csg::minkowski(&meshes) {
+                csg::Minkowski::Ok(mesh) => leaf_colored(mesh, color),
+                csg::Minkowski::TooLarge(n) => {
+                    ctx.out.warnings.push(format!(
+                        "minkowski(): {} pairwise points exceed the preview cap ({}); \
+                         reduce $fn on the operands — showing the first operand only",
+                        n,
+                        csg::MINKOWSKI_MAX_POINTS
+                    ));
+                    // Degrade gracefully: show the first non-empty operand.
+                    let first = meshes.into_iter().find(|m| !m.positions.is_empty());
+                    match first {
+                        Some(m) => leaf_colored(m, color),
+                        None => Vec::new(),
+                    }
+                }
+            }
         }
         "children" => instantiate_children(bound.get("index"), ctx),
         "child" => {
@@ -3025,6 +3052,11 @@ mod tests {
         let out = run("hull() { translate([-8,0,0]) sphere(2, $fn=12); translate([8,0,0]) sphere(2, $fn=12); }");
         assert_eq!(out.shapes.len(), 1);
         assert!(total_volume(&out) > 0.0);
+        // minkowski() rounds a cube with a sphere → one larger solid.
+        let plain = run("cube(10, center=true);");
+        let out = run("minkowski() { cube(10, center=true); sphere(2, $fn=12); }");
+        assert_eq!(out.shapes.len(), 1);
+        assert!(total_volume(&out) > total_volume(&plain));
     }
 
     #[test]
