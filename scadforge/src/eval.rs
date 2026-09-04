@@ -1351,13 +1351,9 @@ fn call_builtin_module(
                     return Vec::new();
                 }
             };
-            if path.starts_with('/') || path.split(['/', '\\']).any(|seg| seg == "..") {
-                ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
-                return Vec::new();
-            }
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(_) => {
+            let text = match sandboxed_path(&path).and_then(|p| std::fs::read_to_string(p).ok()) {
+                Some(t) => t,
+                None => {
                     ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
                     return Vec::new();
                 }
@@ -1884,6 +1880,30 @@ fn collect_2d(children: &[Stmt], scope: &Rc<Scope>, ctx: &mut Ctx) -> Poly2 {
 /// empty geometry (evaluation continues, per the reference); an unsupported
 /// extension is an error. The path is resolved relative to the working
 /// directory and may not escape it (no absolute paths, no `..`).
+/// Resolve a data-file path (import/surface) relative to the working directory
+/// and require it to stay under it — refusing absolute paths, `..` traversal,
+/// and symlink escapes (canonicalized). None => refused. A missing file
+/// returns its lexical path so the caller's read fails and warns.
+fn sandboxed_path(path: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let joined = cwd.join(p);
+    match joined.canonicalize() {
+        Ok(canon) => {
+            let root = cwd.canonicalize().unwrap_or(cwd);
+            if canon.starts_with(&root) {
+                Some(canon)
+            } else {
+                None // symlink escaping the working directory
+            }
+        }
+        Err(_) => Some(joined), // missing file: let the read fail and warn
+    }
+}
+
 fn import_file(path: &str, ctx: &mut Ctx) -> Vec<Shape> {
     let format = match io::format_from_ext(path) {
         Some(f) => f,
@@ -1895,18 +1915,21 @@ fn import_file(path: &str, ctx: &mut Ctx) -> Vec<Shape> {
             return Vec::new();
         }
     };
-    if path.starts_with('/') || path.split(['/', '\\']).any(|seg| seg == "..") {
-        ctx.out
-            .warnings
-            .push(format!("WARNING: Can't open import file '{}'.", path));
-        return Vec::new();
-    }
+    let resolved = match sandboxed_path(path) {
+        Some(p) => p,
+        None => {
+            ctx.out
+                .warnings
+                .push(format!("WARNING: Can't open import file '{}'.", path));
+            return Vec::new();
+        }
+    };
     let mesh = match format {
-        io::MeshFormat::Stl => match std::fs::read(path) {
+        io::MeshFormat::Stl => match std::fs::read(&resolved) {
             Ok(bytes) => io::read_stl(&bytes),
             Err(_) => Err(String::new()),
         },
-        io::MeshFormat::Off => match std::fs::read_to_string(path) {
+        io::MeshFormat::Off => match std::fs::read_to_string(&resolved) {
             Ok(text) => io::read_off(&text),
             Err(_) => Err(String::new()),
         },

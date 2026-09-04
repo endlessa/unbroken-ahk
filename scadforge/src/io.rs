@@ -163,8 +163,15 @@ pub fn read_stl(bytes: &[u8]) -> Result<Mesh, String> {
         read_stl_binary(bytes)
     } else if bytes.len() >= 5 && &bytes[..5] == b"solid" {
         // Try ASCII; a mis-sniffed binary that happens to start with "solid"
-        // but failed the size check falls back to binary.
-        read_stl_ascii(bytes).or_else(|_| read_stl_binary(bytes))
+        // but failed the size check falls back to binary — including the case
+        // where the ASCII parse "succeeds" but finds no facets (a binary body).
+        match read_stl_ascii(bytes) {
+            Ok(m) if !m.tris.is_empty() => Ok(m),
+            _ => match read_stl_binary(bytes) {
+                Ok(b) if !b.tris.is_empty() => Ok(b),
+                _ => read_stl_ascii(bytes), // neither found geometry; keep ASCII result
+            },
+        }
     } else {
         read_stl_binary(bytes)
     }
@@ -175,8 +182,11 @@ fn read_stl_binary(bytes: &[u8]) -> Result<Mesh, String> {
         return Err("binary STL too short".into());
     }
     let count = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
+    // NEVER pre-allocate the untrusted count: a tiny file can claim billions of
+    // triangles (OOM/abort). Cap the reservation at what the bytes can hold.
+    let max_possible = bytes.len().saturating_sub(84) / 50;
     let mut w = Welder::new();
-    let mut tris = Vec::with_capacity(count);
+    let mut tris = Vec::with_capacity(count.min(max_possible));
     let mut off = 84;
     let rf = |b: &[u8], o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as f64;
     for _ in 0..count {
@@ -249,26 +259,33 @@ pub fn read_off(text: &str) -> Result<Mesh, String> {
     if toks.len() < 3 {
         return Err("OFF: missing counts line".into());
     }
-    let nv = toks[0] as usize;
-    let nf = toks[1] as usize;
-    // vertices start at index 3 (after nv nf ne)
-    let mut idx = 3;
-    let mut positions = Vec::with_capacity(nv);
+    // `f64 as usize` saturates (inf/huge → usize::MAX), so the declared counts
+    // are untrusted; never reserve more than the token stream can supply (each
+    // vertex needs 3 tokens, each face ≥ 4). This bounds the allocation to the
+    // input size — a "4000000000 0 0" header can't OOM the process.
+    let count = |t: f64| if t.is_finite() && t >= 0.0 { t as usize } else { 0 };
+    let nv = count(toks[0]);
+    let nf = count(toks[1]);
+    let mut idx = 3; // vertices start after "nv nf ne"
+    let mut positions = Vec::with_capacity(nv.min(toks.len() / 3));
     for _ in 0..nv {
         if idx + 3 > toks.len() {
             return Err("OFF: truncated vertex list".into());
         }
-        positions.push([toks[idx], toks[idx + 1], toks[idx + 2]]);
+        let fin = |x: f64| if x.is_finite() { x } else { 0.0 };
+        positions.push([fin(toks[idx]), fin(toks[idx + 1]), fin(toks[idx + 2])]);
         idx += 3;
     }
-    let mut tris = Vec::with_capacity(nf);
+    let mut tris = Vec::with_capacity(nf.min(toks.len() / 4));
     for _ in 0..nf {
         if idx >= toks.len() {
             break;
         }
-        let k = toks[idx] as usize;
+        let k = count(toks[idx]);
         idx += 1;
-        if idx + k > toks.len() {
+        // Checked against remaining tokens (idx + k can overflow if k saturates
+        // to usize::MAX, wrapping the bound and forcing an OOB index).
+        if k > toks.len().saturating_sub(idx) {
             break;
         }
         let face: Vec<u32> = (0..k).map(|j| toks[idx + j] as u32).collect();
@@ -285,8 +302,11 @@ pub fn read_off(text: &str) -> Result<Mesh, String> {
 }
 
 /// Intern a triangle's vertices and push it, dropping degenerate (zero-area)
-/// triangles so they can't seed downstream CSG errors.
+/// or non-finite triangles so they can't seed downstream CSG errors.
 fn push_triangle(w: &mut Welder, tris: &mut Vec<[u32; 3]>, a: [f64; 3], b: [f64; 3], c: [f64; 3]) {
+    if [a, b, c].iter().flatten().any(|x| !x.is_finite()) {
+        return; // a NaN/inf coordinate (triangle_normal wouldn't catch NaN)
+    }
     if triangle_normal(a, b, c) == [0.0, 0.0, 0.0] {
         return; // zero-area / collinear
     }
@@ -321,10 +341,11 @@ pub fn parse_surface_text(text: &str) -> Vec<Vec<f64>> {
 }
 
 /// Build a closed 3D solid from a height grid: the top surface follows the
-/// samples (one unit per sample in X/Y), a flat base closes it below at the
+/// samples (one unit per sample in X/Y), a flat base closes it below the
 /// minimum height, and skirt walls join the two. `center` centres the grid on
-/// the origin; `invert` negates the heights. The first row maps to the
-/// largest Y (text top = far side), matching the reference.
+/// the origin; `invert` negates the heights. The first row maps to the largest
+/// Y (text top = far side), matching the reference. Output is OUTWARD-wound
+/// (positive signed volume), like every other primitive.
 pub fn heightmap_solid(grid: &[Vec<f64>], center: bool, invert: bool) -> Mesh {
     let rows = grid.len();
     let cols = grid.first().map_or(0, |r| r.len());
@@ -333,14 +354,19 @@ pub fn heightmap_solid(grid: &[Vec<f64>], center: bool, invert: bool) -> Mesh {
     }
     let h = |r: usize, c: usize| {
         let v = grid[r].get(c).copied().unwrap_or(0.0);
+        let v = if v.is_finite() { v } else { 0.0 }; // a NaN/inf sample → 0
         if invert { -v } else { v }
     };
-    let mut base = f64::INFINITY;
+    let mut min_h = f64::INFINITY;
     for r in 0..rows {
         for c in 0..cols {
-            base = base.min(h(r, c));
+            min_h = min_h.min(h(r, c));
         }
     }
+    // The base plane sits strictly BELOW the lowest sample so boundary cells at
+    // the minimum still get non-degenerate walls (a flat grid would otherwise
+    // collapse the solid to zero-area triangles).
+    let base = min_h - 1.0;
     let (ox, oy) = if center {
         ((cols - 1) as f64 / 2.0, (rows - 1) as f64 / 2.0)
     } else {
@@ -387,6 +413,11 @@ pub fn heightmap_solid(grid: &[Vec<f64>], center: bool, invert: bool) -> Mesh {
     for r in 0..rows - 1 {
         wall(top(r, 0), top(r + 1, 0)); // left edge
         wall(top(r + 1, cols - 1), top(r, cols - 1)); // right edge
+    }
+    // The winding above is globally INWARD (top faces −Z); flip every triangle
+    // so the solid is outward-wound / positive-volume like every primitive.
+    for t in &mut tris {
+        t.swap(1, 2);
     }
     Mesh { positions, tris }
 }
@@ -507,6 +538,20 @@ mod tests {
         edges.values().all(|&c| c == 2)
     }
 
+    /// SIGNED volume (no abs) — detects an inverted (inside-out) mesh.
+    fn raw_signed_volume(m: &Mesh) -> f64 {
+        let mut v = 0.0;
+        for t in &m.tris {
+            let a = m.positions[t[0] as usize];
+            let b = m.positions[t[1] as usize];
+            let c = m.positions[t[2] as usize];
+            v += (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                / 6.0;
+        }
+        v
+    }
+
     #[test]
     fn surface_builds_a_closed_heightmap_solid() {
         let grid = parse_surface_text("# a little hill\n0 0 0\n0 3 0\n0 0 0\n");
@@ -514,13 +559,35 @@ mod tests {
         assert_eq!(grid[1], vec![0.0, 3.0, 0.0]);
         let m = heightmap_solid(&grid, false, false);
         assert!(is_closed_manifold(&m), "surface must be a closed 2-manifold");
-        assert!(signed_volume(&m) > 0.0, "the hill has positive volume");
+        // OUTWARD-wound: the raw signed volume must be POSITIVE, like every
+        // other primitive (the earlier winding was inside-out / negative).
+        assert!(raw_signed_volume(&m) > 0.0, "outward-wound, got {}", raw_signed_volume(&m));
+        // A FLAT grid must still be a non-degenerate closed solid (the base sits
+        // below the samples, so walls have height).
+        let flat = heightmap_solid(&parse_surface_text("2 2\n2 2\n"), false, false);
+        assert!(is_closed_manifold(&flat) && raw_signed_volume(&flat) > 0.0, "flat grid non-degenerate");
         // Ragged rows pad with zeros to a rectangular grid.
-        let g2 = parse_surface_text("1 2 3\n4 5\n");
-        assert_eq!(g2[1], vec![4.0, 5.0, 0.0]);
-        // invert negates the heights but still yields a closed solid.
+        assert_eq!(parse_surface_text("1 2 3\n4 5\n")[1], vec![4.0, 5.0, 0.0]);
+        // invert stays a valid outward closed solid.
         let mi = heightmap_solid(&grid, true, true);
-        assert!(is_closed_manifold(&mi));
+        assert!(is_closed_manifold(&mi) && raw_signed_volume(&mi) > 0.0);
+    }
+
+    #[test]
+    fn malicious_mesh_headers_do_not_oom_or_panic() {
+        // A tiny binary STL claiming ~4 billion triangles must not allocate on
+        // the untrusted count (it is bounded to what the bytes can hold).
+        let mut bin = vec![0u8; 84];
+        bin[80..84].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        assert!(read_stl(&bin).unwrap().tris.is_empty());
+        // OFF with absurd counts / inf tokens must not OOM, overflow, or index
+        // out of bounds — returning Err or an empty mesh are both acceptable
+        // (reaching these asserts at all proves no panic/abort occurred).
+        let ok = |r: Result<Mesh, String>| r.map_or(true, |m| m.tris.is_empty());
+        assert!(ok(read_off("OFF\n4000000000 0 0\n")));
+        assert!(ok(read_off("OFF\n0 4000000000 0\n")));
+        assert!(ok(read_off("OFF\n1 1 0\n0 0 0\n1e300\n"))); // face-size token saturates usize
+        assert!(ok(read_off("OFF\n1e309 0 0\n"))); // inf vertex count
     }
 
     #[test]
