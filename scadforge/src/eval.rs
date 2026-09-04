@@ -2037,6 +2037,10 @@ fn import_file(path: &str, ctx: &mut Ctx) -> Vec<Shape> {
             Ok(text) => io::read_off(&text),
             Err(_) => Err(String::new()),
         },
+        io::MeshFormat::Amf => match std::fs::read_to_string(&resolved) {
+            Ok(text) => Ok(io::read_amf(&text)),
+            Err(_) => Err(String::new()),
+        },
     };
     match mesh {
         Ok(m) if !m.tris.is_empty() => leaf(m),

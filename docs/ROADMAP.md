@@ -142,8 +142,10 @@ Landed (2026-09-03):
   path; DXF export writes closed LWPOLYLINE entities; DXF import reads
   LINE/LWPOLYLINE/POLYLINE/CIRCLE/ARC (curves tessellated by $fn/$fa/$fs),
   stitches loose segments into even-odd loops, and warns on unsupported
-  entities. `POST /export?format=stl|off|svg|dxf`. Remaining: AMF, 3MF, PDF,
-  and SVG import (a path-command parser).
+  entities. **AMF** read/write also lands (write_amf / read_amf — XML mesh
+  via a from-scratch tag scanner, geometry only). `POST
+  /export?format=stl|off|amf|svg|dxf`. Remaining: 3MF (needs a from-scratch
+  ZIP/deflate), PDF, and SVG import (a path-command parser).
 - ◐ `include` / `use` / library-path (`scadforge/src/preproc.rs`): a
   source-resolution pass run before eval. `include <path>` textually inlines
   the referenced file (recursively, cycle-guarded); its geometry runs and its

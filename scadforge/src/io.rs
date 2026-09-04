@@ -396,6 +396,72 @@ pub fn write_off(mesh: &Mesh) -> String {
     s
 }
 
+/// AMF (XML mesh): one object with a vertex list and a triangle volume.
+/// Geometry only — no units/color metadata (unit attribute is millimetre).
+pub fn write_amf(mesh: &Mesh) -> String {
+    let mut s = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<amf unit=\"millimeter\">\n  <object id=\"0\">\n    <mesh>\n      <vertices>\n",
+    );
+    for p in &mesh.positions {
+        s.push_str(&format!(
+            "        <vertex><coordinates><x>{}</x><y>{}</y><z>{}</z></coordinates></vertex>\n",
+            fmt_coord(p[0]),
+            fmt_coord(p[1]),
+            fmt_coord(p[2])
+        ));
+    }
+    s.push_str("      </vertices>\n      <volume>\n");
+    for t in &mesh.tris {
+        s.push_str(&format!(
+            "        <triangle><v1>{}</v1><v2>{}</v2><v3>{}</v3></triangle>\n",
+            t[0], t[1], t[2]
+        ));
+    }
+    s.push_str("      </volume>\n    </mesh>\n  </object>\n</amf>\n");
+    s
+}
+
+/// Read an AMF mesh with a minimal tag scanner (no XML dependency): every
+/// `<vertex>` contributes a point, every `<triangle>` a face; all objects and
+/// volumes union into one mesh. Out-of-range triangle indices are dropped.
+pub fn read_amf(text: &str) -> Mesh {
+    fn between(s: &str, open: &str, close: &str) -> Option<f64> {
+        let a = s.find(open)? + open.len();
+        let b = s[a..].find(close)? + a;
+        s[a..b].trim().parse().ok()
+    }
+    let mut positions = Vec::new();
+    let mut scan = text;
+    while let Some(p) = scan.find("<vertex>") {
+        let rest = &scan[p + 8..];
+        let end = rest.find("</vertex>").unwrap_or(rest.len());
+        let chunk = &rest[..end];
+        match (between(chunk, "<x>", "</x>"), between(chunk, "<y>", "</y>"), between(chunk, "<z>", "</z>")) {
+            (Some(x), Some(y), Some(z)) if x.is_finite() && y.is_finite() && z.is_finite() => {
+                positions.push([x, y, z]);
+            }
+            _ => {}
+        }
+        scan = &rest[end..];
+    }
+    let n = positions.len();
+    let mut tris = Vec::new();
+    let mut scan = text;
+    while let Some(p) = scan.find("<triangle>") {
+        let rest = &scan[p + 10..];
+        let end = rest.find("</triangle>").unwrap_or(rest.len());
+        let chunk = &rest[..end];
+        let idx = |tag_o: &str, tag_c: &str| between(chunk, tag_o, tag_c).map(|v| v as usize);
+        if let (Some(a), Some(b), Some(c)) = (idx("<v1>", "</v1>"), idx("<v2>", "</v2>"), idx("<v3>", "</v3>")) {
+            if a < n && b < n && c < n && a != b && b != c && a != c {
+                tris.push([a as u32, b as u32, c as u32]);
+            }
+        }
+        scan = &rest[end..];
+    }
+    Mesh { positions, tris }
+}
+
 // -- Import -----------------------------------------------------------------
 
 /// Weld coincident vertices by EXACT position (STL stores each triangle's
@@ -704,6 +770,7 @@ pub fn heightmap_solid(grid: &[Vec<f64>], center: bool, invert: bool) -> Mesh {
 pub enum MeshFormat {
     Stl,
     Off,
+    Amf,
 }
 
 pub fn format_from_ext(path: &str) -> Option<MeshFormat> {
@@ -711,6 +778,7 @@ pub fn format_from_ext(path: &str) -> Option<MeshFormat> {
     match ext.as_str() {
         "stl" => Some(MeshFormat::Stl),
         "off" => Some(MeshFormat::Off),
+        "amf" => Some(MeshFormat::Amf),
         _ => None,
     }
 }
@@ -759,6 +827,23 @@ mod tests {
         assert_eq!(tri_count(&back), 12);
         assert_eq!(back.positions.len(), 8);
         assert!((signed_volume(&back) - 8.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn amf_round_trips_a_cube() {
+        let cube = geom::cube([2.0, 3.0, 4.0], false); // volume 24
+        let xml = write_amf(&cube);
+        assert!(xml.contains("<amf") && xml.contains("<triangle>"));
+        let back = read_amf(&xml);
+        assert_eq!(tri_count(&back), 12);
+        assert_eq!(back.positions.len(), 8);
+        assert!((signed_volume(&back) - 24.0).abs() < 1e-6, "vol {}", signed_volume(&back));
+        // A triangle referencing an out-of-range vertex is dropped.
+        let bad = "<amf><object><mesh><vertices>\
+            <vertex><coordinates><x>0</x><y>0</y><z>0</z></coordinates></vertex>\
+            </vertices><volume><triangle><v1>0</v1><v2>1</v2><v3>99</v3></triangle></volume>\
+            </mesh></object></amf>";
+        assert_eq!(tri_count(&read_amf(bad)), 0);
     }
 
     #[test]

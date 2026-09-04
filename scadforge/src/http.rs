@@ -91,6 +91,10 @@ fn export_response(query: &str, source: &str) -> Response {
             Ok(m) => Response { status: "200 OK", content_type: "text/plain; charset=utf-8", body: crate::io::write_off(&m) },
             Err(e) => err422(e),
         },
+        "amf" => match eval::export_mesh(&out) {
+            Ok(m) => Response { status: "200 OK", content_type: "application/x-amf", body: crate::io::write_amf(&m) },
+            Err(e) => err422(e),
+        },
         // Default and "stl": ASCII STL.
         _ => match eval::export_mesh(&out) {
             Ok(m) => Response { status: "200 OK", content_type: "model/stl", body: crate::io::write_stl_ascii(&m) },
