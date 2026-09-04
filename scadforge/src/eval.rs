@@ -2219,6 +2219,10 @@ pub fn render_export(
 ) -> Result<String, String> {
     let effective = crate::customizer::apply_overrides(source, overrides);
     let out = evaluate_source(&effective, base_dir);
+    // `.echo` captures the console stream regardless of a fatal error.
+    if format == "echo" {
+        return Ok(echo_stream(&out));
+    }
     if let Some(e) = out.error {
         return Err(e);
     }
@@ -2236,6 +2240,25 @@ pub fn export_bytes(out: &EvalOutput, format: &str) -> Result<Vec<u8>, String> {
     }
 }
 
+/// The `.echo` export: the console message stream — every `ECHO:` line, then
+/// the class-prefixed diagnostics (WARNING/DEPRECATED), then a fatal ERROR if
+/// one halted the run. Unlike the geometry exports it is produced even when
+/// evaluation errored, so a `.echo` of an asserting script still captures the
+/// assert message (matching the reference's console-stream semantics).
+pub fn echo_stream(out: &EvalOutput) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.extend(out.echoes.iter().cloned());
+    lines.extend(out.warnings.iter().cloned());
+    if let Some(e) = &out.error {
+        lines.push(e.clone());
+    }
+    let mut s = lines.join("\n");
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s
+}
+
 /// Headless render to bytes: apply Customizer overrides, evaluate, and
 /// serialize to `format` (binary formats included). The CLI's core.
 pub fn render_export_bytes(
@@ -2246,6 +2269,10 @@ pub fn render_export_bytes(
 ) -> Result<Vec<u8>, String> {
     let effective = crate::customizer::apply_overrides(source, overrides);
     let out = evaluate_source(&effective, base_dir);
+    // `.echo` captures the console stream regardless of a fatal error.
+    if format == "echo" {
+        return Ok(echo_stream(&out).into_bytes());
+    }
     if let Some(e) = out.error {
         return Err(e);
     }
@@ -2261,6 +2288,7 @@ pub fn render_export_bytes(
 /// message.
 pub fn export_string(out: &EvalOutput, format: &str) -> Result<String, String> {
     match format {
+        "echo" => Ok(echo_stream(out)),
         "svg" => Ok(crate::io::write_svg(&export_2d(out)?)),
         "dxf" => Ok(crate::io::write_dxf_2d(&export_2d(out)?)),
         "pdf" => Ok(crate::io::write_pdf(&export_2d(out)?)),
@@ -4109,6 +4137,23 @@ mod tests {
 
     fn run(src: &str) -> EvalOutput {
         evaluate(&parse(src).unwrap())
+    }
+
+    #[test]
+    fn echo_export_captures_the_console_stream() {
+        let base = std::path::Path::new(".");
+        // A normal run: ECHO lines and a warning, no geometry needed.
+        let src = "echo(\"hi\", 1 + 2); frobnicate();";
+        let s = render_export(src, base, &[], "echo").unwrap();
+        assert!(s.contains("ECHO: \"hi\", 3"), "echo stream: {s}");
+        assert!(s.contains("WARNING") && s.contains("frobnicate"), "warnings included: {s}");
+
+        // A run that fatally errors still yields the stream (ECHO before the
+        // assert, plus the error line) rather than failing the export.
+        let bad = "echo(\"before\"); assert(false, \"boom\"); cube(1);";
+        let out = render_export(bad, base, &[], "echo").unwrap();
+        assert!(out.contains("ECHO: \"before\""), "pre-assert echo kept: {out}");
+        assert!(out.contains("boom") || out.contains("assert"), "error captured: {out}");
     }
 
     #[test]

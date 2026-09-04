@@ -124,6 +124,16 @@ fn export_response(query: &str, source: &str) -> Response {
     // injection the /render path uses, so a downloaded mesh matches the preview.
     let effective = customizer::apply_overrides(source, &overrides_from_query(query));
     let out = eval::evaluate_source(&effective, &base);
+    // `.echo` returns the console stream (ECHO + diagnostics), and captures it
+    // even when a fatal error halted evaluation — so it is handled before the
+    // error check that the geometry exports use.
+    if format == "echo" {
+        return Response {
+            status: "200 OK",
+            content_type: "text/plain; charset=utf-8",
+            body: eval::echo_stream(&out),
+        };
+    }
     if let Some(err) = &out.error {
         return Response {
             status: "422 Unprocessable Entity",

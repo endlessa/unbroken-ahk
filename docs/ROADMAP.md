@@ -4,9 +4,10 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after Customizer + SVG import + PDF export + 3MF (2026-09-04):
-**150 full / 21 partial / 12 untouched — 82% full, 93% touched.** PHASE 4
-COMPLETE. Phase 5
+Standing after Customizer + SVG import + PDF export + 3MF + `.echo`
+(2026-09-04): **150 full / 22 partial / 11 untouched — 82% full, 94%
+touched.** Every geometry and I/O *format* of 2021.01 is implemented.
+PHASE 4 COMPLETE. Phase 5
 so far:
 modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
 export and DXF import (2D vector) → partial; number formatting + value
@@ -222,12 +223,16 @@ Landed (2026-09-03):
 
 ## The honest tail
 
-~12 entries remain, and they are the true tail — desktop-application
+~11 entries remain, and they are the true tail — desktop-application
 surface rather than the modeling language: GUI-viewport PNG export,
 `$vpr`-family viewport variables (camera state), DXF-era deprecated
-metadata functions (`dxf_dim`/`dxf_cross`), and the debug/text export
-formats (`.csg`/`.ast`/`.term`/`.echo`/`.nef3`) whose `.csg` is really a
-second evaluation mode. Each gets a per-entry decision — web-app
+metadata functions (`dxf_dim`/`dxf_cross`), and the rest of the debug/text
+export formats. Of those, `.echo` now lands (the console stream — every
+`ECHO:` line plus the class-prefixed diagnostics — exported by
+`?format=echo` / `-o out.echo`, and captured even when a script fatally
+errors); `.csg` is the highest-value remaining one but is really a second
+evaluation mode (recording the resolved instantiation tree), with `.ast`/
+`.term`/`.nef3` optional or stubs. Each gets a per-entry decision — web-app
 equivalent, or documented as intentionally out of scope. Every geometry
 and I/O format of 2021.01 is now implemented; 100% of the *language* is
 reachable; 100% of all 183 entries goes through those judgment calls.
