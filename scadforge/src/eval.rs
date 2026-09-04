@@ -2218,6 +2218,7 @@ pub fn export_string(out: &EvalOutput, format: &str) -> Result<String, String> {
     match format {
         "svg" => Ok(crate::io::write_svg(&export_2d(out)?)),
         "dxf" => Ok(crate::io::write_dxf_2d(&export_2d(out)?)),
+        "pdf" => Ok(crate::io::write_pdf(&export_2d(out)?)),
         "off" => Ok(crate::io::write_off(&export_mesh(out)?)),
         "amf" => Ok(crate::io::write_amf(&export_mesh(out)?)),
         "stl" => Ok(crate::io::write_stl_ascii(&export_mesh(out)?)),
@@ -4620,10 +4621,18 @@ mod tests {
         // DXF export of a 2D design.
         let dxf = crate::http::handle("POST", "/export?format=dxf", "circle(5, $fn = 32);");
         assert!(dxf.body.contains("LWPOLYLINE"));
+        // PDF export of a 2D design: a well-formed one-page vector document.
+        let pdf = crate::http::handle("POST", "/export?format=pdf", "square([10, 6]);");
+        assert_eq!(pdf.status, "200 OK");
+        assert_eq!(pdf.content_type, "application/pdf");
+        assert!(pdf.body.starts_with("%PDF-1.4") && pdf.body.trim_end().ends_with("%%EOF"));
         // Exporting a 3D result to a 2D format is the reference error.
         let bad = crate::http::handle("POST", "/export?format=svg", "cube(3);");
         assert_eq!(bad.status, "422 Unprocessable Entity");
         assert!(bad.body.contains("not a 2D object"));
+        // PDF of a 3D result is likewise the reference error.
+        let bad_pdf = crate::http::handle("POST", "/export?format=pdf", "cube(3);");
+        assert_eq!(bad_pdf.status, "422 Unprocessable Entity");
         // DXF round-trip: export a square to DXF, import it back, extrude.
         let path = "scadforge_test_rt.dxf";
         std::fs::write(path, crate::http::handle("POST", "/export?format=dxf", "square(10);").body)

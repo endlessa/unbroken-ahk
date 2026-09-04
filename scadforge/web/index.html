@@ -17,6 +17,9 @@
   header button { margin-left:auto; background:#238636; color:#fff; border:0; border-radius:6px;
                   padding:6px 16px; font-size:13px; font-weight:600; cursor:pointer; }
   header button:hover { background:#2ea043; }
+  header #exportFmt { background:var(--panel); color:var(--text); border:1px solid var(--line);
+                      border-radius:6px; padding:5px 8px; font-size:12px; }
+  header #exportBtn { margin-left:8px; }
   main { flex:1; display:flex; min-height:0; }
   #left { width:44%; display:flex; flex-direction:column; border-right:1px solid var(--line); min-width:280px; }
   #editor { flex:1; background:var(--bg); color:var(--text); border:0; outline:none; resize:none;
@@ -66,7 +69,15 @@
   <h1>scad<span>forge</span></h1>
   <div class="sub">from-scratch OpenSCAD-compatible modeler &middot; localhost &middot; zero dependencies</div>
   <button id="renderBtn">Render&nbsp;(Ctrl+Enter)</button>
-  <button id="exportBtn">Export&nbsp;STL</button>
+  <select id="exportFmt" title="Export format">
+    <option value="stl">STL</option>
+    <option value="off">OFF</option>
+    <option value="amf">AMF</option>
+    <option value="svg">SVG</option>
+    <option value="dxf">DXF</option>
+    <option value="pdf">PDF</option>
+  </select>
+  <button id="exportBtn">Export</button>
 </header>
 <main>
   <div id="left">
@@ -688,17 +699,20 @@ document.getElementById('custReset').addEventListener('click', () => {
 });
 document.getElementById('custSave').addEventListener('click', savePreset);
 document.getElementById('custPreset').addEventListener('change', e => loadPreset(e.target.value));
+const EXPORT_MIME = { stl: 'model/stl', off: 'text/plain', amf: 'application/x-amf',
+                      svg: 'image/svg+xml', dxf: 'application/dxf', pdf: 'application/pdf' };
 document.getElementById('exportBtn').addEventListener('click', async () => {
+  const fmt = document.getElementById('exportFmt').value;
   try {
     const q = overrideQuery();
-    const res = await fetch('/export?format=stl' + (q ? '&' + q.slice(1) : ''),
+    const res = await fetch(`/export?format=${fmt}` + (q ? '&' + q.slice(1) : ''),
                             { method: 'POST', body: editor.value });
     const text = await res.text();
     if (!res.ok) { setMessages([{cls:'err', text: 'export: ' + text}]); return; }
-    const blob = new Blob([text], { type: 'model/stl' });
+    const blob = new Blob([text], { type: EXPORT_MIME[fmt] || 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = 'scadforge_model.stl';
+    a.href = url; a.download = `scadforge_model.${fmt}`;
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
   } catch (e) {

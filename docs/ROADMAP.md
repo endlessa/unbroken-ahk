@@ -4,8 +4,9 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after Customizer + SVG import (2026-09-04): **147 full / 24
-partial / 12 untouched — 80% full, 93% touched.** PHASE 4 COMPLETE. Phase 5
+Standing after Customizer + SVG import + PDF export (2026-09-04): **148
+full / 23 partial / 12 untouched — 81% full, 93% touched.** PHASE 4
+COMPLETE. Phase 5
 so far:
 modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
 export and DXF import (2D vector) → partial; number formatting + value
@@ -160,9 +161,15 @@ Landed (2026-09-03):
   region survives an export→import round-trip (pinned). `<text>` is ignored
   with a warning; only fill geometry imports (strokes not expanded), and
   self-intersecting nonzero-fill resolution is the one approximation (shared
-  with the whole even-odd 2D kernel). `POST
-  /export?format=stl|off|amf|svg|dxf`. Remaining: 3MF (needs a from-scratch
-  ZIP/deflate) and PDF export.
+  with the whole even-odd 2D kernel). **PDF export** also lands
+  (`io::write_pdf`): a minimal, uncompressed, ASCII-safe one-page vector PDF
+  — the geometry filled even-odd and stroked, the page sized to its bbox in
+  points, with a hand-built xref table whose byte offsets and stream
+  `/Length` are pinned by tests (so the file actually opens). It rides the
+  text export path, so `POST /export?format=stl|off|amf|svg|dxf|pdf` and the
+  CLI (`-o out.pdf`) both produce it, and the web UI now has a format
+  selector for the whole export surface. Remaining: 3MF (needs a from-scratch
+  ZIP + DEFLATE codec).
 - ◐ `include` / `use` / library-path (`scadforge/src/preproc.rs`): a
   source-resolution pass run before eval. `include <path>` textually inlines
   the referenced file (recursively, cycle-guarded); its geometry runs and its
@@ -206,7 +213,7 @@ Landed (2026-09-03):
 ~12 entries remain. Some describe the desktop application, not the
 language: GUI-viewport PNG export, `$vpr`-family viewport variables,
 DXF-era deprecated functions. Others are genuine formats deferred for a
-from-scratch codec (3MF needs ZIP/deflate; PDF). Each gets a
+from-scratch codec (3MF needs a ZIP + DEFLATE codec). Each gets a
 per-entry decision — web-app
 equivalent, or documented as intentionally out of scope. 100% of the
 *language* is reachable; 100% of all 183 entries goes through those

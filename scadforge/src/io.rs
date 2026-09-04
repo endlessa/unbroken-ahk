@@ -72,6 +72,71 @@ pub fn write_svg(regions: &[Poly2]) -> String {
     )
 }
 
+/// Write a 2D region set as a minimal one-page vector PDF (new in 2021.01).
+/// Zero-dependency and uncompressed — legal PDF. The page is sized to the
+/// geometry's bounding box plus a small margin; coordinates convert from
+/// millimetres to PostScript points (1 mm = 72/25.4 pt). PDF's Y axis points
+/// up (like OpenSCAD), so no flip is needed. Every contour is one subpath and
+/// the whole set is filled even-odd (holes read correctly) and stroked.
+///
+/// The cross-reference table needs exact byte offsets, so the document is
+/// assembled object-by-object while tracking the running byte length. Output
+/// is pure ASCII, so it rides the same text export path as SVG/DXF.
+pub fn write_pdf(regions: &[Poly2]) -> String {
+    const K: f64 = 72.0 / 25.4; // mm → pt
+    const MARGIN: f64 = 5.0 * 72.0 / 25.4; // 5 mm in points
+    let (lo, hi) = regions_bbox(regions);
+    let w = (hi[0] - lo[0]) * K + 2.0 * MARGIN;
+    let h = (hi[1] - lo[1]) * K + 2.0 * MARGIN;
+    // Build the content stream: path ops in page points (origin bottom-left).
+    let mut cs = String::from("0.8 0.8 0.8 rg 0 0 0 RG 0.5 w\n");
+    for r in regions {
+        for c in &r.contours {
+            if c.len() < 3 {
+                continue;
+            }
+            for (i, p) in c.iter().enumerate() {
+                let x = (p[0] - lo[0]) * K + MARGIN;
+                let y = (p[1] - lo[1]) * K + MARGIN;
+                cs.push_str(&format!("{} {} {}\n", fmt_coord(x), fmt_coord(y), if i == 0 { "m" } else { "l" }));
+            }
+            cs.push_str("h\n");
+        }
+    }
+    // Even-odd fill then stroke the same path.
+    cs.push_str("B*\n");
+
+    // Assemble objects, recording each one's byte offset for the xref table.
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents 4 0 R /Resources << >> >>",
+            fmt_coord(w),
+            fmt_coord(h)
+        ),
+        format!("<< /Length {} >>\nstream\n{}endstream", cs.len(), cs),
+    ];
+    let mut out = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, body));
+    }
+    let xref_pos = out.len();
+    let n = objects.len() + 1; // +1 for the free object 0
+    out.push_str(&format!("xref\n0 {}\n", n));
+    out.push_str("0000000000 65535 f \n");
+    for off in &offsets {
+        out.push_str(&format!("{:010} 00000 n \n", off));
+    }
+    out.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+        n, xref_pos
+    ));
+    out
+}
+
 /// Write a 2D region set as a minimal DXF: one closed LWPOLYLINE entity per
 /// contour (the entity CAM tools read most reliably). Millimetre units.
 pub fn write_dxf_2d(regions: &[Poly2]) -> String {
@@ -1013,5 +1078,44 @@ mod tests {
         assert_eq!(format_from_ext("part.STL"), Some(MeshFormat::Stl));
         assert_eq!(format_from_ext("/a/b/Model.off"), Some(MeshFormat::Off));
         assert_eq!(format_from_ext("thing.3mf"), None);
+    }
+
+    #[test]
+    fn pdf_export_is_well_formed_with_correct_xref_offsets() {
+        let ring = Poly2::new(vec![
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            vec![[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]],
+        ]);
+        let pdf = write_pdf(std::slice::from_ref(&ring));
+        assert!(pdf.starts_with("%PDF-1.4"));
+        assert!(pdf.trim_end().ends_with("%%EOF"));
+        assert!(pdf.contains("/MediaBox"));
+        assert!(pdf.contains("B*")); // even-odd fill + stroke
+        // Two closed subpaths (outer + hole).
+        assert_eq!(pdf.matches(" h\n").count() + pdf.matches("\nh\n").count(), 2);
+
+        // The xref offsets must point exactly at each "N 0 obj" — a wrong offset
+        // makes the PDF unreadable, so verify the table against the bytes.
+        let xref_pos = pdf.rfind("\nxref\n").unwrap() + 1;
+        let table = &pdf[xref_pos..];
+        let lines: Vec<&str> = table.lines().collect();
+        // lines: "xref", "0 5", "0000000000 65535 f", then 4 object entries.
+        assert_eq!(lines[1], "0 5");
+        for (i, entry) in lines[3..7].iter().enumerate() {
+            let off: usize = entry.split_whitespace().next().unwrap().parse().unwrap();
+            let expect = format!("{} 0 obj", i + 1);
+            assert!(pdf[off..].starts_with(&expect), "obj {} at offset {}: {:?}", i + 1, off, &pdf[off..off + 10]);
+        }
+        // startxref must point at the "xref" keyword.
+        let sx: usize = pdf.rsplit("startxref\n").next().unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        assert!(pdf[sx..].starts_with("xref\n"), "startxref points at xref");
+
+        // The stream /Length must equal the actual byte count between
+        // `stream\n` and `endstream` — a wrong length makes the PDF unreadable.
+        let len_kw = pdf.find("/Length ").unwrap();
+        let declared: usize = pdf[len_kw + 8..].split_whitespace().next().unwrap().parse().unwrap();
+        let s0 = pdf.find("stream\n").unwrap() + "stream\n".len();
+        let s1 = pdf.find("endstream").unwrap();
+        assert_eq!(declared, s1 - s0, "declared /Length matches the stream bytes");
     }
 }

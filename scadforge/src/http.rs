@@ -135,12 +135,13 @@ fn export_response(query: &str, source: &str) -> Response {
     // pair each format with its MIME type. 2D vector formats export the 2D
     // outlines; mesh formats export the solid geometry.
     let tag = match format {
-        "svg" | "dxf" | "off" | "amf" | "stl" => format,
+        "svg" | "dxf" | "pdf" | "off" | "amf" | "stl" => format,
         _ => "stl",
     };
     let content_type = match tag {
         "svg" => "image/svg+xml",
         "dxf" => "application/dxf",
+        "pdf" => "application/pdf",
         "off" => "text/plain; charset=utf-8",
         "amf" => "application/x-amf",
         _ => "model/stl",

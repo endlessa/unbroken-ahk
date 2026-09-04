@@ -121,9 +121,9 @@ fn render_headless(
     // eval::export_string understands).
     let ext = output.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     let format = match ext.as_str() {
-        "stl" | "off" | "amf" | "svg" | "dxf" => ext,
+        "stl" | "off" | "amf" | "svg" | "dxf" | "pdf" => ext,
         _ => {
-            eprintln!("cannot infer export format from '{}' (use .stl/.off/.amf/.svg/.dxf)", output);
+            eprintln!("cannot infer export format from '{}' (use .stl/.off/.amf/.svg/.dxf/.pdf)", output);
             return 2;
         }
     };
