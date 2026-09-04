@@ -134,8 +134,13 @@ pub fn inflate(data: &[u8], expected: Option<usize>) -> Option<Vec<u8>> {
         match btype {
             0 => {
                 r.align();
-                let len = r.bits(16)? as usize;
-                let _nlen = r.bits(16)?;
+                let len = r.bits(16)?;
+                let nlen = r.bits(16)?;
+                // A valid stored block has NLEN = one's-complement of LEN.
+                if nlen != (!len & 0xFFFF) {
+                    return None;
+                }
+                let len = len as usize;
                 for _ in 0..len {
                     out.push(r.bits(8)? as u8);
                     if out.len() > MAX_OUT {

@@ -90,10 +90,10 @@ pub fn write_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 fn rd_u16(d: &[u8], off: usize) -> Option<u16> {
-    d.get(off..off + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+    d.get(off..off.checked_add(2)?).map(|s| u16::from_le_bytes([s[0], s[1]]))
 }
 fn rd_u32(d: &[u8], off: usize) -> Option<u32> {
-    d.get(off..off + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    d.get(off..off.checked_add(4)?).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 /// Read a ZIP archive into `(name, bytes)` pairs, decompressing stored and
@@ -113,6 +113,11 @@ pub fn read_zip(d: &[u8]) -> Vec<(String, Vec<u8>)> {
         Some(o) => o as usize,
         None => return out,
     };
+    // A global cap on the SUM of decompressed bytes across all entries. The
+    // per-stream inflate cap does not bound the total, and a crafted archive
+    // can point thousands of central-directory records at one small,
+    // highly-compressible stream — so budget the whole archive here.
+    let mut budget: usize = 256 << 20;
     for _ in 0..count {
         // Central directory header.
         if rd_u32(d, cd) != Some(0x0201_4b50) {
@@ -122,6 +127,7 @@ pub fn read_zip(d: &[u8]) -> Vec<(String, Vec<u8>)> {
             Some(m) => m,
             None => break,
         };
+        let crc = rd_u32(d, cd + 16).unwrap_or(0);
         let comp_size = match rd_u32(d, cd + 20) {
             Some(s) => s as usize,
             None => break,
@@ -133,8 +139,9 @@ pub fn read_zip(d: &[u8]) -> Vec<(String, Vec<u8>)> {
             Some(o) => o as usize,
             None => break,
         };
-        let name = d
-            .get(cd + 46..cd + 46 + name_len)
+        let name = cd
+            .checked_add(46)
+            .and_then(|s| d.get(s..s.checked_add(name_len)?))
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
         // Local header at local_off: recompute the data start from ITS own
@@ -142,15 +149,29 @@ pub fn read_zip(d: &[u8]) -> Vec<(String, Vec<u8>)> {
         if rd_u32(d, local_off) == Some(0x0403_4b50) {
             let lname = rd_u16(d, local_off + 26).unwrap_or(0) as usize;
             let lextra = rd_u16(d, local_off + 28).unwrap_or(0) as usize;
-            let data_start = local_off + 30 + lname + lextra;
-            if let Some(raw) = d.get(data_start..data_start + comp_size) {
+            // All-checked arithmetic so a hostile offset can't wrap `usize`
+            // (a concern only on 32-bit targets, but free to be correct).
+            let data_start = local_off
+                .checked_add(30)
+                .and_then(|s| s.checked_add(lname))
+                .and_then(|s| s.checked_add(lextra));
+            let raw = data_start
+                .and_then(|s| s.checked_add(comp_size).map(|e| (s, e)))
+                .and_then(|(s, e)| d.get(s..e));
+            if let Some(raw) = raw {
                 let bytes = match method {
                     0 => Some(raw.to_vec()),
                     8 => deflate::inflate(raw, None),
                     _ => None,
                 };
+                // Verify the CRC-32 (from the central directory) — this both
+                // catches corruption and rejects an entry whose local-header
+                // data range disagrees with its central record.
                 if let Some(b) = bytes {
-                    out.push((name, b));
+                    if b.len() <= budget && crc32(&b) == crc {
+                        budget -= b.len();
+                        out.push((name, b));
+                    }
                 }
             }
         }
@@ -210,6 +231,22 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, "m");
         assert_eq!(back[0].1, vec![b'A'; 64]);
+    }
+
+    #[test]
+    fn corrupted_entry_data_fails_crc_and_is_skipped() {
+        // A valid two-entry archive; flip a byte of the first entry's stored
+        // data. Its CRC no longer matches, so read_zip drops it (and any
+        // crafted local/central size disagreement is caught the same way).
+        let mut z = write_zip(&[("a", b"hello world"), ("b", b"kept")]);
+        // The first entry's data begins right after its 30-byte local header
+        // plus the 1-byte name "a".
+        let data_pos = 30 + 1;
+        z[data_pos] ^= 0xFF;
+        let back = read_zip(&z);
+        assert_eq!(back.len(), 1, "corrupted entry dropped, valid one kept");
+        assert_eq!(back[0].0, "b");
+        assert_eq!(back[0].1, b"kept");
     }
 
     #[test]
