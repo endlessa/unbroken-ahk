@@ -55,8 +55,9 @@ errors, and the builtins: `str` (shared 6-significant-digit formatter),
 `chr`, `ord`, `echo` (statement + expression), `assert` (halting, with
 serialized condition text), `search`, `lookup`, `rands`,
 `version`/`version_num`, `parent_module`/`$parent_modules`.
-Remaining partials here: assert lacks file/line + TRACE stack; string
-literal escapes are the basic four.
+String literal escapes are now the full reference set — `\n \t \r \\ \"`
+plus `\uXXXX` Unicode code points (four hex digits, surrogates rejected).
+Remaining partial here: assert lacks file/line + the TRACE stack.
 
 ### ✅ Phase 3 — CSG booleans (DONE)
 

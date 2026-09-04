@@ -133,6 +133,33 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                                 s.push('\t');
                                 i += 2;
                             }
+                            Some(b'r') => {
+                                s.push('\r');
+                                i += 2;
+                            }
+                            Some(b'u') => {
+                                // `\uXXXX` — exactly four hex digits → one
+                                // Unicode code point (rejecting surrogates and
+                                // non-hex, per the reference's escape set).
+                                match b
+                                    .get(i + 2..i + 6)
+                                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                                    .and_then(|h| std::str::from_utf8(h).ok())
+                                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                    .and_then(char::from_u32)
+                                {
+                                    Some(ch) => {
+                                        s.push(ch);
+                                        i += 6;
+                                    }
+                                    None => {
+                                        return Err(format!(
+                                            "bad \\u escape in string at byte {}",
+                                            i
+                                        ))
+                                    }
+                                }
+                            }
                             _ => return Err(format!("bad escape in string at byte {}", i)),
                         },
                         Some(&ch) if ch < 0x80 => {
@@ -226,6 +253,24 @@ mod tests {
         let toks = lex("$fn = 1e2;").unwrap();
         assert!(matches!(&toks[0].tok, Tok::Ident(s) if s == "$fn"));
         assert!(matches!(&toks[2].tok, Tok::Num(n) if *n == 100.0));
+    }
+
+    #[test]
+    fn string_escapes_cover_the_reference_set() {
+        let toks = lex("\"a\\tb\\nc\\rd\\\\e\\\"f\";").unwrap();
+        match &toks[0].tok {
+            Tok::Str(s) => assert_eq!(s, "a\tb\nc\rd\\e\"f"),
+            other => panic!("expected string, got {:?}", other),
+        }
+        // \uXXXX decodes a Unicode code point (Ω = U+03A9, é = U+00E9).
+        match &lex("\"\\u03a9\\u00e9\";").unwrap()[0].tok {
+            Tok::Str(s) => assert_eq!(s, "Ωé"),
+            other => panic!("expected string, got {:?}", other),
+        }
+        // Malformed \u (short / non-hex) and an unknown escape are errors.
+        assert!(lex("\"\\u03z9\";").is_err());
+        assert!(lex("\"\\u03\";").is_err());
+        assert!(lex("\"\\q\";").unwrap_err().contains("bad escape"));
     }
 
     #[test]
