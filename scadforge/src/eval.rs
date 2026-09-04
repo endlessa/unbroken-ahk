@@ -1244,7 +1244,9 @@ fn call_builtin_module(
                     return Vec::new();
                 }
             };
-            import_file(&path, ctx)
+            // dpi (SVG only) scales px/unitless user units; default 96.
+            let dpi = bound.get("dpi").and_then(Value::as_num).unwrap_or(96.0);
+            import_file(&path, dpi, ctx)
         }
         "projection" => {
             let groups = eval_children_grouped(children, scope, ctx);
@@ -1418,7 +1420,7 @@ fn call_builtin_module(
                 Some(Value::Str(s)) => s.clone(),
                 _ => return Vec::new(),
             };
-            let poly = import_file(&path, ctx).into_iter().find_map(|s| s.outline);
+            let poly = import_file(&path, 96.0, ctx).into_iter().find_map(|s| s.outline);
             let poly = match poly {
                 Some(p) if !p.is_empty() => p,
                 _ => return Vec::new(),
@@ -2052,11 +2054,11 @@ fn sandboxed_path(path: &str) -> Option<std::path::PathBuf> {
     }
 }
 
-fn import_file(path: &str, ctx: &mut Ctx) -> Vec<Shape> {
+fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    // DXF is a 2D vector format — it imports as a 2D shape, not a mesh. Its
-    // circle/arc tessellation follows the $fn/$fa/$fs in scope at the call.
-    if ext == "dxf" {
+    // DXF and SVG are 2D vector formats — they import as a 2D shape, not a mesh.
+    // Their curve tessellation follows the $fn/$fa/$fs in scope at the call.
+    if ext == "dxf" || ext == "svg" {
         let resolved = match sandboxed_path(path) {
             Some(p) => p,
             None => {
@@ -2072,7 +2074,12 @@ fn import_file(path: &str, ctx: &mut Ctx) -> Vec<Shape> {
             }
         };
         let get = |k: &str, d: f64| ctx.dynv.lookup(k).and_then(|v| v.as_num()).unwrap_or(d);
-        let (poly, warns) = io::read_dxf(&text, get("$fn", 0.0), get("$fa", 12.0), get("$fs", 2.0));
+        let (fn_, fa, fs) = (get("$fn", 0.0), get("$fa", 12.0), get("$fs", 2.0));
+        let (poly, warns) = if ext == "svg" {
+            crate::svg::read_svg(&text, dpi, fn_, fa, fs)
+        } else {
+            io::read_dxf(&text, fn_, fa, fs)
+        };
         ctx.out.warnings.extend(warns);
         return Shape::flat(poly).into_iter().collect();
     }
@@ -2286,7 +2293,9 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         "rotate_extrude" => &["angle"],
         "offset" => &["r"],
         "projection" => &["cut"],
-        "import" | "import_stl" | "import_off" | "import_dxf" => &["file", "convexity"],
+        "import" | "import_stl" | "import_off" | "import_dxf" => {
+            &["file", "convexity", "layer", "dpi"]
+        }
         "surface" => &["file", "center", "convexity"],
         "render" => &["convexity"],
         "text" => &["text", "size", "font", "halign", "valign", "spacing", "direction"],
@@ -4631,6 +4640,15 @@ mod tests {
         std::fs::remove_file(p2).ok();
         assert!(out.warnings.iter().any(|w| w.contains("DEPRECATED") && w.contains("dxf_linear_extrude")));
         assert!((total_volume(&out) - 8.0 * 8.0 * 5.0).abs() < 1e-2, "dxf_linear_extrude vol {}", total_volume(&out));
+
+        // SVG round-trip: export a square to SVG, import it back, extrude. The
+        // reader is the exact inverse of the writer, so the volume is preserved.
+        let ps = "scadforge_test_rt.svg";
+        std::fs::write(ps, crate::http::handle("POST", "/export?format=svg", "square(10);").body)
+            .unwrap();
+        let out = run(&format!("linear_extrude(height = 2) import(\"{}\");", ps));
+        std::fs::remove_file(ps).ok();
+        assert!((total_volume(&out) - 200.0).abs() < 1e-3, "SVG round-trip vol {}", total_volume(&out));
     }
 
     #[test]

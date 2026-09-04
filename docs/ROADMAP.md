@@ -4,8 +4,8 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after the Customizer milestone (2026-09-04): **146 full / 24
-partial / 13 untouched — 80% full, 93% touched.** PHASE 4 COMPLETE. Phase 5
+Standing after Customizer + SVG import (2026-09-04): **147 full / 24
+partial / 12 untouched — 80% full, 93% touched.** PHASE 4 COMPLETE. Phase 5
 so far:
 modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
 export and DXF import (2D vector) → partial; number formatting + value
@@ -149,9 +149,20 @@ Landed (2026-09-03):
   LINE/LWPOLYLINE/POLYLINE/CIRCLE/ARC (curves tessellated by $fn/$fa/$fs),
   stitches loose segments into even-odd loops, and warns on unsupported
   entities. **AMF** read/write also lands (write_amf / read_amf — XML mesh
-  via a from-scratch tag scanner, geometry only). `POST
+  via a from-scratch tag scanner, geometry only). **SVG import** now lands too
+  (`scadforge/src/svg.rs`): a from-scratch reader for the 2021.01 element
+  subset — `<path>` (M/L/H/V/C/S/Q/T/A/Z, absolute + relative, béziers and
+  endpoint-arcs flattened by $fn/$fa/$fs), `<rect>` (rounded corners),
+  `<circle>`, `<ellipse>`, `<line>`, `<polyline>`, `<polygon>`, with `<g>`
+  transforms (translate/scale/rotate/matrix/skew) — honoring the `dpi`
+  argument (px/unitless user units → mm) and mm/cm/in/pt/pc physical units,
+  with the SVG Y axis flipped. It is the exact inverse of the SVG writer, so a
+  region survives an export→import round-trip (pinned). `<text>` is ignored
+  with a warning; only fill geometry imports (strokes not expanded), and
+  self-intersecting nonzero-fill resolution is the one approximation (shared
+  with the whole even-odd 2D kernel). `POST
   /export?format=stl|off|amf|svg|dxf`. Remaining: 3MF (needs a from-scratch
-  ZIP/deflate), PDF, and SVG import (a path-command parser).
+  ZIP/deflate) and PDF export.
 - ◐ `include` / `use` / library-path (`scadforge/src/preproc.rs`): a
   source-resolution pass run before eval. `include <path>` textually inlines
   the referenced file (recursively, cycle-guarded); its geometry runs and its
@@ -192,11 +203,11 @@ Landed (2026-09-03):
 
 ## The honest tail
 
-~13 entries remain. Some describe the desktop application, not the
+~12 entries remain. Some describe the desktop application, not the
 language: GUI-viewport PNG export, `$vpr`-family viewport variables,
 DXF-era deprecated functions. Others are genuine formats deferred for a
-from-scratch codec (3MF needs ZIP/deflate; PDF; SVG import needs a
-path-command parser). Each gets a per-entry decision — web-app
+from-scratch codec (3MF needs ZIP/deflate; PDF). Each gets a
+per-entry decision — web-app
 equivalent, or documented as intentionally out of scope. 100% of the
 *language* is reachable; 100% of all 183 entries goes through those
 judgment calls.
