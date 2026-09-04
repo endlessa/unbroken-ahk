@@ -86,7 +86,9 @@ pub fn read_svg(text: &str, dpi: f64, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec
             *p = [p[0] * scale, -p[1] * scale];
         }
     }
-    contours.retain(|c| c.len() >= 3);
+    // Keep only real fillable contours: at least a triangle, and every point
+    // finite (a `NaN`/`inf` coordinate from a malformed attribute is dropped).
+    contours.retain(|c| c.len() >= 3 && c.iter().all(|p| p[0].is_finite() && p[1].is_finite()));
     (Poly2::new(contours), warnings)
 }
 
@@ -196,8 +198,8 @@ impl<'a> Iterator for ElementScanner<'a> {
             let raw_str = String::from_utf8_lossy(raw);
             let body = raw_str.trim();
             if let Some(rest) = body.strip_prefix('/') {
-                // Closing tag </g>.
-                if rest.trim() == "g" {
+                // Closing tag </g> (case-insensitive, matching the open path).
+                if rest.trim().eq_ignore_ascii_case("g") {
                     return Some(Element::GroupClose);
                 }
                 continue;
@@ -212,16 +214,17 @@ impl<'a> Iterator for ElementScanner<'a> {
             let name = name.to_ascii_lowercase();
             match name.as_str() {
                 "g" => {
-                    // A self-closing <g/> opens and immediately closes; but
-                    // since we can only return one item, treat it as an open
-                    // whose close is implicit at document end (harmless: it has
-                    // no children). For correctness we push then rely on the
-                    // caller's stack; emit GroupOpen only.
+                    // A self-closing <g .../> has no children, so it opens and
+                    // immediately closes — emitting nothing keeps its transform
+                    // from leaking onto following siblings (there is no matching
+                    // </g> to pop it).
+                    if self_closing {
+                        continue;
+                    }
                     return Some(Element::GroupOpen(attrs.to_string()));
                 }
                 "path" | "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon"
                 | "text" => {
-                    let _ = self_closing;
                     return Some(Element::Shape(name, attrs.to_string()));
                 }
                 _ => continue,
@@ -248,8 +251,8 @@ fn find_open_tag(text: &str, name: &str) -> Option<String> {
 /// `key='value'`). Returns the unescaped-enough value (basic entities only).
 /// Byte-boundary-safe: it searches on `str::find` (always a char boundary) and
 /// never slices at an arbitrary index, so a multi-byte value elsewhere in the
-/// string (e.g. `id="café"`) can't panic the parse.
-fn attr(attrs: &str, key: &str) -> Option<String> {
+/// string (e.g. `id="café"`) can't panic the parse. Shared with the 3MF reader.
+pub(crate) fn attr(attrs: &str, key: &str) -> Option<String> {
     let mut from = 0;
     while let Some(rel) = attrs[from..].find(key) {
         let i = from + rel; // a char boundary (start of the match)
@@ -291,14 +294,14 @@ fn shape_contours(name: &str, attrs: &str, frag: &dyn Fn(f64) -> usize) -> Vec<V
         "rect" => rect_contour(attrs, frag),
         "circle" => {
             let (cx, cy, r) = (attr_f(attrs, "cx", 0.0), attr_f(attrs, "cy", 0.0), attr_f(attrs, "r", 0.0));
-            if r <= 0.0 { vec![] } else { vec![ellipse_pts(cx, cy, r, r, frag(r))] }
+            if !(r > 0.0) { vec![] } else { vec![ellipse_pts(cx, cy, r, r, frag(r))] }
         }
         "ellipse" => {
             let cx = attr_f(attrs, "cx", 0.0);
             let cy = attr_f(attrs, "cy", 0.0);
             let rx = attr_f(attrs, "rx", 0.0);
             let ry = attr_f(attrs, "ry", 0.0);
-            if rx <= 0.0 || ry <= 0.0 { vec![] } else { vec![ellipse_pts(cx, cy, rx, ry, frag(rx.max(ry)))] }
+            if !(rx > 0.0 && ry > 0.0) { vec![] } else { vec![ellipse_pts(cx, cy, rx, ry, frag(rx.max(ry)))] }
         }
         "line" => {
             let p0 = [attr_f(attrs, "x1", 0.0), attr_f(attrs, "y1", 0.0)];
@@ -316,7 +319,7 @@ fn rect_contour(attrs: &str, frag: &dyn Fn(f64) -> usize) -> Vec<Vec<Vec2>> {
     let y = attr_f(attrs, "y", 0.0);
     let w = attr_f(attrs, "width", 0.0);
     let h = attr_f(attrs, "height", 0.0);
-    if w <= 0.0 || h <= 0.0 {
+    if !(w > 0.0 && h > 0.0) {
         return vec![];
     }
     // Rounded corners: rx/ry (either implies the other), clamped to half-extent.
@@ -468,6 +471,7 @@ fn parse_path(d: &str, frag: &dyn Fn(f64) -> usize) -> Vec<Vec<Vec2>> {
                     flatten_cubic(&mut path, cur, c1, c2, end, frag);
                     cur = end;
                     last_ctrl = Some(c2);
+                    last_cmd = 'S'; // later packed sets reflect off this S
                 }
             }
             'Q' => {
@@ -486,6 +490,7 @@ fn parse_path(d: &str, frag: &dyn Fn(f64) -> usize) -> Vec<Vec<Vec2>> {
                     flatten_quad(&mut path, cur, c1, end, frag);
                     cur = end;
                     last_ctrl = Some(c1);
+                    last_cmd = 'T'; // later packed sets reflect off this T
                 }
             }
             'A' => {
@@ -502,12 +507,16 @@ fn parse_path(d: &str, frag: &dyn Fn(f64) -> usize) -> Vec<Vec<Vec2>> {
                 last_ctrl = None;
             }
             'Z' => {
-                // Close the subpath and start a fresh one at the start point.
+                // Close the subpath. Per SVG, if a drawing command (not M)
+                // follows, the next subpath restarts at the SAME initial point,
+                // so re-seed the buffer with it (a lone Z, or an M next, just
+                // discards this single-point buffer via flush / the M flush).
                 if path.len() >= 2 {
                     subpaths.push(std::mem::take(&mut path));
                 }
                 path.clear();
                 cur = start;
+                path.push(start);
                 last_ctrl = None;
             }
             _ => break, // unknown command: stop (permissive)
@@ -880,6 +889,55 @@ mod tests {
         assert!((area(&p) - 100.0).abs() < 1e-9); // the rect still imports
         // Not-svg input yields an empty region, not a panic.
         assert!(read_svg("garbage", 96.0, 8.0, 12.0, 2.0).0.is_empty());
+    }
+
+    #[test]
+    fn smooth_curve_reflects_on_implicit_repeated_sets() {
+        // Two cubic segments packed under one S. The 2nd set must reflect off
+        // the first S's control point → (6,-2), not degrade to the endpoint.
+        // viewBox width == mm width → scale 1, so model y = -(svg y).
+        let p = read("<svg width=\"12mm\" height=\"12mm\" viewBox=\"-4 -4 12 12\">\
+                      <path d=\"M0 0 S2 2 4 0 6 -2 8 0 Z\"/></svg>");
+        // The reflected 2nd control (6,-2) → after Y-flip (2,-2)... assert the
+        // contour dips to a clearly-negative-in-model y near the 2nd segment
+        // (t=0.5 y = -1.5 model, i.e. +1.5 after flip). The buggy version's
+        // t=0.5 was -0.75 → +0.75. Check the extreme flipped-y magnitude.
+        let max_y = p.contours[0].iter().map(|q| q[1]).fold(f64::NEG_INFINITY, f64::max);
+        assert!(max_y > 1.2, "reflected control shapes the 2nd segment: max_y={}", max_y);
+    }
+
+    #[test]
+    fn self_closing_group_does_not_leak_transform() {
+        // An empty <g transform=.../> must NOT shift the following sibling.
+        let p = read("<svg viewBox=\"0 0 20 20\" width=\"20mm\" height=\"20mm\">\
+                      <g transform=\"translate(10,0)\"/>\
+                      <rect x=\"0\" y=\"0\" width=\"5\" height=\"5\"/></svg>");
+        let minx = p.contours[0].iter().map(|q| q[0]).fold(f64::INFINITY, f64::min);
+        assert!((minx - 0.0).abs() < 1e-9, "sibling not translated: minx={}", minx);
+    }
+
+    #[test]
+    fn closepath_then_continue_keeps_initial_point() {
+        // Subpath 2 (after Z, no M) restarts at the initial point (0,0), so it
+        // is the triangle (0,0)-(10,10)-(0,10), area 50, plus subpath 1's line.
+        let p = read("<svg width=\"10mm\" height=\"10mm\" viewBox=\"0 0 10 10\">\
+                      <path d=\"M0 0 L10 0 Z L10 10 L0 10 Z\"/></svg>");
+        // subpath1 (0,0)-(10,0) is a 2-pt line (dropped); subpath2 is the tri.
+        assert_eq!(p.contours.len(), 1, "only the triangle survives");
+        assert!((area(&p) - 50.0).abs() < 1e-9, "restarted-subpath area {}", area(&p));
+    }
+
+    #[test]
+    fn non_finite_dimensions_are_dropped() {
+        // NaN/inf sizes and coordinates must not produce garbage geometry.
+        assert!(read("<svg viewBox=\"0 0 9 9\" width=\"9mm\" height=\"9mm\">\
+                      <rect width=\"NaN\" height=\"9\"/></svg>").is_empty());
+        assert!(read("<svg viewBox=\"0 0 9 9\" width=\"9mm\" height=\"9mm\">\
+                      <circle cx=\"0\" cy=\"0\" r=\"inf\"/></svg>").is_empty());
+        // A NaN coordinate on an otherwise-valid rect drops that contour.
+        let p = read("<svg viewBox=\"0 0 9 9\" width=\"9mm\" height=\"9mm\">\
+                      <rect x=\"NaN\" y=\"0\" width=\"5\" height=\"5\"/></svg>");
+        assert!(p.is_empty());
     }
 
     #[test]
