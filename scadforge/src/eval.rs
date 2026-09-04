@@ -117,6 +117,20 @@ fn evaluate_inner(program: &[Stmt]) -> EvalOutput {
     for s in ctx.cycle_scopes.drain(..) {
         s.vars.borrow_mut().clear();
     }
+    // Stamp the diagnostic class onto each message. Warnings collected through
+    // the run carry only their text; the reference surface prefixes every
+    // line with its class (WARNING/DEPRECATED/ERROR). DEPRECATED/ERROR lines
+    // already carry their prefix, so only unclassified lines become WARNINGs.
+    // (File/line suffixes are not emitted — the evaluator does not yet track
+    // source positions; a documented partial.)
+    for w in &mut ctx.out.warnings {
+        if !(w.starts_with("WARNING:")
+            || w.starts_with("DEPRECATED:")
+            || w.starts_with("ERROR:"))
+        {
+            *w = format!("WARNING: {}", w);
+        }
+    }
     ctx.out
 }
 
@@ -4020,6 +4034,54 @@ mod tests {
         // The projected silhouette re-extrudes (the flatten→re-extrude idiom).
         let out = run("linear_extrude(height = 3) projection() cube(10, center = true);");
         assert!((total_volume(&out) - 300.0).abs() < 1e-3, "re-extrude vol {}", total_volume(&out));
+    }
+
+    #[test]
+    fn number_formatting_matches_2021_01() {
+        // The double-conversion 6-significant-digit rules: fixed for
+        // 1e-5 ≤ |x| < 1e6, scientific (lowercase e, signed, no zero-pad)
+        // otherwise; trailing zeros trimmed; -0 → 0.
+        let cases = [
+            (1.0 / 3.0, "0.333333"),
+            (std::f64::consts::PI, "3.14159"),
+            (10.0, "10"),
+            (100000.0, "100000"),
+            (1_000_000.0, "1e+6"),
+            (1_234_567.0, "1.23457e+6"),
+            (0.0001, "0.0001"),
+            (0.00001, "0.00001"),
+            (1.1e-6, "1.1e-6"),
+            (1e100, "1e+100"),
+            (-0.0, "0"),
+            (0.1 + 0.2, "0.3"),
+        ];
+        for (x, want) in cases {
+            assert_eq!(fmt_num(x), want, "fmt_num({})", x);
+        }
+        assert_eq!(fmt_num(f64::INFINITY), "inf");
+        assert_eq!(fmt_num(f64::NEG_INFINITY), "-inf");
+        assert_eq!(fmt_num(f64::NAN), "nan");
+        // Value display forms: quoted strings inside vectors, spaced-colon
+        // ranges, nested vectors.
+        assert_eq!(fmt_value(&Value::Str("a".into()), true), "\"a\"");
+        assert_eq!(fmt_value(&Value::Str("a".into()), false), "a"); // str() top-level bare
+    }
+
+    #[test]
+    fn diagnostic_surface_prefixes_each_class() {
+        // Plain diagnostics become WARNING:; DEPRECATED keeps its own class
+        // (never double-prefixed).
+        let out = run("frob(1); cube(1);");
+        assert!(!out.warnings.is_empty());
+        assert!(
+            out.warnings.iter().all(|w| w.starts_with("WARNING:") || w.starts_with("DEPRECATED:")),
+            "every diagnostic carries a class prefix: {:?}",
+            out.warnings
+        );
+        assert!(out.warnings.iter().any(|w| w.starts_with("WARNING: unknown module")));
+        let out = run("assign(x = 1) cube(x);");
+        assert!(out.warnings.iter().any(|w| w.starts_with("DEPRECATED:")));
+        assert!(!out.warnings.iter().any(|w| w.starts_with("WARNING: DEPRECATED")));
     }
 
     #[test]

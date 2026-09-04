@@ -120,7 +120,7 @@ async function render() {
   const msgs = [];
   if (data.error) msgs.push({cls:'err', text: data.error.startsWith('ERROR') ? data.error : 'error: ' + data.error});
   for (const e of data.echoes || []) msgs.push({cls:'ok', text: e});
-  for (const w of data.warnings || []) msgs.push({cls:'warn', text: 'warning: ' + w});
+  for (const w of data.warnings || []) msgs.push({cls:'warn', text: w});
   soup = [];
   let tris = 0;
   const lo = [Infinity,Infinity,Infinity], hi = [-Infinity,-Infinity,-Infinity];

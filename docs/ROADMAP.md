@@ -4,11 +4,13 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 5 STL/OFF I/O (2026-09-04): **134 full / 14 partial /
-35 untouched — 73% full, 81% touched.** (Phase 4 complete bar `text()`.
-Phase 5 so far: modifier characters `* ! # %` (full); STL + OFF
-import/export (the `import`, import/export-3D-mesh, and deprecated-alias
-entries → partial, with AMF/3MF/DXF/SVG still to come).)
+Standing after phase 5 diagnostic surface (2026-09-04): **134 full / 15
+partial / 34 untouched — 73% full, 81% touched.** (Phase 4 complete bar
+`text()`. Phase 5 so far: modifier characters `* ! # %` (full); STL + OFF
+import/export (partial, AMF/3MF/DXF/SVG to come); number formatting and
+value display forms confirmed full and pinned; the diagnostic surface now
+class-prefixes every line (WARNING/DEPRECATED/ERROR) → partial, still
+missing file/line, TRACE, and --hardwarnings.)
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -126,9 +128,15 @@ Remaining:
   route + Export-STL button download the scene. Remaining: AMF, 3MF, DXF,
   SVG.
 - `include` / `use`, library path resolution
-- `$t`, `$preview`, viewport variables
-- echo/assert output formatting (6-significant-digit numbers, value
-  display forms, WARNING/ERROR/DEPRECATED/TRACE surface)
+- `$t`, `$preview`, `$children` done (phase 2); viewport `$vp*` variables
+  are desktop-camera state — a documented web judgment call, still open.
+- ◐ echo/assert output formatting: the 6-significant-digit number formatter
+  (fixed for 1e-5..1e6, `1e+6`/`1.23457e+6` scientific, `-0`→`0`) and the
+  value display forms (spaced-colon ranges, container-quoted strings vs bare
+  str() top level, nested vectors, function-literal rendering) are full and
+  pinned. The diagnostic surface now class-prefixes every line
+  (WARNING/DEPRECATED/ERROR); file/line suffixes, the TRACE stack, and
+  --hardwarnings remain.
 - Customizer parameter model
 
 ## The honest tail
