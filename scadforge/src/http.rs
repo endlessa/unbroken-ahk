@@ -6,7 +6,6 @@
 //! sockets.
 
 use crate::eval;
-use crate::parser;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use unbroken_test_platform::json::{obj, str_val, to_json_compact, JsonValue};
@@ -59,17 +58,8 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 
 fn export_response(query: &str, source: &str) -> Response {
     let format = query_param(query, "format").unwrap_or("stl");
-    let program = match parser::parse(source) {
-        Ok(p) => p,
-        Err(e) => {
-            return Response {
-                status: "422 Unprocessable Entity",
-                content_type: "text/plain; charset=utf-8",
-                body: e,
-            }
-        }
-    };
-    let out = eval::evaluate(&program);
+    let base = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let out = eval::evaluate_source(source, &base);
     if let Some(err) = &out.error {
         return Response {
             status: "422 Unprocessable Entity",
@@ -107,9 +97,9 @@ fn export_response(query: &str, source: &str) -> Response {
 ///  "warnings": [...], "echoes": [...], "error": "..."?}
 pub fn render_json(source: &str) -> String {
     let mut pairs: Vec<(&str, JsonValue)> = Vec::new();
-    match parser::parse(source) {
-        Ok(program) => {
-            let out = eval::evaluate(&program);
+    {
+            let base = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            let out = eval::evaluate_source(source, &base);
             let meshes: Vec<JsonValue> = out
                 .shapes
                 .iter()
@@ -161,13 +151,6 @@ pub fn render_json(source: &str) -> String {
             if let Some(err) = &out.error {
                 pairs.push(("error", str_val(err)));
             }
-        }
-        Err(e) => {
-            pairs.push(("meshes", JsonValue::Array(Vec::new())));
-            pairs.push(("warnings", JsonValue::Array(Vec::new())));
-            pairs.push(("echoes", JsonValue::Array(Vec::new())));
-            pairs.push(("error", str_val(&e)));
-        }
     }
     to_json_compact(&obj(pairs))
 }

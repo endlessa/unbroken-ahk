@@ -4,15 +4,14 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after render/surface (2026-09-04): **138 full / 16 partial / 29
-untouched — 75% full, 84% touched.** (Phase 4 complete bar `text()`. Phase
+Standing after include/use (2026-09-04): **138 full / 19 partial / 26
+untouched — 75% full, 86% touched.** (Phase 4 complete bar `text()`. Phase
 5 so far: modifier characters `* ! # %` (full); STL + OFF import/export
-(partial, AMF/3MF/DXF/SVG to come); number formatting and value display
-forms full+pinned; diagnostic surface class-prefixed → partial; `render`
-(exact-union identity) and `convexity` (silently accepted everywhere) full;
-`surface` text-grid heightmap → partial (PNG mode to come); `fill`/`roof`
-confirmed snapshot-only and correctly rejected as unknown modules in
-2021.01.)
+(partial); number formatting + value display forms full+pinned; diagnostic
+surface class-prefixed → partial; `render` and `convexity` full; `surface`
+text heightmap → partial; `fill`/`roof` correctly rejected as unknown in
+2021.01; `include`/`use`/library-path → partial via a source-resolution
+pass.)
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -129,7 +128,17 @@ Remaining:
   `%` background is excluded from exports and `#` included. A `POST /export`
   route + Export-STL button download the scene. Remaining: AMF, 3MF, DXF,
   SVG.
-- `include` / `use`, library path resolution
+- ◐ `include` / `use` / library-path (`scadforge/src/preproc.rs`): a
+  source-resolution pass run before eval. `include <path>` textually inlines
+  the referenced file (recursively, cycle-guarded); its geometry runs and its
+  defs/vars join the scope, so a later main-file assignment wins
+  (override-after-include). `use <path>` exposes only the file's
+  module/function definitions (geometry and top-level vars not run); a local
+  same-name def shadows it. Paths resolve relative to the including file and
+  are sandboxed (no absolute, no `..`); missing files warn with the
+  format-specific text ("Can't open include file" vs "... library") and are
+  non-fatal. Remaining: the 2019.05 override-before-include and used-file
+  private-var scope, and the OPENSCADPATH/user/bundled search tiers.
 - `$t`, `$preview`, `$children` done (phase 2); viewport `$vp*` variables
   are desktop-camera state — a documented web judgment call, still open.
 - ◐ echo/assert output formatting: the 6-significant-digit number formatter

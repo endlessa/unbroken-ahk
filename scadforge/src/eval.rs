@@ -78,6 +78,23 @@ pub struct EvalOutput {
 
 /// Evaluation runs on a dedicated thread with a large stack so deep
 /// non-tail recursion hits our own depth guard, not the platform stack.
+/// Resolve include/use directives (paths relative to `base_dir`) and then
+/// evaluate. Resolution warnings (missing include/use files) are prepended to
+/// the diagnostic stream; a parse error in the resolved source is fatal.
+pub fn evaluate_source(source: &str, base_dir: &std::path::Path) -> EvalOutput {
+    let resolved = crate::preproc::resolve(source, base_dir);
+    if let Some(err) = resolved.error {
+        return EvalOutput { error: Some(err), warnings: resolved.warnings, ..Default::default() };
+    }
+    let mut out = evaluate(&resolved.program);
+    if !resolved.warnings.is_empty() {
+        let mut w = resolved.warnings;
+        w.append(&mut out.warnings);
+        out.warnings = w;
+    }
+    out
+}
+
 pub fn evaluate(program: &[Stmt]) -> EvalOutput {
     std::thread::scope(|s| {
         let handle = std::thread::Builder::new()
@@ -4189,6 +4206,53 @@ mod tests {
         let bad = crate::http::handle("POST", "/export?format=stl", "square(5);");
         assert_eq!(bad.status, "422 Unprocessable Entity");
         assert!(bad.body.contains("not a 3D object"));
+    }
+
+    #[test]
+    fn include_and_use() {
+        let base = std::env::current_dir().unwrap();
+
+        // include: geometry runs, definitions register, and a later same-name
+        // assignment in the main file wins (override-after-include).
+        std::fs::write(
+            "scadforge_test_inc.scad",
+            "w = 3;\nmodule widget() { cube([2, 2, 2]); }\ntranslate([0, 20, 0]) sphere(3);\n",
+        )
+        .unwrap();
+        let out = evaluate_source(
+            "include <scadforge_test_inc.scad>\nw = 7;\nwidget();\ncube([w, 1, 1]);",
+            &base,
+        );
+        std::fs::remove_file("scadforge_test_inc.scad").ok();
+        assert!(out.error.is_none(), "include error: {:?}", out.error);
+        // widget() cube + the included sphere + the main w-sized cube.
+        assert!(out.shapes.len() >= 3, "include runs geometry AND exposes defs");
+        let maxx = out
+            .shapes
+            .iter()
+            .flat_map(|s| s.mesh.positions.iter())
+            .map(|p| p[0])
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((maxx - 7.0).abs() < 1e-6, "main override w=7 wins, maxx {}", maxx);
+
+        // use: only definitions are exposed; the used file's geometry is NOT
+        // instantiated.
+        std::fs::write(
+            "scadforge_test_use.scad",
+            "module gadget() { cube([5, 5, 5]); }\nsphere(100);\n",
+        )
+        .unwrap();
+        let out = evaluate_source("use <scadforge_test_use.scad>\ngadget();", &base);
+        std::fs::remove_file("scadforge_test_use.scad").ok();
+        assert_eq!(out.shapes.len(), 1, "use exposes defs only, not geometry");
+        assert!((total_volume(&out) - 125.0).abs() < 1e-6, "gadget vol {}", total_volume(&out));
+
+        // Missing files warn (distinct messages) and are non-fatal.
+        let out = evaluate_source("include <nope.scad>\ncube(1);", &base);
+        assert!(out.warnings.iter().any(|w| w.contains("Can't open include file")));
+        assert_eq!(out.shapes.len(), 1, "evaluation continues past a missing include");
+        let out = evaluate_source("use <nope.scad>\ncube(1);", &base);
+        assert!(out.warnings.iter().any(|w| w.contains("Can't open library")));
     }
 
     #[test]
