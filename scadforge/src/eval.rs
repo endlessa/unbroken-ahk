@@ -13,6 +13,7 @@ use crate::ast::{Arg, BinOp, Expr, Modifier, Param, Stmt, VecItem};
 use crate::csg;
 use crate::csg2;
 use crate::geom::{self, Mesh};
+use crate::io;
 use crate::poly2::{self, Poly2};
 use crate::value::{FuncVal, Value};
 use std::cell::RefCell;
@@ -1196,6 +1197,24 @@ fn call_builtin_module(
             // A negative offset can annihilate the region — empty, no warning.
             Shape::flat(result).into_iter().collect()
         }
+        "import" | "import_stl" | "import_off" => {
+            if name != "import" {
+                ctx.out.warnings.push(format!(
+                    "DEPRECATED: The {}() module will be removed in future releases. \
+                     Use import() instead.",
+                    name
+                ));
+            }
+            no_children(name, children, ctx);
+            let path = match bound.get("file").or_else(|| bound.get("filename")) {
+                Some(Value::Str(s)) => s.clone(),
+                _ => {
+                    ctx.out.warnings.push("import(): expected a file name string".into());
+                    return Vec::new();
+                }
+            };
+            import_file(&path, ctx)
+        }
         "projection" => {
             let groups = eval_children_grouped(children, scope, ctx);
             if groups.is_empty() {
@@ -1773,6 +1792,81 @@ fn collect_2d(children: &[Stmt], scope: &Rc<Scope>, ctx: &mut Ctx) -> Poly2 {
     csg2::union2(&regions)
 }
 
+/// Read an external mesh file as a 3D primitive. Format is chosen by
+/// extension (case-insensitive). A missing/unreadable file warns and yields
+/// empty geometry (evaluation continues, per the reference); an unsupported
+/// extension is an error. The path is resolved relative to the working
+/// directory and may not escape it (no absolute paths, no `..`).
+fn import_file(path: &str, ctx: &mut Ctx) -> Vec<Shape> {
+    let format = match io::format_from_ext(path) {
+        Some(f) => f,
+        None => {
+            ctx.halt(format!(
+                "ERROR: Unsupported file format while trying to import file '{}'",
+                path
+            ));
+            return Vec::new();
+        }
+    };
+    if path.starts_with('/') || path.split(['/', '\\']).any(|seg| seg == "..") {
+        ctx.out
+            .warnings
+            .push(format!("WARNING: Can't open import file '{}'.", path));
+        return Vec::new();
+    }
+    let mesh = match format {
+        io::MeshFormat::Stl => match std::fs::read(path) {
+            Ok(bytes) => io::read_stl(&bytes),
+            Err(_) => Err(String::new()),
+        },
+        io::MeshFormat::Off => match std::fs::read_to_string(path) {
+            Ok(text) => io::read_off(&text),
+            Err(_) => Err(String::new()),
+        },
+    };
+    match mesh {
+        Ok(m) if !m.tris.is_empty() => leaf(m),
+        Ok(_) => Vec::new(), // parsed but empty
+        Err(_) => {
+            ctx.out
+                .warnings
+                .push(format!("WARNING: Can't open import file '{}'.", path));
+            Vec::new()
+        }
+    }
+}
+
+/// Merge the design's SOLID (non-`%`-background) 3D geometry into one mesh
+/// for export. A purely-2D top level is an error, as is empty geometry (both
+/// matching the reference's export messages). Preview-grade: top-level bodies
+/// are concatenated, not boolean-unioned (a valid multi-body mesh).
+pub fn export_mesh(out: &EvalOutput) -> Result<Mesh, String> {
+    let mut combined = Mesh::empty();
+    let mut saw_2d = false;
+    for s in &out.shapes {
+        if s.background {
+            continue; // % is excluded from all exports
+        }
+        if s.outline.is_some() {
+            saw_2d = true;
+            continue;
+        }
+        let base = combined.positions.len() as u32;
+        combined.positions.extend_from_slice(&s.mesh.positions);
+        for t in &s.mesh.tris {
+            combined.tris.push([t[0] + base, t[1] + base, t[2] + base]);
+        }
+    }
+    if combined.tris.is_empty() {
+        return Err(if saw_2d {
+            "Current top level object is not a 3D object".into()
+        } else {
+            "Current top level object is empty".into()
+        });
+    }
+    Ok(combined)
+}
+
 fn transform_children(
     children: &[Stmt],
     scope: &Rc<Scope>,
@@ -1841,6 +1935,7 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         "rotate_extrude" => &["angle"],
         "offset" => &["r"],
         "projection" => &["cut"],
+        "import" | "import_stl" | "import_off" => &["file", "convexity"],
         "color" => &["c", "alpha"],
         "children" | "child" => &["index"],
         _ => &[],
@@ -3925,6 +4020,55 @@ mod tests {
         // The projected silhouette re-extrudes (the flatten→re-extrude idiom).
         let out = run("linear_extrude(height = 3) projection() cube(10, center = true);");
         assert!((total_volume(&out) - 300.0).abs() < 1e-3, "re-extrude vol {}", total_volume(&out));
+    }
+
+    #[test]
+    fn import_and_export() {
+        // Round-trip: write an ASCII STL cube to a CWD-relative file, import
+        // it back, and check the volume survives.
+        let path = "scadforge_test_import_cube.stl";
+        let cube = geom::cube([2.0, 3.0, 4.0], false); // volume 24
+        std::fs::write(path, io::write_stl_ascii(&cube)).unwrap();
+        let out = run(&format!("import(\"{}\");", path));
+        std::fs::remove_file(path).ok();
+        assert_eq!(out.shapes.len(), 1, "imported mesh is one 3D shape");
+        assert!(out.shapes[0].outline.is_none(), "imported STL is 3D");
+        assert!((total_volume(&out) - 24.0).abs() < 1e-3, "imported vol {}", total_volume(&out));
+
+        // Error paths (no file needed).
+        assert!(
+            run("import(\"nope.stl\");").warnings.iter().any(|w| w.contains("Can't open")),
+            "missing file warns, not fatal"
+        );
+        assert!(run("import(\"model.xyz\");").error.is_some(), "unsupported format is an error");
+        assert!(
+            run("import(\"/etc/hosts.stl\");").warnings.iter().any(|w| w.contains("Can't open")),
+            "an absolute path is refused"
+        );
+        assert!(
+            run("import(\"../secret.stl\");").warnings.iter().any(|w| w.contains("Can't open")),
+            "a .. traversal is refused"
+        );
+
+        // export_mesh: 3D exports; 2D-only and empty are the reference errors;
+        // `%` background is excluded from the export.
+        assert!(export_mesh(&run("cube(2, center=true);")).is_ok());
+        assert!(export_mesh(&run("square(5);")).unwrap_err().contains("not a 3D object"));
+        assert!(export_mesh(&run("if (false) cube(1);")).unwrap_err().contains("empty"));
+        assert!(
+            export_mesh(&run("%cube(2, center=true);")).unwrap_err().contains("empty"),
+            "an only-% scene exports empty"
+        );
+
+        // The HTTP export route serializes ASCII STL / OFF and reports errors.
+        let stl = crate::http::handle("POST", "/export?format=stl", "cube(2, center=true);");
+        assert_eq!(stl.status, "200 OK");
+        assert!(stl.body.starts_with("solid scadforge_model"));
+        let off = crate::http::handle("POST", "/export?format=off", "cube(2, center=true);");
+        assert!(off.body.starts_with("OFF\n"));
+        let bad = crate::http::handle("POST", "/export?format=stl", "square(5);");
+        assert_eq!(bad.status, "422 Unprocessable Entity");
+        assert!(bad.body.contains("not a 3D object"));
     }
 
     #[test]

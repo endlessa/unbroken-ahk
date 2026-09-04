@@ -37,6 +37,7 @@
   <h1>scad<span>forge</span></h1>
   <div class="sub">from-scratch OpenSCAD-compatible modeler &middot; localhost &middot; zero dependencies</div>
   <button id="renderBtn">Render&nbsp;(Ctrl+Enter)</button>
+  <button id="exportBtn">Export&nbsp;STL</button>
 </header>
 <main>
   <div id="left">
@@ -425,6 +426,21 @@ viewport.addEventListener('wheel', e => {
 }, { passive: false });
 window.addEventListener('resize', scheduleDraw);
 document.getElementById('renderBtn').addEventListener('click', render);
+document.getElementById('exportBtn').addEventListener('click', async () => {
+  try {
+    const res = await fetch('/export?format=stl', { method: 'POST', body: editor.value });
+    const text = await res.text();
+    if (!res.ok) { setMessages([{cls:'err', text: 'export: ' + text}]); return; }
+    const blob = new Blob([text], { type: 'model/stl' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'scadforge_model.stl';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    setMessages([{cls:'err', text: 'export request failed: ' + e}]);
+  }
+});
 editor.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); render(); }
 });

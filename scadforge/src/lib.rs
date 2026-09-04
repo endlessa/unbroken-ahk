@@ -13,6 +13,7 @@ pub mod csg2;
 pub mod eval;
 pub mod geom;
 pub mod http;
+pub mod io;
 pub mod lexer;
 pub mod parser;
 pub mod poly2;

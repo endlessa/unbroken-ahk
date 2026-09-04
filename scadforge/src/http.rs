@@ -24,7 +24,8 @@ pub struct Response {
 
 /// Route one parsed request. Pure: no I/O.
 pub fn handle(method: &str, path: &str, body: &str) -> Response {
-    match (method, path) {
+    let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    match (method, route) {
         ("GET", "/") => Response {
             status: "200 OK",
             content_type: "text/html; charset=utf-8",
@@ -35,10 +36,68 @@ pub fn handle(method: &str, path: &str, body: &str) -> Response {
             content_type: "application/json",
             body: render_json(body),
         },
+        // Export the current source's solid geometry as a downloadable mesh
+        // (ASCII STL or OFF). Text formats only over HTTP; binary STL is
+        // available programmatically via io::write_stl_binary.
+        ("POST", "/export") => export_response(query, body),
         _ => Response {
             status: "404 Not Found",
             content_type: "text/plain; charset=utf-8",
             body: "not found".into(),
+        },
+    }
+}
+
+/// Look up a `key=value` pair in a `&`-separated query string.
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+fn export_response(query: &str, source: &str) -> Response {
+    let format = query_param(query, "format").unwrap_or("stl");
+    let program = match parser::parse(source) {
+        Ok(p) => p,
+        Err(e) => {
+            return Response {
+                status: "422 Unprocessable Entity",
+                content_type: "text/plain; charset=utf-8",
+                body: e,
+            }
+        }
+    };
+    let out = eval::evaluate(&program);
+    if let Some(err) = &out.error {
+        return Response {
+            status: "422 Unprocessable Entity",
+            content_type: "text/plain; charset=utf-8",
+            body: err.clone(),
+        };
+    }
+    let mesh = match eval::export_mesh(&out) {
+        Ok(m) => m,
+        Err(e) => {
+            return Response {
+                status: "422 Unprocessable Entity",
+                content_type: "text/plain; charset=utf-8",
+                body: e,
+            }
+        }
+    };
+    match format {
+        "off" => Response {
+            status: "200 OK",
+            content_type: "text/plain; charset=utf-8",
+            body: crate::io::write_off(&mesh),
+        },
+        // Default and "stl": ASCII STL.
+        _ => Response {
+            status: "200 OK",
+            content_type: "model/stl",
+            body: crate::io::write_stl_ascii(&mesh),
         },
     }
 }

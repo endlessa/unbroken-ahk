@@ -4,10 +4,11 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 5 modifier characters (2026-09-03): **134 full / 10
-partial / 39 untouched — 73% full, 79% touched.** (Phase 4 is complete
-bar `text()`; the four modifier characters `* ! # %` are the first Phase 5
-entries done.)
+Standing after phase 5 STL/OFF I/O (2026-09-04): **134 full / 14 partial /
+35 untouched — 73% full, 81% touched.** (Phase 4 complete bar `text()`.
+Phase 5 so far: modifier characters `* ! # %` (full); STL + OFF
+import/export (the `import`, import/export-3D-mesh, and deprecated-alias
+entries → partial, with AMF/3MF/DXF/SVG still to come).)
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -113,7 +114,17 @@ Remaining:
   so a `%` cutter ghosts without cutting and a `%` first child promotes the
   next to minuend). `!`/`%` bypass CSG via passthrough extraction; the
   viewer draws highlight/background from per-mesh flags in the render JSON.
-- Import/export: STL, OFF, AMF, 3MF, DXF, SVG
+- ◐ Import/export: **STL (ASCII + binary) and OFF done** (`scadforge/src/
+  io.rs`): STL read autodetects ASCII vs binary by the size sniff (so a
+  binary file whose header starts with "solid" still loads), welds vertices
+  by exact position, drops degenerate triangles, and ignores stored
+  normals; OFF read skips comments and fan-triangulates n-gons. Writers for
+  ASCII/binary STL and OFF recompute facet normals. `import()` (+ deprecated
+  `import_stl`/`import_off`) routes by extension, warns+empty on a missing
+  file, errors on an unsupported format, and refuses absolute/`..` paths;
+  `%` background is excluded from exports and `#` included. A `POST /export`
+  route + Export-STL button download the scene. Remaining: AMF, 3MF, DXF,
+  SVG.
 - `include` / `use`, library path resolution
 - `$t`, `$preview`, viewport variables
 - echo/assert output formatting (6-significant-digit numbers, value
