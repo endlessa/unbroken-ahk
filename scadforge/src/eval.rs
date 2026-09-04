@@ -1171,6 +1171,16 @@ fn call_builtin_module(
             if poly.is_empty() {
                 return Vec::new();
             }
+            let nverts: usize = poly.contours.iter().map(|c| c.len()).sum();
+            if nverts > csg2::OFFSET_MAX_VERTS {
+                ctx.out.warnings.push(format!(
+                    "offset(): {} outline vertices exceed the preview cap ({}); reduce $fn \
+                     on the children",
+                    nverts,
+                    csg2::OFFSET_MAX_VERTS
+                ));
+                return Vec::new();
+            }
             let r = bound.get("r").and_then(Value::as_num).filter(|v| v.is_finite());
             let delta = bound.get("delta").and_then(Value::as_num).filter(|v| v.is_finite());
             let chamfer = bound.get("chamfer").and_then(Value::as_bool).unwrap_or(false);
@@ -1219,10 +1229,13 @@ fn call_builtin_module(
             if combined.tris.is_empty() {
                 return Vec::new();
             }
-            if !cut && combined.tris.len() > csg2::PROJECT_MAX_TRIS {
+            // Both modes fold per-facet geometry through the 2D kernel, so both
+            // are capped (cut is cheaper, but a huge straddling mesh still
+            // stitches an unbounded number of segments).
+            if combined.tris.len() > csg2::PROJECT_MAX_TRIS {
                 ctx.out.warnings.push(format!(
-                    "projection(): {} facets exceed the silhouette preview cap ({}); \
-                     reduce $fn on the children or use cut = true",
+                    "projection(): {} facets exceed the preview cap ({}); reduce $fn on the \
+                     children",
                     combined.tris.len(),
                     csg2::PROJECT_MAX_TRIS
                 ));

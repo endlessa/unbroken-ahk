@@ -689,6 +689,11 @@ pub fn minkowski2(regions: &[Poly2]) -> Minkowski2 {
 
 // -- 2D offset (offset()) ---------------------------------------------------
 
+/// Above this input-vertex count the caller skips `offset2`: the dilation
+/// unions O(V) slab+cap primitives through the BSP kernel, so a very
+/// high-$fn 2D child could otherwise grind the public preview for seconds.
+pub const OFFSET_MAX_VERTS: usize = 4_000;
+
 /// Convex-corner treatment for `offset2`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Join {
@@ -771,6 +776,10 @@ fn line_intersect(p0: V2, d0: V2, p1: V2, d1: V2) -> Option<V2> {
 /// (gap-opening) vertex.
 fn dilate(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 {
     use std::f64::consts::{PI, TAU};
+    // Clamp the full-circle fragment count so a single corner arc can't
+    // allocate unboundedly for an extreme $fn (1024 is far smoother than any
+    // preview needs). The eval layer separately caps the input vertex count.
+    let frags_full = frags_full.min(1024);
     let mut parts: Vec<Poly2> = vec![region.clone()];
     for contour in poly2::oriented_contours(region) {
         let n = contour.len();
@@ -817,13 +826,17 @@ fn dilate(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 {
                     let cap = match line_intersect(p, din, q, dout) {
                         Some(m)
                             if {
+                                // The reference miter limit is "effectively
+                                // unlimited"; line_intersect already rejects
+                                // (near-)parallel edges, so this only rules out
+                                // a numerically absurd spike (~1e6× the offset).
                                 let d2 = (m[0] - v[0]).powi(2) + (m[1] - v[1]).powi(2);
-                                d2.is_finite() && d2 <= dist * dist * 1.0e6
+                                d2.is_finite() && d2 <= dist * dist * 1.0e12
                             } =>
                         {
-                            vec![v, p, m, q] // sharp miter within the limit
+                            vec![v, p, m, q] // sharp miter to the intersection
                         }
-                        _ => vec![v, p, q], // near-flat/over-limit: bevel it
+                        _ => vec![v, p, q], // degenerate: bevel it
                     };
                     parts.push(Poly2::new(vec![cap]));
                 }
@@ -861,8 +874,13 @@ pub const PROJECT_MAX_TRIS: usize = 4_000;
 /// Project a 3D mesh to 2D at z=0. `cut = false`: the full silhouette
 /// (shadow) — the union of every non-vertical facet's XY projection,
 /// ignoring Z entirely. `cut = true`: the planar cross-section where the
-/// solid crosses z=0 — the section segments of every straddling triangle,
-/// stitched into contours (empty if the solid does not reach z=0).
+/// solid crosses z=0 — the section segments of every straddling triangle
+/// plus the outline of every in-plane facet, stitched into contours (empty
+/// if the solid does not reach z=0). Preview-grade limitation: for cut mode
+/// the caller concatenates multiple children's facets, so two solids that
+/// OVERLAP exactly at z=0 have their section loops even-odd-combined rather
+/// than 3D-unioned first — correct for a single or nested solid (the common
+/// case), approximate for a partial overlap.
 pub fn project(mesh: &Mesh, cut: bool) -> Poly2 {
     if cut {
         project_cut(mesh)
@@ -891,30 +909,62 @@ fn project_silhouette(mesh: &Mesh) -> Poly2 {
 }
 
 fn project_cut(mesh: &Mesh) -> Poly2 {
+    // Tolerance for "a vertex lies on the z=0 plane". Three-way classification
+    // (above / below / on) is symmetric under a Z flip — the earlier strict
+    // `>0` test made a solid's BOTTOM face on the plane yield the section but
+    // its TOP face on the plane yield empty (identical geometry, opposite
+    // answer). A triangle that STRADDLES (verts strictly on both sides) emits
+    // a crossing segment; a triangle lying IN the plane contributes its
+    // projected outline directly, so a face-on-plane cuts the same region from
+    // either side.
+    const ONZ: f64 = 1e-9;
     let mut segs: Vec<Seg> = Vec::new();
+    let mut in_plane: Vec<Poly2> = Vec::new();
     for t in &mesh.tris {
         let v = [
             mesh.positions[t[0] as usize],
             mesh.positions[t[1] as usize],
             mesh.positions[t[2] as usize],
         ];
-        // Points where the triangle's edges cross the z=0 plane (a vertex
-        // exactly on the plane counts as not-above, so a face lying in z=0
-        // yields no segment — the documented tangency choice).
+        let above = v.iter().filter(|p| p[2] > ONZ).count();
+        let below = v.iter().filter(|p| p[2] < -ONZ).count();
+        if above == 0 && below == 0 {
+            // Facet lies in the plane: its projection is part of the section.
+            let (a2, b2, c2) = ([v[0][0], v[0][1]], [v[1][0], v[1][1]], [v[2][0], v[2][1]]);
+            let area2 = (b2[0] - a2[0]) * (c2[1] - a2[1]) - (b2[1] - a2[1]) * (c2[0] - a2[0]);
+            if area2.abs() > ONZ {
+                let contour = if area2 > 0.0 { vec![a2, b2, c2] } else { vec![a2, c2, b2] };
+                in_plane.push(Poly2::new(vec![contour]));
+            }
+            continue;
+        }
+        if above == 0 || below == 0 {
+            continue; // wholly on one side (a mere tangent touch is not a cut)
+        }
+        // Straddling: the two points where the plane crosses the triangle's
+        // boundary (a vertex exactly on the plane is one of them).
         let mut pts: Vec<V2> = Vec::new();
         for e in 0..3 {
             let p0 = v[e];
             let p1 = v[(e + 1) % 3];
-            if (p0[2] > 0.0) != (p1[2] > 0.0) {
-                let tt = p0[2] / (p0[2] - p1[2]);
+            let (z0, z1) = (p0[2], p1[2]);
+            if (z0 > ONZ && z1 < -ONZ) || (z0 < -ONZ && z1 > ONZ) {
+                let tt = z0 / (z0 - z1);
                 pts.push([p0[0] + (p1[0] - p0[0]) * tt, p0[1] + (p1[1] - p0[1]) * tt]);
+            } else if z0.abs() <= ONZ && z1.abs() > ONZ {
+                pts.push([p0[0], p0[1]]); // edge starts on the plane
             }
+        }
+        // Dedup to two distinct endpoints (an on-plane vertex is shared).
+        pts.dedup_by(|a, b| dist2(*a, *b) <= ONZ * ONZ);
+        if pts.len() > 1 && dist2(pts[0], pts[pts.len() - 1]) <= ONZ * ONZ {
+            pts.pop();
         }
         if pts.len() != 2 {
             continue;
         }
-        // Orient the section segment by the triangle's (outward) normal so the
-        // stitched loops wind consistently: dir = N × ẑ = (Ny, −Nx).
+        // Orient the section segment by the triangle's normal so the stitched
+        // loops wind consistently: dir = N × ẑ = (Ny, −Nx).
         let e1 = [v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2]];
         let e2 = [v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2]];
         let n = [
@@ -930,7 +980,16 @@ fn project_cut(mesh: &Mesh) -> Poly2 {
             segs.push(s);
         }
     }
-    segments_to_poly(&segs)
+    let straddle = segments_to_poly(&segs);
+    // A face-in-plane section and any straddle section unite into one region.
+    if in_plane.is_empty() {
+        return straddle;
+    }
+    let mut parts = in_plane;
+    if !straddle.is_empty() {
+        parts.push(straddle);
+    }
+    union2(&parts)
 }
 
 #[cfg(test)]
@@ -1109,6 +1168,22 @@ mod tests {
         assert!((area(&project(&high, false)) - 100.0).abs() < 1e-6, "Z must be ignored");
         // cut=true of the lifted cube (entirely above z=0) → empty, silently.
         assert!(project(&high, true).is_empty(), "cut above the plane is empty");
+
+        // Tangency symmetry (review finding): a cube resting its BOTTOM face on
+        // z=0 and the same cube resting its TOP face on z=0 must both cut the
+        // full 100-area face — the earlier strict `>0` test gave 100 vs 0.
+        let bottom = crate::geom::cube([10.0, 10.0, 10.0], false); // z ∈ [0,10]
+        let mut top = bottom.clone();
+        for p in &mut top.positions {
+            p[2] -= 10.0; // z ∈ [-10,0]
+        }
+        let (ab, at) = (area(&project(&bottom, true)), area(&project(&top, true)));
+        assert!(
+            (ab - 100.0).abs() < 1e-6 && (at - 100.0).abs() < 1e-6,
+            "face-on-plane cut must be Z-flip symmetric: bottom {} vs top {}",
+            ab,
+            at
+        );
     }
 
     #[test]
