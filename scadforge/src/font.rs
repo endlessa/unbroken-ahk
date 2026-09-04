@@ -38,6 +38,12 @@ fn be32(d: &[u8], o: usize) -> u32 {
 }
 
 impl Font {
+    /// Parse an sfnt font. NOTE: only the bundled, well-formed default face is
+    /// parsed today, so the direct table reads below are safe. Before wiring
+    /// `use <font.ttf>` (which would feed UNTRUSTED bytes here) this needs
+    /// bounds-checked readers and a cmap-12 entry cap — a malformed font can
+    /// otherwise drive an out-of-bounds panic (aborting the whole render) or,
+    /// via a packed format-12 cmap, unbounded map growth.
     pub fn parse(data: Vec<u8>) -> Option<Font> {
         if data.len() < 12 {
             return None;

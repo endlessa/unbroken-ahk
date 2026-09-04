@@ -1385,10 +1385,69 @@ fn call_builtin_module(
             };
             let halign = as_string(bound.get("halign"));
             let valign = as_string(bound.get("valign"));
+            if let Some(h) = &halign {
+                if !matches!(h.as_str(), "left" | "center" | "right") {
+                    ctx.out.warnings.push(format!(
+                        "WARNING: text(): unknown halign '{}'; using \"left\".",
+                        h
+                    ));
+                }
+            }
+            if let Some(v) = &valign {
+                if !matches!(v.as_str(), "baseline" | "top" | "center" | "bottom") {
+                    ctx.out.warnings.push(format!(
+                        "WARNING: text(): unknown valign '{}'; using \"baseline\".",
+                        v
+                    ));
+                }
+            }
             // Curve flattening follows $fn/$fa/$fs (on the size as the radius).
             let steps = (resolve_fragments(size, ctx) as usize / 8).clamp(2, 24);
             let region = text_region(&s, size, spacing, halign.as_deref(), valign.as_deref(), steps);
             Shape::flat(region).into_iter().collect()
+        }
+        "dxf_linear_extrude" | "dxf_rotate_extrude" => {
+            // Deprecated aliases: extrude a DXF file loaded via file=/layer=.
+            let modern = if name == "dxf_linear_extrude" { "linear_extrude" } else { "rotate_extrude" };
+            ctx.out.warnings.push(format!(
+                "DEPRECATED: The {}() module will be removed in future releases. Use {}() instead.",
+                name, modern
+            ));
+            no_children(name, children, ctx);
+            let path = match bound.get("file").or_else(|| bound.get("filename")) {
+                Some(Value::Str(s)) => s.clone(),
+                _ => return Vec::new(),
+            };
+            let poly = import_file(&path, ctx).into_iter().find_map(|s| s.outline);
+            let poly = match poly {
+                Some(p) if !p.is_empty() => p,
+                _ => return Vec::new(),
+            };
+            if name == "dxf_linear_extrude" {
+                let height = bound
+                    .get("height")
+                    .and_then(Value::as_num)
+                    .filter(|h| h.is_finite())
+                    .unwrap_or(100.0);
+                if height <= 0.0 {
+                    return Vec::new();
+                }
+                let center = bound.get("center").and_then(Value::as_bool).unwrap_or(false);
+                let twist = bound.get("twist").and_then(Value::as_num).unwrap_or(0.0);
+                let (positions, tris) =
+                    poly2::extrude_linear(&poly, height, center, twist, 1, [1.0, 1.0]);
+                leaf(Mesh { positions, tris })
+            } else {
+                let max_r = poly.contours.iter().flatten().map(|p| p[0].abs()).fold(0.0, f64::max);
+                let frags = resolve_fragments(max_r, ctx).max(1) as usize;
+                match poly2::extrude_rotate(&poly, 360.0, frags) {
+                    Ok((positions, tris)) => leaf(Mesh { positions, tris }),
+                    Err(e) => {
+                        ctx.out.warnings.push(format!("ERROR: {}", e));
+                        Vec::new()
+                    }
+                }
+            }
         }
         "difference" => {
             let mut groups = eval_children_grouped(children, scope, ctx);
@@ -1926,6 +1985,13 @@ fn text_region(
         None => return Poly2::new(Vec::new()),
     };
     let scale = size / font.units_per_em;
+    // Every glyph's contours go into ONE even-odd region: a glyph's counters
+    // (O/e/a) are holes, and side-by-side glyphs at normal spacing don't
+    // overlap, so even-odd fills each correctly. Preview-grade limitation: the
+    // reference UNIONS the glyphs, so heavily OVERLAPPING glyphs (spacing < 1,
+    // negative spacing, or self-overlapping faces) can show an even-odd hole
+    // in the overlap; a robust union of complex holed glyph outlines is beyond
+    // this kernel's triangulator (it would lose area), so it is left as-is.
     let mut contours: Vec<Vec<[f64; 2]>> = Vec::new();
     let mut pen = 0.0f64; // in font units
     for ch in s.chars() {
@@ -1935,6 +2001,7 @@ fn text_region(
         }
         pen += font.advance(gid) * spacing;
     }
+    let mut region = Poly2::new(contours);
     let width = pen * scale;
     // Horizontal anchor from the total advance width.
     let dx = match halign {
@@ -1951,14 +2018,14 @@ fn text_region(
         _ => 0.0, // "baseline" / default / unknown
     };
     if dx != 0.0 || dy != 0.0 {
-        for c in &mut contours {
+        for c in &mut region.contours {
             for p in c {
                 p[0] += dx;
                 p[1] += dy;
             }
         }
     }
-    Poly2::new(contours)
+    region
 }
 
 /// Resolve a data-file path (import/surface) relative to the working directory
@@ -2186,6 +2253,8 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         "surface" => &["file", "center", "convexity"],
         "render" => &["convexity"],
         "text" => &["text", "size", "font", "halign", "valign", "spacing", "direction"],
+        "dxf_linear_extrude" => &["file", "layer", "height", "origin", "scale"],
+        "dxf_rotate_extrude" => &["file", "layer", "origin"],
         "color" => &["c", "alpha"],
         "children" | "child" => &["index"],
         _ => &[],
@@ -4442,6 +4511,8 @@ mod tests {
         let (lo, hi) = (xs.iter().cloned().fold(f64::INFINITY, f64::min),
                         xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
         assert!(lo < 0.0 && hi > 0.0, "centered text straddles x=0: {}..{}", lo, hi);
+        // An unknown alignment warns and falls back.
+        assert!(run("text(\"A\", halign = \"middle\");").warnings.iter().any(|w| w.contains("halign")));
     }
 
     #[test]
@@ -4492,6 +4563,15 @@ mod tests {
         let out = run(&format!("linear_extrude(height = 2) import(\"{}\");", path));
         std::fs::remove_file(path).ok();
         assert!((total_volume(&out) - 200.0).abs() < 1e-3, "DXF round-trip vol {}", total_volume(&out));
+
+        // Deprecated dxf_linear_extrude: extrude a DXF file directly, warning.
+        let p2 = "scadforge_test_dxfle.dxf";
+        std::fs::write(p2, crate::http::handle("POST", "/export?format=dxf", "square(8);").body)
+            .unwrap();
+        let out = run(&format!("dxf_linear_extrude(file = \"{}\", height = 5);", p2));
+        std::fs::remove_file(p2).ok();
+        assert!(out.warnings.iter().any(|w| w.contains("DEPRECATED") && w.contains("dxf_linear_extrude")));
+        assert!((total_volume(&out) - 8.0 * 8.0 * 5.0).abs() < 1e-2, "dxf_linear_extrude vol {}", total_volume(&out));
     }
 
     #[test]

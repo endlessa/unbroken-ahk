@@ -4,8 +4,9 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after 2D vector I/O (2026-09-04): **140 full / 24 partial / 19
-untouched — 77% full, 90% touched.** PHASE 4 COMPLETE. Phase 5 so far:
+Standing after DXF-extrude + font review (2026-09-04): **141 full / 24
+partial / 18 untouched — 77% full, 90% touched.** PHASE 4 COMPLETE. Phase 5
+so far:
 modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
 export and DXF import (2D vector) → partial; number formatting + value
 display forms full+pinned; diagnostic surface class-prefixed → partial;
