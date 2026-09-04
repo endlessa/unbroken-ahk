@@ -4,8 +4,8 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after Customizer + SVG import + PDF export (2026-09-04): **148
-full / 23 partial / 12 untouched — 81% full, 93% touched.** PHASE 4
+Standing after Customizer + SVG import + PDF export + 3MF (2026-09-04):
+**150 full / 21 partial / 12 untouched — 82% full, 93% touched.** PHASE 4
 COMPLETE. Phase 5
 so far:
 modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
@@ -135,7 +135,7 @@ Landed (2026-09-03):
   so a `%` cutter ghosts without cutting and a `%` first child promotes the
   next to minuend). `!`/`%` bypass CSG via passthrough extraction; the
   viewer draws highlight/background from per-mesh flags in the render JSON.
-- ◐ Import/export: **STL (ASCII + binary) and OFF done** (`scadforge/src/
+- ✅ Import/export: **STL (ASCII + binary) and OFF done** (`scadforge/src/
   io.rs`): STL read autodetects ASCII vs binary by the size sniff (so a
   binary file whose header starts with "solid" still loads), welds vertices
   by exact position, drops degenerate triangles, and ignores stored
@@ -168,8 +168,19 @@ Landed (2026-09-03):
   `/Length` are pinned by tests (so the file actually opens). It rides the
   text export path, so `POST /export?format=stl|off|amf|svg|dxf|pdf` and the
   CLI (`-o out.pdf`) both produce it, and the web UI now has a format
-  selector for the whole export surface. Remaining: 3MF (needs a from-scratch
-  ZIP + DEFLATE codec).
+  selector for the whole export surface. **3MF read + write also land** — the
+  last mesh format — via a from-scratch ZIP + DEFLATE stack: `deflate.rs`
+  inflates RFC-1951 streams (stored / fixed / dynamic Huffman + LZ77, pinned
+  against Python-generated blobs), `zip.rs` writes STORED archives and reads
+  both stored and deflated entries (CRC-32 from scratch), and `io::write_3mf`
+  / `read_3mf` wrap/parse the OPC parts (`[Content_Types].xml`, `_rels/.rels`,
+  `3D/3dmodel.model`). 3MF export is binary, so it goes through the CLI's
+  bytes path (`-o out.3mf`, `eval::render_export_bytes`) rather than the
+  String HTTP route (which returns a clear 415 for `format=3mf`); `import()`
+  reads `.3mf` like any mesh. Verified against real Python-authored,
+  deflate-compressed `.3mf` files (export re-opened by Python; a Python zip
+  imported and re-exported). This closes the STL/OFF/AMF/3MF import AND export
+  entries. Remaining 2D: none.
 - ◐ `include` / `use` / library-path (`scadforge/src/preproc.rs`): a
   source-resolution pass run before eval. `include <path>` textually inlines
   the referenced file (recursively, cycle-guarded); its geometry runs and its
@@ -210,14 +221,15 @@ Landed (2026-09-03):
 
 ## The honest tail
 
-~12 entries remain. Some describe the desktop application, not the
-language: GUI-viewport PNG export, `$vpr`-family viewport variables,
-DXF-era deprecated functions. Others are genuine formats deferred for a
-from-scratch codec (3MF needs a ZIP + DEFLATE codec). Each gets a
-per-entry decision — web-app
-equivalent, or documented as intentionally out of scope. 100% of the
-*language* is reachable; 100% of all 183 entries goes through those
-judgment calls.
+~12 entries remain, and they are the true tail — desktop-application
+surface rather than the modeling language: GUI-viewport PNG export,
+`$vpr`-family viewport variables (camera state), DXF-era deprecated
+metadata functions (`dxf_dim`/`dxf_cross`), and the debug/text export
+formats (`.csg`/`.ast`/`.term`/`.echo`/`.nef3`) whose `.csg` is really a
+second evaluation mode. Each gets a per-entry decision — web-app
+equivalent, or documented as intentionally out of scope. Every geometry
+and I/O format of 2021.01 is now implemented; 100% of the *language* is
+reachable; 100% of all 183 entries goes through those judgment calls.
 
 ## Working method (established, keep using it)
 

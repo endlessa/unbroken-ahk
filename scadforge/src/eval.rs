@@ -2083,6 +2083,24 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
         ctx.out.warnings.extend(warns);
         return Shape::flat(poly).into_iter().collect();
     }
+    // 3MF is a ZIP+XML mesh container (binary), read from bytes like STL.
+    if ext == "3mf" {
+        let resolved = match sandboxed_path(path) {
+            Some(p) => p,
+            None => {
+                ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                return Vec::new();
+            }
+        };
+        return match std::fs::read(&resolved).ok().map(|b| io::read_3mf(&b)) {
+            Some(Ok(m)) if !m.tris.is_empty() => leaf(m),
+            Some(Ok(_)) => Vec::new(),
+            _ => {
+                ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                Vec::new()
+            }
+        };
+    }
     let format = match io::format_from_ext(path) {
         Some(f) => f,
         None => {
@@ -2207,10 +2225,37 @@ pub fn render_export(
     export_string(&out, format)
 }
 
+/// Export the design to a format's serialized bytes. Binary formats (`3mf`)
+/// are produced directly; every text format delegates to `export_string`. This
+/// is the CLI's export core, so it covers the binary formats the String-based
+/// HTTP path can't.
+pub fn export_bytes(out: &EvalOutput, format: &str) -> Result<Vec<u8>, String> {
+    match format {
+        "3mf" => Ok(crate::io::write_3mf(&export_mesh(out)?)),
+        other => export_string(out, other).map(String::into_bytes),
+    }
+}
+
+/// Headless render to bytes: apply Customizer overrides, evaluate, and
+/// serialize to `format` (binary formats included). The CLI's core.
+pub fn render_export_bytes(
+    source: &str,
+    base_dir: &std::path::Path,
+    overrides: &[(String, String)],
+    format: &str,
+) -> Result<Vec<u8>, String> {
+    let effective = crate::customizer::apply_overrides(source, overrides);
+    let out = evaluate_source(&effective, base_dir);
+    if let Some(e) = out.error {
+        return Err(e);
+    }
+    export_bytes(&out, format)
+}
+
 /// Export the design to a text format's serialized string, dispatching by a
-/// lowercase format tag (`stl`|`off`|`amf` for the solid mesh, `svg`|`dxf` for
-/// the 2D outlines). The shared core behind both the HTTP `/export` route and
-/// the CLI headless render, so the two never drift. `stl` is ASCII (binary STL
+/// lowercase format tag (`stl`|`off`|`amf` for the solid mesh, `svg`|`dxf`|`pdf`
+/// for the 2D outlines). The shared core behind both the HTTP `/export` route
+/// and the CLI headless render, so the two never drift. `stl` is ASCII (binary STL
 /// is available programmatically via `io::write_stl_binary`). An unknown tag,
 /// or geometry of the wrong dimensionality, is an `Err` with the reference's
 /// message.
@@ -4470,6 +4515,16 @@ mod tests {
         assert_eq!(out.shapes.len(), 1, "imported mesh is one 3D shape");
         assert!(out.shapes[0].outline.is_none(), "imported STL is 3D");
         assert!((total_volume(&out) - 24.0).abs() < 1e-3, "imported vol {}", total_volume(&out));
+
+        // 3MF round-trip through the CLI's export core: render a cube to .3mf
+        // bytes (a real ZIP), write them, import back, and check the volume.
+        let p3 = "scadforge_test_import.3mf";
+        let bytes = render_export_bytes("cube([2,3,4]);", std::path::Path::new("."), &[], "3mf").unwrap();
+        std::fs::write(p3, &bytes).unwrap();
+        let out = run(&format!("import(\"{}\");", p3));
+        std::fs::remove_file(p3).ok();
+        assert!(out.shapes.len() == 1 && out.shapes[0].outline.is_none(), "imported 3MF is one 3D mesh");
+        assert!((total_volume(&out) - 24.0).abs() < 1e-3, "3MF round-trip vol {}", total_volume(&out));
 
         // Error paths (no file needed).
         assert!(

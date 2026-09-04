@@ -121,9 +121,12 @@ fn render_headless(
     // eval::export_string understands).
     let ext = output.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     let format = match ext.as_str() {
-        "stl" | "off" | "amf" | "svg" | "dxf" | "pdf" => ext,
+        "stl" | "off" | "amf" | "svg" | "dxf" | "pdf" | "3mf" => ext,
         _ => {
-            eprintln!("cannot infer export format from '{}' (use .stl/.off/.amf/.svg/.dxf/.pdf)", output);
+            eprintln!(
+                "cannot infer export format from '{}' (use .stl/.off/.amf/.svg/.dxf/.pdf/.3mf)",
+                output
+            );
             return 2;
         }
     };
@@ -169,8 +172,8 @@ fn render_headless(
     }
     overrides.extend_from_slice(defines);
 
-    match scadforge::eval::render_export(&source, &base, &overrides, &format) {
-        Ok(body) => match std::fs::write(&output, body.as_bytes()) {
+    match scadforge::eval::render_export_bytes(&source, &base, &overrides, &format) {
+        Ok(body) => match std::fs::write(&output, &body) {
             Ok(()) => {
                 eprintln!("wrote {}", output);
                 0

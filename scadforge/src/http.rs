@@ -131,6 +131,17 @@ fn export_response(query: &str, source: &str) -> Response {
             body: err.clone(),
         };
     }
+    // 3MF is binary (ZIP); the String-bodied HTTP response can't carry it, so
+    // it is a CLI-only export. Say so rather than silently returning STL.
+    if format == "3mf" {
+        return Response {
+            status: "415 Unsupported Media Type",
+            content_type: "text/plain; charset=utf-8",
+            body: "3MF is a binary format; export it with the CLI: \
+                   scadforge -o model.3mf input.scad"
+                .into(),
+        };
+    }
     // Normalize the tag (default STL) so it matches eval::export_string, then
     // pair each format with its MIME type. 2D vector formats export the 2D
     // outlines; mesh formats export the solid geometry.
