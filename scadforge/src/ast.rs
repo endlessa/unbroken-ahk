@@ -101,8 +101,40 @@ pub struct Param {
     pub default: Option<Expr>,
 }
 
+/// A modifier character prefixing one instantiation (`* ! # %`). They stack
+/// (`*!x`, `%#x`) and nest as `Modified` wrapping `Modified`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modifier {
+    /// `*` — disable: the subtree is dropped from the design and NOT
+    /// instantiated (no echo/assert side effects, no evaluation cost).
+    Disable,
+    /// `!` — root: the marked subtree becomes the design root; everything
+    /// else is pruned (ancestor transforms still apply to it).
+    Root,
+    /// `#` — highlight: geometrically a no-op; the subtree is drawn tinted in
+    /// preview but participates in the CSG result unchanged.
+    Highlight,
+    /// `%` — background: the subtree is drawn as a ghost but EXCLUDED from the
+    /// CSG result and exports (still instantiated, so side effects run).
+    Background,
+}
+
+impl Modifier {
+    pub fn glyph(self) -> char {
+        match self {
+            Modifier::Disable => '*',
+            Modifier::Root => '!',
+            Modifier::Highlight => '#',
+            Modifier::Background => '%',
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
+    /// A modifier character applied to one instantiation (recursive for
+    /// stacked modifiers).
+    Modified { modifier: Modifier, stmt: Box<Stmt> },
     /// name = expr;
     Assign { name: String, value: Expr },
     /// module_name(args) <children>  — children is empty for the `;` form,

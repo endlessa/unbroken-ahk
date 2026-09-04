@@ -28,6 +28,8 @@ pub enum Tok {
     Question,
     Dot,
     Bang,
+    /// `#` — the highlight/debug modifier prefix (no expression meaning).
+    Hash,
     Lt,
     Le,
     Gt,
@@ -98,6 +100,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b'*' => push1(&mut out, Tok::Star, &mut i),
             b'/' => push1(&mut out, Tok::Slash, &mut i),
             b'%' => push1(&mut out, Tok::Percent, &mut i),
+            b'#' => push1(&mut out, Tok::Hash, &mut i),
             // '.' followed by a digit starts a number (.5); otherwise it
             // is member access (v.x).
             b'.' if !matches!(b.get(i + 1), Some(d) if d.is_ascii_digit()) => {

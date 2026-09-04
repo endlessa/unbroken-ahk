@@ -17,8 +17,23 @@
 //!               a comprehension clause chain (for / C-style for / each /
 //!               if-else / let)
 
-use crate::ast::{Arg, BinOp, Expr, Param, Stmt, VecItem};
+use crate::ast::{Arg, BinOp, Expr, Modifier, Param, Stmt, VecItem};
 use crate::lexer::{lex, Tok, Token};
+
+/// A statement a modifier character may prefix: an instantiation (a call,
+/// control-flow statement, or another already-modified instantiation) — but
+/// NOT a definition, assignment, or naked `{ }` block.
+fn is_instantiation(s: &Stmt) -> bool {
+    matches!(
+        s,
+        Stmt::Call { .. }
+            | Stmt::For { .. }
+            | Stmt::IntersectionFor { .. }
+            | Stmt::If { .. }
+            | Stmt::Let { .. }
+            | Stmt::Modified { .. }
+    )
+}
 
 /// The 2021.01 reserved set: not usable as identifiers in ANY namespace.
 /// echo and assert joined it with their 2019.05 expression forms; assign
@@ -138,6 +153,29 @@ impl Parser {
     }
 
     fn stmt_inner(&mut self) -> Result<Stmt, String> {
+        // Modifier characters (* ! # %) prefix exactly one instantiation and
+        // stack (`*!x`). At statement position these glyphs are unambiguous —
+        // multiplication/modulo/not/hash only occur inside expressions.
+        let modifier = match self.peek() {
+            Some(Tok::Star) => Some(Modifier::Disable),
+            Some(Tok::Bang) => Some(Modifier::Root),
+            Some(Tok::Hash) => Some(Modifier::Highlight),
+            Some(Tok::Percent) => Some(Modifier::Background),
+            _ => None,
+        };
+        if let Some(m) = modifier {
+            self.pos += 1;
+            let inner = self.stmt()?; // recurse: handles stacking + the target
+            // Modifiers attach to instantiations, not to definitions,
+            // assignments, or a naked { } block.
+            if !is_instantiation(&inner) {
+                return Err(format!(
+                    "modifier '{}' must prefix a module instantiation",
+                    m.glyph()
+                ));
+            }
+            return Ok(Stmt::Modified { modifier: m, stmt: Box::new(inner) });
+        }
         if self.peek() == Some(&Tok::LBrace) {
             self.pos += 1;
             return Ok(Stmt::Block(self.block_body()?));

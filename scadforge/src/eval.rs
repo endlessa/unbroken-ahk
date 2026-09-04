@@ -9,7 +9,7 @@
 //! echo/str value formatter. Union is still mesh concatenation — real
 //! CSG booleans are phase 3.
 
-use crate::ast::{Arg, BinOp, Expr, Param, Stmt, VecItem};
+use crate::ast::{Arg, BinOp, Expr, Modifier, Param, Stmt, VecItem};
 use crate::csg;
 use crate::csg2;
 use crate::geom::{self, Mesh};
@@ -26,11 +26,20 @@ use std::rc::Rc;
 /// contours at z=0 (the `mesh` is then their triangulated flat fill). 3D
 /// shapes leave it None. Extrusion, offset and projection read/produce
 /// it; mixing a 2D shape into a 3D boolean is an error.
+///
+/// The three display flags carry modifier-character state up the tree:
+/// `rooted` (`!` — this shape is inside a root-marked subtree; if any exists
+/// the design shows only rooted shapes), `highlight` (`#` — draw tinted, but
+/// still part of the CSG result), and `background` (`%` — draw as a ghost and
+/// EXCLUDE from every boolean and export).
 #[derive(Debug, Clone)]
 pub struct Shape {
     pub mesh: Mesh,
     pub color: Option<[f64; 4]>,
     pub outline: Option<Poly2>,
+    pub rooted: bool,
+    pub highlight: bool,
+    pub background: bool,
 }
 
 impl Shape {
@@ -42,7 +51,14 @@ impl Shape {
             return None;
         }
         let positions = verts.iter().map(|v| [v[0], v[1], 0.0]).collect();
-        Some(Shape { mesh: Mesh { positions, tris }, color: None, outline: Some(poly) })
+        Some(Shape {
+            mesh: Mesh { positions, tris },
+            color: None,
+            outline: Some(poly),
+            rooted: false,
+            highlight: false,
+            background: false,
+        })
     }
 }
 
@@ -84,7 +100,14 @@ fn evaluate_inner(program: &[Stmt]) -> EvalOutput {
         cycle_scopes: Vec::new(),
     };
     let root = Scope::root();
-    let shapes = exec_scope(program, &root, &mut ctx);
+    let mut shapes = exec_scope(program, &root, &mut ctx);
+    // Root modifier (`!`): if any shape is root-marked, the design shows ONLY
+    // root-marked shapes — everything else is pruned (their side effects have
+    // already run, and ancestor transforms are already baked into these
+    // meshes). Multiple/independent `!` subtrees all survive (union of roots).
+    if shapes.iter().any(|s| s.rooted) {
+        shapes.retain(|s| s.rooted);
+    }
     ctx.out.shapes.extend(shapes);
     // Function values capture their defining scope; storing one in a
     // scope on that capture chain forms an Rc cycle. Clearing the
@@ -393,6 +416,48 @@ fn set_var(scope: &Rc<Scope>, ctx: &mut Ctx, name: &str, v: Value) {
 fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
     match stmt {
         Stmt::Assign { .. } | Stmt::ModuleDef { .. } | Stmt::FunctionDef { .. } => Vec::new(),
+        Stmt::Modified { modifier, stmt } => {
+            // `*` disables: the subtree is not instantiated at all, so its
+            // echo/assert side effects never fire (an early-out, not a
+            // post-hoc filter).
+            if *modifier == Modifier::Disable {
+                return Vec::new();
+            }
+            // The others fully instantiate the subtree (side effects run),
+            // then tag the produced shapes so the flag propagates up the tree.
+            let mut shapes = exec_stmt(stmt, scope, ctx);
+            match modifier {
+                Modifier::Root => {
+                    for s in &mut shapes {
+                        s.rooted = true;
+                    }
+                    shapes
+                }
+                Modifier::Background => {
+                    for s in &mut shapes {
+                        s.background = true;
+                    }
+                    shapes
+                }
+                Modifier::Highlight => {
+                    // `#` is a geometric NO-OP: the real geometry stays in the
+                    // CSG result unchanged, PLUS a display-only pink ghost
+                    // overlay is added — so a #-marked cutter both cuts AND
+                    // shows where it cut (the debug idiom). The ghost carries
+                    // `background` so it bypasses every boolean.
+                    let mut out = Vec::with_capacity(shapes.len() * 2);
+                    for s in shapes {
+                        let mut ghost = s.clone();
+                        ghost.highlight = true;
+                        ghost.background = true;
+                        out.push(s);
+                        out.push(ghost);
+                    }
+                    out
+                }
+                Modifier::Disable => unreachable!(),
+            }
+        }
         Stmt::Block(body) => exec_scope(body, scope, ctx),
         Stmt::If { cond, then, els } => {
             let c = eval_expr(cond, scope, ctx);
@@ -1184,64 +1249,76 @@ fn call_builtin_module(
         // visually identical for non-overlapping or opaque solids.
         "union" | "group" => exec_scope(children, scope, ctx),
         "difference" => {
-            let groups = eval_children_grouped(children, scope, ctx);
+            let mut groups = eval_children_grouped(children, scope, ctx);
             if groups.is_empty() {
                 return Vec::new();
             }
-            if all_2d(&groups) {
+            // `!`/`%` children bypass the boolean (and can promote the minuend).
+            let pass = extract_passthrough(&mut groups);
+            let mut out = if groups.is_empty() {
+                Vec::new() // every child was passthrough
+            } else if all_2d(&groups) {
                 let color = groups[0].iter().find_map(|s| s.color);
                 let first = group_region(&groups[0]);
                 let rest: Vec<Poly2> = groups[1..].iter().map(|g| group_region(g)).collect();
-                let mut shapes = Shape::flat(csg2::difference2(&first, &rest))
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                let mut shapes =
+                    Shape::flat(csg2::difference2(&first, &rest)).into_iter().collect::<Vec<_>>();
                 for s in &mut shapes {
                     s.color = color;
                 }
-                return shapes;
-            }
-            if any_2d(&groups) {
+                shapes
+            } else if any_2d(&groups) {
                 ctx.out.warnings.push(
                     "difference(): mixing 2D and 3D children is unsupported — shown un-combined"
                         .into(),
                 );
-                return groups.into_iter().flatten().collect();
-            }
-            let (minuend, color) = combine_group(&groups[0]);
-            // Empty minuend → empty result, regardless of later children.
-            if minuend.positions.is_empty() {
-                return Vec::new();
-            }
-            let cutters: Vec<Mesh> =
-                groups[1..].iter().map(|g| combine_group(g).0).collect();
-            leaf_colored(csg::difference(&minuend, &cutters), color)
+                groups.into_iter().flatten().collect()
+            } else {
+                let (minuend, color) = combine_group(&groups[0]);
+                // Empty minuend → empty result, regardless of later children.
+                if minuend.positions.is_empty() {
+                    Vec::new()
+                } else {
+                    let cutters: Vec<Mesh> =
+                        groups[1..].iter().map(|g| combine_group(g).0).collect();
+                    leaf_colored(csg::difference(&minuend, &cutters), color)
+                }
+            };
+            out.extend(pass);
+            out
         }
         "intersection" => {
-            let groups = eval_children_grouped(children, scope, ctx);
+            let mut groups = eval_children_grouped(children, scope, ctx);
             if groups.is_empty() {
                 return Vec::new();
             }
-            if all_2d(&groups) {
+            // `!`/`%` children bypass the intersection (a `%` child can't
+            // annihilate it); they pass through for display.
+            let pass = extract_passthrough(&mut groups);
+            let mut out = if groups.is_empty() {
+                Vec::new()
+            } else if all_2d(&groups) {
                 let color = groups[0].iter().find_map(|s| s.color);
                 let regions: Vec<Poly2> = groups.iter().map(|g| group_region(g)).collect();
-                let mut shapes = Shape::flat(csg2::intersection2(&regions))
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                let mut shapes =
+                    Shape::flat(csg2::intersection2(&regions)).into_iter().collect::<Vec<_>>();
                 for s in &mut shapes {
                     s.color = color;
                 }
-                return shapes;
-            }
-            if any_2d(&groups) {
+                shapes
+            } else if any_2d(&groups) {
                 ctx.out.warnings.push(
                     "intersection(): mixing 2D and 3D children is unsupported — shown un-combined"
                         .into(),
                 );
-                return groups.into_iter().flatten().collect();
-            }
-            let color = groups[0].iter().find_map(|s| s.color);
-            let meshes: Vec<Mesh> = groups.iter().map(|g| combine_group(g).0).collect();
-            leaf_colored(csg::intersection_all(&meshes), color)
+                groups.into_iter().flatten().collect()
+            } else {
+                let color = groups[0].iter().find_map(|s| s.color);
+                let meshes: Vec<Mesh> = groups.iter().map(|g| combine_group(g).0).collect();
+                leaf_colored(csg::intersection_all(&meshes), color)
+            };
+            out.extend(pass);
+            out
         }
         "hull" => {
             let groups = eval_children_grouped(children, scope, ctx);
@@ -1424,7 +1501,14 @@ fn leaf(mesh: Mesh) -> Vec<Shape> {
     if mesh.positions.is_empty() {
         Vec::new()
     } else {
-        vec![Shape { mesh, color: None, outline: None }]
+        vec![Shape {
+            mesh,
+            color: None,
+            outline: None,
+            rooted: false,
+            highlight: false,
+            background: false,
+        }]
     }
 }
 
@@ -1432,7 +1516,14 @@ fn leaf_colored(mesh: Mesh, color: Option<[f64; 4]>) -> Vec<Shape> {
     if mesh.positions.is_empty() {
         Vec::new()
     } else {
-        vec![Shape { mesh, color, outline: None }]
+        vec![Shape {
+            mesh,
+            color,
+            outline: None,
+            rooted: false,
+            highlight: false,
+            background: false,
+        }]
     }
 }
 
@@ -1610,6 +1701,37 @@ fn all_2d(groups: &[Vec<Shape>]) -> bool {
 fn group_region(shapes: &[Shape]) -> Poly2 {
     let regions: Vec<Poly2> = shapes.iter().filter_map(|s| s.outline.clone()).collect();
     csg2::union2(&regions)
+}
+
+/// Pull the shapes that must bypass a boolean out of its child groups:
+/// rooted (`!`) and background (`%`) shapes never participate in the CSG —
+/// they pass through for display only (a `%` cutter ghosts without cutting;
+/// a `!` child shows raw, the boolean discarded). A group emptied *by this
+/// removal* is dropped so the next sibling promotes (the `%`/`!`-first-child
+/// promotion), while a group that was already empty (an `if(false)` branch)
+/// is kept — an empty minuend still yields an empty difference.
+fn extract_passthrough(groups: &mut Vec<Vec<Shape>>) -> Vec<Shape> {
+    let mut pass = Vec::new();
+    let mut i = 0;
+    while i < groups.len() {
+        let before = groups[i].len();
+        let mut keep = Vec::with_capacity(before);
+        for s in groups[i].drain(..) {
+            if s.rooted || s.background {
+                pass.push(s);
+            } else {
+                keep.push(s);
+            }
+        }
+        let removed = before - keep.len();
+        groups[i] = keep;
+        if groups[i].is_empty() && removed > 0 {
+            groups.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    pass
 }
 
 /// Collect the child 2D geometry for an extrusion into one region: the true
@@ -3790,6 +3912,77 @@ mod tests {
         // The projected silhouette re-extrudes (the flatten→re-extrude idiom).
         let out = run("linear_extrude(height = 3) projection() cube(10, center = true);");
         assert!((total_volume(&out) - 300.0).abs() < 1e-3, "re-extrude vol {}", total_volume(&out));
+    }
+
+    #[test]
+    fn modifier_characters() {
+        // Signed volume of the SOLID (non-ghost) shapes only.
+        fn solid_vol(out: &EvalOutput) -> f64 {
+            let mut v = 0.0;
+            for s in out.shapes.iter().filter(|s| !s.background) {
+                for t in &s.mesh.tris {
+                    let a = s.mesh.positions[t[0] as usize];
+                    let b = s.mesh.positions[t[1] as usize];
+                    let c = s.mesh.positions[t[2] as usize];
+                    v += (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                        / 6.0;
+                }
+            }
+            v.abs()
+        }
+
+        // `*` disable: the subtree is DROPPED and NOT instantiated — its
+        // echo/assert side effects never fire (short-circuit, not filter).
+        assert!((solid_vol(&run("*cube(10); cube(2);")) - 8.0).abs() < 1e-9);
+        assert!(run("*echo(\"x\"); cube(1);").echoes.is_empty(), "* short-circuits echo");
+        let out = run("*assert(false); cube(1);");
+        assert!(out.error.is_none(), "* short-circuits a failing assert");
+
+        // `!` root: siblings are pruned; ancestor transforms still apply.
+        let out = run("!cube(2); cube(10);");
+        assert!((solid_vol(&out) - 8.0).abs() < 1e-9, "only the rooted cube shows");
+        assert!(out.shapes.iter().all(|s| s.rooted));
+        let out = run("translate([100, 0, 0]) !cube(2); cube(10);");
+        assert!(
+            !out.shapes.is_empty() && out.shapes.iter().all(|s| s.mesh.positions.iter().all(|p| p[0] >= 99.999)),
+            "ancestor translate still applies to the rooted subtree"
+        );
+        // `!` on a difference child discards the boolean, shows the raw child.
+        let out = run("difference() { cube(10, center=true); !cube(2, center=true); }");
+        assert!((solid_vol(&out) - 8.0).abs() < 1e-6, "boolean discarded, raw child: {}", solid_vol(&out));
+
+        // `#` highlight: geometric NO-OP plus a pink ghost overlay.
+        let out = run("#cube(2);");
+        assert!((solid_vol(&out) - 8.0).abs() < 1e-9, "# keeps the solid geometry");
+        assert!(out.shapes.iter().any(|s| s.highlight), "# adds a highlight overlay");
+        // A #-marked cutter STILL cuts (4³ − 2³ = 56) and leaves a ghost.
+        let out = run("difference() { cube(4, center=true); #cube(2, center=true); }");
+        assert!((solid_vol(&out) - 56.0).abs() < 1e-4, "# cutter still cuts: {}", solid_vol(&out));
+        assert!(out.shapes.iter().any(|s| s.highlight), "# cutter leaves a ghost");
+
+        // `%` background: excluded from the CSG result, still shown as a ghost.
+        let out = run("difference() { cube(4, center=true); %cube(2, center=true); }");
+        assert!((solid_vol(&out) - 64.0).abs() < 1e-6, "% cutter does NOT cut: {}", solid_vol(&out));
+        assert!(out.shapes.iter().any(|s| s.background), "% shows a ghost");
+        // %-first-child promotes the next child to minuend (can't empty it).
+        let out = run("difference() { %cube(2, center=true); cube(4, center=true); }");
+        assert!((solid_vol(&out) - 64.0).abs() < 1e-6, "%-first promotes minuend: {}", solid_vol(&out));
+        // %-child of intersection can't annihilate it.
+        let out = run("intersection() { cube(4, center=true); %cube(20, center=true); }");
+        assert!((solid_vol(&out) - 64.0).abs() < 1e-6, "% can't annihilate intersection: {}", solid_vol(&out));
+
+        // Modifiers stack; `*` dominates (the subtree is simply gone).
+        assert!((solid_vol(&run("*#cube(5); cube(1);")) - 1.0).abs() < 1e-9, "* over # → gone");
+        assert!((solid_vol(&run("*!cube(9); cube(2);")) - 8.0).abs() < 1e-9, "* over ! → gone");
+
+        // A modifier must prefix an instantiation — not a def/assign/naked block.
+        assert!(parse("*x = 5;").is_err(), "modifier before assignment is a parse error");
+        assert!(parse("#{ cube(1); }").is_err(), "modifier before a naked block is a parse error");
+        assert!(parse("%module m() { cube(1); }").is_err(), "modifier before a def is a parse error");
+        // But a modifier before for/if is fine.
+        assert!(parse("*for (i = [0:3]) cube(1);").is_ok());
+        assert!(parse("!if (true) cube(1);").is_ok());
     }
 
     #[test]

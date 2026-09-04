@@ -67,7 +67,15 @@ pub fn render_json(source: &str) -> String {
                         .iter()
                         .flat_map(|t| t.iter().map(|&i| JsonValue::Number(i as f64)))
                         .collect();
-                    let color = s.color.unwrap_or([0.83, 0.71, 0.28, 1.0]); // default gold
+                    // Uncolored geometry defaults to gold; uncolored `%`
+                    // background ghosts default to gray (an explicit color()
+                    // inside a `%` subtree is preserved and tints the ghost).
+                    let default = if s.background {
+                        [0.6, 0.6, 0.6, 1.0]
+                    } else {
+                        [0.83, 0.71, 0.28, 1.0]
+                    };
+                    let color = s.color.unwrap_or(default);
                     obj(vec![
                         ("positions", JsonValue::Array(positions)),
                         ("indices", JsonValue::Array(indices)),
@@ -75,6 +83,10 @@ pub fn render_json(source: &str) -> String {
                             "color",
                             JsonValue::Array(color.iter().map(|&c| JsonValue::Number(c)).collect()),
                         ),
+                        // Modifier-character display state: `#` draws tinted,
+                        // `%` draws as a translucent ghost (background).
+                        ("highlight", JsonValue::Bool(s.highlight)),
+                        ("background", JsonValue::Bool(s.background)),
                     ])
                 })
                 .collect();

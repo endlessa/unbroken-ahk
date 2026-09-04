@@ -40,50 +40,36 @@
 </header>
 <main>
   <div id="left">
-    <textarea id="editor" spellcheck="false">// scadforge demo — offset() and projection(), the last two phase-4 ops.
-// offset grows/shrinks 2D outlines; projection drops 3D solids to 2D.
+    <textarea id="editor" spellcheck="false">// scadforge demo — modifier characters (* disable, ! root, # highlight,
+// % background). Each prefixes one instantiation and changes the design.
 $fn = 48;
 
 // base plate
 color("#39404f") translate([0, 0, -1.5]) cube([90, 90, 3], center = true);
 
-// OFFSET (round): grow a rectangle outward with rounded corners → a pebble
+// # HIGHLIGHT: the drilled bore is #-marked — it STILL cuts the block, and
+// also shows as a translucent pink ghost of exactly where it bit.
 color("goldenrod")
-translate([-30, 0, 0])
-linear_extrude(height = 5)
-offset(r = 4) square([12, 7], center = true);
-
-// OFFSET as a frame: (outline grown) minus (outline) → a rounded picture frame
-color("tomato")
-translate([0, 0, 0])
-linear_extrude(height = 6)
+translate([-26, 0, 0])
 difference() {
-  offset(r = 3) square([16, 10], center = true);
-  square([16, 10], center = true);
+  cube([22, 22, 15], center = true);
+  #cylinder(h = 34, r = 5, center = true);
 }
 
-// OFFSET (chamfer): delta with flat-cut corners → a chamfered square
-color("steelblue")
-translate([28, 0, 0])
-linear_extrude(height = 6)
-offset(delta = 3, chamfer = true) square([10, 10], center = true);
+// % BACKGROUND: a gray reference envelope (a jig / build volume) drawn as a
+// ghost around a real part — excluded from the CSG result and every export.
+translate([26, 0, 0]) color("steelblue") sphere(9);
+%translate([26, 0, 0]) cube([27, 27, 27], center = true);
 
-// PROJECTION (cut): slice a sphere at its equator → a disc, re-extruded
-color([0.4, 0.7, 0.5])
-translate([-26, 32, 0])
-linear_extrude(height = 4)
-projection(cut = true) sphere(9);
+// A plain, unmarked part for scale.
+color([0.4, 0.7, 0.5]) translate([0, 30, 0]) cylinder(h = 12, r = 6);
 
-// PROJECTION (silhouette): the shadow of a cube drilled by a hex bar →
-// a square with a hexagonal hole, re-extruded into a plate
-color("orange")
-translate([24, 32, 0])
-linear_extrude(height = 4)
-projection()
-difference() {
-  cube(15, center = true);
-  cylinder(h = 30, r = 5, center = true, $fn = 6);
-}
+// * DISABLE: this heavy subtree is "commented out" with * — it is never
+// instantiated (no geometry, and any echo/assert inside would not fire).
+*color("tomato") translate([0, 30, 0]) sphere(20);
+
+// ! ROOT would isolate one subtree (hiding everything else), so it is not
+// shown here — try prefixing any object above with ! to zoom into just it.
 </textarea>
     <div id="messages"><span class="ok">ready.</span></div>
   </div>
@@ -156,7 +142,16 @@ async function render() {
       }
       tris++;
     }
-    soup.push({ verts, color: mesh.color });
+    // Modifier-character display: `%` background draws as a translucent
+    // ghost (its color, forced low-alpha); `#` highlight draws as a
+    // translucent debug pink. Both land in the transparency pass via alpha<1.
+    let color = mesh.color;
+    if (mesh.highlight) {
+      color = [1.0, 0.28, 0.34, 0.55]; // # debug pink (checked first: # ghosts also carry background)
+    } else if (mesh.background) {
+      color = [color[0], color[1], color[2], 0.22]; // % translucent ghost
+    }
+    soup.push({ verts, color });
   }
   // Opaque meshes first so both render paths can draw transparency in a
   // second pass (depth-tested, no depth write). Stable sort keeps source

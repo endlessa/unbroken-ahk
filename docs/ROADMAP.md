@@ -4,11 +4,10 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 4e offset + projection (2026-09-03): **130 full / 10
-partial / 43 untouched — 71% full, 76% touched.** (offset and projection
-were the last two untouched 2D entries; phase 4d's 2D booleans deepened
-the already-full `difference`/`intersection`/`hull`/`minkowski` entries to
-full 2D+3D fidelity. Only `text()` + its 5 sub-entries remain in phase 4.)
+Standing after phase 5 modifier characters (2026-09-03): **134 full / 10
+partial / 39 untouched — 73% full, 79% touched.** (Phase 4 is complete
+bar `text()`; the four modifier characters `* ! # %` are the first Phase 5
+entries done.)
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -104,9 +103,18 @@ Remaining:
 
 ### Phase 5 — I/O + polish (~30 entries)
 
+- ✅ Modifier characters `*` `!` `#` `%` — parser-level prefixes on one
+  instantiation, stacking (`*!x`). `*` disables (short-circuits
+  instantiation, so echo/assert inside never fire); `!` roots (prunes
+  siblings, keeps ancestor transforms, so a `!` child of a boolean shows
+  the raw child); `#` highlights (geometric no-op + a translucent pink
+  ghost overlay, so a `#` cutter both cuts and shows where); `%`
+  backgrounds (excluded from every boolean/export, shown as a gray ghost,
+  so a `%` cutter ghosts without cutting and a `%` first child promotes the
+  next to minuend). `!`/`%` bypass CSG via passthrough extraction; the
+  viewer draws highlight/background from per-mesh flags in the render JSON.
 - Import/export: STL, OFF, AMF, 3MF, DXF, SVG
 - `include` / `use`, library path resolution
-- Modifier characters `*` `!` `#` `%`
 - `$t`, `$preview`, viewport variables
 - echo/assert output formatting (6-significant-digit numbers, value
   display forms, WARNING/ERROR/DEPRECATED/TRACE surface)
