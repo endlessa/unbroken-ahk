@@ -41,36 +41,29 @@
 </header>
 <main>
   <div id="left">
-    <textarea id="editor" spellcheck="false">// scadforge demo — modifier characters (* disable, ! root, # highlight,
-// % background). Each prefixes one instantiation and changes the design.
+    <textarea id="editor" spellcheck="false">// scadforge demo — text(): real glyph outlines from a from-scratch
+// TrueType parser (bundled Instrument Sans, SIL OFL), rendered as 2D
+// geometry — so it extrudes, booleans, and offsets like any 2D shape.
 $fn = 48;
 
 // base plate
-color("#39404f") translate([0, 0, -1.5]) cube([90, 90, 3], center = true);
+color("#39404f") translate([0, 0, -2.5]) cube([140, 66, 3], center = true);
 
-// # HIGHLIGHT: the drilled bore is #-marked — it STILL cuts the block, and
-// also shows as a translucent pink ghost of exactly where it bit.
+// RAISED: the project name, centered and extruded into 3D letters.
 color("goldenrod")
-translate([-26, 0, 0])
+translate([0, 15, 0])
+linear_extrude(height = 8)
+text("scadforge", size = 17, halign = "center", valign = "center");
+
+// ENGRAVED: text subtracted from a plate (text under difference()).
+color("steelblue")
+translate([0, -13, 0])
 difference() {
-  cube([22, 22, 15], center = true);
-  #cylinder(h = 34, r = 5, center = true);
+  cube([120, 22, 7], center = true);
+  translate([0, 0, 2])
+    linear_extrude(height = 6)
+    text("from scratch", size = 10, halign = "center", valign = "center");
 }
-
-// % BACKGROUND: a gray reference envelope (a jig / build volume) drawn as a
-// ghost around a real part — excluded from the CSG result and every export.
-translate([26, 0, 0]) color("steelblue") sphere(9);
-%translate([26, 0, 0]) cube([27, 27, 27], center = true);
-
-// A plain, unmarked part for scale.
-color([0.4, 0.7, 0.5]) translate([0, 30, 0]) cylinder(h = 12, r = 6);
-
-// * DISABLE: this heavy subtree is "commented out" with * — it is never
-// instantiated (no geometry, and any echo/assert inside would not fire).
-*color("tomato") translate([0, 30, 0]) sphere(20);
-
-// ! ROOT would isolate one subtree (hiding everything else), so it is not
-// shown here — try prefixing any object above with ! to zoom into just it.
 </textarea>
     <div id="messages"><span class="ok">ready.</span></div>
   </div>

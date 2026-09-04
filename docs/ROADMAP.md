@@ -4,14 +4,15 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after include/use (2026-09-04): **138 full / 19 partial / 26
-untouched — 75% full, 86% touched.** (Phase 4 complete bar `text()`. Phase
-5 so far: modifier characters `* ! # %` (full); STL + OFF import/export
-(partial); number formatting + value display forms full+pinned; diagnostic
-surface class-prefixed → partial; `render` and `convexity` full; `surface`
-text heightmap → partial; `fill`/`roof` correctly rejected as unknown in
-2021.01; `include`/`use`/library-path → partial via a source-resolution
-pass.)
+Standing after text() (2026-09-04): **140 full / 22 partial / 21 untouched
+— 77% full, 88% touched.** PHASE 4 IS NOW COMPLETE — `text()` renders real
+glyph outlines from a from-scratch TrueType parser. Phase 5 so far:
+modifier characters `* ! # %` (full); STL + OFF import/export (partial);
+number formatting + value display forms full+pinned; diagnostic surface
+class-prefixed → partial; `render` and `convexity` full; `surface` text
+heightmap → partial; `fill`/`roof` correctly rejected as unknown in
+2021.01; `include`/`use`/library-path → partial; io/preproc hardened after
+a security review.
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -100,10 +101,18 @@ Landed (2026-09-03):
   section at z=0 (triangle-plane crossings stitched into contours), with
   the flatten→re-extrude idiom round-tripping (`csg2::project`).
 
-Remaining:
-
-- `text()` and its 5 sub-entries need a from-scratch font rasterizer —
-  likely the very last item in the project.
+- ✅ `text()`: real glyph geometry from a from-scratch TrueType parser
+  (`scadforge/src/font.rs`: sfnt table directory, `head`/`maxp`/`hhea`,
+  `hmtx` advances, `cmap` formats 4 and 12, `loca`, and `glyf` simple +
+  composite outlines with quadratic Béziers flattened by $fn/$fa/$fs). The
+  bundled default face is Instrument Sans (SIL OFL, `fonts/`). `text_region`
+  lays glyphs out with size, spacing, and halign/valign (all four vertical
+  anchors via ascent/descent metrics); the run is one even-odd region, so
+  counters (O/e/a) are holes and it extrudes/booleans/offsets like any 2D
+  shape. Full alignment + spacing; PARTIAL on font selection (only the
+  bundled face — no fontconfig match or `use <font.ttf>` loading) and on
+  direction/shaping (ltr only, no kerning/ligatures/bidi). `textmetrics`/
+  `fontmetrics` are snapshot-only (absent in 2021.01).
 
 ### Phase 5 — I/O + polish (~30 entries)
 

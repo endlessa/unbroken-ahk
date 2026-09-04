@@ -1363,6 +1363,33 @@ fn call_builtin_module(
             let grid = io::parse_surface_text(&text);
             leaf(io::heightmap_solid(&grid, center, invert))
         }
+        "text" => {
+            no_children(name, children, ctx);
+            // A non-string text argument yields empty geometry (the reference
+            // does NOT auto-str() it); an empty string is silently empty.
+            let s = match bound.get("text") {
+                Some(Value::Str(s)) => s.clone(),
+                Some(Value::Undef) | None => return Vec::new(),
+                Some(_) => {
+                    ctx.out
+                        .warnings
+                        .push("WARNING: text(): text argument must be a string".into());
+                    return Vec::new();
+                }
+            };
+            let size = bound.get("size").and_then(Value::as_num).filter(|v| *v > 0.0).unwrap_or(10.0);
+            let spacing = bound.get("spacing").and_then(Value::as_num).unwrap_or(1.0);
+            let as_string = |v: Option<&Value>| match v {
+                Some(Value::Str(s)) => Some(s.clone()),
+                _ => None,
+            };
+            let halign = as_string(bound.get("halign"));
+            let valign = as_string(bound.get("valign"));
+            // Curve flattening follows $fn/$fa/$fs (on the size as the radius).
+            let steps = (resolve_fragments(size, ctx) as usize / 8).clamp(2, 24);
+            let region = text_region(&s, size, spacing, halign.as_deref(), valign.as_deref(), steps);
+            Shape::flat(region).into_iter().collect()
+        }
         "difference" => {
             let mut groups = eval_children_grouped(children, scope, ctx);
             if groups.is_empty() {
@@ -1880,6 +1907,60 @@ fn collect_2d(children: &[Stmt], scope: &Rc<Scope>, ctx: &mut Ctx) -> Poly2 {
 /// empty geometry (evaluation continues, per the reference); an unsupported
 /// extension is an error. The path is resolved relative to the working
 /// directory and may not escape it (no absolute paths, no `..`).
+/// Lay a string out as a 2D region: each glyph's flattened outline is scaled
+/// by size/units-per-em, advanced by the (spacing-scaled) glyph advance, and
+/// collected into one even-odd region (so counters like 'O'/'e' are holes and
+/// glyphs sit side by side). halign/valign anchor the run using the font's
+/// advance width and ascent/descent metrics. Uses the bundled default face;
+/// font selection and shaping (kerning/ligatures/bidi) are not yet applied.
+fn text_region(
+    s: &str,
+    size: f64,
+    spacing: f64,
+    halign: Option<&str>,
+    valign: Option<&str>,
+    steps: usize,
+) -> Poly2 {
+    let font = match crate::font::default_font() {
+        Some(f) => f,
+        None => return Poly2::new(Vec::new()),
+    };
+    let scale = size / font.units_per_em;
+    let mut contours: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut pen = 0.0f64; // in font units
+    for ch in s.chars() {
+        let gid = font.glyph_id(ch);
+        for c in font.glyph_contours(gid, steps) {
+            contours.push(c.iter().map(|p| [(pen + p[0]) * scale, p[1] * scale]).collect());
+        }
+        pen += font.advance(gid) * spacing;
+    }
+    let width = pen * scale;
+    // Horizontal anchor from the total advance width.
+    let dx = match halign {
+        Some("center") => -width / 2.0,
+        Some("right") => -width,
+        _ => 0.0, // "left" / default / unknown
+    };
+    // Vertical anchor from font metrics (baseline default; "bottom" floats
+    // above y=0 by the descent margin, matching the reference).
+    let dy = match valign {
+        Some("top") => -font.ascent * scale,
+        Some("center") => -(font.ascent + font.descent) / 2.0 * scale,
+        Some("bottom") => -font.descent * scale,
+        _ => 0.0, // "baseline" / default / unknown
+    };
+    if dx != 0.0 || dy != 0.0 {
+        for c in &mut contours {
+            for p in c {
+                p[0] += dx;
+                p[1] += dy;
+            }
+        }
+    }
+    Poly2::new(contours)
+}
+
 /// Resolve a data-file path (import/surface) relative to the working directory
 /// and require it to stay under it — refusing absolute paths, `..` traversal,
 /// and symlink escapes (canonicalized). None => refused. A missing file
@@ -2048,6 +2129,7 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         "import" | "import_stl" | "import_off" => &["file", "convexity"],
         "surface" => &["file", "center", "convexity"],
         "render" => &["convexity"],
+        "text" => &["text", "size", "font", "halign", "valign", "spacing", "direction"],
         "color" => &["c", "alpha"],
         "children" | "child" => &["index"],
         _ => &[],
@@ -4276,6 +4358,34 @@ mod tests {
         assert_eq!(out.shapes.len(), 1, "evaluation continues past a missing include");
         let out = evaluate_source("use <nope.scad>\ncube(1);", &base);
         assert!(out.warnings.iter().any(|w| w.contains("Can't open library")));
+    }
+
+    #[test]
+    fn text_renders_glyphs_as_2d_geometry() {
+        // A letter becomes a 2D shape with real filled area.
+        let out = run("text(\"A\", size = 20);");
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes[0].outline.is_some(), "text output is 2D");
+        assert!(flat_area(&out) > 0.0, "'A' has ink");
+        // A wider string covers more area than one glyph.
+        let one = flat_area(&run("text(\"I\", size = 20);"));
+        let many = flat_area(&run("text(\"IIII\", size = 20);"));
+        assert!(many > one * 2.0, "four glyphs cover more than one: {} vs {}", many, one);
+        // Empty string → empty, no warning.
+        let out = run("text(\"\");");
+        assert!(out.shapes.is_empty() && out.warnings.is_empty());
+        // A non-string argument warns and yields nothing (no auto-str()).
+        let out = run("text(42);");
+        assert!(out.shapes.is_empty() && out.warnings.iter().any(|w| w.contains("must be a string")));
+        // text() extrudes to 3D (the standard label idiom).
+        let out = run("linear_extrude(height = 3) text(\"Hi\", size = 15);");
+        assert!(out.shapes[0].outline.is_none() && total_volume(&out) > 0.0, "extruded label");
+        // halign=center shifts the run left of the origin (its bbox straddles x=0).
+        let c = run("text(\"WWWW\", size = 20, halign = \"center\");");
+        let xs: Vec<f64> = c.shapes[0].mesh.positions.iter().map(|p| p[0]).collect();
+        let (lo, hi) = (xs.iter().cloned().fold(f64::INFINITY, f64::min),
+                        xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
+        assert!(lo < 0.0 && hi > 0.0, "centered text straddles x=0: {}..{}", lo, hi);
     }
 
     #[test]
