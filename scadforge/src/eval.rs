@@ -1294,6 +1294,62 @@ fn call_builtin_module(
         // preview does not compute the exact union either, and it is
         // visually identical for non-overlapping or opaque solids.
         "union" | "group" => exec_scope(children, scope, ctx),
+        "render" => {
+            // Identity that FORCES exact evaluation: children are implicitly
+            // unioned and baked into one opaque leaf. We are always exact, so
+            // this just computes the real union (unlike union/group's preview
+            // concatenation). `!`/`%`/`#`-ghost children pass through.
+            let shapes = exec_scope(children, scope, ctx);
+            let (combinable, pass): (Vec<Shape>, Vec<Shape>) =
+                shapes.into_iter().partition(|s| !s.rooted && !s.background);
+            let any_2d_child = combinable.iter().any(|s| s.outline.is_some());
+            let all_2d_child = combinable
+                .iter()
+                .all(|s| s.outline.is_some() || s.mesh.positions.is_empty());
+            let color = combinable.iter().find_map(|s| s.color);
+            let mut out = if combinable.is_empty() {
+                Vec::new()
+            } else if any_2d_child && all_2d_child {
+                let regions: Vec<Poly2> =
+                    combinable.iter().filter_map(|s| s.outline.clone()).collect();
+                let mut sh =
+                    Shape::flat(csg2::union2(&regions)).into_iter().collect::<Vec<_>>();
+                for s in &mut sh {
+                    s.color = color;
+                }
+                sh
+            } else {
+                let meshes: Vec<Mesh> = combinable.into_iter().map(|s| s.mesh).collect();
+                leaf_colored(csg::union_all(&meshes), color)
+            };
+            out.extend(pass);
+            out
+        }
+        "surface" => {
+            no_children(name, children, ctx);
+            let path = match bound.get("file").or_else(|| bound.get("filename")) {
+                Some(Value::Str(s)) => s.clone(),
+                _ => {
+                    ctx.out.warnings.push("WARNING: surface(): expected a file name string".into());
+                    return Vec::new();
+                }
+            };
+            if path.starts_with('/') || path.split(['/', '\\']).any(|seg| seg == "..") {
+                ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                return Vec::new();
+            }
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(_) => {
+                    ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                    return Vec::new();
+                }
+            };
+            let center = bound.get("center").and_then(Value::as_bool).unwrap_or(false);
+            let invert = bound.get("invert").and_then(Value::as_bool).unwrap_or(false);
+            let grid = io::parse_surface_text(&text);
+            leaf(io::heightmap_solid(&grid, center, invert))
+        }
         "difference" => {
             let mut groups = eval_children_grouped(children, scope, ctx);
             if groups.is_empty() {
@@ -1950,6 +2006,8 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         "offset" => &["r"],
         "projection" => &["cut"],
         "import" | "import_stl" | "import_off" => &["file", "convexity"],
+        "surface" => &["file", "center", "convexity"],
+        "render" => &["convexity"],
         "color" => &["c", "alpha"],
         "children" | "child" => &["index"],
         _ => &[],
@@ -4131,6 +4189,34 @@ mod tests {
         let bad = crate::http::handle("POST", "/export?format=stl", "square(5);");
         assert_eq!(bad.status, "422 Unprocessable Entity");
         assert!(bad.body.contains("not a 3D object"));
+    }
+
+    #[test]
+    fn render_and_surface() {
+        // render() bakes its children into ONE exact-union leaf (unlike
+        // union/group's preview concatenation).
+        let out = run("render() { cube(2, center=true); translate([1,0,0]) cube(2, center=true); }");
+        assert_eq!(out.shapes.len(), 1, "render bakes one leaf");
+        // Two 2³ cubes overlapping half in X: 8 + 8 − 4 = 12.
+        assert!((total_volume(&out) - 12.0).abs() < 1e-4, "render union vol {}", total_volume(&out));
+        // The same children under group() stay two separate shapes.
+        assert_eq!(run("group() { cube(2); translate([1,0,0]) cube(2); }").shapes.len(), 2);
+        // render() accepts convexity silently.
+        assert!(run("render(convexity = 4) cube(1);").warnings.is_empty());
+
+        // surface() builds a 3D heightmap solid from a text grid file.
+        let path = "scadforge_test_surface.dat";
+        std::fs::write(path, "# hill\n0 0 0\n0 5 0\n0 0 0\n").unwrap();
+        let out = run(&format!("surface(\"{}\");", path));
+        std::fs::remove_file(path).ok();
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes[0].outline.is_none(), "surface output is 3D");
+        assert!(total_volume(&out) > 0.0, "the hill has volume");
+        // A missing surface file warns and is non-fatal.
+        assert!(
+            run("surface(\"nope.dat\");").warnings.iter().any(|w| w.contains("Can't open")),
+            "missing surface file warns"
+        );
     }
 
     #[test]

@@ -296,6 +296,101 @@ fn push_triangle(w: &mut Welder, tris: &mut Vec<[u32; 3]>, a: [f64; 3], b: [f64;
     }
 }
 
+// -- surface() heightmap -----------------------------------------------------
+
+/// Parse a `surface()` text grid: whitespace-separated numeric heights, one
+/// row per non-comment line (`#`-led lines and blank lines skipped). Rows are
+/// padded to the widest with zeros so the grid is rectangular.
+pub fn parse_surface_text(text: &str) -> Vec<Vec<f64>> {
+    let mut grid: Vec<Vec<f64>> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let row: Vec<f64> = line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        if !row.is_empty() {
+            grid.push(row);
+        }
+    }
+    let cols = grid.iter().map(|r| r.len()).max().unwrap_or(0);
+    for r in &mut grid {
+        r.resize(cols, 0.0);
+    }
+    grid
+}
+
+/// Build a closed 3D solid from a height grid: the top surface follows the
+/// samples (one unit per sample in X/Y), a flat base closes it below at the
+/// minimum height, and skirt walls join the two. `center` centres the grid on
+/// the origin; `invert` negates the heights. The first row maps to the
+/// largest Y (text top = far side), matching the reference.
+pub fn heightmap_solid(grid: &[Vec<f64>], center: bool, invert: bool) -> Mesh {
+    let rows = grid.len();
+    let cols = grid.first().map_or(0, |r| r.len());
+    if rows < 2 || cols < 2 {
+        return Mesh::empty(); // need at least a 2×2 grid for any area
+    }
+    let h = |r: usize, c: usize| {
+        let v = grid[r].get(c).copied().unwrap_or(0.0);
+        if invert { -v } else { v }
+    };
+    let mut base = f64::INFINITY;
+    for r in 0..rows {
+        for c in 0..cols {
+            base = base.min(h(r, c));
+        }
+    }
+    let (ox, oy) = if center {
+        ((cols - 1) as f64 / 2.0, (rows - 1) as f64 / 2.0)
+    } else {
+        (0.0, 0.0)
+    };
+    let x = |c: usize| c as f64 - ox;
+    let y = |r: usize| (rows - 1 - r) as f64 - oy; // first row → largest Y
+    let mut positions: Vec<[f64; 3]> = Vec::with_capacity(rows * cols * 2);
+    let top = |r: usize, c: usize| (r * cols + c) as u32;
+    let bot_base = (rows * cols) as u32;
+    let bot = |r: usize, c: usize| bot_base + (r * cols + c) as u32;
+    for r in 0..rows {
+        for c in 0..cols {
+            positions.push([x(c), y(r), h(r, c)]);
+        }
+    }
+    for r in 0..rows {
+        for c in 0..cols {
+            positions.push([x(c), y(r), base]);
+        }
+    }
+    let mut tris: Vec<[u32; 3]> = Vec::new();
+    for r in 0..rows - 1 {
+        for c in 0..cols - 1 {
+            // Top surface (faces +Z, CCW seen from above).
+            tris.push([top(r, c), top(r, c + 1), top(r + 1, c + 1)]);
+            tris.push([top(r, c), top(r + 1, c + 1), top(r + 1, c)]);
+            // Base (faces −Z, reversed winding).
+            tris.push([bot(r, c), bot(r + 1, c + 1), bot(r, c + 1)]);
+            tris.push([bot(r, c), bot(r + 1, c), bot(r + 1, c + 1)]);
+        }
+    }
+    // Skirt walls around the perimeter (top edge down to the base edge).
+    let mut wall = |a: u32, b: u32| {
+        // a,b are adjacent TOP perimeter vertices; connect to their base twins.
+        let (abz, bbz) = (a + bot_base, b + bot_base);
+        tris.push([a, b, bbz]);
+        tris.push([a, bbz, abz]);
+    };
+    for c in 0..cols - 1 {
+        wall(top(0, c + 1), top(0, c)); // far edge (r=0)
+        wall(top(rows - 1, c), top(rows - 1, c + 1)); // near edge
+    }
+    for r in 0..rows - 1 {
+        wall(top(r, 0), top(r + 1, 0)); // left edge
+        wall(top(r + 1, cols - 1), top(r, cols - 1)); // right edge
+    }
+    Mesh { positions, tris }
+}
+
 /// The 3D mesh format implied by a file path's extension (case-insensitive).
 #[derive(PartialEq, Debug)]
 pub enum MeshFormat {
@@ -395,6 +490,37 @@ mod tests {
             endsolid t\n";
         let m = read_stl(ascii.as_bytes()).unwrap();
         assert_eq!(tri_count(&m), 1, "the collinear facet is dropped");
+    }
+
+    fn is_closed_manifold(m: &Mesh) -> bool {
+        use std::collections::HashMap;
+        if m.tris.is_empty() {
+            return false;
+        }
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in &m.tris {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let key = if a < b { (a, b) } else { (b, a) };
+                *edges.entry(key).or_insert(0) += 1;
+            }
+        }
+        edges.values().all(|&c| c == 2)
+    }
+
+    #[test]
+    fn surface_builds_a_closed_heightmap_solid() {
+        let grid = parse_surface_text("# a little hill\n0 0 0\n0 3 0\n0 0 0\n");
+        assert_eq!(grid.len(), 3);
+        assert_eq!(grid[1], vec![0.0, 3.0, 0.0]);
+        let m = heightmap_solid(&grid, false, false);
+        assert!(is_closed_manifold(&m), "surface must be a closed 2-manifold");
+        assert!(signed_volume(&m) > 0.0, "the hill has positive volume");
+        // Ragged rows pad with zeros to a rectangular grid.
+        let g2 = parse_surface_text("1 2 3\n4 5\n");
+        assert_eq!(g2[1], vec![4.0, 5.0, 0.0]);
+        // invert negates the heights but still yields a closed solid.
+        let mi = heightmap_solid(&grid, true, true);
+        assert!(is_closed_manifold(&mi));
     }
 
     #[test]

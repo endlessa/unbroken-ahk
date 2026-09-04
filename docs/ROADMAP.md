@@ -4,13 +4,15 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after phase 5 diagnostic surface (2026-09-04): **134 full / 15
-partial / 34 untouched — 73% full, 81% touched.** (Phase 4 complete bar
-`text()`. Phase 5 so far: modifier characters `* ! # %` (full); STL + OFF
-import/export (partial, AMF/3MF/DXF/SVG to come); number formatting and
-value display forms confirmed full and pinned; the diagnostic surface now
-class-prefixes every line (WARNING/DEPRECATED/ERROR) → partial, still
-missing file/line, TRACE, and --hardwarnings.)
+Standing after render/surface (2026-09-04): **138 full / 16 partial / 29
+untouched — 75% full, 84% touched.** (Phase 4 complete bar `text()`. Phase
+5 so far: modifier characters `* ! # %` (full); STL + OFF import/export
+(partial, AMF/3MF/DXF/SVG to come); number formatting and value display
+forms full+pinned; diagnostic surface class-prefixed → partial; `render`
+(exact-union identity) and `convexity` (silently accepted everywhere) full;
+`surface` text-grid heightmap → partial (PNG mode to come); `fill`/`roof`
+confirmed snapshot-only and correctly rejected as unknown modules in
+2021.01.)
 
 Ground rules (from the project owner, non-negotiable):
 
