@@ -4,8 +4,8 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after DXF-extrude + font review (2026-09-04): **141 full / 24
-partial / 18 untouched — 77% full, 90% touched.** PHASE 4 COMPLETE. Phase 5
+Standing after the Customizer milestone (2026-09-04): **146 full / 24
+partial / 13 untouched — 80% full, 93% touched.** PHASE 4 COMPLETE. Phase 5
 so far:
 modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
 export and DXF import (2D vector) → partial; number formatting + value
@@ -13,9 +13,14 @@ display forms full+pinned; diagnostic surface class-prefixed → partial;
 `render` and `convexity` full; `surface` text heightmap → partial; `text()`
 via a from-scratch TrueType parser; `fill`/`roof` correctly rejected as
 unknown in 2021.01; `include`/`use`/library-path → partial; io/preproc/font
-hardened after security reviews. Remaining untouched are mostly the honest
-tail (PDF/AMF/3MF export, SVG import, Customizer, `$vp*` viewport vars,
-DXF-era deprecated functions).
+hardened after security reviews. **The whole Customizer category now lands
+(all 5 entries full)**: the comment-based parameter model + widget grammar +
+group tabs (`scadforge/src/customizer.rs`), preset JSON (`parameterSets`
+sidecar, round-tripped), `-D name=value` overrides, plus a headless CLI
+(`scadforge -o out.stl -D w=40 -p sets.json -P Big in.scad`) and a live web
+panel (grouped sliders/checkbox/dropdown, in-place value rewrite, preset
+save/load). Remaining untouched are the honest tail (PDF/3MF export, SVG
+import, `$vp*` viewport vars, DXF-era deprecated functions).
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -158,6 +163,23 @@ Landed (2026-09-03):
   format-specific text ("Can't open include file" vs "... library") and are
   non-fatal. Remaining: the 2019.05 override-before-include and used-file
   private-var scope, and the OPENSCADPATH/user/bundled search tiers.
+- ✅ Customizer (`scadforge/src/customizer.rs`): a comment-based parameter
+  model scanned from the main file — a typed literal RHS (number/bool/string/
+  vector) before the first `module`/`function`, with a `// [widget]` comment
+  selecting the widget (slider `[min:max]`/`[min:step:max]`/`[max]`, dropdown
+  `[a, b]`/`[v:label]`, checkbox, textbox, spinbox), a `// label` line above
+  it, and `/* [Group] */` opening a section (`[Hidden]` hides). Overrides are
+  applied by rewriting each parameter's declaration line IN PLACE (RHS
+  replaced, widget comment kept) — no duplicate assignment, no "reassigned"
+  warning — and are validated against the model (right name, a single literal
+  of the right kind), so a hostile value like `"a"; cube(9); //"` can never
+  smuggle a statement into the source (pinned by a regression test). Preset
+  sets round-trip through the reference `{parameterSets}` JSON. Exposed three
+  ways: the web `/render` JSON carries the parameter model and takes `p=`
+  overrides; the CLI runs headless (`scadforge -o out.stl -D name=value
+  -p file.json -P SetName in.scad`, `-D` winning over the preset); and the web
+  panel renders grouped live widgets with preset save/load (localStorage, the
+  same sidecar schema).
 - `$t`, `$preview`, `$children` done (phase 2); viewport `$vp*` variables
   are desktop-camera state — a documented web judgment call, still open.
 - ◐ echo/assert output formatting: the 6-significant-digit number formatter
@@ -167,16 +189,17 @@ Landed (2026-09-03):
   pinned. The diagnostic surface now class-prefixes every line
   (WARNING/DEPRECATED/ERROR); file/line suffixes, the TRACE stack, and
   --hardwarnings remain.
-- Customizer parameter model
 
 ## The honest tail
 
-15–20 entries describe the desktop application, not the language: CLI
-switches, GUI-viewport PNG export, `$vpr`-family viewport variables,
-DXF-era deprecated functions, Customizer preset JSON. Each gets a
-per-entry decision — web-app equivalent, or documented as intentionally
-out of scope. 100% of the *language* is reachable; 100% of all 183
-entries goes through those judgment calls.
+~13 entries remain. Some describe the desktop application, not the
+language: GUI-viewport PNG export, `$vpr`-family viewport variables,
+DXF-era deprecated functions. Others are genuine formats deferred for a
+from-scratch codec (3MF needs ZIP/deflate; PDF; SVG import needs a
+path-command parser). Each gets a per-entry decision — web-app
+equivalent, or documented as intentionally out of scope. 100% of the
+*language* is reachable; 100% of all 183 entries goes through those
+judgment calls.
 
 ## Working method (established, keep using it)
 

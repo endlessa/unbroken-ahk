@@ -10,6 +10,7 @@
 pub mod ast;
 pub mod csg;
 pub mod csg2;
+pub mod customizer;
 pub mod eval;
 pub mod font;
 pub mod geom;

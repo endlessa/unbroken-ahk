@@ -2181,6 +2181,43 @@ pub fn export_mesh(out: &EvalOutput) -> Result<Mesh, String> {
     Ok(combined)
 }
 
+/// Headless render-and-export: apply Customizer overrides (`-D name=value`),
+/// resolve include/use, evaluate, and serialize to `format`. This is the CLI's
+/// core (`scadforge -o out.stl -D w=40 in.scad`) and the exact
+/// override-then-export path the web `/export` route runs, so the command line
+/// and the app agree. A fatal evaluation error is returned as `Err`.
+pub fn render_export(
+    source: &str,
+    base_dir: &std::path::Path,
+    overrides: &[(String, String)],
+    format: &str,
+) -> Result<String, String> {
+    let effective = crate::customizer::apply_overrides(source, overrides);
+    let out = evaluate_source(&effective, base_dir);
+    if let Some(e) = out.error {
+        return Err(e);
+    }
+    export_string(&out, format)
+}
+
+/// Export the design to a text format's serialized string, dispatching by a
+/// lowercase format tag (`stl`|`off`|`amf` for the solid mesh, `svg`|`dxf` for
+/// the 2D outlines). The shared core behind both the HTTP `/export` route and
+/// the CLI headless render, so the two never drift. `stl` is ASCII (binary STL
+/// is available programmatically via `io::write_stl_binary`). An unknown tag,
+/// or geometry of the wrong dimensionality, is an `Err` with the reference's
+/// message.
+pub fn export_string(out: &EvalOutput, format: &str) -> Result<String, String> {
+    match format {
+        "svg" => Ok(crate::io::write_svg(&export_2d(out)?)),
+        "dxf" => Ok(crate::io::write_dxf_2d(&export_2d(out)?)),
+        "off" => Ok(crate::io::write_off(&export_mesh(out)?)),
+        "amf" => Ok(crate::io::write_amf(&export_mesh(out)?)),
+        "stl" => Ok(crate::io::write_stl_ascii(&export_mesh(out)?)),
+        other => Err(format!("unsupported export format '{}'", other)),
+    }
+}
+
 fn transform_children(
     children: &[Stmt],
     scope: &Rc<Scope>,
@@ -4017,6 +4054,28 @@ mod tests {
 
     fn run(src: &str) -> EvalOutput {
         evaluate(&parse(src).unwrap())
+    }
+
+    #[test]
+    fn render_export_applies_defines_and_serializes() {
+        // A parametric cube whose edge is a Customizer parameter.
+        let src = "e = 2; // [1:10]\ncube(e);";
+        let base = std::path::Path::new(".");
+        // No overrides → edge-2 cube; ASCII STL mentions a 2.0 vertex.
+        let stl = render_export(src, base, &[], "stl").unwrap();
+        assert!(stl.contains("facet"), "STL body: {}", &stl[..stl.len().min(80)]);
+        // -D e=5 grows the cube; the STL must now carry a 5 coordinate and no 2.
+        let stl5 = render_export(src, base, &[("e".into(), "5".into())], "stl").unwrap();
+        assert!(stl5.contains("5.0") || stl5.contains(" 5 "), "override took effect");
+        // A rejected override (wrong kind) leaves the default in force.
+        let stl_bad = render_export(src, base, &[("e".into(), "\"x\"".into())], "stl").unwrap();
+        assert_eq!(stl, stl_bad);
+        // An unknown format is an error, not a panic.
+        assert!(render_export(src, base, &[], "obj").is_err());
+        // A 2D design exports SVG; asking for STL is the reference's error.
+        let sq = "s = 4; // [1:9]\nsquare(s);";
+        assert!(render_export(sq, base, &[], "svg").unwrap().contains("<svg"));
+        assert!(render_export(sq, base, &[], "stl").unwrap_err().contains("not a 3D"));
     }
 
     /// Evaluate one expression against a fresh root scope; returns
