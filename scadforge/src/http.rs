@@ -67,27 +67,34 @@ fn export_response(query: &str, source: &str) -> Response {
             body: err.clone(),
         };
     }
-    let mesh = match eval::export_mesh(&out) {
-        Ok(m) => m,
-        Err(e) => {
-            return Response {
-                status: "422 Unprocessable Entity",
-                content_type: "text/plain; charset=utf-8",
-                body: e,
-            }
-        }
+    let err422 = |e: String| Response {
+        status: "422 Unprocessable Entity",
+        content_type: "text/plain; charset=utf-8",
+        body: e,
     };
+    // 2D vector formats export the design's 2D outlines; mesh formats export
+    // the solid geometry.
     match format {
-        "off" => Response {
-            status: "200 OK",
-            content_type: "text/plain; charset=utf-8",
-            body: crate::io::write_off(&mesh),
+        "svg" => match eval::export_2d(&out) {
+            Ok(r) => Response { status: "200 OK", content_type: "image/svg+xml", body: crate::io::write_svg(&r) },
+            Err(e) => err422(e),
+        },
+        "dxf" => match eval::export_2d(&out) {
+            Ok(r) => Response {
+                status: "200 OK",
+                content_type: "application/dxf",
+                body: crate::io::write_dxf_2d(&r),
+            },
+            Err(e) => err422(e),
+        },
+        "off" => match eval::export_mesh(&out) {
+            Ok(m) => Response { status: "200 OK", content_type: "text/plain; charset=utf-8", body: crate::io::write_off(&m) },
+            Err(e) => err422(e),
         },
         // Default and "stl": ASCII STL.
-        _ => Response {
-            status: "200 OK",
-            content_type: "model/stl",
-            body: crate::io::write_stl_ascii(&mesh),
+        _ => match eval::export_mesh(&out) {
+            Ok(m) => Response { status: "200 OK", content_type: "model/stl", body: crate::io::write_stl_ascii(&m) },
+            Err(e) => err422(e),
         },
     }
 }

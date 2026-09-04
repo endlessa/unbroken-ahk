@@ -8,7 +8,284 @@
 //! selection happens in the caller, which hands us the already-merged solid.
 
 use crate::geom::Mesh;
+use crate::poly2::Poly2;
 use std::collections::HashMap;
+
+// -- 2D vector formats (SVG / DXF) ------------------------------------------
+
+fn regions_bbox(regions: &[Poly2]) -> ([f64; 2], [f64; 2]) {
+    let mut lo = [f64::INFINITY; 2];
+    let mut hi = [f64::NEG_INFINITY; 2];
+    for r in regions {
+        for c in &r.contours {
+            for p in c {
+                lo[0] = lo[0].min(p[0]);
+                lo[1] = lo[1].min(p[1]);
+                hi[0] = hi[0].max(p[0]);
+                hi[1] = hi[1].max(p[1]);
+            }
+        }
+    }
+    if !lo[0].is_finite() {
+        ([0.0, 0.0], [0.0, 0.0])
+    } else {
+        (lo, hi)
+    }
+}
+
+/// Write a 2D region set as one SVG document: every contour becomes a closed
+/// `<path>` subpath and the whole set is one filled path with
+/// `fill-rule="evenodd"` (so holes read correctly). The Y axis is flipped so
+/// the drawing appears upright in an SVG viewer, matching the import
+/// convention. Coordinates are millimetres.
+pub fn write_svg(regions: &[Poly2]) -> String {
+    let (lo, hi) = regions_bbox(regions);
+    let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
+    let mut d = String::new();
+    for r in regions {
+        for c in &r.contours {
+            if c.len() < 3 {
+                continue;
+            }
+            for (i, p) in c.iter().enumerate() {
+                // Flip Y: SVG's axis points down.
+                let (x, y) = (p[0], -p[1]);
+                d.push_str(if i == 0 { "M" } else { "L" });
+                d.push_str(&format!("{} {} ", fmt_coord(x), fmt_coord(y)));
+            }
+            d.push_str("Z ");
+        }
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}mm\" height=\"{}mm\" \
+         viewBox=\"{} {} {} {}\">\n\
+         <path d=\"{}\" fill-rule=\"evenodd\" fill=\"lightgray\" stroke=\"black\" stroke-width=\"0.5\"/>\n\
+         </svg>\n",
+        fmt_coord(w),
+        fmt_coord(h),
+        fmt_coord(lo[0]),
+        fmt_coord(-hi[1]),
+        fmt_coord(w),
+        fmt_coord(h),
+        d.trim_end()
+    )
+}
+
+/// Write a 2D region set as a minimal DXF: one closed LWPOLYLINE entity per
+/// contour (the entity CAM tools read most reliably). Millimetre units.
+pub fn write_dxf_2d(regions: &[Poly2]) -> String {
+    let mut s = String::from("0\nSECTION\n2\nENTITIES\n");
+    for r in regions {
+        for c in &r.contours {
+            if c.len() < 3 {
+                continue;
+            }
+            s.push_str("0\nLWPOLYLINE\n8\n0\n"); // entity, layer 0
+            s.push_str(&format!("90\n{}\n70\n1\n", c.len())); // vertex count, closed
+            for p in c {
+                s.push_str(&format!("10\n{}\n20\n{}\n", fmt_coord(p[0]), fmt_coord(p[1])));
+            }
+        }
+    }
+    s.push_str("0\nENDSEC\n0\nEOF\n");
+    s
+}
+
+/// Read a DXF into a 2D region: LINE / LWPOLYLINE / POLYLINE edges are
+/// stitched into closed loops by endpoint matching, and CIRCLE / ARC are
+/// tessellated with the given fragment parameters. Unsupported entities are
+/// skipped with a warning. Z is ignored (2D only).
+pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut contours: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut segs: Vec<([f64; 2], [f64; 2])> = Vec::new();
+    let mut unsupported: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // DXF is a stream of (group-code, value) line pairs.
+    let mut pairs: Vec<(i64, String)> = Vec::new();
+    let mut lines = text.lines();
+    while let (Some(code), Some(val)) = (lines.next(), lines.next()) {
+        if let Ok(c) = code.trim().parse::<i64>() {
+            pairs.push((c, val.trim().to_string()));
+        }
+    }
+    // Walk entities: an entity starts at a `0` code naming its type.
+    let mut i = 0;
+    while i < pairs.len() {
+        if pairs[i].0 != 0 {
+            i += 1;
+            continue;
+        }
+        let etype = pairs[i].1.to_ascii_uppercase();
+        i += 1;
+        // Collect this entity's codes until the next `0`.
+        let start = i;
+        while i < pairs.len() && pairs[i].0 != 0 {
+            i += 1;
+        }
+        let body = &pairs[start..i];
+        match etype.as_str() {
+            "LINE" => {
+                let (mut x1, mut y1, mut x2, mut y2) = (0.0, 0.0, 0.0, 0.0);
+                for (c, v) in body {
+                    let f = v.parse::<f64>().unwrap_or(0.0);
+                    match c {
+                        10 => x1 = f,
+                        20 => y1 = f,
+                        11 => x2 = f,
+                        21 => y2 = f,
+                        _ => {}
+                    }
+                }
+                segs.push(([x1, y1], [x2, y2]));
+            }
+            "LWPOLYLINE" | "POLYLINE" => {
+                let mut verts: Vec<[f64; 2]> = Vec::new();
+                let mut closed = false;
+                let mut cur_x = None;
+                for (c, v) in body {
+                    let f = v.parse::<f64>().unwrap_or(0.0);
+                    match c {
+                        70 => closed = (f as i64) & 1 != 0,
+                        10 => cur_x = Some(f),
+                        20 => {
+                            if let Some(x) = cur_x.take() {
+                                verts.push([x, f]);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if verts.len() >= 2 {
+                    if closed && verts.len() >= 3 {
+                        contours.push(verts);
+                    } else {
+                        for w in verts.windows(2) {
+                            segs.push((w[0], w[1]));
+                        }
+                    }
+                }
+            }
+            "CIRCLE" => {
+                let (mut cx, mut cy, mut r) = (0.0, 0.0, 0.0);
+                for (c, v) in body {
+                    let f = v.parse::<f64>().unwrap_or(0.0);
+                    match c {
+                        10 => cx = f,
+                        20 => cy = f,
+                        40 => r = f,
+                        _ => {}
+                    }
+                }
+                if r > 0.0 {
+                    let n = crate::geom::fragments(r, fn_, fa, fs).max(3);
+                    let ring = (0..n)
+                        .map(|k| {
+                            let a = std::f64::consts::TAU * k as f64 / n as f64;
+                            [cx + r * a.cos(), cy + r * a.sin()]
+                        })
+                        .collect();
+                    contours.push(ring);
+                }
+            }
+            "ARC" => {
+                let (mut cx, mut cy, mut r, mut a0, mut a1) = (0.0, 0.0, 0.0, 0.0, 0.0);
+                for (c, v) in body {
+                    let f = v.parse::<f64>().unwrap_or(0.0);
+                    match c {
+                        10 => cx = f,
+                        20 => cy = f,
+                        40 => r = f,
+                        50 => a0 = f,
+                        51 => a1 = f,
+                        _ => {}
+                    }
+                }
+                if r > 0.0 {
+                    let sweep = if a1 >= a0 { a1 - a0 } else { a1 + 360.0 - a0 };
+                    let n = (crate::geom::fragments(r, fn_, fa, fs) as f64 * sweep / 360.0)
+                        .ceil()
+                        .max(1.0) as u32;
+                    let mut prev: Option<[f64; 2]> = None;
+                    for k in 0..=n {
+                        let a = (a0 + sweep * k as f64 / n as f64).to_radians();
+                        let p = [cx + r * a.cos(), cy + r * a.sin()];
+                        if let Some(q) = prev {
+                            segs.push((q, p));
+                        }
+                        prev = Some(p);
+                    }
+                }
+            }
+            "SECTION" | "ENDSEC" | "EOF" | "TABLE" | "ENDTAB" | "VERTEX" | "SEQEND"
+            | "BLOCK" | "ENDBLK" | "" => {}
+            other => {
+                unsupported.insert(other.to_string());
+            }
+        }
+    }
+    // Stitch the loose segments (LINE / ARC / open polylines) into closed loops.
+    contours.extend(stitch_loops(&segs));
+    for u in unsupported {
+        warnings.push(format!("WARNING: DXF entity '{}' is not supported; skipped.", u));
+    }
+    (Poly2::new(contours), warnings)
+}
+
+/// Chain undirected segments into closed loops by endpoint matching (grid-
+/// quantized). Open chains are dropped.
+fn stitch_loops(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
+    const SNAP: f64 = 1e-4;
+    let key = |p: [f64; 2]| ((p[0] / SNAP).round() as i64, (p[1] / SNAP).round() as i64);
+    // adjacency: point key -> list of (segment index, endpoint 0/1)
+    let mut adj: HashMap<(i64, i64), Vec<(usize, usize)>> = HashMap::new();
+    for (i, s) in segs.iter().enumerate() {
+        if key(s.0) == key(s.1) {
+            continue; // zero-length
+        }
+        adj.entry(key(s.0)).or_default().push((i, 0));
+        adj.entry(key(s.1)).or_default().push((i, 1));
+    }
+    let ends = |s: &([f64; 2], [f64; 2]), e: usize| if e == 0 { (s.0, s.1) } else { (s.1, s.0) };
+    let mut used = vec![false; segs.len()];
+    let mut loops = Vec::new();
+    for start in 0..segs.len() {
+        if used[start] {
+            continue;
+        }
+        let (a0, _) = ends(&segs[start], 0);
+        let mut loop_pts = vec![a0];
+        let mut cur = start;
+        let mut from_end = 0usize;
+        let mut ok = false;
+        for _ in 0..segs.len() + 1 {
+            used[cur] = true;
+            let (_, tail) = ends(&segs[cur], from_end);
+            loop_pts.push(tail);
+            if key(tail) == key(a0) {
+                loop_pts.pop(); // closed: drop the duplicated start
+                ok = loop_pts.len() >= 3;
+                break;
+            }
+            // find an unused segment continuing from `tail`
+            let next = adj.get(&key(tail)).and_then(|cands| {
+                cands.iter().find(|&&(si, _)| !used[si]).copied()
+            });
+            match next {
+                Some((si, e)) => {
+                    cur = si;
+                    from_end = e;
+                }
+                None => break, // open chain — dropped
+            }
+        }
+        if ok {
+            loops.push(loop_pts);
+        }
+    }
+    loops
+}
 
 // -- Export -----------------------------------------------------------------
 
@@ -588,6 +865,62 @@ mod tests {
         assert!(ok(read_off("OFF\n0 4000000000 0\n")));
         assert!(ok(read_off("OFF\n1 1 0\n0 0 0\n1e300\n"))); // face-size token saturates usize
         assert!(ok(read_off("OFF\n1e309 0 0\n"))); // inf vertex count
+    }
+
+    fn area2(poly: &Poly2) -> f64 {
+        let (v, t) = crate::poly2::triangulate(poly);
+        t.iter()
+            .map(|tri| {
+                let (a, b, c) = (v[tri[0] as usize], v[tri[1] as usize], v[tri[2] as usize]);
+                ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0
+            })
+            .sum()
+    }
+
+    #[test]
+    fn dxf_round_trips_a_square_with_a_hole() {
+        // A 10×10 square with a 4×4 hole (area 84).
+        let ring = Poly2::new(vec![
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            vec![[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]],
+        ]);
+        let dxf = write_dxf_2d(std::slice::from_ref(&ring));
+        assert!(dxf.contains("LWPOLYLINE") && dxf.contains("EOF"));
+        let (back, warns) = read_dxf(&dxf, 0.0, 12.0, 2.0);
+        assert!(warns.is_empty());
+        assert_eq!(back.contours.len(), 2, "outer + hole");
+        assert!((area2(&back) - 84.0).abs() < 1e-6, "area {}", area2(&back));
+    }
+
+    #[test]
+    fn dxf_stitches_lines_into_a_loop_and_tessellates_circles() {
+        // Four LINE entities forming a 5×5 square, plus a CIRCLE.
+        let dxf = "0\nSECTION\n2\nENTITIES\n\
+            0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n\
+            0\nLINE\n10\n5\n20\n0\n11\n5\n21\n5\n\
+            0\nLINE\n10\n5\n20\n5\n11\n0\n21\n5\n\
+            0\nLINE\n10\n0\n20\n5\n11\n0\n21\n0\n\
+            0\nCIRCLE\n10\n20\n20\n0\n40\n3\n\
+            0\nSPLINE\n\
+            0\nENDSEC\n0\nEOF\n";
+        let (poly, warns) = read_dxf(dxf, 32.0, 12.0, 2.0);
+        assert_eq!(poly.contours.len(), 2, "the square loop + the circle");
+        // area = 25 (square) + ~π·9 (circle) ≈ 53.3
+        assert!((area2(&poly) - (25.0 + std::f64::consts::PI * 9.0)).abs() < 0.5, "area {}", area2(&poly));
+        assert!(warns.iter().any(|w| w.contains("SPLINE")), "unsupported entity warns");
+    }
+
+    #[test]
+    fn svg_export_emits_a_filled_evenodd_path() {
+        let ring = Poly2::new(vec![
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            vec![[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]],
+        ]);
+        let svg = write_svg(std::slice::from_ref(&ring));
+        assert!(svg.contains("<svg") && svg.contains("fill-rule=\"evenodd\""));
+        assert!(svg.contains("width=\"10mm\"") && svg.contains("height=\"10mm\""));
+        // Two subpaths (outer + hole), each closed with Z.
+        assert_eq!(svg.matches('Z').count(), 2);
     }
 
     #[test]

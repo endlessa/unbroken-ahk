@@ -1228,7 +1228,7 @@ fn call_builtin_module(
             // A negative offset can annihilate the region — empty, no warning.
             Shape::flat(result).into_iter().collect()
         }
-        "import" | "import_stl" | "import_off" => {
+        "import" | "import_stl" | "import_off" | "import_dxf" => {
             if name != "import" {
                 ctx.out.warnings.push(format!(
                     "DEPRECATED: The {}() module will be removed in future releases. \
@@ -1986,6 +1986,29 @@ fn sandboxed_path(path: &str) -> Option<std::path::PathBuf> {
 }
 
 fn import_file(path: &str, ctx: &mut Ctx) -> Vec<Shape> {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    // DXF is a 2D vector format — it imports as a 2D shape, not a mesh. Its
+    // circle/arc tessellation follows the $fn/$fa/$fs in scope at the call.
+    if ext == "dxf" {
+        let resolved = match sandboxed_path(path) {
+            Some(p) => p,
+            None => {
+                ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                return Vec::new();
+            }
+        };
+        let text = match std::fs::read_to_string(&resolved) {
+            Ok(t) => t,
+            Err(_) => {
+                ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                return Vec::new();
+            }
+        };
+        let get = |k: &str, d: f64| ctx.dynv.lookup(k).and_then(|v| v.as_num()).unwrap_or(d);
+        let (poly, warns) = io::read_dxf(&text, get("$fn", 0.0), get("$fa", 12.0), get("$fs", 2.0));
+        ctx.out.warnings.extend(warns);
+        return Shape::flat(poly).into_iter().collect();
+    }
     let format = match io::format_from_ext(path) {
         Some(f) => f,
         None => {
@@ -2025,6 +2048,35 @@ fn import_file(path: &str, ctx: &mut Ctx) -> Vec<Shape> {
             Vec::new()
         }
     }
+}
+
+/// Collect the design's SOLID (non-`%`-background) 2D outlines for export to a
+/// 2D vector format. A top level that is 3D (and has no 2D geometry) is an
+/// error, as is empty geometry — matching the reference's 2D-export messages.
+pub fn export_2d(out: &EvalOutput) -> Result<Vec<Poly2>, String> {
+    let mut regions = Vec::new();
+    let mut saw_3d = false;
+    for s in &out.shapes {
+        if s.background {
+            continue;
+        }
+        match &s.outline {
+            Some(poly) => regions.push(poly.clone()),
+            None => {
+                if !s.mesh.positions.is_empty() {
+                    saw_3d = true;
+                }
+            }
+        }
+    }
+    if regions.is_empty() {
+        return Err(if saw_3d {
+            "Current top level object is not a 2D object".into()
+        } else {
+            "Current top level object is empty".into()
+        });
+    }
+    Ok(regions)
 }
 
 /// Merge the design's SOLID (non-`%`-background) 3D geometry into one mesh
@@ -2126,7 +2178,7 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         "rotate_extrude" => &["angle"],
         "offset" => &["r"],
         "projection" => &["cut"],
-        "import" | "import_stl" | "import_off" => &["file", "convexity"],
+        "import" | "import_stl" | "import_off" | "import_dxf" => &["file", "convexity"],
         "surface" => &["file", "center", "convexity"],
         "render" => &["convexity"],
         "text" => &["text", "size", "font", "halign", "valign", "spacing", "direction"],
@@ -4414,6 +4466,28 @@ mod tests {
             run("surface(\"nope.dat\");").warnings.iter().any(|w| w.contains("Can't open")),
             "missing surface file warns"
         );
+    }
+
+    #[test]
+    fn two_d_vector_io() {
+        // SVG export of a 2D design.
+        let svg = crate::http::handle("POST", "/export?format=svg", "square([10, 6]);");
+        assert_eq!(svg.status, "200 OK");
+        assert!(svg.body.contains("<svg") && svg.body.contains("fill-rule"));
+        // DXF export of a 2D design.
+        let dxf = crate::http::handle("POST", "/export?format=dxf", "circle(5, $fn = 32);");
+        assert!(dxf.body.contains("LWPOLYLINE"));
+        // Exporting a 3D result to a 2D format is the reference error.
+        let bad = crate::http::handle("POST", "/export?format=svg", "cube(3);");
+        assert_eq!(bad.status, "422 Unprocessable Entity");
+        assert!(bad.body.contains("not a 2D object"));
+        // DXF round-trip: export a square to DXF, import it back, extrude.
+        let path = "scadforge_test_rt.dxf";
+        std::fs::write(path, crate::http::handle("POST", "/export?format=dxf", "square(10);").body)
+            .unwrap();
+        let out = run(&format!("linear_extrude(height = 2) import(\"{}\");", path));
+        std::fs::remove_file(path).ok();
+        assert!((total_volume(&out) - 200.0).abs() < 1e-3, "DXF round-trip vol {}", total_volume(&out));
     }
 
     #[test]

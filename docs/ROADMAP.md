@@ -4,15 +4,17 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after text() (2026-09-04): **140 full / 22 partial / 21 untouched
-— 77% full, 88% touched.** PHASE 4 IS NOW COMPLETE — `text()` renders real
-glyph outlines from a from-scratch TrueType parser. Phase 5 so far:
-modifier characters `* ! # %` (full); STL + OFF import/export (partial);
-number formatting + value display forms full+pinned; diagnostic surface
-class-prefixed → partial; `render` and `convexity` full; `surface` text
-heightmap → partial; `fill`/`roof` correctly rejected as unknown in
-2021.01; `include`/`use`/library-path → partial; io/preproc hardened after
-a security review.
+Standing after 2D vector I/O (2026-09-04): **140 full / 24 partial / 19
+untouched — 77% full, 90% touched.** PHASE 4 COMPLETE. Phase 5 so far:
+modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
+export and DXF import (2D vector) → partial; number formatting + value
+display forms full+pinned; diagnostic surface class-prefixed → partial;
+`render` and `convexity` full; `surface` text heightmap → partial; `text()`
+via a from-scratch TrueType parser; `fill`/`roof` correctly rejected as
+unknown in 2021.01; `include`/`use`/library-path → partial; io/preproc/font
+hardened after security reviews. Remaining untouched are mostly the honest
+tail (PDF/AMF/3MF export, SVG import, Customizer, `$vp*` viewport vars,
+DXF-era deprecated functions).
 
 Ground rules (from the project owner, non-negotiable):
 
@@ -135,8 +137,13 @@ Landed (2026-09-03):
   `import_stl`/`import_off`) routes by extension, warns+empty on a missing
   file, errors on an unsupported format, and refuses absolute/`..` paths;
   `%` background is excluded from exports and `#` included. A `POST /export`
-  route + Export-STL button download the scene. Remaining: AMF, 3MF, DXF,
-  SVG.
+  route + Export-STL button download the scene. **SVG + DXF export and DXF
+  import now land too**: SVG export writes one Y-flipped even-odd filled
+  path; DXF export writes closed LWPOLYLINE entities; DXF import reads
+  LINE/LWPOLYLINE/POLYLINE/CIRCLE/ARC (curves tessellated by $fn/$fa/$fs),
+  stitches loose segments into even-odd loops, and warns on unsupported
+  entities. `POST /export?format=stl|off|svg|dxf`. Remaining: AMF, 3MF, PDF,
+  and SVG import (a path-command parser).
 - ◐ `include` / `use` / library-path (`scadforge/src/preproc.rs`): a
   source-resolution pass run before eval. `include <path>` textually inlines
   the referenced file (recursively, cycle-guarded); its geometry runs and its
