@@ -355,13 +355,26 @@ pub fn builtin_head(module: &str, b: &HashMap<String, Value>, f: Frags) -> Optio
             num(num_of("convexity").unwrap_or(2.0)),
             f.spell()
         ),
-        "offset" => format!(
-            "offset(r = {}, delta = {}, chamfer = {}, {})",
-            b.get("r").map(value).unwrap_or_else(|| "undef".into()),
-            b.get("delta").map(value).unwrap_or_else(|| "undef".into()),
-            bool_of("chamfer", false),
-            f.spell()
-        ),
+        "offset" => {
+            // The reference records this one in RESOLVED form — as
+            // `offset(r = …)` or `offset(delta = …)`, never both — which
+            // makes the dump an oracle for the r-wins-over-delta rule and
+            // for the neither-given default (a 1-unit round offset).
+            let r = num_of("r").filter(|v| v.is_finite());
+            let delta = num_of("delta").filter(|v| v.is_finite());
+            match (r, delta) {
+                (Some(r), _) => {
+                    format!("offset(r = {}, chamfer = false, {})", num(r), f.spell())
+                }
+                (None, Some(d)) => format!(
+                    "offset(delta = {}, chamfer = {}, {})",
+                    num(d),
+                    bool_of("chamfer", false),
+                    f.spell()
+                ),
+                (None, None) => format!("offset(r = 1, chamfer = false, {})", f.spell()),
+            }
+        }
         "projection" => format!("projection(cut = {})", bool_of("cut", false)),
         _ => return None,
     };

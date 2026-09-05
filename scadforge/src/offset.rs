@@ -41,6 +41,7 @@
 //! 96 randomised polygons, worst relative area error 0.061%, and stable across
 //! nine decades of the tolerance knob.
 
+use crate::csg2::Join;
 use crate::poly2::Vec2 as P2;
 use std::collections::HashMap;
 
@@ -283,50 +284,205 @@ impl Dsu {
 #[derive(Clone, Copy)]
 struct RawSeg { a: P2, b: P2, center: Option<P2> }
 
-fn build_raw(polys: &[Vec<P2>], r: f64, steps_per_turn: usize) -> Vec<RawSeg> {
+/// How far a miter apex may sit from its corner, as a multiple of `r`. The
+/// reference describes the real kernel's limit as "set astronomically high so
+/// it never truncates in practice", and spikes on acute corners are the
+/// documented behaviour — so this exists only to keep a 180° reversal (where
+/// the apex is at infinity) finite. It bites at a turn of 179.99°, i.e. a
+/// corner whose two edges double back on each other.
+const MITER_LIMIT: f64 = 1.0e4;
+
+/// The intermediate points of a convex-corner cap, between the two offset
+/// endpoints `p0` and `p1` (which the caller supplies and which are never
+/// returned here).
+///
+/// This is the ONE place a corner's shape is decided. The raw curve and the
+/// trim region are both built from it, so they cannot disagree about, say,
+/// whether a given corner's miter tripped the limit and fell back to a flat
+/// cut — a disagreement that would trim away the very segments the curve
+/// emitted and punch a hole in the result.
+fn corner_cap(
+    v: P2, p0: P2, p1: P2, d1: P2, d2: P2, turn: f64, r: f64,
+    join: Join, steps_per_turn: usize,
+) -> Vec<P2> {
+    match join {
+        Join::Round => {
+            let step = 2.0 * std::f64::consts::PI / steps_per_turn as f64;
+            let k = ((turn / step).ceil() as usize).max(1);
+            let n0 = scl(sub(p0, v), 1.0 / r);
+            let a0 = n0[1].atan2(n0[0]);
+            (1..k)
+                .map(|q| {
+                    let ang = a0 + turn * (q as f64) / (k as f64);
+                    [v[0] + r * ang.cos(), v[1] + r * ang.sin()]
+                })
+                .collect()
+        }
+        // A flat cut straight across: p0 -> p1, no intermediate point.
+        Join::Chamfer => Vec::new(),
+        Join::Miter => {
+            // Where the two offset edge lines meet. `turn > 0` guarantees they
+            // are not parallel, but a turn approaching pi sends the apex to
+            // infinity, so fall back to the flat cut past the limit.
+            let denom = cross(d1, d2);
+            if denom == 0.0 {
+                return Vec::new();
+            }
+            let w = sub(p1, p0);
+            let t = cross(w, d2) / denom;
+            let apex = add(p0, scl(d1, t));
+            if norm(sub(apex, v)) > r * MITER_LIMIT {
+                Vec::new()
+            } else {
+                vec![apex]
+            }
+        }
+    }
+}
+
+/// Per-contour edge normals, offset endpoints and turn angles — the shared
+/// preamble of the raw curve and the trim pieces.
+struct CornerGeom {
+    nrm: Vec<P2>,
+    turn: Vec<f64>,
+}
+
+fn corner_geometry(c: &[P2]) -> CornerGeom {
+    let n = c.len();
+    // outward (right) normals per edge i: c[i] -> c[i+1]
+    let mut nrm: Vec<P2> = Vec::with_capacity(n);
+    for i in 0..n {
+        let d = sub(c[(i + 1) % n], c[i]);
+        let l = norm(d);
+        nrm.push(if l > 0.0 { [d[1] / l, -d[0] / l] } else { [0.0, 0.0] });
+    }
+    // turn at vertex i, between edge i-1 and edge i
+    let mut turn: Vec<f64> = Vec::with_capacity(n);
+    for i in 0..n {
+        let ip = (i + n - 1) % n;
+        let d1 = sub(c[i], c[ip]);
+        let d2 = sub(c[(i + 1) % n], c[i]);
+        turn.push(cross(d1, d2).atan2(dot(d1, d2))); // (-pi, pi]
+    }
+    CornerGeom { nrm, turn }
+}
+
+fn build_raw(polys: &[Vec<P2>], r: f64, steps_per_turn: usize, join: Join) -> Vec<RawSeg> {
     let mut out: Vec<RawSeg> = Vec::new();
-    let step = 2.0 * std::f64::consts::PI / steps_per_turn as f64;
     for c in polys {
         let n = c.len();
         if n < 3 { continue; }
-        // outward (right) normals per edge i: c[i] -> c[i+1]
-        let mut nrm: Vec<P2> = Vec::with_capacity(n);
-        for i in 0..n {
-            let d = sub(c[(i + 1) % n], c[i]);
-            let l = norm(d);
-            nrm.push(if l > 0.0 { [d[1] / l, -d[0] / l] } else { [0.0, 0.0] });
-        }
+        let g = corner_geometry(c);
         // offset edges
         for i in 0..n {
-            let a = add(c[i], scl(nrm[i], r));
-            let b = add(c[(i + 1) % n], scl(nrm[i], r));
+            let a = add(c[i], scl(g.nrm[i], r));
+            let b = add(c[(i + 1) % n], scl(g.nrm[i], r));
             if dist2(a, b) > 0.0 { out.push(RawSeg { a, b, center: None }); }
         }
         // joins at vertex i (between edge i-1 and edge i)
         for i in 0..n {
             let ip = (i + n - 1) % n;
-            let d1 = sub(c[i], c[ip]);
-            let d2 = sub(c[(i + 1) % n], c[i]);
-            let turn = cross(d1, d2).atan2(dot(d1, d2)); // (-pi, pi]
             let v = c[i];
-            let p0 = add(v, scl(nrm[ip], r));
-            let p1 = add(v, scl(nrm[i], r));
-            if turn > 1e-12 {
-                // convex: CCW arc of angle `turn` about v, radius r
-                let k = ((turn / step).ceil() as usize).max(1);
-                let a0 = nrm[ip][1].atan2(nrm[ip][0]);
+            let p0 = add(v, scl(g.nrm[ip], r));
+            let p1 = add(v, scl(g.nrm[i], r));
+            if g.turn[i] > 1e-12 {
+                let d1 = sub(c[i], c[ip]);
+                let d2 = sub(c[(i + 1) % n], c[i]);
+                let cap = corner_cap(v, p0, p1, d1, d2, g.turn[i], r, join, steps_per_turn);
+                // Only a round cap rides a circle about `v`; the trim test
+                // uses `center` to project chord midpoints back onto it, and
+                // a straight miter or chamfer edge must not be projected.
+                let center = if join == Join::Round { Some(v) } else { None };
                 let mut prev = p0;
-                for q in 1..k {
-                    let ang = a0 + turn * (q as f64) / (k as f64);
-                    let p = [v[0] + r * ang.cos(), v[1] + r * ang.sin()];
-                    out.push(RawSeg { a: prev, b: p, center: Some(v) });
+                for p in cap {
+                    if dist2(prev, p) > 0.0 { out.push(RawSeg { a: prev, b: p, center }); }
                     prev = p;
                 }
-                out.push(RawSeg { a: prev, b: p1, center: Some(v) });
+                if dist2(prev, p1) > 0.0 { out.push(RawSeg { a: prev, b: p1, center }); }
             } else if dist2(p0, p1) > 0.0 {
                 // reflex (or straight): plain crossing join, trimmed away later
                 out.push(RawSeg { a: p0, b: p1, center: None });
             }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// trim region, for the straight joins
+// ---------------------------------------------------------------------------
+//
+// Round has an exact and cheap membership test — a point is inside the
+// dilated region iff its distance to the input is below `r` — because the
+// round dilation IS the Minkowski sum with a disc. Miter and chamfer are not
+// Minkowski sums of anything, so their region has to be described the way it
+// is built: the input, plus one slab per edge, plus one cap per convex
+// corner. Each piece is convex, which makes "strictly inside, by a margin"
+// a few dot products rather than a polygon-in-polygon test.
+
+struct Piece {
+    poly: Vec<P2>,       // CCW convex
+    bb: [f64; 4],        // xmin, ymin, xmax, ymax
+}
+
+fn make_piece(mut poly: Vec<P2>) -> Option<Piece> {
+    if poly.len() < 3 { return None; }
+    if signed_area(&poly) < 0.0 { poly.reverse(); }
+    let mut bb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for p in &poly {
+        bb[0] = bb[0].min(p[0]); bb[1] = bb[1].min(p[1]);
+        bb[2] = bb[2].max(p[0]); bb[3] = bb[3].max(p[1]);
+    }
+    Some(Piece { poly, bb })
+}
+
+/// Is `p` inside this convex piece by more than `eps`? For a convex polygon
+/// that is exactly "left of every edge line by eps", so a point sitting ON
+/// the offset boundary is never trimmed.
+fn strictly_inside(piece: &Piece, p: P2, eps: f64) -> bool {
+    if p[0] < piece.bb[0] - eps || p[0] > piece.bb[2] + eps
+        || p[1] < piece.bb[1] - eps || p[1] > piece.bb[3] + eps
+    {
+        return false;
+    }
+    let n = piece.poly.len();
+    for i in 0..n {
+        let a = piece.poly[i];
+        let e = sub(piece.poly[(i + 1) % n], a);
+        let l = norm(e);
+        if l <= 0.0 { continue; }
+        if cross(e, sub(p, a)) / l <= eps { return false; }
+    }
+    true
+}
+
+/// The slabs and corner caps whose union (with the input region itself) is
+/// the dilated region. Built from `corner_cap`, exactly like the raw curve.
+fn build_pieces(polys: &[Vec<P2>], r: f64, steps_per_turn: usize, join: Join) -> Vec<Piece> {
+    let mut out: Vec<Piece> = Vec::new();
+    for c in polys {
+        let n = c.len();
+        if n < 3 { continue; }
+        let g = corner_geometry(c);
+        for i in 0..n {
+            let a = c[i];
+            let b = c[(i + 1) % n];
+            if dist2(a, b) <= 0.0 { continue; }
+            let off = scl(g.nrm[i], r);
+            out.extend(make_piece(vec![a, b, add(b, off), add(a, off)]));
+        }
+        for i in 0..n {
+            if g.turn[i] <= 1e-12 { continue; }
+            let ip = (i + n - 1) % n;
+            let v = c[i];
+            let p0 = add(v, scl(g.nrm[ip], r));
+            let p1 = add(v, scl(g.nrm[i], r));
+            let d1 = sub(c[i], c[ip]);
+            let d2 = sub(c[(i + 1) % n], c[i]);
+            let mut poly = vec![v, p0];
+            poly.extend(corner_cap(v, p0, p1, d1, d2, g.turn[i], r, join, steps_per_turn));
+            poly.push(p1);
+            out.extend(make_piece(poly));
         }
     }
     out
@@ -397,13 +553,13 @@ pub struct OffsetStats {
 /// inputs those two bounds are close together.  Verifying and retrying is what
 /// makes this robust -- and the worst case still returns closed contours
 /// rather than nothing.
-pub fn offset_polygon(input: &[Vec<P2>], r: f64, steps_per_turn: usize)
+pub fn offset_polygon(input: &[Vec<P2>], r: f64, steps_per_turn: usize, join: Join)
     -> (Vec<Vec<P2>>, OffsetStats)
 {
     const LADDER: [f64; 8] = [1e-3, 3e-3, 1e-2, 3e-4, 1e-4, 3e-2, 1e-5, 1e-6];
     let mut best: Option<(Vec<Vec<P2>>, OffsetStats)> = None;
     for &m in LADDER.iter() {
-        let (c, st) = offset_once(input, r, steps_per_turn, m);
+        let (c, st) = offset_once(input, r, steps_per_turn, m, join);
         let defects = st.degree_mismatch + st.dead_ends;
         if defects == 0 && !c.is_empty() { return (c, st); }
         let better = match &best {
@@ -418,7 +574,7 @@ pub fn offset_polygon(input: &[Vec<P2>], r: f64, steps_per_turn: usize)
     best.unwrap()
 }
 
-fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64)
+fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64, join: Join)
     -> (Vec<Vec<P2>>, OffsetStats)
 {
     let scale = {
@@ -444,7 +600,7 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64)
     }
     if !(feature > 0.0) { feature = scale; }
     let snap_tol = (feature * mul).max(scale * 1e-13);
-    let raw = build_raw(&polys, r, steps_per_turn);
+    let raw = build_raw(&polys, r, steps_per_turn, join);
     let mut reg = Registry::new(snap_tol);
 
     // register raw endpoints
@@ -540,9 +696,19 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64)
     let subs = segs;
 
     // ---- TRIM ----
+    // A sub-segment survives iff its midpoint lies ON the dilated region's
+    // boundary rather than strictly inside it. Round tests that exactly, by
+    // distance: the round dilation is the Minkowski sum with a disc of radius
+    // r, so "inside" is "closer to the input than r". The straight joins are
+    // not a Minkowski sum, so they test membership of the union of pieces the
+    // corner cap actually produced.
     let eps = 4.0 * snap_tol;
+    let pieces = if join == Join::Round {
+        Vec::new()
+    } else {
+        build_pieces(&polys, r, steps_per_turn, join)
+    };
     let mut kept: Vec<(u32, u32)> = Vec::new();
-    let mut borderline = 0usize;
     for s in &subs {
         let a = coord(&reg, s.a); let b = coord(&reg, s.b);
         let mut m = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
@@ -552,14 +718,15 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64)
             let l = norm(d);
             if l > 1e-15 { m = add(c, scl(d, r / l)); }
         }
-        let sd = signed_dist(&polys, m);
-        if (sd - r).abs() < 1e-2 && (sd - r).abs() > eps {
-            borderline += 1;
-        }
-        if sd >= r - eps { kept.push((s.a, s.b)); }
+        let keep = if join == Join::Round {
+            signed_dist(&polys, m) >= r - eps
+        } else {
+            signed_dist(&polys, m) >= -eps
+                && !pieces.iter().any(|p| strictly_inside(p, m, eps))
+        };
+        if keep { kept.push((s.a, s.b)); }
     }
     let kept_n = kept.len();
-    let _ = borderline;
 
     // ---- cancel opposite / dedupe equal ----
     let mut edges = cancel_dedupe(&kept);
@@ -688,13 +855,134 @@ mod tests {
     fn convex_dilation_matches_the_closed_form() {
         let sq = vec![vec![[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]]];
         for r in [0.5, 1.0, 3.0, 7.5] {
-            let (out, _) = offset_polygon(&sq, r, 512);
+            let (out, _) = offset_polygon(&sq, r, 512, Join::Round);
             let want = 400.0 + 80.0 * r + std::f64::consts::PI * r * r;
             let got = area(&out);
             assert!(
                 (got - want).abs() / want < 2e-3,
                 "r={r}: got {got}, want {want}"
             );
+        }
+    }
+
+    /// The straight joins have exact closed forms on a CONVEX polygon, and
+    /// they differ from each other only in the corner term:
+    ///
+    ///     round    A + P*r + sum r^2 * theta/2      (= A + P*r + pi r^2)
+    ///     miter    A + P*r + sum r^2 * tan(theta/2)
+    ///     chamfer  A + P*r + sum r^2 * sin(theta)/2
+    ///
+    /// where theta is each corner's turn angle. A regular n-gon makes every
+    /// theta equal to 2*pi/n, so all three are one line of arithmetic — and
+    /// the three constants are far enough apart that a join computing the
+    /// wrong corner shape cannot pass by accident.
+    #[test]
+    fn straight_join_dilation_matches_the_closed_form() {
+        use std::f64::consts::PI;
+        for n in [3usize, 5, 8, 12] {
+            let rad = 15.0;
+            let poly: Vec<P2> = (0..n)
+                .map(|i| {
+                    let a = 2.0 * PI * (i as f64) / (n as f64);
+                    [rad * a.cos(), rad * a.sin()]
+                })
+                .collect();
+            let theta = 2.0 * PI / n as f64;
+            let base_a = 0.5 * (n as f64) * rad * rad * theta.sin();
+            let perim = 2.0 * (n as f64) * rad * (theta / 2.0).sin();
+            for r in [0.5, 2.0, 6.0] {
+                for (join, corner) in [
+                    (Join::Miter, (n as f64) * r * r * (theta / 2.0).tan()),
+                    (Join::Chamfer, 0.5 * (n as f64) * r * r * theta.sin()),
+                ] {
+                    let (out, st) = offset_polygon(&vec![poly.clone()], r, 512, join);
+                    let want = base_a + perim * r + corner;
+                    let got = area(&out);
+                    assert_eq!(st.degree_mismatch, 0, "n={n} r={r} {join:?}: unbalanced graph");
+                    assert_eq!(st.dead_ends, 0, "n={n} r={r} {join:?}: dead ends");
+                    assert!(
+                        (got - want).abs() / want < 1e-6,
+                        "n={n} r={r} {join:?}: got {got}, want {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The corner terms above are not interchangeable: on a sharp corner a
+    /// miter spike is much bigger than a round arc, which is bigger than a
+    /// chamfer's flat cut. If a join silently fell back to another one, the
+    /// closed-form test would still pass for whichever it fell back to — this
+    /// pins the ordering so a fallback cannot hide.
+    #[test]
+    fn joins_are_ordered_miter_then_round_then_chamfer() {
+        // A 5-point star: 72-degree points, sharp enough to separate them.
+        let star: Vec<P2> = (0..10)
+            .map(|i| {
+                let a = std::f64::consts::PI * (i as f64) / 5.0;
+                let rr = if i % 2 == 0 { 20.0 } else { 8.0 };
+                [rr * a.cos(), rr * a.sin()]
+            })
+            .collect();
+        let r = 3.0;
+        let a_of = |j| area(&offset_polygon(&vec![star.clone()], r, 512, j).0);
+        let (m, o, c) = (a_of(Join::Miter), a_of(Join::Round), a_of(Join::Chamfer));
+        assert!(m > o * 1.001, "miter {m} should exceed round {o}");
+        assert!(o > c * 1.001, "round {o} should exceed chamfer {c}");
+    }
+
+    /// The offset region's own definition, checked against the traced result
+    /// on a shape with no closed form: sample a grid, ask both "is this point
+    /// in the union of the input, its edge slabs and its corner caps?" and "is
+    /// it inside the contours we traced?", and require the two to agree
+    /// everywhere except within one cell of the boundary.
+    #[test]
+    fn straight_join_matches_the_union_of_its_pieces() {
+        let star: Vec<P2> = (0..24)
+            .map(|i| {
+                let a = std::f64::consts::PI * (i as f64) / 12.0;
+                let rr = if i % 2 == 0 { 20.0 } else { 11.0 };
+                [rr * a.cos(), rr * a.sin()]
+            })
+            .collect();
+        let input = vec![star];
+        for join in [Join::Miter, Join::Chamfer] {
+            for r in [1.0, 4.0] {
+                let (out, _) = offset_polygon(&input, r, 512, join);
+                let polys = normalize(&input, 1e-12);
+                let pieces = build_pieces(&polys, r, 512, join);
+                let step = 0.25;
+                let lim = 30.0;
+                let mut bad = 0usize;
+                let mut n = 0usize;
+                let mut y = -lim;
+                while y <= lim {
+                    let mut x = -lim;
+                    while x <= lim {
+                        let p = [x, y];
+                        // Truth: in the input, or in any piece. Points within
+                        // one cell of a piece boundary are skipped — that band
+                        // is where a sample legitimately straddles the edge.
+                        let inside_any = signed_dist(&polys, p) <= 0.0
+                            || pieces.iter().any(|q| strictly_inside(q, p, 0.0));
+                        let clear = pieces.iter().all(|q| !strictly_inside(q, p, -step))
+                            || pieces.iter().any(|q| strictly_inside(q, p, step));
+                        if clear && signed_dist(&polys, p).abs() > step {
+                            n += 1;
+                            if point_inside(&out, p) != inside_any {
+                                bad += 1;
+                            }
+                        }
+                        x += step;
+                    }
+                    y += step;
+                }
+                assert!(n > 10_000, "{join:?} r={r}: only {n} samples");
+                assert!(
+                    bad * 1000 <= n,
+                    "{join:?} r={r}: {bad}/{n} grid points disagree with the piece union"
+                );
+            }
         }
     }
 
@@ -718,7 +1006,7 @@ mod tests {
             [5.77351, -10.000013], [5.297937, -5.626571], [5.174109, -4.487828], 
             [5.000006, -2.886755], [6.473628, -2.236995], [11.54702, -0.0], 
         ];        let region = vec![pts];
-        let (out, stats) = offset_polygon(&region, 2.2, 48);
+        let (out, stats) = offset_polygon(&region, 2.2, 48, Join::Round);
         assert!(!out.is_empty(), "must not come back empty");
         assert_eq!(out.len(), 1, "one outer contour");
         let got = area(&out);
@@ -735,13 +1023,13 @@ mod tests {
         let hole = vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]];
         let region = vec![outer, hole];
         // r = 2: outer 30 -> exact convex formula; hole 10 erodes to a 6x6 square.
-        let (out, _) = offset_polygon(&region, 2.0, 512);
+        let (out, _) = offset_polygon(&region, 2.0, 512, Join::Round);
         assert_eq!(out.len(), 2, "outer + surviving hole");
         let want = (900.0 + 120.0 * 2.0 + std::f64::consts::PI * 4.0) - 36.0;
         let got = area(&out);
         assert!((got - want).abs() / want < 3e-3, "got {got}, want {want}");
         // r = 5 exceeds half the hole width, so the hole closes entirely.
-        let (closed, _) = offset_polygon(&region, 5.0, 512);
+        let (closed, _) = offset_polygon(&region, 5.0, 512, Join::Round);
         assert_eq!(closed.len(), 1, "the hole is gone");
     }
 }

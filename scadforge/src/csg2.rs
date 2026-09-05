@@ -804,120 +804,24 @@ fn box_contour(lo: V2, hi: V2) -> Vec<V2> {
     vec![[lo[0], lo[1]], [hi[0], lo[1]], [hi[0], hi[1]], [lo[0], hi[1]]]
 }
 
-/// Intersection of the line through `p0` with direction `d0` and the line
-/// through `p1` with direction `d1`. None if (near-)parallel.
-fn line_intersect(p0: V2, d0: V2, p1: V2, d1: V2) -> Option<V2> {
-    let denom = d0[0] * d1[1] - d0[1] * d1[0];
-    if denom.abs() < 1e-12 {
-        return None;
-    }
-    let s = ((p1[0] - p0[0]) * d1[1] - (p1[1] - p0[1]) * d1[0]) / denom;
-    Some([p0[0] + s * d0[0], p0[1] + s * d0[1]])
-}
-
 /// Dilate (grow) a region by `dist > 0` with the given corner join, as the
 /// union of the region, its outward edge slabs, and a cap at each convex
 /// (gap-opening) vertex.
 fn dilate(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 {
-    use std::f64::consts::{PI, TAU};
-    // ROUND joins go through the direct raw-offset-curve algorithm, which
-    // computes the Minkowski dilation with NO boolean at all. The union-of-
-    // slabs-and-caps path below is riddled with tangencies (every piece's
-    // boundary sits at exactly `dist`), and the segment-BSP shredded the
-    // resulting cycles — returning an EMPTY region on many concave profiles.
-    // See `crate::offset`.
-    if join == Join::Round {
-        let steps = frags_full.clamp(8, 1024) as usize;
-        let (contours, _stats) = crate::offset::offset_polygon(&region.contours, dist, steps);
-        return Poly2::new(contours);
-    }
-    // Clamp the full-circle fragment count so a single corner arc can't
-    // allocate unboundedly for an extreme $fn (1024 is far smoother than any
-    // preview needs). The eval layer separately caps the input vertex count.
-    let frags_full = frags_full.min(1024);
-    let mut parts: Vec<Poly2> = vec![region.clone()];
-    for contour in poly2::oriented_contours(region) {
-        let n = contour.len();
-        if n < 3 {
-            continue;
-        }
-        // Outward unit normal (right of each directed edge; filled on left).
-        let nrm: Vec<V2> = (0..n)
-            .map(|i| {
-                let d = sub(contour[(i + 1) % n], contour[i]);
-                let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
-                if l < EPS { [0.0, 0.0] } else { [d[1] / l, -d[0] / l] }
-            })
-            .collect();
-        // Edge slabs: each edge swept outward by `dist`.
-        for i in 0..n {
-            if nrm[i] == [0.0, 0.0] {
-                continue;
-            }
-            let a = contour[i];
-            let b = contour[(i + 1) % n];
-            let ao = [a[0] + dist * nrm[i][0], a[1] + dist * nrm[i][1]];
-            let bo = [b[0] + dist * nrm[i][0], b[1] + dist * nrm[i][1]];
-            parts.push(Poly2::new(vec![vec![a, b, bo, ao]]));
-        }
-        // Convex-corner caps. A gap opens where turn·dist > 0 (dist > 0 here).
-        for i in 0..n {
-            let prev = (i + n - 1) % n;
-            let v = contour[i];
-            if nrm[prev] == [0.0, 0.0] || nrm[i] == [0.0, 0.0] {
-                continue;
-            }
-            let din = sub(v, contour[prev]);
-            let dout = sub(contour[(i + 1) % n], v);
-            let turn = din[0] * dout[1] - din[1] * dout[0];
-            if turn <= 0.0 {
-                continue; // reflex or straight: the slabs already cover it
-            }
-            let p = [v[0] + dist * nrm[prev][0], v[1] + dist * nrm[prev][1]];
-            let q = [v[0] + dist * nrm[i][0], v[1] + dist * nrm[i][1]];
-            match join {
-                Join::Chamfer => parts.push(Poly2::new(vec![vec![v, p, q]])),
-                Join::Miter => {
-                    let cap = match line_intersect(p, din, q, dout) {
-                        Some(m)
-                            if {
-                                // The reference miter limit is "effectively
-                                // unlimited"; line_intersect already rejects
-                                // (near-)parallel edges, so this only rules out
-                                // a numerically absurd spike (~1e6× the offset).
-                                let d2 = (m[0] - v[0]).powi(2) + (m[1] - v[1]).powi(2);
-                                d2.is_finite() && d2 <= dist * dist * 1.0e12
-                            } =>
-                        {
-                            vec![v, p, m, q] // sharp miter to the intersection
-                        }
-                        _ => vec![v, p, q], // degenerate: bevel it
-                    };
-                    parts.push(Poly2::new(vec![cap]));
-                }
-                Join::Round => {
-                    let a0 = (p[1] - v[1]).atan2(p[0] - v[0]);
-                    let a1 = (q[1] - v[1]).atan2(q[0] - v[0]);
-                    let mut sweep = a1 - a0;
-                    while sweep <= -PI {
-                        sweep += TAU;
-                    }
-                    while sweep > PI {
-                        sweep -= TAU;
-                    }
-                    let seg = ((frags_full as f64) * sweep.abs() / TAU).ceil().max(1.0) as usize;
-                    let mut poly = vec![v, p];
-                    for k in 1..seg {
-                        let t = a0 + sweep * (k as f64) / (seg as f64);
-                        poly.push([v[0] + dist * t.cos(), v[1] + dist * t.sin()]);
-                    }
-                    poly.push(q);
-                    parts.push(Poly2::new(vec![poly]));
-                }
-            }
-        }
-    }
-    union2(&parts)
+    // All three joins go through the direct raw-offset-curve algorithm, which
+    // computes the dilation with NO boolean at all: it emits the (self-
+    // intersecting) offset curve, splits it at every crossing, and keeps the
+    // pieces that lie on the region's boundary.
+    //
+    // The union-of-slabs-and-caps construction this replaced was riddled with
+    // tangencies — every piece's boundary sits at exactly `dist`, touching its
+    // neighbours and never crossing them — and the segment-BSP shredded the
+    // resulting cycles, returning an EMPTY region on many concave profiles.
+    // It failed the standard corner-rounding idiom on 15 of 24 star cases and
+    // on every gear profile at every radius. See `crate::offset`.
+    let steps = frags_full.clamp(8, 1024) as usize;
+    let (contours, _stats) = crate::offset::offset_polygon(&region.contours, dist, steps, join);
+    Poly2::new(contours)
 }
 
 // -- Projection (projection()) ----------------------------------------------
@@ -1067,29 +971,45 @@ mod tests {
                 .collect();
             Poly2::new(vec![pts])
         };
+        // Every join for the shrink AND every join for the re-grow: the
+        // erosion half runs the SAME dilation on the complement, so a join
+        // that is broken outward is broken inward too — which is exactly how
+        // miter kept failing here after round was fixed.
+        let joins = [Join::Round, Join::Miter, Join::Chamfer];
         for &(n, ro, ri) in &[(4usize, 17.0, 8.5), (6, 17.0, 8.5), (12, 18.0, 13.0)] {
             let src = ring(n, ro, ri);
             for &k in &[1.0f64, 2.0, 3.0] {
-                let eroded = offset2(&src, -k, Join::Miter, 48);
-                let rounded = offset2(&eroded, k, Join::Round, 48);
-                assert!(
-                    !rounded.is_empty(),
-                    "{}-point profile, k={}: rounding idiom returned EMPTY",
-                    n,
-                    k
-                );
-                // Rounding must not blow the shape up or collapse it.
-                let a_src = poly2::signed_area2(&src.contours[0]).abs() / 2.0;
-                let a_out: f64 =
-                    rounded.contours.iter().map(|c| poly2::signed_area2(c).abs() / 2.0).sum();
-                assert!(
-                    a_out > 0.2 * a_src && a_out < 1.8 * a_src,
-                    "{}-point k={}: area {} vs source {}",
-                    n,
-                    k,
-                    a_out,
-                    a_src
-                );
+                for &shrink in &joins {
+                    for &grow in &joins {
+                        let eroded = offset2(&src, -k, shrink, 48);
+                        let rounded = offset2(&eroded, k, grow, 48);
+                        assert!(
+                            !rounded.is_empty(),
+                            "{}-point profile, k={}, {:?}->{:?}: idiom returned EMPTY",
+                            n,
+                            k,
+                            shrink,
+                            grow
+                        );
+                        // Rounding must not blow the shape up or collapse it.
+                        let a_src = poly2::signed_area2(&src.contours[0]).abs() / 2.0;
+                        let a_out: f64 = rounded
+                            .contours
+                            .iter()
+                            .map(|c| poly2::signed_area2(c).abs() / 2.0)
+                            .sum();
+                        assert!(
+                            a_out > 0.2 * a_src && a_out < 1.8 * a_src,
+                            "{}-point k={} {:?}->{:?}: area {} vs source {}",
+                            n,
+                            k,
+                            shrink,
+                            grow,
+                            a_out,
+                            a_src
+                        );
+                    }
+                }
             }
         }
     }

@@ -132,10 +132,33 @@ Landed (2026-09-03):
   tracing; and every HashMap key that can influence output is sorted first
   (determinism). Pinned by three tests — exact closed-form area for convex
   dilation (`A + P·r + πr²`), the eroded-star regression, and hole-shrink.
-  24/24 stars and every gear radius now pass. **Miter and chamfer joins
-  still take the old boolean path and still have this bug** (the erode half
-  of the idiom fails at small radii on a 12-tooth gear); that is the open
-  follow-up.
+
+  **Miter and chamfer now go through the same kernel (2026-09-05), and the
+  old boolean path is deleted.** Round has an exact, cheap membership test —
+  the round dilation IS the Minkowski sum with a disc, so a point is inside
+  iff its distance to the input is below `r`. Miter and chamfer are not a
+  Minkowski sum of anything, so their trim tests membership of the union of
+  pieces the corner cap actually produced: the input, one slab per edge, one
+  cap per convex corner. Each piece is convex, which turns "strictly inside,
+  by a margin" into a few dot products. One `corner_cap` function decides a
+  corner's shape for both the raw curve and the trim region, so the two
+  cannot disagree about (say) whether a miter tripped its limit and fell
+  back to a flat cut — a disagreement would trim away the very segments the
+  curve emitted. The miter limit exists only to keep a 180° reversal finite;
+  it bites at 179.99°, matching the reference's "set astronomically high so
+  it never truncates in practice", because arbitrarily long spikes on acute
+  corners are the documented behaviour.
+
+  All three joins are pinned by exact closed forms on a regular n-gon, where
+  they differ only in the corner term — `Σ r²·θ/2` (round, = πr²), `Σ
+  r²·tan(θ/2)` (miter), `Σ r²·sin(θ)/2` (chamfer) — matched to 1e-6 relative
+  across four polygon sizes and three radii; the three constants are far
+  enough apart that a join computing the wrong corner cannot pass by
+  accident, and a separate test pins miter > round > chamfer in area so a
+  silent fallback cannot hide. A grid oracle checks the traced result
+  against the piece union on a 24-point star, and the idiom sweep now runs
+  all nine shrink-join × grow-join combinations across three profiles and
+  three radii.
 - ✅ `projection` (3D→2D): `cut = false` silhouette (union of every
   non-vertical facet's XY shadow, Z ignored) and `cut = true` planar
   section at z=0 (triangle-plane crossings stitched into contours), with
