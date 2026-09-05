@@ -4,9 +4,9 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after Customizer + SVG import + PDF export + 3MF + `.echo`
-(2026-09-04): **150 full / 22 partial / 11 untouched — 82% full, 94%
-touched.** Every geometry and I/O *format* of 2021.01 is implemented.
+Standing after Customizer + SVG import + PDF export + 3MF + `.echo` +
+the offset-kernel rewrite (2026-09-05): **150 full / 22 partial / 11
+untouched — 82% full, 94% touched.** Every geometry and I/O *format* of 2021.01 is implemented.
 PHASE 4 COMPLETE. Phase 5
 so far:
 modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
@@ -102,11 +102,40 @@ Landed (2026-09-03):
   Mixing 2D and 3D children in one boolean warns.
 
 - ✅ `offset` (2D): round (`r`, arc corners from $fn/$fa/$fs), miter and
-  chamfer (`delta`), both signs. Clean-room via Minkowski dilation
-  (region ∪ edge-slabs ∪ convex-corner caps) for positive and the
-  complement identity `erode(P) = B − dilate(B − P)` for negative — so
-  hole-shrink, split-into-islands, and silent annihilation on over-inset
-  all fall out of the union2/difference2 kernel (`csg2::offset2`).
+  chamfer (`delta`), both signs. Clean-room; negative offsets use the
+  complement identity `erode(P) = B − dilate(B − P)`, so hole-shrink,
+  split-into-islands, and silent annihilation on over-inset all fall out
+  of the same dilation (`csg2::offset2`).
+
+  **Round dilation was rewritten (2026-09-05) after a severe bug.** The
+  original decomposed dilation as an n-ary boolean *union* of region ∪
+  edge-slabs ∪ convex-corner caps. That decomposition is *all tangencies*:
+  every piece's boundary touches every neighbour's at exactly `r`, never
+  crossing. The segment-BSP shredded the shared boundary into a soup with
+  no cycles — on one 6-point star only 4 of 171 surviving edges could lie
+  on any cycle — and the stitcher then returned an EMPTY region. Measured
+  severity of `offset(r=k) offset(delta=-k)`, the standard corner-rounding
+  idiom: **15 of 24 star cases failed, and every gear profile at every
+  radius.** Simple convex-ish shapes (square, L, plus, ring) always passed,
+  which is why it survived the first review pass.
+
+  The fix (`scadforge/src/offset.rs`) computes the offset directly, with no
+  boolean at all: orient each contour material-on-left, emit the raw
+  (self-intersecting) offset curve — segment translated by `r·n̂`, plus an
+  arc fan at each convex corner — split every piece at all pairwise
+  intersections, then trim by the defining predicate: a point survives iff
+  its distance to the *input* region is ≥ `r`. Cancel opposite directed
+  edges, weld, and trace by smallest clockwise turn. Four details carry the
+  correctness: arcs are tested at their chord-midpoint *projected back onto
+  the generating circle*; endpoints and intersections snap through one
+  shared registry; equal/opposite directed edges are cancelled before
+  tracing; and every HashMap key that can influence output is sorted first
+  (determinism). Pinned by three tests — exact closed-form area for convex
+  dilation (`A + P·r + πr²`), the eroded-star regression, and hole-shrink.
+  24/24 stars and every gear radius now pass. **Miter and chamfer joins
+  still take the old boolean path and still have this bug** (the erode half
+  of the idiom fails at small radii on a 12-tooth gear); that is the open
+  follow-up.
 - ✅ `projection` (3D→2D): `cut = false` silhouette (union of every
   non-vertical facet's XY shadow, Z ignored) and `cut = true` planar
   section at z=0 (triangle-plane crossings stitched into contours), with
@@ -248,3 +277,9 @@ reachable; 100% of all 183 entries goes through those judgment calls.
 4. Re-score completeness against all 183 entries.
 5. Adversarial review panel over the new code; fix confirmed findings.
 6. Commit + push each milestone.
+7. For kernel work, sweep a *parameter space*, not a handful of shapes.
+   The `offset` bug hid behind squares and rings for weeks and only showed
+   up under a 24-case star × radius sweep. A geometry test that exercises
+   one nice shape is a smoke test, not a proof — and any construction whose
+   pieces meet only in tangencies should be assumed to break the BSP until
+   a sweep says otherwise.
