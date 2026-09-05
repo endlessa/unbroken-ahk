@@ -416,9 +416,48 @@ fn segments_to_poly(segs: &[Seg]) -> Poly2 {
     for (i, &(u, _)) in edges.iter().enumerate() {
         out.entry(u).or_default().push(i);
     }
-    // 3. Chain edges into closed loops.
+    // 3. Prune edges that cannot lie on ANY cycle. The BSP fold is not exact:
+    // the same crossing computed from either operand can disagree slightly, and
+    // the SNAP merge above can collapse a hair-thin segment to zero length. Both
+    // leave dangling ends, so the soup is a set of cycles PLUS a few open
+    // chains. Every edge of a real loop has an incoming edge at its source and
+    // an outgoing edge at its target, so repeatedly dropping edges that fail
+    // that test removes the open chains and leaves the cycles intact.
+    let mut alive = vec![true; edges.len()];
+    loop {
+        let mut indeg = vec![0usize; verts.len()];
+        let mut outdeg = vec![0usize; verts.len()];
+        for (i, &(u, v)) in edges.iter().enumerate() {
+            if alive[i] {
+                outdeg[u] += 1;
+                indeg[v] += 1;
+            }
+        }
+        let mut changed = false;
+        for (i, &(u, v)) in edges.iter().enumerate() {
+            if alive[i] && (indeg[u] == 0 || outdeg[v] == 0) {
+                alive[i] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break; // fixpoint: what remains is cycle-only
+        }
+    }
+
+    // 4. Chain edges into closed loops. A traversal that dead-ends must NOT
+    // consume the edges it walked: those edges usually belong to a genuine loop
+    // that a different start would trace, and permanently marking them used
+    // lets one bad start annihilate many good contours (the whole region could
+    // come back empty). So mark speculatively and roll back on failure.
     let mut used = vec![false; edges.len()];
+    for (i, &a) in alive.iter().enumerate() {
+        if !a {
+            used[i] = true; // pruned: never traced, never re-tried
+        }
+    }
     let mut contours: Vec<Vec<V2>> = Vec::new();
+    let mut path: Vec<usize> = Vec::new();
     for start in 0..edges.len() {
         if used[start] {
             continue;
@@ -426,31 +465,36 @@ fn segments_to_poly(segs: &[Seg]) -> Poly2 {
         let start_v = edges[start].0;
         let mut cur = start;
         let mut contour: Vec<V2> = Vec::new();
-        let mut steps = 0;
+        path.clear();
         let mut closed = false;
         loop {
             used[cur] = true;
+            path.push(cur);
             let (u, v) = edges[cur];
             contour.push(verts[u]);
-            steps += 1;
             if v == start_v {
                 closed = true; // returned to the loop's start vertex
                 break;
             }
             match next_edge(v, u, &edges, &out, &used, &verts) {
                 Some(nx) => cur = nx,
-                None => break, // dead end: an open chain, discarded below
+                None => break, // dead end: an open chain, rolled back below
             }
-            if steps > edges.len() + 4 {
+            if path.len() > edges.len() + 4 {
                 break; // safety against a pathological cycle
             }
         }
         // Only CLOSED loops are real contours. An open chain (dead end, or the
         // safety break) must be dropped, not pushed — pushing it would forge a
         // closing edge from its tail back to its head that exists in neither
-        // operand.
+        // operand — and its edges are released for another start to use.
         if closed && contour.len() >= 3 {
             contours.push(contour);
+        } else {
+            for &e in &path {
+                used[e] = false;
+            }
+            used[start] = true; // don't retry this exact dead-end start
         }
     }
     Poly2::new(contours)
@@ -994,6 +1038,39 @@ fn project_cut(mesh: &Mesh) -> Poly2 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A dangling in-edge feeding a genuine loop must not destroy the loop.
+    /// The BSP fold is not exact, so its segment soup is occasionally a set of
+    /// cycles PLUS a few open chains. Tracing from an edge on such a chain
+    /// walks into the loop and dead-ends; if that traversal kept the edges it
+    /// consumed, the real contour would vanish and the whole region could come
+    /// back EMPTY. Pruning non-cycle edges (and rolling back failed walks)
+    /// keeps the loop.
+    #[test]
+    fn stitcher_keeps_loops_reachable_from_a_dangling_chain() {
+        let sq = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let mut segs = Vec::new();
+        // A dangling edge that feeds INTO the square's first vertex. Listed
+        // first so the tracer starts on it and walks into the loop.
+        segs.push(Seg::new([-7.0, -7.0], sq[0]).unwrap());
+        for i in 0..4 {
+            segs.push(Seg::new(sq[i], sq[(i + 1) % 4]).unwrap());
+        }
+        let out = segments_to_poly(&segs);
+        assert_eq!(out.contours.len(), 1, "the square survives the dangling chain");
+        assert!(
+            (poly2::signed_area2(&out.contours[0]).abs() / 2.0 - 100.0).abs() < 1e-9,
+            "area {}",
+            poly2::signed_area2(&out.contours[0]).abs() / 2.0
+        );
+        // The dangling vertex must not appear in the traced contour.
+        assert!(
+            !out.contours[0].iter().any(|p| p[0] < -1.0),
+            "open chain excluded: {:?}",
+            out.contours[0]
+        );
+    }
+
     use super::*;
 
     /// Total filled area of an even-odd region (via its triangulation).
@@ -1210,4 +1287,6 @@ mod tests {
         }
         assert!((vol.abs() - 1.5).abs() < 1e-6, "extruded union vol {}", vol);
     }
+
+
 }
