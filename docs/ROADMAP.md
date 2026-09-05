@@ -5,8 +5,8 @@ OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
 Standing after Customizer + SVG import + PDF export + 3MF + `.echo` +
-the offset-kernel rewrite (2026-09-05): **150 full / 22 partial / 11
-untouched — 82% full, 94% touched.** Every geometry and I/O *format* of 2021.01 is implemented.
+the offset-kernel rewrite + `.csg` export (2026-09-05): **151 full / 22
+partial / 10 untouched — 83% full, 94% touched.** Every geometry and I/O *format* of 2021.01 is implemented.
 PHASE 4 COMPLETE. Phase 5
 so far:
 modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
@@ -252,19 +252,56 @@ Landed (2026-09-03):
 
 ## The honest tail
 
-~11 entries remain, and they are the true tail — desktop-application
+~10 entries remain, and they are the true tail — desktop-application
 surface rather than the modeling language: GUI-viewport PNG export,
-`$vpr`-family viewport variables (camera state), DXF-era deprecated
-metadata functions (`dxf_dim`/`dxf_cross`), and the rest of the debug/text
-export formats. Of those, `.echo` now lands (the console stream — every
-`ECHO:` line plus the class-prefixed diagnostics — exported by
-`?format=echo` / `-o out.echo`, and captured even when a script fatally
-errors); `.csg` is the highest-value remaining one but is really a second
-evaluation mode (recording the resolved instantiation tree), with `.ast`/
-`.term`/`.nef3` optional or stubs. Each gets a per-entry decision — web-app
-equivalent, or documented as intentionally out of scope. Every geometry
-and I/O format of 2021.01 is now implemented; 100% of the *language* is
-reachable; 100% of all 183 entries goes through those judgment calls.
+`$vpr`-family viewport variables (camera state), and DXF-era deprecated
+metadata functions (`dxf_dim`/`dxf_cross`). Each gets a per-entry decision
+— web-app equivalent, or documented as intentionally out of scope. Every
+geometry and I/O format of 2021.01 is now implemented; 100% of the
+*language* is reachable; 100% of all 183 entries goes through those
+judgment calls.
+
+**The debug/text export entry now lands in full (2026-09-05).** `.echo` is
+the console stream — every `ECHO:` line plus the class-prefixed
+diagnostics — exported by `?format=echo` / `-o out.echo`, captured even
+when a script fatally errors. `.csg` is the evaluated instantiation tree
+(`scadforge/src/csgfmt.rs` for the node model and spellings, the recorder
+in `eval.rs`): every variable, loop, function call and user module
+resolved away, leaving canonical built-ins — every affine transform
+collapsed to `multmatrix`, `d` resolved to `r`, `color("tomato")` to its
+RGBA, user modules and control flow to `group()`. `.nef3`/`.nefdbg` are
+refused by name as CGAL internals (the reference's own recommendation),
+and `.ast`/`.term` say plainly that they are not implemented rather than
+reading as a typo.
+
+Two properties make `.csg` the oracle the reference says it is, and both
+are pinned by tests:
+
+1. **The export is valid OpenSCAD that reproduces the design.** Numbers
+   print in the shortest round-tripping form (so 1/3 keeps all 16 digits —
+   "more digits than echo's %g", and exact on re-parse). A test evaluates a
+   script, exports `.csg`, re-evaluates the export, and compares the STL,
+   over one scene per recording path.
+2. **The child-grouping structure survives.** A `for` that emits three
+   cubes is ONE operand of a surrounding `difference()`, not three, so
+   every statement records exactly one node — a `group()` wrapper when it
+   has no more specific head. Flattening would silently change what the
+   re-import subtracts.
+
+**That oracle found a real bug within an hour of existing.** Sweeping 46
+scenes through export-and-re-import turned up four mismatches, which
+bisected to `hull()` — not to the export. `convex_hull` read its horizon
+edges back out of a `HashSet`, and Rust seeds `HashSet`'s hasher randomly
+*per process*: the cap faces were appended in a different order every run,
+so `hull()` emitted a different mesh — different triangles *and* different
+vertex numbering — each time the same file was exported. Five runs of one
+two-sphere hull gave five different STLs. Fixed by walking the visible
+faces in their own order and keeping only ordered containers on any path
+that reaches output (`csg.rs`, the same discipline `offset.rs` already
+followed). Pinned by an exact emission snapshot; note that the
+set-comparison test alongside it does *not* catch this class of bug,
+because it sorts away the very ordering that breaks — worth remembering
+when writing the next determinism test.
 
 ## Working method (established, keep using it)
 

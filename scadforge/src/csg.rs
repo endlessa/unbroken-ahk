@@ -645,8 +645,12 @@ fn convex_hull(input: &[V3]) -> Mesh {
         faces.push(make_face(pts, tri, interior));
     }
 
-    let mut vis_edges: std::collections::HashSet<(usize, usize)> =
-        std::collections::HashSet::new();
+    // A BTreeSet, not a HashSet: the horizon is read back to build the cap
+    // faces, and `HashSet` iteration order is seeded randomly per process —
+    // reading it made hull() emit a DIFFERENT mesh on every run of the same
+    // file. Any container whose order reaches the output has to be ordered.
+    let mut vis_edges: std::collections::BTreeSet<(usize, usize)> =
+        std::collections::BTreeSet::new();
     for (pi, &p) in pts.iter().enumerate() {
         if pi == i0 || pi == i1 || pi == i2 || pi == i3 {
             continue;
@@ -667,11 +671,25 @@ fn convex_hull(input: &[V3]) -> Mesh {
                 vis_edges.insert((f.v[2], f.v[0]));
             }
         }
-        let horizon: Vec<(usize, usize)> = vis_edges
-            .iter()
-            .filter(|&&(a, b)| !vis_edges.contains(&(b, a)))
-            .cloned()
-            .collect();
+        // Walk the faces in their own order (not the set's) so the cap
+        // faces are appended deterministically; the set is only consulted
+        // for the reverse-edge test and to keep each edge once.
+        let mut horizon: Vec<(usize, usize)> = Vec::new();
+        let mut on_horizon: std::collections::BTreeSet<(usize, usize)> =
+            std::collections::BTreeSet::new();
+        for (fi, f) in faces.iter().enumerate() {
+            if !visible[fi] {
+                continue;
+            }
+            for e in [(f.v[0], f.v[1]), (f.v[1], f.v[2]), (f.v[2], f.v[0])] {
+                if vis_edges.contains(&(e.1, e.0)) {
+                    continue; // interior to the visible cap, not its boundary
+                }
+                if on_horizon.insert(e) {
+                    horizon.push(e);
+                }
+            }
+        }
         // Robustness guard: near-coplanar facets can make floating drift
         // flip the visibility test inconsistently, so the horizon is not
         // a simple closed loop. Capping such a horizon would emit an
@@ -1060,6 +1078,104 @@ mod tests {
             .collect();
         let u = union_all(&many);
         assert!(signed_volume(&u).abs() > signed_volume(&geom::sphere(2.0, 12)).abs());
+    }
+
+    #[test]
+    fn hull_emission_is_reproducible() {
+        // REGRESSION. The horizon edges were read back out of a HashSet,
+        // and Rust seeds HashSet's hasher randomly PER PROCESS — so the cap
+        // faces were appended in a different order every run, and `hull()`
+        // emitted a different mesh (different triangles AND different
+        // vertex numbering) each time the same file was exported. Five runs
+        // of one two-sphere hull gave five different STLs.
+        //
+        // The property that broke is reproducibility of the emitted
+        // sequence, so that is what this pins: an exact snapshot. The
+        // set-level test below does NOT catch it — it sorts the very
+        // ordering the bug perturbs — which is why both exist.
+        let pts: Vec<V3> = vec![
+            [0.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 3.0, 0.0],
+            [0.0, 3.0, 0.0],
+            [0.0, 0.0, 2.0],
+            [4.0, 0.0, 2.0],
+            [4.0, 3.0, 2.0],
+            [0.0, 3.0, 2.0],
+        ];
+        let m = convex_hull(&pts);
+        assert_eq!(
+            m.tris,
+            vec![
+                [0, 1, 2],
+                [0, 2, 3],
+                [2, 4, 3],
+                [1, 0, 5],
+                [0, 3, 5],
+                [3, 4, 5],
+                [4, 1, 6],
+                [1, 5, 6],
+                [5, 4, 6],
+                [4, 2, 7],
+                [2, 1, 7],
+                [1, 4, 7],
+            ],
+            "hull emission order drifted — check for an unordered container \
+             whose iteration reaches the output"
+        );
+    }
+
+    #[test]
+    fn hull_output_does_not_depend_on_point_order() {
+        // A strictly convex point set (no four points coplanar) has a
+        // unique hull triangulation, so the emitted triangles must match as
+        // a SET whatever order the points arrive in. Independent of the
+        // reproducibility pin above: this one would still hold under a
+        // deterministic-but-order-sensitive implementation.
+        let pts: Vec<V3> = (0..60)
+            .map(|i| {
+                // A deterministic spiral on the unit sphere: irrational
+                // pitch keeps any four points off a common plane.
+                let k = i as f64;
+                let z = 1.0 - 2.0 * (k + 0.5) / 60.0;
+                let r = (1.0 - z * z).sqrt();
+                let a = k * 2.399963229728653; // golden angle, radians
+                [r * a.cos() * 10.0, r * a.sin() * 10.0, z * 10.0]
+            })
+            .collect();
+
+        let canonical = |m: &Mesh| {
+            let mut tris: Vec<[String; 3]> = m
+                .tris
+                .iter()
+                .map(|t| {
+                    // Key each triangle by its vertex COORDINATES, sorted,
+                    // so index numbering and winding rotation don't matter.
+                    let mut v: Vec<String> = t
+                        .iter()
+                        .map(|&i| {
+                            let p = m.positions[i as usize];
+                            format!("{:.9},{:.9},{:.9}", p[0], p[1], p[2])
+                        })
+                        .collect();
+                    v.sort();
+                    [v[0].clone(), v[1].clone(), v[2].clone()]
+                })
+                .collect();
+            tris.sort();
+            tris
+        };
+
+        let base = canonical(&convex_hull(&pts));
+        assert!(base.len() > 50, "expected a real hull, got {} tris", base.len());
+
+        let mut rotated = pts.clone();
+        rotated.rotate_left(17);
+        assert_eq!(base, canonical(&convex_hull(&rotated)), "rotating the input changed the hull");
+
+        let mut reversed = pts.clone();
+        reversed.reverse();
+        assert_eq!(base, canonical(&convex_hull(&reversed)), "reversing the input changed the hull");
     }
 
     // ---- Refuter #1 adversarial probes for convex_hull correctness ----

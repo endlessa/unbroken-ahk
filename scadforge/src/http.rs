@@ -123,7 +123,8 @@ fn export_response(query: &str, source: &str) -> Response {
     // Export the design as the Customizer currently has it: the same override
     // injection the /render path uses, so a downloaded mesh matches the preview.
     let effective = customizer::apply_overrides(source, &overrides_from_query(query));
-    let out = eval::evaluate_source(&effective, &base);
+    // `.csg` needs the evaluator to record the instantiation tree as it runs.
+    let out = eval::evaluate_source_for(&effective, &base, format == "csg");
     // `.echo` returns the console stream (ECHO + diagnostics), and captures it
     // even when a fatal error halted evaluation — so it is handled before the
     // error check that the geometry exports use.
@@ -156,7 +157,7 @@ fn export_response(query: &str, source: &str) -> Response {
     // pair each format with its MIME type. 2D vector formats export the 2D
     // outlines; mesh formats export the solid geometry.
     let tag = match format {
-        "svg" | "dxf" | "pdf" | "off" | "amf" | "stl" => format,
+        "svg" | "dxf" | "pdf" | "off" | "amf" | "stl" | "csg" => format,
         _ => "stl",
     };
     let content_type = match tag {
@@ -165,6 +166,7 @@ fn export_response(query: &str, source: &str) -> Response {
         "pdf" => "application/pdf",
         "off" => "text/plain; charset=utf-8",
         "amf" => "application/x-amf",
+        "csg" => "text/plain; charset=utf-8",
         _ => "model/stl",
     };
     match eval::export_string(&out, tag) {

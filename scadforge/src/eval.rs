@@ -74,6 +74,9 @@ pub struct EvalOutput {
     /// A fatal diagnostic (assert failure, recursion limit): evaluation
     /// halted here; shapes/echoes hold everything produced before it.
     pub error: Option<String>,
+    /// The evaluated instantiation tree, recorded only when the run asked
+    /// for it (`evaluate_recording`). `None` on a normal render.
+    pub csg: Option<crate::csgfmt::CsgNode>,
 }
 
 /// Evaluation runs on a dedicated thread with a large stack so deep
@@ -82,11 +85,21 @@ pub struct EvalOutput {
 /// evaluate. Resolution warnings (missing include/use files) are prepended to
 /// the diagnostic stream; a parse error in the resolved source is fatal.
 pub fn evaluate_source(source: &str, base_dir: &std::path::Path) -> EvalOutput {
+    evaluate_source_for(source, base_dir, false)
+}
+
+/// `evaluate_source`, optionally recording the instantiation tree for the
+/// `.csg` export (`out.csg`).
+pub fn evaluate_source_for(
+    source: &str,
+    base_dir: &std::path::Path,
+    record_csg: bool,
+) -> EvalOutput {
     let resolved = crate::preproc::resolve(source, base_dir);
     if let Some(err) = resolved.error {
         return EvalOutput { error: Some(err), warnings: resolved.warnings, ..Default::default() };
     }
-    let mut out = evaluate(&resolved.program);
+    let mut out = evaluate_maybe_recording(&resolved.program, record_csg);
     if !resolved.warnings.is_empty() {
         let mut w = resolved.warnings;
         w.append(&mut out.warnings);
@@ -96,10 +109,21 @@ pub fn evaluate_source(source: &str, base_dir: &std::path::Path) -> EvalOutput {
 }
 
 pub fn evaluate(program: &[Stmt]) -> EvalOutput {
+    evaluate_maybe_recording(program, false)
+}
+
+/// Evaluate while recording the instantiation tree for `.csg` export. The
+/// geometry kernel still runs (so one code path serves both modes and the
+/// tree can never disagree with the render); only the tree is extra.
+pub fn evaluate_recording(program: &[Stmt]) -> EvalOutput {
+    evaluate_maybe_recording(program, true)
+}
+
+fn evaluate_maybe_recording(program: &[Stmt], record: bool) -> EvalOutput {
     std::thread::scope(|s| {
         let handle = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
-            .spawn_scoped(s, || evaluate_inner(program))
+            .spawn_scoped(s, || evaluate_inner(program, record))
             .expect("failed to spawn the evaluator thread");
         handle.join().unwrap_or_else(|_| EvalOutput {
             error: Some("ERROR: the evaluator crashed (please report this script)".into()),
@@ -108,7 +132,7 @@ pub fn evaluate(program: &[Stmt]) -> EvalOutput {
     })
 }
 
-fn evaluate_inner(program: &[Stmt]) -> EvalOutput {
+fn evaluate_inner(program: &[Stmt], record: bool) -> EvalOutput {
     let mut ctx = Ctx {
         out: EvalOutput::default(),
         dynv: DynScope::root(),
@@ -116,6 +140,7 @@ fn evaluate_inner(program: &[Stmt]) -> EvalOutput {
         children: None,
         fn_depth: 0,
         cycle_scopes: Vec::new(),
+        csg: record.then(|| vec![CsgFrame { head: Some("group()".into()), nodes: Vec::new() }]),
     };
     let root = Scope::root();
     let mut shapes = exec_scope(program, &root, &mut ctx);
@@ -127,6 +152,15 @@ fn evaluate_inner(program: &[Stmt]) -> EvalOutput {
         shapes.retain(|s| s.rooted);
     }
     ctx.out.shapes.extend(shapes);
+    // The root frame was never closed (nothing to close it into); take it
+    // directly as the tree's `group()` root.
+    if let Some(st) = &mut ctx.csg {
+        let root_frame = st.remove(0);
+        ctx.out.csg = Some(crate::csgfmt::CsgNode {
+            head: root_frame.head.unwrap_or_else(|| "group()".into()),
+            children: root_frame.nodes,
+        });
+    }
     // Function values capture their defining scope; storing one in a
     // scope on that capture chain forms an Rc cycle. Clearing the
     // variables of every scope that received a function-containing value
@@ -303,6 +337,17 @@ struct ChildrenCtx {
     outer: Option<Rc<ChildrenCtx>>,
 }
 
+/// One open level of the `.csg` recording. `head` is filled in by whoever
+/// knows the canonical spelling — usually after argument binding, which
+/// happens well inside the call — so it starts empty and is set later. A
+/// frame closed with no head splices its children into the parent instead
+/// of wrapping them (that is how `children()`, `echo(...) child;`, and
+/// unknown modules disappear from the tree without losing their subtree).
+struct CsgFrame {
+    head: Option<String>,
+    nodes: Vec<crate::csgfmt::CsgNode>,
+}
+
 struct Ctx {
     out: EvalOutput,
     dynv: Rc<DynScope>,
@@ -313,6 +358,10 @@ struct Ctx {
     /// Scopes holding function-containing values — potential Rc cycles,
     /// broken at the end of evaluation.
     cycle_scopes: Vec<Rc<Scope>>,
+    /// `.csg` recording, innermost frame last. `None` during a normal
+    /// render: the hooks below all short-circuit, so recording costs
+    /// nothing when it is off.
+    csg: Option<Vec<CsgFrame>>,
 }
 
 impl Ctx {
@@ -323,6 +372,80 @@ impl Ctx {
     fn halt(&mut self, msg: String) {
         if self.out.error.is_none() {
             self.out.error = Some(msg);
+        }
+    }
+
+    // -- .csg recording -----------------------------------------------
+    //
+    // Every statement that can produce geometry records EXACTLY ONE node,
+    // so the child-grouping structure of the source survives into the
+    // export: `difference() { for (…) cube(); sphere(); }` must not become
+    // a difference with four operands.
+
+    fn csg_on(&self) -> bool {
+        self.csg.is_some()
+    }
+
+    /// Open a frame. Pair with exactly one `csg_close`.
+    fn csg_open(&mut self) {
+        if let Some(st) = &mut self.csg {
+            st.push(CsgFrame { head: None, nodes: Vec::new() });
+        }
+    }
+
+    /// Name the frame currently open. Called once the canonical head is
+    /// known; leaving it unset makes the frame splice on close.
+    fn csg_head(&mut self, head: String) {
+        if let Some(st) = &mut self.csg {
+            if let Some(f) = st.last_mut() {
+                f.head = Some(head);
+            }
+        }
+    }
+
+    /// Close the open frame: wrap its nodes under its head and append to
+    /// the parent, or splice them up if it never got one.
+    fn csg_close(&mut self) {
+        let Some(st) = &mut self.csg else { return };
+        let Some(frame) = st.pop() else { return };
+        let Some(parent) = st.last_mut() else { return };
+        match frame.head {
+            Some(head) => parent.nodes.push(crate::csgfmt::CsgNode { head, children: frame.nodes }),
+            None => parent.nodes.extend(frame.nodes),
+        }
+    }
+
+    /// Forget everything recorded in the open frame. Used when a builtin
+    /// drops its subtree (a bad transform argument), so the export does not
+    /// hoist children the render never drew.
+    fn csg_clear(&mut self) {
+        if let Some(st) = &mut self.csg {
+            if let Some(f) = st.last_mut() {
+                f.nodes.clear();
+            }
+        }
+    }
+
+    /// Prefix the most recently recorded node with a modifier character.
+    /// `#`, `%` and `!` are all valid OpenSCAD statement prefixes, so the
+    /// export stays re-importable and re-imports to the same meaning.
+    fn csg_modify(&mut self, ch: char) {
+        if let Some(st) = &mut self.csg {
+            if let Some(node) = st.last_mut().and_then(|f| f.nodes.last_mut()) {
+                node.head.insert(0, ch);
+            }
+        }
+    }
+
+    /// The `$fn`/`$fa`/`$fs` triple in effect right now.
+    fn csg_frags(&self) -> crate::csgfmt::Frags {
+        let get = |key: &str, default: f64| {
+            self.dynv.lookup(key).and_then(|v| v.as_num()).unwrap_or(default)
+        };
+        crate::csgfmt::Frags {
+            fn_: get("$fn", 0.0),
+            fa: get("$fa", 12.0),
+            fs: get("$fs", 2.0),
         }
     }
 }
@@ -445,6 +568,17 @@ fn set_var(scope: &Rc<Scope>, ctx: &mut Ctx, name: &str, v: Value) {
     scope.vars.borrow_mut().insert(name.to_string(), v);
 }
 
+/// Run `body` with one `.csg` frame open under `head`, so everything it
+/// instantiates lands inside a single node. A no-op wrapper when recording
+/// is off.
+fn csg_grouped<T>(ctx: &mut Ctx, head: &str, body: impl FnOnce(&mut Ctx) -> T) -> T {
+    ctx.csg_open();
+    ctx.csg_head(head.to_string());
+    let out = body(ctx);
+    ctx.csg_close();
+    out
+}
+
 fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
     match stmt {
         Stmt::Assign { .. } | Stmt::ModuleDef { .. } | Stmt::FunctionDef { .. } => Vec::new(),
@@ -458,6 +592,15 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
             // The others fully instantiate the subtree (side effects run),
             // then tag the produced shapes so the flag propagates up the tree.
             let mut shapes = exec_stmt(stmt, scope, ctx);
+            // The inner statement recorded exactly one node; mark it. `#`,
+            // `%` and `!` are valid statement prefixes, so the export stays
+            // re-importable and re-imports to the same meaning.
+            match modifier {
+                Modifier::Root => ctx.csg_modify('!'),
+                Modifier::Highlight => ctx.csg_modify('#'),
+                Modifier::Background => ctx.csg_modify('%'),
+                Modifier::Disable => {}
+            }
             match modifier {
                 Modifier::Root => {
                     for s in &mut shapes {
@@ -490,14 +633,20 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
                 Modifier::Disable => unreachable!(),
             }
         }
-        Stmt::Block(body) => exec_scope(body, scope, ctx),
+        // Blocks, ifs, lets and loops each record ONE `group()` node, even
+        // when they produce zero or many shapes: a surrounding
+        // `difference()` counts them as one operand, and the export has to
+        // agree or the re-import subtracts different things.
+        Stmt::Block(body) => csg_grouped(ctx, "group()", |ctx| exec_scope(body, scope, ctx)),
         Stmt::If { cond, then, els } => {
             let c = eval_expr(cond, scope, ctx);
-            if truthy(&c) {
-                exec_scope(then, scope, ctx)
-            } else {
-                exec_scope(els, scope, ctx)
-            }
+            csg_grouped(ctx, "group()", |ctx| {
+                if truthy(&c) {
+                    exec_scope(then, scope, ctx)
+                } else {
+                    exec_scope(els, scope, ctx)
+                }
+            })
         }
         Stmt::Let { bindings, body, deprecated_assign } => {
             if *deprecated_assign {
@@ -508,7 +657,7 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
             let saved_dyn = ctx.dynv.clone();
             ctx.dynv = DynScope::layer(&saved_dyn);
             let bind_scope = sequential_bindings(bindings, scope, ctx);
-            let shapes = exec_scope(body, &bind_scope, ctx);
+            let shapes = csg_grouped(ctx, "group()", |ctx| exec_scope(body, &bind_scope, ctx));
             ctx.dynv = saved_dyn;
             shapes
         }
@@ -521,6 +670,9 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
                 })
                 .collect();
             let mut shapes = Vec::new();
+            // One group for the whole loop, iterations flattened inside it.
+            ctx.csg_open();
+            ctx.csg_head("group()".into());
             cross_product(&iterables, 0, &mut Vec::new(), &mut |vals, ctx| {
                 let saved_dyn = ctx.dynv.clone();
                 ctx.dynv = DynScope::layer(&saved_dyn);
@@ -531,6 +683,7 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
                 shapes.extend(exec_scope(body, &iter_scope, ctx));
                 ctx.dynv = saved_dyn;
             }, ctx);
+            ctx.csg_close();
             shapes
         }
         Stmt::IntersectionFor { bindings, body } => {
@@ -545,6 +698,10 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
                 .collect();
             let mut operands: Vec<Mesh> = Vec::new();
             let mut color = None;
+            // `intersection_for` records as a plain `intersection()` over
+            // one `group()` per iteration — the resolved form of the loop.
+            ctx.csg_open();
+            ctx.csg_head("intersection()".into());
             cross_product(&iterables, 0, &mut Vec::new(), &mut |vals, ctx| {
                 let saved_dyn = ctx.dynv.clone();
                 ctx.dynv = DynScope::layer(&saved_dyn);
@@ -552,13 +709,14 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
                 for (name, v) in vals {
                     set_var(&iter_scope, ctx, name, v.clone());
                 }
-                let shapes = exec_scope(body, &iter_scope, ctx);
+                let shapes = csg_grouped(ctx, "group()", |ctx| exec_scope(body, &iter_scope, ctx));
                 if color.is_none() {
                     color = shapes.iter().find_map(|s| s.color);
                 }
                 operands.push(combine_group(&shapes).0);
                 ctx.dynv = saved_dyn;
             }, ctx);
+            ctx.csg_close();
             if operands.is_empty() {
                 Vec::new()
             } else {
@@ -702,11 +860,16 @@ fn exec_call(name: &str, args: &[Arg], children: &[Stmt], scope: &Rc<Scope>, ctx
         }
     }
 
+    // One frame per instantiation. Whoever knows the canonical head fills
+    // it in; a frame left unnamed (echo, assert, children(), an unknown
+    // module) splices its subtree into the parent instead of wrapping it.
+    ctx.csg_open();
     let shapes = if let Some((def, def_scope)) = scope.lookup_module(name) {
         call_user_module(name, &def, &def_scope, &ev, children, scope, ctx)
     } else {
         call_builtin_module(name, args, &ev, children, scope, ctx)
     };
+    ctx.csg_close();
     ctx.dynv = saved_dyn;
     shapes
 }
@@ -725,6 +888,9 @@ fn call_user_module(
         return Vec::new();
     }
     let param_scope = bind_params(name, &def.params, ev, def_scope, ctx);
+    // A user module has no representation in the evaluated tree: its body
+    // is inlined under a plain group().
+    ctx.csg_head("group()".into());
 
     let saved_children = ctx.children.take();
     ctx.children = Some(Rc::new(ChildrenCtx {
@@ -901,6 +1067,17 @@ fn call_builtin_module(
     ctx: &mut Ctx,
 ) -> Vec<Shape> {
     let bound = bind_builtin_args(name, ev, ctx);
+    // The canonical head for everything whose spelling follows from its
+    // bound arguments alone. Transforms, `color` and `resize` set theirs
+    // below instead, from the values they actually computed; the modules
+    // that record nothing (echo/assert/children/unknown) return None here
+    // and leave the frame unnamed.
+    if ctx.csg_on() {
+        let frags = ctx.csg_frags();
+        if let Some(head) = crate::csgfmt::builtin_head(name, &bound, frags) {
+            ctx.csg_head(head);
+        }
+    }
 
     match name {
         "cube" => {
@@ -1044,6 +1221,10 @@ fn call_builtin_module(
             transform_children(children, scope, ctx, matrix)
         }
         "resize" => {
+            if ctx.csg_on() {
+                let ns = bound.get("newsize").and_then(Value::as_vec3).unwrap_or([0.0; 3]);
+                ctx.csg_head(crate::csgfmt::resize_head(ns, resize_auto_flags(bound.get("auto"))));
+            }
             let mut shapes = exec_scope(children, scope, ctx);
             let newsize = bound.get("newsize").and_then(Value::as_vec3);
             match newsize {
@@ -1297,6 +1478,9 @@ fn call_builtin_module(
         }
         "color" => {
             let rgba = parse_color(bound.get("c"), bound.get("alpha"), ctx);
+            if ctx.csg_on() {
+                ctx.csg_head(crate::csgfmt::color_head(rgba));
+            }
             let mut shapes = exec_scope(children, scope, ctx);
             if let Some(rgba) = rgba {
                 for s in &mut shapes {
@@ -2218,7 +2402,7 @@ pub fn render_export(
     format: &str,
 ) -> Result<String, String> {
     let effective = crate::customizer::apply_overrides(source, overrides);
-    let out = evaluate_source(&effective, base_dir);
+    let out = evaluate_source_for(&effective, base_dir, format == "csg");
     // `.echo` captures the console stream regardless of a fatal error.
     if format == "echo" {
         return Ok(echo_stream(&out));
@@ -2268,7 +2452,7 @@ pub fn render_export_bytes(
     format: &str,
 ) -> Result<Vec<u8>, String> {
     let effective = crate::customizer::apply_overrides(source, overrides);
-    let out = evaluate_source(&effective, base_dir);
+    let out = evaluate_source_for(&effective, base_dir, format == "csg");
     // `.echo` captures the console stream regardless of a fatal error.
     if format == "echo" {
         return Ok(echo_stream(&out).into_bytes());
@@ -2289,6 +2473,15 @@ pub fn render_export_bytes(
 pub fn export_string(out: &EvalOutput, format: &str) -> Result<String, String> {
     match format {
         "echo" => Ok(echo_stream(out)),
+        "csg" => match &out.csg {
+            Some(tree) => Ok(crate::csgfmt::render(tree)),
+            // The tree is only recorded when the run asked for it; a caller
+            // that evaluated without recording gets a clear message rather
+            // than a silently empty file.
+            None => Err("the .csg export needs a recording evaluation \
+                         (eval::evaluate_source_for(.., true))"
+                .into()),
+        },
         "svg" => Ok(crate::io::write_svg(&export_2d(out)?)),
         "dxf" => Ok(crate::io::write_dxf_2d(&export_2d(out)?)),
         "pdf" => Ok(crate::io::write_pdf(&export_2d(out)?)),
@@ -2305,7 +2498,19 @@ fn transform_children(
     ctx: &mut Ctx,
     matrix: Option<geom::Mat4>,
 ) -> Vec<Shape> {
+    // translate/rotate/scale/mirror/multmatrix all record as the one
+    // matrix they resolved to — that collapse is what "every variable
+    // resolved" means for transforms.
+    if let (true, Some(m)) = (ctx.csg_on(), &matrix) {
+        ctx.csg_head(crate::csgfmt::multmatrix_head(m));
+    }
     let mut shapes = exec_scope(children, scope, ctx);
+    // Bad arguments drop the subtree from the render; drop it from the
+    // export too, or the unnamed frame would splice the children upward
+    // and the re-import would draw what the render did not.
+    if ctx.csg_on() && matrix.is_none() {
+        ctx.csg_clear();
+    }
     if let Some(m) = matrix {
         for s in &mut shapes {
             match &mut s.outline {
@@ -4139,6 +4344,150 @@ mod tests {
         evaluate(&parse(src).unwrap())
     }
 
+    // ---- .csg export: the evaluated instantiation tree ----------------
+
+    fn csg_of(src: &str) -> String {
+        render_export(src, std::path::Path::new("."), &[], "csg").unwrap()
+    }
+
+    /// The oracle in one line: does re-running the export reproduce the
+    /// design? Compares the exported STL, so it covers geometry, not just
+    /// tree shape.
+    fn assert_csg_round_trips(src: &str) {
+        let base = std::path::Path::new(".");
+        let tree = csg_of(src);
+        let before = render_export(src, base, &[], "stl")
+            .unwrap_or_else(|e| panic!("source did not export: {e}\n{src}"));
+        let after = render_export(&tree, base, &[], "stl")
+            .unwrap_or_else(|e| panic!("exported .csg did not re-import: {e}\n{tree}"));
+        assert_eq!(before, after, "re-importing the .csg changed the geometry\n{tree}");
+    }
+
+    #[test]
+    fn csg_resolves_variables_loops_and_user_modules() {
+        // Everything here has to disappear: the variable, the loop, the
+        // user module, and the arithmetic in the arguments.
+        let tree = csg_of(
+            "n = 2; module post() { cylinder(h = 4, r = 1, $fn = 5); }\n\
+             for (i = [0 : n]) translate([i * 10, 0, 0]) post();",
+        );
+        assert_eq!(
+            tree,
+            "group() {\n\
+             \tgroup() {\n\
+             \t\tmultmatrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]) {\n\
+             \t\t\tgroup() {\n\
+             \t\t\t\tcylinder($fn = 5, $fa = 12, $fs = 2, h = 4, r1 = 1, r2 = 1, center = false);\n\
+             \t\t\t}\n\
+             \t\t}\n\
+             \t\tmultmatrix([[1, 0, 0, 10], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]) {\n\
+             \t\t\tgroup() {\n\
+             \t\t\t\tcylinder($fn = 5, $fa = 12, $fs = 2, h = 4, r1 = 1, r2 = 1, center = false);\n\
+             \t\t\t}\n\
+             \t\t}\n\
+             \t\tmultmatrix([[1, 0, 0, 20], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]) {\n\
+             \t\t\tgroup() {\n\
+             \t\t\t\tcylinder($fn = 5, $fa = 12, $fs = 2, h = 4, r1 = 1, r2 = 1, center = false);\n\
+             \t\t\t}\n\
+             \t\t}\n\
+             \t}\n\
+             }\n",
+            "actual:\n{}",
+            tree
+        );
+    }
+
+    #[test]
+    fn csg_keeps_one_node_per_child_statement() {
+        // THE structural invariant. A `for` that emits three cubes is ONE
+        // operand of the difference, not three: flattening it would make
+        // the re-import subtract two of the cubes from the first.
+        let src = "difference() { for (i = [0:2]) translate([i, 0, 0]) cube(1); sphere(0.4); }";
+        let tree = csg_of(src);
+        let top: Vec<&str> = tree
+            .lines()
+            .filter(|l| l.starts_with("\t\t") && !l.starts_with("\t\t\t"))
+            .collect();
+        assert_eq!(
+            top,
+            vec!["\t\tgroup() {", "\t\t}", "\t\tsphere($fn = 0, $fa = 12, $fs = 2, r = 0.4);"],
+            "difference must see exactly two operands:\n{}",
+            tree
+        );
+        assert_csg_round_trips(src);
+    }
+
+    #[test]
+    fn csg_records_modifiers_as_statement_prefixes() {
+        // `*` never instantiates, so it leaves no trace; `#`, `%` and `!`
+        // are recorded as the prefixes they are — which keeps the export
+        // valid OpenSCAD AND keeps its meaning on re-import.
+        let tree = csg_of("difference() { cube(4, center = true); #sphere(1); %sphere(2); *sphere(3); }");
+        assert!(tree.contains("#sphere("), "highlight kept:\n{}", tree);
+        assert!(tree.contains("%sphere("), "background kept:\n{}", tree);
+        assert!(!tree.contains("r = 3"), "disabled subtree must not appear:\n{}", tree);
+        assert!(csg_of("!cube(2); sphere(1);").contains("!cube("), "root kept");
+    }
+
+    #[test]
+    fn csg_drops_a_subtree_the_render_dropped() {
+        // A bad transform argument drops its children from the render. The
+        // export must drop them too — an unnamed frame that spliced its
+        // children upward would draw a cube the preview never showed.
+        let tree = csg_of("translate(\"nope\") cube(3);");
+        assert!(!tree.contains("cube"), "dropped subtree leaked into the export:\n{}", tree);
+    }
+
+    #[test]
+    fn csg_round_trips_the_language() {
+        // One scene per construct that has its own recording path.
+        for src in [
+            "cube([1, 2, 3], center = true);",
+            "sphere(d = 4, $fn = 12);",
+            "cylinder(h = 3, r1 = 2, r2 = 0, $fn = 9);",
+            "polyhedron(points = [[0,0,0],[2,0,0],[0,2,0],[0,0,2]], \
+                         faces = [[0,2,1],[0,1,3],[1,2,3],[2,0,3]]);",
+            "rotate([20, 30, 40]) scale([1, 2, 0.5]) mirror([1, 0, 0]) cube(2);",
+            "multmatrix([[1,0,0,1],[0,1,0,2],[0,0,1,3],[0,0,0,1]]) cube(2);",
+            "difference() { cube(4, center = true); sphere(2.4, $fn = 16); }",
+            "intersection() { cube(4, center = true); sphere(2.6, $fn = 16); }",
+            "union() { cube(2); translate([1,1,1]) sphere(1, $fn = 10); }",
+            "hull() { cube(1); translate([4, 0, 0]) sphere(1, $fn = 10); }",
+            "minkowski() { cube([4, 4, 1]); cylinder(r = 1, h = 1, $fn = 8); }",
+            "render() cube(2);",
+            "color(\"tomato\") cube(2);",
+            "color([0.2, 0.4, 0.6, 0.5]) cube(2);",
+            "resize([10, 0, 0], auto = true) cube(2);",
+            "linear_extrude(height = 3, twist = 45, slices = 6, scale = 0.5) square(4, center = true);",
+            "rotate_extrude(angle = 270, $fn = 24) translate([4, 0]) square([1, 2]);",
+            "linear_extrude(2) offset(r = 1, $fn = 16) square([6, 3], center = true);",
+            "linear_extrude(2) offset(delta = -0.5) square([6, 3], center = true);",
+            "linear_extrude(1) polygon(points = [[0,0],[5,0],[5,4],[2,6],[0,4]]);",
+            "linear_extrude(1) text(\"Ab\", size = 8, halign = \"center\");",
+            "linear_extrude(1) projection(cut = true) translate([0,0,-1]) sphere(3, $fn = 14);",
+            "intersection_for (a = [0 : 60 : 179]) rotate([0, 0, a]) cube([8, 2, 2], center = true);",
+            "module wrap() { children(); } wrap() cube(2);",
+            "module twice() { children(0); translate([3,0,0]) children(0); } twice() sphere(1, $fn = 8);",
+            "let (h = 4) cube([1, 1, h]);",
+            "if (true) cube(2); else sphere(1);",
+            "for (i = [0:2]) { translate([i*3, 0, 0]) cube(1); }",
+            "assert(1 < 2) cube(2);",
+            "echo(\"noise\"); cube(2);",
+            "$fn = 7; sphere(2);",
+        ] {
+            assert_csg_round_trips(src);
+        }
+    }
+
+    #[test]
+    fn csg_needs_a_recording_evaluation() {
+        // Asking a non-recording EvalOutput for its tree is an error with a
+        // pointer to the fix, not a silently empty file.
+        let out = run("cube(1);");
+        let err = export_string(&out, "csg").unwrap_err();
+        assert!(err.contains("recording"), "message: {err}");
+    }
+
     #[test]
     fn echo_export_captures_the_console_stream() {
         let base = std::path::Path::new(".");
@@ -4193,6 +4542,7 @@ mod tests {
             children: None,
             fn_depth: 0,
             cycle_scopes: Vec::new(),
+            csg: None,
         };
         let root = Scope::root();
         let v = eval_expr(&value, &root, &mut ctx);
@@ -5464,6 +5814,7 @@ mod tests {
             children: None,
             fn_depth: 0,
             cycle_scopes: Vec::new(),
+            csg: None,
         };
         let root = Scope::root();
         let weak = Rc::downgrade(&root);

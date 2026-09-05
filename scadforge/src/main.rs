@@ -121,11 +121,33 @@ fn render_headless(
     // eval::export_string understands).
     let ext = output.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     let format = match ext.as_str() {
-        "stl" | "off" | "amf" | "svg" | "dxf" | "pdf" | "3mf" | "echo" => ext,
+        "stl" | "off" | "amf" | "svg" | "dxf" | "pdf" | "3mf" | "echo" | "csg" => ext,
+        // Known 2021.01 debug formats we deliberately do not produce. The
+        // reference recommends refusing the CGAL dumps outright rather than
+        // emulating kernel internals; `.ast`/`.term` are re-serializations
+        // of stages this pipeline does not keep. Name them, so a user does
+        // not read "unknown extension" and assume a typo.
+        "nef3" | "nefdbg" => {
+            eprintln!(
+                "'{}' is a CGAL Nef polyhedron dump — kernel internals this \
+                 implementation has no equivalent for, and does not emulate. \
+                 Use .csg for the evaluated tree.",
+                ext
+            );
+            return 2;
+        }
+        "ast" | "term" => {
+            eprintln!(
+                "'{}' export is not implemented. Use .csg for the fully \
+                 evaluated instantiation tree.",
+                ext
+            );
+            return 2;
+        }
         _ => {
             eprintln!(
                 "cannot infer export format from '{}' \
-                 (use .stl/.off/.amf/.svg/.dxf/.pdf/.3mf/.echo)",
+                 (use .stl/.off/.amf/.svg/.dxf/.pdf/.3mf/.echo/.csg)",
                 output
             );
             return 2;

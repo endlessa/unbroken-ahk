@@ -10,6 +10,7 @@
 pub mod ast;
 pub mod csg;
 pub mod csg2;
+pub mod csgfmt;
 pub mod customizer;
 pub mod deflate;
 pub mod eval;
