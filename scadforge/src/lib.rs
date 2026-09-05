@@ -20,6 +20,7 @@ pub mod io;
 pub mod lexer;
 pub mod parser;
 pub mod preproc;
+pub mod offset;
 pub mod poly2;
 pub mod svg;
 pub mod value;

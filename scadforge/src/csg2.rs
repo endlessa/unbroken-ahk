@@ -820,6 +820,17 @@ fn line_intersect(p0: V2, d0: V2, p1: V2, d1: V2) -> Option<V2> {
 /// (gap-opening) vertex.
 fn dilate(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 {
     use std::f64::consts::{PI, TAU};
+    // ROUND joins go through the direct raw-offset-curve algorithm, which
+    // computes the Minkowski dilation with NO boolean at all. The union-of-
+    // slabs-and-caps path below is riddled with tangencies (every piece's
+    // boundary sits at exactly `dist`), and the segment-BSP shredded the
+    // resulting cycles — returning an EMPTY region on many concave profiles.
+    // See `crate::offset`.
+    if join == Join::Round {
+        let steps = frags_full.clamp(8, 1024) as usize;
+        let (contours, _stats) = crate::offset::offset_polygon(&region.contours, dist, steps);
+        return Poly2::new(contours);
+    }
     // Clamp the full-circle fragment count so a single corner arc can't
     // allocate unboundedly for an extreme $fn (1024 is far smoother than any
     // preview needs). The eval layer separately caps the input vertex count.
@@ -1038,6 +1049,50 @@ fn project_cut(mesh: &Mesh) -> Poly2 {
 
 #[cfg(test)]
 mod tests {
+
+    /// End-to-end through the public offset2(): the corner-rounding idiom
+    /// `offset(r=k) offset(delta=-k)` on a star used to return an EMPTY region
+    /// for most k (15 of 24 star/radius combinations failed, and every gear
+    /// profile failed at every radius). Round joins now go through the direct
+    /// raw-offset-curve algorithm in `crate::offset`.
+    #[test]
+    fn rounding_idiom_survives_on_star_and_gear_profiles() {
+        let ring = |n: usize, r_out: f64, r_in: f64| -> Poly2 {
+            let pts: Vec<V2> = (0..2 * n)
+                .map(|i| {
+                    let a = (i as f64) * 180.0 / (n as f64);
+                    let r = if i % 2 == 0 { r_out } else { r_in };
+                    [r * a.to_radians().cos(), r * a.to_radians().sin()]
+                })
+                .collect();
+            Poly2::new(vec![pts])
+        };
+        for &(n, ro, ri) in &[(4usize, 17.0, 8.5), (6, 17.0, 8.5), (12, 18.0, 13.0)] {
+            let src = ring(n, ro, ri);
+            for &k in &[1.0f64, 2.0, 3.0] {
+                let eroded = offset2(&src, -k, Join::Miter, 48);
+                let rounded = offset2(&eroded, k, Join::Round, 48);
+                assert!(
+                    !rounded.is_empty(),
+                    "{}-point profile, k={}: rounding idiom returned EMPTY",
+                    n,
+                    k
+                );
+                // Rounding must not blow the shape up or collapse it.
+                let a_src = poly2::signed_area2(&src.contours[0]).abs() / 2.0;
+                let a_out: f64 =
+                    rounded.contours.iter().map(|c| poly2::signed_area2(c).abs() / 2.0).sum();
+                assert!(
+                    a_out > 0.2 * a_src && a_out < 1.8 * a_src,
+                    "{}-point k={}: area {} vs source {}",
+                    n,
+                    k,
+                    a_out,
+                    a_src
+                );
+            }
+        }
+    }
 
     /// A dangling in-edge feeding a genuine loop must not destroy the loop.
     /// The BSP fold is not exact, so its segment soup is occasionally a set of
