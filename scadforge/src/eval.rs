@@ -404,15 +404,24 @@ impl Ctx {
     }
 
     /// Close the open frame: wrap its nodes under its head and append to
-    /// the parent, or splice them up if it never got one.
+    /// the parent. A frame that never got a head becomes a plain `group()`.
+    ///
+    /// It must WRAP, never splice. The renderer counts one operand per child
+    /// statement (`eval_children_grouped` pushes one `Vec<Shape>` each), so
+    /// `children()` forwarding two shapes into an `intersection()` is ONE
+    /// operand, not two. Splicing them made the export re-import as a
+    /// three-operand intersection and silently changed the result. The same
+    /// rule keeps a statement that draws nothing — `echo`, an unknown module,
+    /// a transform whose subtree was dropped — recording the EMPTY operand
+    /// the renderer counted.
     fn csg_close(&mut self) {
         let Some(st) = &mut self.csg else { return };
         let Some(frame) = st.pop() else { return };
         let Some(parent) = st.last_mut() else { return };
-        match frame.head {
-            Some(head) => parent.nodes.push(crate::csgfmt::CsgNode { head, children: frame.nodes }),
-            None => parent.nodes.extend(frame.nodes),
-        }
+        parent.nodes.push(crate::csgfmt::CsgNode {
+            head: frame.head.unwrap_or_else(|| "group()".into()),
+            children: frame.nodes,
+        });
     }
 
     /// Forget everything recorded in the open frame. Used when a builtin
@@ -585,8 +594,13 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
         Stmt::Modified { modifier, stmt } => {
             // `*` disables: the subtree is not instantiated at all, so its
             // echo/assert side effects never fire (an early-out, not a
-            // post-hoc filter).
+            // post-hoc filter). It still OCCUPIES its operand slot though —
+            // the renderer pushes an empty group for the statement — so the
+            // export records that empty group rather than nothing.
             if *modifier == Modifier::Disable {
+                if ctx.csg_on() {
+                    csg_grouped(ctx, "group()", |_| ());
+                }
                 return Vec::new();
             }
             // The others fully instantiate the subtree (side effects run),
@@ -1347,6 +1361,18 @@ fn call_builtin_module(
                 }
                 _ => 1,
             };
+            // Record the slice count the sweep ACTUALLY used. With `twist`
+            // set and `slices` omitted it comes from $fa, and printing the
+            // literal argument (or 1) exported a flat prism instead of the
+            // twisted sweep.
+            if ctx.csg_on() {
+                let frags = ctx.csg_frags();
+                ctx.csg_head(crate::csgfmt::linear_extrude_head(
+                    height, center,
+                    bound.get("convexity").and_then(Value::as_num).unwrap_or(1.0),
+                    twist, slices as f64, scale, frags,
+                ));
+            }
             let (positions, tris) =
                 poly2::extrude_linear(&poly, height, center, twist, slices, scale);
             leaf(Mesh { positions, tris })
@@ -1427,6 +1453,16 @@ fn call_builtin_module(
             };
             // dpi (SVG only) scales px/unitless user units; default 96.
             let dpi = bound.get("dpi").and_then(Value::as_num).unwrap_or(96.0);
+            if ctx.csg_on() {
+                let frags = ctx.csg_frags();
+                ctx.csg_head(crate::csgfmt::import_head(
+                    &path,
+                    bound.get("layer"),
+                    bound.get("convexity").and_then(Value::as_num).unwrap_or(1.0),
+                    dpi,
+                    frags,
+                ));
+            }
             import_file(&path, dpi, ctx)
         }
         "projection" => {
@@ -1546,6 +1582,12 @@ fn call_builtin_module(
             };
             let center = bound.get("center").and_then(Value::as_bool).unwrap_or(false);
             let invert = bound.get("invert").and_then(Value::as_bool).unwrap_or(false);
+            if ctx.csg_on() {
+                ctx.csg_head(crate::csgfmt::surface_head(
+                    &path, center, invert,
+                    bound.get("convexity").and_then(Value::as_num).unwrap_or(1.0),
+                ));
+            }
             let grid = io::parse_surface_text(&text);
             leaf(io::heightmap_solid(&grid, center, invert))
         }
@@ -2498,6 +2540,20 @@ fn transform_children(
     ctx: &mut Ctx,
     matrix: Option<geom::Mat4>,
 ) -> Vec<Shape> {
+    // A non-finite matrix drops the subtree, for EVERY affine transform.
+    // `multmatrix` already did this (the reference requires it), but
+    // `translate([0, 0, 0/0])` built a NaN matrix and pushed NaN vertices all
+    // the way into the STL — `facet normal NaN NaN NaN`, which no slicer will
+    // read. One rule for all of them, applied where they share a path.
+    let matrix = match matrix {
+        Some(m) if !m.iter().flatten().all(|v| v.is_finite()) => {
+            ctx.out.warnings.push(
+                "transform: matrix contains NaN/Infinity — subtree removed".into(),
+            );
+            None
+        }
+        other => other,
+    };
     // translate/rotate/scale/mirror/multmatrix all record as the one
     // matrix they resolved to — that collapse is what "every variable
     // resolved" means for transforms.
@@ -4363,6 +4419,21 @@ mod tests {
         assert_eq!(before, after, "re-importing the .csg changed the geometry\n{tree}");
     }
 
+    /// Like `assert_csg_round_trips`, but for scripts whose render is empty:
+    /// the export must reproduce THAT too, rather than conjuring geometry.
+    fn assert_csg_round_trips_or_both_empty(src: &str) {
+        let base = std::path::Path::new(".");
+        let tree = csg_of(src);
+        let before = render_export(src, base, &[], "stl");
+        let after = render_export(&tree, base, &[], "stl");
+        match (before, after) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "geometry changed on re-import\n{tree}"),
+            (Err(_), Err(_)) => {}
+            (Ok(_), Err(e)) => panic!("re-import lost the geometry: {e}\n{tree}"),
+            (Err(_), Ok(_)) => panic!("re-import INVENTED geometry the render refused\n{tree}"),
+        }
+    }
+
     #[test]
     fn csg_resolves_variables_loops_and_user_modules() {
         // Everything here has to disappear: the variable, the loop, the
@@ -4476,6 +4547,93 @@ mod tests {
             "$fn = 7; sphere(2);",
         ] {
             assert_csg_round_trips(src);
+        }
+    }
+
+    #[test]
+    fn csg_records_one_node_per_statement_even_when_it_draws_nothing() {
+        // REGRESSION. The recorder used to SPLICE an unnamed frame's nodes
+        // into its parent, so a statement that instantiated two shapes
+        // recorded two nodes — and a surrounding boolean gained an operand.
+        // The renderer counts one operand per child statement, so the export
+        // has to as well, whether the statement drew two shapes, one, or none.
+        for src in [
+            // children() forwards two shapes: ONE operand of the intersection.
+            "module m() { intersection() { cube(20, center=true); children(); } }\n\
+             m() { sphere(12); translate([16,0,0]) sphere(12); }",
+            "intersection() { cube(20, center=true); \
+             assert(true) { sphere(12); translate([16,0,0]) sphere(12); } }",
+            // Statements that draw NOTHING still hold their operand slot.
+            "intersection() { cube(20, center=true); *sphere(12); }",
+            "intersection() { cube(20, center=true); nosuchmodule(); }",
+            "difference() { translate(\"oops\") cube(20, center=true); sphere(11); }",
+            "difference() { cube(10); echo(\"noise\"); }",
+        ] {
+            assert_csg_round_trips_or_both_empty(src);
+        }
+    }
+
+    #[test]
+    fn csg_modifier_lands_on_its_own_statement() {
+        // REGRESSION. csg_modify prefixes the last node in the frame. When
+        // the modified statement recorded nothing, that was the PRECEDING
+        // SIBLING — so `cube(10); %echo("hi");` marked the CUBE background,
+        // and the re-import rendered nothing at all.
+        let tree = csg_of("cube(10);\n%echo(\"hi\");");
+        assert!(!tree.contains("%cube"), "the % landed on the cube:\n{}", tree);
+        assert_csg_round_trips("cube(10);\n%echo(\"hi\");");
+        assert_csg_round_trips("cube(10);\n#nosuchmodule();");
+    }
+
+    #[test]
+    fn csg_records_resolved_slices_invert_and_dpi() {
+        // REGRESSION. These three values are computed by the renderer, not
+        // readable off the bound arguments: `slices` comes from $fa when
+        // twist is set and slices omitted, and invert/dpi were simply absent
+        // from their heads. Each one silently changed the re-imported model.
+        let tree = csg_of("linear_extrude(height = 5, twist = 90) square([4,6], center=true);");
+        assert!(!tree.contains("slices = 1,"), "twist flattened to one slice:\n{}", tree);
+        assert_csg_round_trips("linear_extrude(height = 5, twist = 90) square([4,6], center=true);");
+        assert_csg_round_trips("linear_extrude(height = 4, twist = 180, $fa = 3) square(3);");
+        // invert/dpi need real files, so just pin that the heads carry them.
+        let f = crate::csgfmt::Frags { fn_: 0.0, fa: 12.0, fs: 2.0 };
+        assert!(crate::csgfmt::surface_head("h.dat", true, true, 1.0).contains("invert = true"));
+        assert!(crate::csgfmt::import_head("a.svg", None, 1.0, 25.4, f).contains("dpi = 25.4"));
+    }
+
+    #[test]
+    fn csg_does_not_export_a_shape_the_renderer_rejected() {
+        // REGRESSION. builtin_head coerced sizes the renderer refuses, so a
+        // statement that drew nothing exported a unit cube.
+        for src in ["cube(size = \"big\");", "square([4,5,6]);", "cube(size = [1,2]);"] {
+            assert_csg_round_trips_or_both_empty(src);
+        }
+    }
+
+    #[test]
+    fn non_finite_transforms_drop_their_subtree() {
+        // REGRESSION. `multmatrix` dropped a non-finite matrix (the reference
+        // requires it) but `translate` did not, so translate([0,0,0/0]) wrote
+        // an STL full of `facet normal NaN NaN NaN` that no slicer can read.
+        // Every affine transform shares one rule now.
+        for src in [
+            "translate([0, 0, 0/0]) cube(3);",
+            "scale([1, 1/0, 1]) cube(3);",
+            "rotate([0/0, 0, 0]) cube(3);",
+        ] {
+            let out = run(src);
+            assert!(
+                out.shapes.iter().all(|s| s
+                    .mesh
+                    .positions
+                    .iter()
+                    .all(|p| p.iter().all(|c| c.is_finite()))),
+                "non-finite vertices reached the mesh for: {src}"
+            );
+            assert!(
+                out.warnings.iter().any(|w| w.contains("NaN/Infinity")),
+                "the dropped subtree was not reported for: {src}"
+            );
         }
     }
 

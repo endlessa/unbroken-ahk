@@ -133,11 +133,16 @@ fn takes_children(head: &str) -> bool {
 /// "more digits" (1/3 prints all 16) and the only choice that makes
 /// invariant 1 exact: re-parsing the export cannot drift the geometry.
 pub fn num(x: f64) -> String {
+    // `inf` and `nan` are not literals in this language — spelling them that
+    // way made the export re-import as two unbound identifiers, i.e. undef,
+    // and the shape changed or vanished. These forms are expressions that
+    // re-evaluate to the same non-finite value, so invariant 1 holds even
+    // for a design that computed one.
     if x.is_nan() {
-        return "nan".into();
+        return "(0/0)".into();
     }
     if x.is_infinite() {
-        return if x < 0.0 { "-inf".into() } else { "inf".into() };
+        return if x < 0.0 { "-1e999".into() } else { "1e999".into() };
     }
     // Rust's Display for f64 is the shortest round-tripping form and
     // already prints integral values without a decimal point (5, not 5.0).
@@ -245,10 +250,18 @@ pub fn builtin_head(module: &str, b: &HashMap<String, Value>, f: Frags) -> Optio
 
     let head = match module {
         "cube" => {
+            // Exactly the renderer's acceptance rule. Coercing a value the
+            // renderer REJECTS used to export a unit cube for a statement
+            // that drew nothing; returning None here records the empty
+            // operand the renderer actually produced.
             let size = match b.get("size") {
                 Some(Value::Num(s)) => [*s, *s, *s],
-                Some(v) => v.as_vec3().unwrap_or([1.0, 1.0, 1.0]),
-                None => [1.0, 1.0, 1.0],
+                Some(Value::Undef) | None => [1.0, 1.0, 1.0],
+                Some(v @ Value::Vector(_)) => match v.as_vec3() {
+                    Some(s) => s,
+                    None => return None,
+                },
+                Some(_) => return None,
             };
             format!(
                 "cube(size = [{}, {}, {}], center = {})",
@@ -279,12 +292,19 @@ pub fn builtin_head(module: &str, b: &HashMap<String, Value>, f: Frags) -> Optio
             num(num_of("convexity").unwrap_or(1.0))
         ),
         "square" => {
+            // The renderer requires EXACTLY two numeric components; accepting
+            // len() >= 2 here exported a square for `square([4,5,6])`, which
+            // the renderer rejects.
             let size = match b.get("size") {
                 Some(Value::Num(s)) => [*s, *s],
-                Some(Value::Vector(items)) if items.len() >= 2 => {
-                    [items[0].as_num().unwrap_or(1.0), items[1].as_num().unwrap_or(1.0)]
+                Some(Value::Undef) | None => [1.0, 1.0],
+                Some(Value::Vector(items)) if items.len() == 2 => {
+                    match (items[0].as_num(), items[1].as_num()) {
+                        (Some(x), Some(y)) => [x, y],
+                        _ => return None,
+                    }
                 }
-                _ => [1.0, 1.0],
+                Some(_) => return None,
             };
             format!(
                 "square(size = [{}, {}], center = {})",
@@ -314,41 +334,17 @@ pub fn builtin_head(module: &str, b: &HashMap<String, Value>, f: Frags) -> Optio
             string(&str_of("valign").unwrap_or_else(|| "baseline".into())),
             f.spell()
         ),
-        "surface" => format!(
-            "surface(file = {}, center = {}, convexity = {})",
-            string(&str_of("file").unwrap_or_default()),
-            bool_of("center", false),
-            num(num_of("convexity").unwrap_or(1.0))
-        ),
-        "import" | "import_stl" | "import_off" | "import_dxf" => format!(
-            "import(file = {}, layer = {}, convexity = {}, $fn = {}, $fa = {}, $fs = {})",
-            string(&str_of("file").unwrap_or_default()),
-            b.get("layer").map(value).unwrap_or_else(|| "undef".into()),
-            num(num_of("convexity").unwrap_or(1.0)),
-            num(f.fn_),
-            num(f.fa),
-            num(f.fs)
-        ),
         "union" | "difference" | "intersection" | "hull" | "group" => format!("{}()", module),
         "minkowski" => {
             format!("minkowski(convexity = {})", num(num_of("convexity").unwrap_or(1.0)))
         }
         "render" => format!("render(convexity = {})", num(num_of("convexity").unwrap_or(1.0))),
-        "linear_extrude" => format!(
-            "linear_extrude(height = {}, center = {}, convexity = {}, twist = {}, \
-             slices = {}, scale = {}, {})",
-            num(num_of("height").unwrap_or(100.0)),
-            bool_of("center", false),
-            num(num_of("convexity").unwrap_or(1.0)),
-            num(num_of("twist").unwrap_or(0.0)),
-            num(num_of("slices").unwrap_or(1.0)),
-            match b.get("scale") {
-                Some(Value::Num(s)) => format!("[{}, {}]", num(*s), num(*s)),
-                Some(v @ Value::Vector(_)) => value(v),
-                _ => "[1, 1]".into(),
-            },
-            f.spell()
-        ),
+        // linear_extrude, surface and import are recorded from eval.rs
+        // instead: their heads carry values the renderer RESOLVED (the
+        // $fa-derived slice count, `invert`, `dpi`) which are not recoverable
+        // from the bound arguments alone.
+        "linear_extrude" | "surface" | "import" | "import_stl" | "import_off"
+        | "import_dxf" => return None,
         "rotate_extrude" => format!(
             "rotate_extrude(angle = {}, convexity = {}, {})",
             num(num_of("angle").unwrap_or(360.0)),
@@ -379,6 +375,63 @@ pub fn builtin_head(module: &str, b: &HashMap<String, Value>, f: Frags) -> Optio
         _ => return None,
     };
     Some(head)
+}
+
+/// The `linear_extrude` head, built from the values the sweep actually used.
+/// `slices` in particular is derived from $fa when `twist` is set and `slices`
+/// omitted, so it cannot be read off the arguments.
+pub fn linear_extrude_head(
+    height: f64,
+    center: bool,
+    convexity: f64,
+    twist: f64,
+    slices: f64,
+    scale: [f64; 2],
+    f: Frags,
+) -> String {
+    format!(
+        "linear_extrude(height = {}, center = {}, convexity = {}, twist = {}, \
+         slices = {}, scale = [{}, {}], {})",
+        num(height),
+        center,
+        num(convexity),
+        num(twist),
+        num(slices),
+        num(scale[0]),
+        num(scale[1]),
+        f.spell()
+    )
+}
+
+/// The `surface()` head. `invert` flips the height field, so dropping it
+/// exported a different solid than the one rendered.
+pub fn surface_head(file: &str, center: bool, invert: bool, convexity: f64) -> String {
+    format!(
+        "surface(file = {}, center = {}, invert = {}, convexity = {})",
+        string(file),
+        center,
+        invert,
+        num(convexity)
+    )
+}
+
+/// The `import()` head. `dpi` converts SVG user units to mm, so dropping it
+/// rescaled every non-default-dpi import by dpi/96 on re-import.
+pub fn import_head(
+    file: &str,
+    layer: Option<&Value>,
+    convexity: f64,
+    dpi: f64,
+    f: Frags,
+) -> String {
+    format!(
+        "import(file = {}, layer = {}, convexity = {}, dpi = {}, {})",
+        string(file),
+        layer.map(value).unwrap_or_else(|| "undef".into()),
+        num(convexity),
+        num(dpi),
+        f.spell()
+    )
 }
 
 /// The `color()` head, built from the already-resolved RGBA. `color()` with
@@ -416,9 +469,14 @@ mod tests {
         // "more digits than echo's %g": echo would print 0.333333.
         assert_eq!(num(1.0 / 3.0), "0.3333333333333333");
         assert_eq!(num(1.0 / 3.0).parse::<f64>().unwrap(), 1.0 / 3.0);
-        assert_eq!(num(f64::INFINITY), "inf");
-        assert_eq!(num(f64::NEG_INFINITY), "-inf");
-        assert_eq!(num(f64::NAN), "nan");
+        // Non-finite values must come back as EXPRESSIONS the lexer can
+        // read, not as the words inf/nan — those re-import as unbound
+        // identifiers, i.e. undef, and silently change the design.
+        assert_eq!(num(f64::INFINITY), "1e999");
+        assert_eq!(num(f64::NEG_INFINITY), "-1e999");
+        assert_eq!(num(f64::NAN), "(0/0)");
+        assert!(num(f64::INFINITY).parse::<f64>().unwrap().is_infinite());
+        assert!(num(f64::NEG_INFINITY).parse::<f64>().unwrap() < 0.0);
     }
 
     #[test]

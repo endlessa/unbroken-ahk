@@ -165,7 +165,12 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
     let mut warnings = Vec::new();
     let mut contours: Vec<Vec<[f64; 2]>> = Vec::new();
     let mut segs: Vec<([f64; 2], [f64; 2])> = Vec::new();
-    let mut unsupported: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // A BTreeSet, not a HashSet: these names are iterated straight into the
+    // diagnostic stream, and HashSet's iteration order is seeded randomly per
+    // process — the .echo export of one DXF import came out in a different
+    // order on five of six runs. Anything whose iteration reaches output has
+    // to be ordered. (Same defect class as the convex_hull horizon.)
+    let mut unsupported: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     // DXF is a stream of (group-code, value) line pairs.
     let mut pairs: Vec<(i64, String)> = Vec::new();
@@ -292,7 +297,7 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
     }
     // Stitch the loose segments (LINE / ARC / open polylines) into closed loops.
     contours.extend(stitch_loops(&segs));
-    for u in unsupported {
+    for u in &unsupported {
         warnings.push(format!("WARNING: DXF entity '{}' is not supported; skipped.", u));
     }
     (Poly2::new(contours), warnings)
