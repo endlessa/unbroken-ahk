@@ -696,18 +696,41 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64, join:
     let subs = segs;
 
     // ---- TRIM ----
-    // A sub-segment survives iff its midpoint lies ON the dilated region's
-    // boundary rather than strictly inside it. Round tests that exactly, by
-    // distance: the round dilation is the Minkowski sum with a disc of radius
-    // r, so "inside" is "closer to the input than r". The straight joins are
-    // not a Minkowski sum, so they test membership of the union of pieces the
-    // corner cap actually produced.
+    // A sub-segment survives iff it lies ON the dilated region's boundary
+    // rather than inside it.
+    //
+    // ROUND tests that directly, by distance: the round dilation IS the
+    // Minkowski sum with a disc of radius r, so "inside" is "closer to the
+    // input than r".
+    //
+    // The STRAIGHT joins are not a Minkowski sum of anything, so their region
+    // has to be described the way it is built — the input, plus one slab per
+    // edge, plus one cap per convex corner. But asking "is the midpoint
+    // strictly inside SOME piece?" is the wrong question, and it cost a
+    // release: a point can be interior to the UNION while sitting on the
+    // shared boundary of two pieces, strictly inside neither. On a plus-sign
+    // at delta = 6 the offset of one arm's side lands exactly on the line of
+    // the next arm's end; four such points survived that should have been
+    // trimmed, and the single contour shattered into four disjoint slivers
+    // with half the area gone. That is the same tangency blind spot that
+    // sank the boolean implementation, one layer down.
+    //
+    // So probe the OUTWARD SIDE instead. The raw curve is oriented
+    // material-on-left, so a sub-segment's outward direction is its own right
+    // normal; the segment is on the boundary exactly when a point just
+    // outside it is covered by nothing. Shared piece boundaries stop
+    // mattering, because the probe lands clear of them.
     let eps = 4.0 * snap_tol;
     let pieces = if join == Join::Round {
         Vec::new()
     } else {
         build_pieces(&polys, r, steps_per_turn, join)
     };
+    // The probe steps far enough to clear the snapping noise, and the
+    // membership tests are CLOSED (a negative margin) so a probe that lands
+    // back on a piece edge still counts as covered.
+    let probe_step = eps;
+    let closed = -0.25 * snap_tol;
     let mut kept: Vec<(u32, u32)> = Vec::new();
     for s in &subs {
         let a = coord(&reg, s.a); let b = coord(&reg, s.b);
@@ -721,8 +744,17 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64, join:
         let keep = if join == Join::Round {
             signed_dist(&polys, m) >= r - eps
         } else {
-            signed_dist(&polys, m) >= -eps
-                && !pieces.iter().any(|p| strictly_inside(p, m, eps))
+            let d = sub(b, a);
+            let l = norm(d);
+            if l <= 0.0 {
+                false
+            } else {
+                let out = [d[1] / l, -d[0] / l]; // right normal = outward
+                let probe = add(m, scl(out, probe_step));
+                let covered = signed_dist(&polys, probe) <= -closed
+                    || pieces.iter().any(|q| strictly_inside(q, probe, closed));
+                !covered
+            }
         };
         if keep { kept.push((s.a, s.b)); }
     }
@@ -982,6 +1014,68 @@ mod tests {
                     bad * 1000 <= n,
                     "{join:?} r={r}: {bad}/{n} grid points disagree with the piece union"
                 );
+            }
+        }
+    }
+
+    /// REGRESSION, and a general net for its whole class.
+    ///
+    /// The straight-join trim used to ask "is the midpoint strictly inside
+    /// SOME piece?". A point interior to the UNION but on the shared boundary
+    /// of two pieces is strictly inside neither, so it survived. On a
+    /// plus-sign at delta = 6 — where the offset of one arm's side lands
+    /// exactly on the line of the next arm's end — four such points survived
+    /// and the contour shattered into four slivers with half the area gone.
+    ///
+    /// Rather than pin that one delta, pin the property it violated: the
+    /// offset area is a CONTINUOUS function of the offset distance, with
+    /// dA/dd equal to the offset perimeter. Sweeping delta finely, the area
+    /// may never jump. A collapse is a discontinuity, so this catches the
+    /// whole family of exact-tangency failures, not just the one found.
+    #[test]
+    fn straight_join_area_is_continuous_in_delta() {
+        let plus: Vec<P2> = vec![
+            [3.0, 3.0], [3.0, 9.0], [-3.0, 9.0], [-3.0, 3.0],
+            [-9.0, 3.0], [-9.0, -3.0], [-3.0, -3.0], [-3.0, -9.0],
+            [3.0, -9.0], [3.0, -3.0], [9.0, -3.0], [9.0, 3.0],
+        ];
+        // A comb, whose tooth width and gap width are both exact tangency
+        // distances for several deltas.
+        let comb: Vec<P2> = {
+            let mut v = vec![[-20.0, -6.0], [20.0, -6.0], [20.0, 0.0]];
+            for i in 0..5 {
+                let x = 16.0 - (i as f64) * 8.0;
+                v.push([x, 0.0]);
+                v.push([x, 10.0]);
+                v.push([x - 4.0, 10.0]);
+                v.push([x - 4.0, 0.0]);
+            }
+            v.push([-20.0, 0.0]);
+            v
+        };
+        for (name, poly) in [("plus", plus), ("comb", comb)] {
+            for join in [Join::Miter, Join::Chamfer, Join::Round] {
+                let step = 0.05;
+                let mut prev: Option<(f64, f64)> = None;
+                let mut d = 0.4;
+                while d <= 8.0 {
+                    let (out, _) = offset_polygon(&vec![poly.clone()], d, 64, join);
+                    let a = area(&out);
+                    assert!(a > 0.0, "{name}/{join:?} at delta={d}: EMPTY result");
+                    if let Some((pd, pa)) = prev {
+                        // dA/dd is the offset perimeter; 400 bounds it for
+                        // these shapes at these distances by a wide margin,
+                        // while a collapse loses hundreds of units at once.
+                        assert!(
+                            (a - pa).abs() < 400.0 * (d - pd),
+                            "{name}/{join:?}: area jumped from {pa} at delta={pd} \
+                             to {a} at delta={d} — the region collapsed"
+                        );
+                        assert!(a > pa, "{name}/{join:?}: area shrank as delta grew");
+                    }
+                    prev = Some((d, a));
+                    d += step;
+                }
             }
         }
     }
