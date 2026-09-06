@@ -197,6 +197,10 @@ struct Node {
     segs: Vec<Seg>,
 }
 
+/// Deepest the segment-BSP will recurse. A healthy tree over n segments is
+/// far shallower; this only bounds pathological input (see `build_at`).
+const MAX_BSP_DEPTH: usize = 4096;
+
 impl Node {
     fn new() -> Node {
         Node { line: None, front: None, back: None, segs: Vec::new() }
@@ -209,6 +213,24 @@ impl Node {
     }
 
     fn build(&mut self, segs: Vec<Seg>) {
+        self.build_at(segs, 0);
+    }
+
+    /// Build the tree, refusing to recurse forever.
+    ///
+    /// `split_segment`'s epsilon is absolute, so at large coordinate
+    /// magnitudes a segment can be classified as neither coplanar with the
+    /// chosen line nor cleanly on one side of it. The child then receives the
+    /// SAME set its parent had, picks the same line, and recurses until the
+    /// stack dies — `offset(delta = -4e9) circle(r = 1e10, $fn = 6)` aborted
+    /// the whole process with SIGABRT, which a user cannot even catch.
+    ///
+    /// Two guards. The no-progress check is the precise one: a partition that
+    /// moved nothing will never move anything, so the segments stay here as
+    /// coplanar rather than recursing. The depth cap is the blunt backstop for
+    /// any other path to the same place — degrading a boolean's accuracy is
+    /// always better than killing the process.
+    fn build_at(&mut self, segs: Vec<Seg>, depth: usize) {
         if segs.is_empty() {
             return;
         }
@@ -225,11 +247,21 @@ impl Node {
         }
         self.segs.extend(coplanar_front);
         self.segs.extend(coplanar_back);
+        let stuck = front.len() == segs.len() || back.len() == segs.len();
+        if depth >= MAX_BSP_DEPTH || stuck {
+            self.segs.extend(front);
+            self.segs.extend(back);
+            return;
+        }
         if !front.is_empty() {
-            self.front.get_or_insert_with(|| Box::new(Node::new())).build(front);
+            self.front
+                .get_or_insert_with(|| Box::new(Node::new()))
+                .build_at(front, depth + 1);
         }
         if !back.is_empty() {
-            self.back.get_or_insert_with(|| Box::new(Node::new())).build(back);
+            self.back
+                .get_or_insert_with(|| Box::new(Node::new()))
+                .build_at(back, depth + 1);
         }
     }
 
@@ -1011,6 +1043,27 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn erosion_survives_large_coordinates() {
+        // REGRESSION. `offset(delta = -4e9) circle(r = 1e10, $fn = 6)` aborted
+        // the process: the erosion's padded-box complement drove the
+        // segment-BSP into unbounded recursion at that coordinate magnitude.
+        for mag in [1.0e6f64, 1.0e9, 1.0e10, 1.0e12] {
+            let hex: Vec<V2> = (0..6)
+                .map(|i| {
+                    let a = std::f64::consts::PI * (i as f64) / 3.0;
+                    [mag * a.cos(), mag * a.sin()]
+                })
+                .collect();
+            let region = Poly2::new(vec![hex]);
+            let out = offset2(&region, -0.4 * mag, Join::Round, 24);
+            assert!(
+                out.contours.iter().flatten().all(|p| p.iter().all(|c| c.is_finite())),
+                "magnitude {mag}: non-finite vertices in the eroded region"
+            );
         }
     }
 

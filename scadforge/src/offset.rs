@@ -180,10 +180,28 @@ fn clean_contour(c: &[P2], tol: f64) -> Vec<P2> {
 }
 
 /// Orient contours: outer (even nesting depth) CCW, holes (odd) CW.
-fn normalize(polys: &[Vec<P2>], tol: f64) -> Vec<Vec<P2>> {
+/// `rel` is a RELATIVE cleanup tolerance, applied against each contour's own
+/// extent. It used to be one absolute distance derived from the whole
+/// region's largest coordinate, which meant a distant contour set the
+/// tolerance for a small one: `offset(r=1) { square(10); translate([1e13,0])
+/// square(10); }` derived a tolerance of 10 — the square's own edge length —
+/// and clean_contour deleted every vertex of both squares, emptying the
+/// result. Scaling each contour by itself keeps the operation local.
+fn normalize(polys: &[Vec<P2>], rel: f64) -> Vec<Vec<P2>> {
     let cleaned: Vec<Vec<P2>> = polys.iter()
-        .map(|c| clean_contour(c, tol))
-        .filter(|c| c.len() >= 3 && signed_area(c).abs() > tol * tol)
+        .map(|c| {
+            let mut lo = [f64::INFINITY; 2];
+            let mut hi = [f64::NEG_INFINITY; 2];
+            for p in c {
+                lo[0] = lo[0].min(p[0]); lo[1] = lo[1].min(p[1]);
+                hi[0] = hi[0].max(p[0]); hi[1] = hi[1].max(p[1]);
+            }
+            let span = (hi[0] - lo[0]).abs().max((hi[1] - lo[1]).abs());
+            let tol = if span.is_finite() && span > 0.0 { span * rel } else { rel };
+            (clean_contour(c, tol), tol)
+        })
+        .filter(|(c, tol)| c.len() >= 3 && signed_area(c).abs() > tol * tol)
+        .map(|(c, _)| c)
         .collect();
     let depths = nesting_depths(&cleaned);
     let mut out = Vec::new();
@@ -587,7 +605,7 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64, join:
     // smallest raw feature (arc chord ~ r*2pi/steps, and the shortest source
     // edge) yet comfortably above the conditioning error of near-tangential
     // intersections, which is ~1e-7 relative for this construction.
-    let polys = normalize(input, scale * 1e-12);
+    let polys = normalize(input, 1e-12);
     // The tolerance is a fraction of the FEATURE SIZE -- the shortest source
     // edge and the arc chord length (NOT the shortest raw segment, which is
     // legitimately tiny: arc remainders, near-straight reflex joins).  Making
@@ -599,7 +617,12 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64, join:
         for i in 0..n { feature = feature.min(norm(sub(c[(i + 1) % n], c[i]))); }
     }
     if !(feature > 0.0) { feature = scale; }
-    let snap_tol = (feature * mul).max(scale * 1e-13);
+    // The floor keeps the tolerance above genuine float noise at these
+    // coordinate magnitudes — 8 ULPs of the largest coordinate. It used to be
+    // scale*1e-13, which at a 1e13 coordinate demanded a tolerance of 1.0 and
+    // dissolved a 10-unit square placed out there; 8 ULPs is 0.018, which is
+    // above the real representable precision and far below any feature.
+    let snap_tol = (feature * mul).max(scale * f64::EPSILON * 8.0);
     let raw = build_raw(&polys, r, steps_per_turn, join);
     let mut reg = Registry::new(snap_tol);
 
@@ -853,7 +876,14 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64, join:
         }
         if pts.len() >= 3 {
             let a = signed_area(&pts);
-            if a.abs() > 1e-9 { contours.push(pts); }
+            // The floor is the snapping tolerance squared — the area of the
+            // smallest sliver snapping can manufacture. It must track the
+            // FEATURE size, not the bounding box: an absolute 1e-9 made the
+            // operation scale-dependent (`offset(r=1e-6) square(1e-5)`, true
+            // area 4.8e-10, was silently annihilated), and a bbox-relative
+            // floor is just as wrong the other way (two 10-unit squares 1e11
+            // apart give a floor of 1e4, which discards both).
+            if a.abs() > snap_tol * snap_tol { contours.push(pts); }
         }
     }
 
@@ -1015,6 +1045,64 @@ mod tests {
                     "{join:?} r={r}: {bad}/{n} grid points disagree with the piece union"
                 );
             }
+        }
+    }
+
+    /// The operation must be SCALE-INVARIANT: offsetting a shape magnified by
+    /// 10^k, by a distance magnified by 10^k, must give 10^2k the area. Two
+    /// hard-coded tolerances broke that in opposite directions — an absolute
+    /// 1e-9 area floor annihilated `offset(r=1e-6) square(1e-5)`, and a
+    /// bounding-box-relative cleanup tolerance let one distant contour set the
+    /// tolerance for a small one, emptying BOTH.
+    #[test]
+    fn offset_is_scale_invariant() {
+        let unit: Vec<P2> = vec![[0.0, 0.0], [3.0, 0.0], [3.0, 2.0], [1.0, 2.0],
+                                 [1.0, 1.0], [0.0, 1.0]];
+        let mut reference: Option<f64> = None;
+        for k in [-6i32, -4, -2, 0, 2, 4, 6] {
+            let f = 10f64.powi(k);
+            let poly: Vec<P2> = unit.iter().map(|p| [p[0] * f, p[1] * f]).collect();
+            for join in [Join::Round, Join::Miter, Join::Chamfer] {
+                let (out, _) = offset_polygon(&vec![poly.clone()], 0.4 * f, 64, join);
+                let a = area(&out) / (f * f);
+                assert!(a > 0.0, "scale 1e{k} {join:?}: EMPTY");
+                if join == Join::Round {
+                    match reference {
+                        None => reference = Some(a),
+                        Some(r0) => assert!(
+                            (a - r0).abs() / r0 < 1e-6,
+                            "scale 1e{k}: normalized area {a} != {r0} at scale 1"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A distant contour must not change what happens to a near one. The
+    /// cleanup tolerance was derived from the whole region's largest
+    /// coordinate, so a square parked at x=1e13 set a tolerance of 10 — its
+    /// neighbour's entire edge length — and both squares vanished.
+    #[test]
+    fn a_distant_contour_does_not_dissolve_its_neighbour() {
+        let sq = |dx: f64| -> Vec<P2> {
+            vec![[dx, 0.0], [dx + 10.0, 0.0], [dx + 10.0, 10.0], [dx, 10.0]]
+        };
+        let alone = area(&offset_polygon(&vec![sq(0.0)], 1.0, 64, Join::Round).0);
+        for sep in [1e6f64, 1e9, 1e11, 1e13, 1e14] {
+            let (out, _) = offset_polygon(&vec![sq(0.0), sq(sep)], 1.0, 64, Join::Round);
+            assert_eq!(out.len(), 2, "separation {sep}: expected two contours");
+            let both = area(&out);
+            // The tolerance has to grow with the separation: at x=1e13 one
+            // ULP is 2mm, so the arc points of a 10-unit square out there
+            // genuinely cannot be placed more precisely than that. What this
+            // test guards against is DISSOLUTION — a 100% error — not the
+            // last few digits.
+            let tol = 1e-6 + sep * f64::EPSILON;
+            assert!(
+                (both - 2.0 * alone).abs() / (2.0 * alone) < tol,
+                "separation {sep}: area {both}, expected {}", 2.0 * alone
+            );
         }
     }
 

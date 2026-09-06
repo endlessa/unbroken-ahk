@@ -227,6 +227,10 @@ struct Node {
     polygons: Vec<Polygon>,
 }
 
+/// Deepest the BSP will recurse. A balanced tree over n facets is far
+/// shallower; this only bounds pathological input (see `build_at`).
+const MAX_BSP_DEPTH: usize = 4096;
+
 impl Node {
     fn new() -> Node {
         Node { plane: None, front: None, back: None, polygons: Vec::new() }
@@ -240,6 +244,23 @@ impl Node {
 
     /// Add polygons, splitting them into this node's half-spaces.
     fn build(&mut self, polygons: Vec<Polygon>) {
+        self.build_at(polygons, 0);
+    }
+
+    /// Build the tree, refusing to recurse forever.
+    ///
+    /// `split_polygon`'s epsilon is absolute, so at large coordinate
+    /// magnitudes a facet can be classified as neither coplanar with the
+    /// chosen plane nor cleanly on one side of it. The child then receives
+    /// the SAME set its parent had and recurses until the stack dies:
+    /// `difference() { cube(1e9, center=true); sphere(r=0.6e9, $fn=12); }`
+    /// aborted the whole process with SIGABRT — and a model measured in
+    /// microns reaches 1e9 without trying.
+    ///
+    /// The no-progress check is the precise guard (a partition that moved
+    /// nothing never will); the depth cap is the backstop for any other route
+    /// to the same place. Degrading a boolean beats killing the process.
+    fn build_at(&mut self, polygons: Vec<Polygon>, depth: usize) {
         if polygons.is_empty() {
             return;
         }
@@ -269,11 +290,21 @@ impl Node {
         // Coplanar facets (either orientation) live at this node.
         self.polygons.extend(coplanar_front);
         self.polygons.extend(coplanar_back);
+        let stuck = front.len() == polygons.len() || back.len() == polygons.len();
+        if depth >= MAX_BSP_DEPTH || stuck {
+            self.polygons.extend(front);
+            self.polygons.extend(back);
+            return;
+        }
         if !front.is_empty() {
-            self.front.get_or_insert_with(|| Box::new(Node::new())).build(front);
+            self.front
+                .get_or_insert_with(|| Box::new(Node::new()))
+                .build_at(front, depth + 1);
         }
         if !back.is_empty() {
-            self.back.get_or_insert_with(|| Box::new(Node::new())).build(back);
+            self.back
+                .get_or_insert_with(|| Box::new(Node::new()))
+                .build_at(back, depth + 1);
         }
     }
 
@@ -1176,6 +1207,30 @@ mod tests {
         let mut reversed = pts.clone();
         reversed.reverse();
         assert_eq!(base, canonical(&convex_hull(&reversed)), "reversing the input changed the hull");
+    }
+
+    #[test]
+    fn booleans_survive_large_coordinates() {
+        // REGRESSION. `difference() { cube(1e9, center=true); sphere(0.6e9); }`
+        // aborted the PROCESS with a stack overflow: split_polygon's epsilon
+        // is absolute, so at that magnitude a facet is neither coplanar with
+        // the chosen plane nor cleanly on one side, and build() handed the
+        // same set to a child forever. A model measured in microns reaches
+        // 1e9 without trying. Accuracy may degrade out here; aborting may not.
+        for mag in [1.0e6f64, 1.0e9, 1.0e10, 1.0e13] {
+            let mut cube = geom::cube([mag, mag, mag], true);
+            let mut ball = geom::sphere(0.6 * mag, 12);
+            // Nudge both off-origin too — the same defect showed up there.
+            for p in cube.positions.iter_mut().chain(ball.positions.iter_mut()) {
+                p[0] += mag * 0.5;
+            }
+            let out = difference(&cube, &[ball]);
+            assert!(!out.tris.is_empty(), "magnitude {mag}: difference came back empty");
+            assert!(
+                out.positions.iter().all(|p| p.iter().all(|c| c.is_finite())),
+                "magnitude {mag}: non-finite vertices"
+            );
+        }
     }
 
     // ---- Refuter #1 adversarial probes for convex_hull correctness ----
