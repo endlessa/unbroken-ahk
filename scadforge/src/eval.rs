@@ -63,6 +63,21 @@ impl Shape {
     }
 }
 
+/// Which buffer the next line of the console stream comes from.
+///
+/// `echoes` and `warnings` are kept as separate vectors because the web API
+/// reports them separately, but the reference is explicit that the console is
+/// ONE stream: "Messages are emitted in depth-first instantiation/evaluation
+/// order, interleaved with ECHO lines". Two independent vectors cannot express
+/// that — a warning raised between two echoes always sorted after both, so the
+/// `.echo` export could never match a reference stream once any warning fired.
+/// This records the interleaving alongside them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Chan {
+    Echo,
+    Diag,
+}
+
 #[derive(Debug, Default)]
 pub struct EvalOutput {
     pub shapes: Vec<Shape>,
@@ -74,6 +89,9 @@ pub struct EvalOutput {
     /// A fatal diagnostic (assert failure, recursion limit): evaluation
     /// halted here; shapes/echoes hold everything produced before it.
     pub error: Option<String>,
+    /// Emission order across `echoes` and `warnings`, oldest first. Walking
+    /// it with a cursor into each vector reconstructs the real console.
+    pub order: Vec<Chan>,
     /// The evaluated instantiation tree, recorded only when the run asked
     /// for it (`evaluate_recording`). `None` on a normal render.
     pub csg: Option<crate::csgfmt::CsgNode>,
@@ -84,8 +102,21 @@ pub struct EvalOutput {
 /// Resolve include/use directives (paths relative to `base_dir`) and then
 /// evaluate. Resolution warnings (missing include/use files) are prepended to
 /// the diagnostic stream; a parse error in the resolved source is fatal.
+/// Evaluate for the interactive preview: `$preview` is true, the tree is not
+/// recorded. This is the web viewport's path.
 pub fn evaluate_source(source: &str, base_dir: &std::path::Path) -> EvalOutput {
-    evaluate_source_for(source, base_dir, false)
+    evaluate_source_for(source, base_dir, false, Mode::Preview)
+}
+
+/// Which mode the pipeline is running in. The reference binds `$preview` from
+/// this: true for the F5-style preview, false for "F6 render and CLI mesh/2D
+/// exports". It was hard-coded true, so the very common idiom
+/// `$fn = $preview ? 24 : 120;` exported the COARSE mesh — a print-quality bug
+/// that leaves no trace in the output file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Mode {
+    Preview,
+    Render,
 }
 
 /// `evaluate_source`, optionally recording the instantiation tree for the
@@ -94,36 +125,52 @@ pub fn evaluate_source_for(
     source: &str,
     base_dir: &std::path::Path,
     record_csg: bool,
+    mode: Mode,
 ) -> EvalOutput {
     let resolved = crate::preproc::resolve(source, base_dir);
     if let Some(err) = resolved.error {
-        return EvalOutput { error: Some(err), warnings: resolved.warnings, ..Default::default() };
+        let n = resolved.warnings.len();
+        let mut out = EvalOutput {
+            error: Some(err),
+            warnings: resolved.warnings,
+            order: vec![Chan::Diag; n],
+            ..Default::default()
+        };
+        stamp_error(&mut out);
+        return out;
     }
-    let mut out = evaluate_maybe_recording(&resolved.program, record_csg);
+    let mut out = evaluate_maybe_recording(&resolved.program, record_csg, mode);
     if !resolved.warnings.is_empty() {
+        // These are raised before evaluation begins, so they lead the stream —
+        // and `order` has to be shifted with them or every index after the
+        // prepend points at the wrong line.
+        let n = resolved.warnings.len();
         let mut w = resolved.warnings;
         w.append(&mut out.warnings);
         out.warnings = w;
+        let mut o = vec![Chan::Diag; n];
+        o.append(&mut out.order);
+        out.order = o;
     }
     out
 }
 
 pub fn evaluate(program: &[Stmt]) -> EvalOutput {
-    evaluate_maybe_recording(program, false)
+    evaluate_maybe_recording(program, false, Mode::Preview)
 }
 
 /// Evaluate while recording the instantiation tree for `.csg` export. The
 /// geometry kernel still runs (so one code path serves both modes and the
 /// tree can never disagree with the render); only the tree is extra.
 pub fn evaluate_recording(program: &[Stmt]) -> EvalOutput {
-    evaluate_maybe_recording(program, true)
+    evaluate_maybe_recording(program, true, Mode::Render)
 }
 
-fn evaluate_maybe_recording(program: &[Stmt], record: bool) -> EvalOutput {
+fn evaluate_maybe_recording(program: &[Stmt], record: bool, mode: Mode) -> EvalOutput {
     std::thread::scope(|s| {
         let handle = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
-            .spawn_scoped(s, || evaluate_inner(program, record))
+            .spawn_scoped(s, || evaluate_inner(program, record, mode))
             .expect("failed to spawn the evaluator thread");
         handle.join().unwrap_or_else(|_| EvalOutput {
             error: Some("ERROR: the evaluator crashed (please report this script)".into()),
@@ -132,7 +179,7 @@ fn evaluate_maybe_recording(program: &[Stmt], record: bool) -> EvalOutput {
     })
 }
 
-fn evaluate_inner(program: &[Stmt], record: bool) -> EvalOutput {
+fn evaluate_inner(program: &[Stmt], record: bool, mode: Mode) -> EvalOutput {
     let mut ctx = Ctx {
         out: EvalOutput::default(),
         dynv: DynScope::root(),
@@ -141,7 +188,12 @@ fn evaluate_inner(program: &[Stmt], record: bool) -> EvalOutput {
         fn_depth: 0,
         cycle_scopes: Vec::new(),
         csg: record.then(|| vec![CsgFrame { head: Some("group()".into()), nodes: Vec::new() }]),
+        clamp_warned: Vec::new(),
     };
+    ctx.dynv
+        .vars
+        .borrow_mut()
+        .insert("$preview".into(), Value::Bool(mode == Mode::Preview));
     let root = Scope::root();
     let mut shapes = exec_scope(program, &root, &mut ctx);
     // Root modifier (`!`): if any shape is root-marked, the design shows ONLY
@@ -182,7 +234,21 @@ fn evaluate_inner(program: &[Stmt], record: bool) -> EvalOutput {
             *w = format!("WARNING: {}", w);
         }
     }
+    stamp_error(&mut ctx.out);
     ctx.out
+}
+
+/// Class-prefix the fatal diagnostic, if any. Runtime fatals (assert,
+/// recursion) build their own `ERROR:` inline, but parse and lex failures
+/// arrive from `preproc` as bare text — so `^ERROR:` matched every assert
+/// failure and no syntax error at all, which is exactly backwards for anything
+/// grepping the stream.
+fn stamp_error(out: &mut EvalOutput) {
+    if let Some(e) = &mut out.error {
+        if !(e.starts_with("ERROR:") || e.starts_with("WARNING:")) {
+            *e = format!("ERROR: {}", e);
+        }
+    }
 }
 
 /// Would storing `v` in `scope` close an Rc cycle? Only if some function
@@ -362,6 +428,9 @@ struct Ctx {
     /// render: the hooks below all short-circuit, so recording costs
     /// nothing when it is off.
     csg: Option<Vec<CsgFrame>>,
+    /// `$fa`/`$fs` names already reported as clamped, so the warning is
+    /// raised once per run rather than once per instantiation.
+    clamp_warned: Vec<String>,
 }
 
 impl Ctx {
@@ -373,6 +442,26 @@ impl Ctx {
         if self.out.error.is_none() {
             self.out.error = Some(msg);
         }
+    }
+
+    /// Record a diagnostic, keeping its position in the console stream.
+    /// Every warning goes through here so the interleaving with ECHO lines
+    /// cannot drift.
+    fn warn(&mut self, msg: impl Into<String>) {
+        self.out.warnings.push(msg.into());
+        self.out.order.push(Chan::Diag);
+    }
+
+    fn warn_all<I: IntoIterator<Item = String>>(&mut self, msgs: I) {
+        for m in msgs {
+            self.warn(m);
+        }
+    }
+
+    /// Record an ECHO line, keeping its position in the console stream.
+    fn echo_line(&mut self, line: String) {
+        self.out.echoes.push(line);
+        self.out.order.push(Chan::Echo);
     }
 
     // -- .csg recording -----------------------------------------------
@@ -507,9 +596,7 @@ fn build_scope(stmts: &[Stmt], parent: &Rc<Scope>, ctx: &mut Ctx) -> Rc<Scope> {
                     )
                     .is_some()
                 {
-                    ctx.out
-                        .warnings
-                        .push(format!("module {}() was redefined; the last definition wins", name));
+                    ctx.warn(format!("module {}() was redefined; the last definition wins", name));
                 }
             }
             Stmt::FunctionDef { name, params, body } => {
@@ -520,9 +607,7 @@ fn build_scope(stmts: &[Stmt], parent: &Rc<Scope>, ctx: &mut Ctx) -> Rc<Scope> {
                     )
                     .is_some()
                 {
-                    ctx.out
-                        .warnings
-                        .push(format!("function {}() was redefined; the last definition wins", name));
+                    ctx.warn(format!("function {}() was redefined; the last definition wins", name));
                 }
             }
             _ => {}
@@ -546,7 +631,7 @@ fn eval_slots(stmts: &[Stmt], scope: &Rc<Scope>, ctx: &mut Ctx) {
     for stmt in stmts {
         if let Stmt::Assign { name, value } = stmt {
             if winning.insert(name.as_str(), value).is_some() {
-                ctx.out.warnings.push(format!("variable '{}' was reassigned", name));
+                ctx.warn(format!("variable '{}' was reassigned", name));
             } else {
                 order.push(name.as_str());
             }
@@ -664,8 +749,8 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
         }
         Stmt::Let { bindings, body, deprecated_assign } => {
             if *deprecated_assign {
-                ctx.out.warnings.push(
-                    "DEPRECATED: Assign is deprecated. Use a regular assignment instead.".into(),
+                ctx.warn(
+                    "DEPRECATED: Assign is deprecated. Use a regular assignment instead.",
                 );
             }
             let saved_dyn = ctx.dynv.clone();
@@ -797,19 +882,16 @@ fn iterate(v: &Value, ctx: &mut Ctx) -> Vec<Value> {
         Value::Range { start, step, end, implicit_step } => {
             let mut items = Vec::new();
             if *step == 0.0 || !step.is_finite() {
-                ctx.out
-                    .warnings
-                    .push("for: range step must be a nonzero finite number".into());
+                ctx.warn("for: range step must be a nonzero finite number");
                 return items;
             }
             // Legacy two-part reversed range [10:1]: DEPRECATED, bounds
             // swap and iteration ascends. The explicit-step form does
             // NOT swap — [10:1:0] simply yields zero iterations.
             let (start, end) = if *implicit_step && start > end {
-                ctx.out.warnings.push(
+                ctx.warn(
                     "DEPRECATED: using ranges of the form [begin:end] with begin \
-                     greater than end; bounds swapped"
-                        .into(),
+                     greater than end; bounds swapped",
                 );
                 (*end, *start)
             } else {
@@ -823,7 +905,7 @@ fn iterate(v: &Value, ctx: &mut Ctx) -> Vec<Value> {
                 return items;
             }
             if count > MAX_RANGE_ITEMS as f64 {
-                ctx.out.warnings.push(format!(
+                ctx.warn(format!(
                     "for: range of {} elements truncated at {}",
                     fmt_num(count),
                     MAX_RANGE_ITEMS
@@ -949,13 +1031,13 @@ fn bind_params(
             Some(n) => {
                 if params.iter().any(|p| &p.name == n) {
                     if bound.insert(params.iter().find(|p| &p.name == n).unwrap().name.as_str(), a.value.clone()).is_some() {
-                        ctx.out.warnings.push(format!(
+                        ctx.warn(format!(
                             "{}: parameter '{}' was bound more than once; the last binding wins",
                             callee, n
                         ));
                     }
                 } else {
-                    ctx.out.warnings.push(format!(
+                    ctx.warn(format!(
                         "{}: unknown parameter '{}' ignored",
                         callee, n
                     ));
@@ -972,9 +1054,7 @@ fn bind_params(
                     next_pos += 1;
                 } else if !too_many {
                     too_many = true;
-                    ctx.out
-                        .warnings
-                        .push(format!("{}: too many unnamed arguments", callee));
+                    ctx.warn(format!("{}: too many unnamed arguments", callee));
                 }
             }
         }
@@ -1009,9 +1089,7 @@ fn instantiate_children(selection: Option<&Value>, ctx: &mut Ctx) -> Vec<Shape> 
     let cctx = match ctx.children.clone() {
         Some(c) => c,
         None => {
-            ctx.out
-                .warnings
-                .push("children() called outside a module body".into());
+            ctx.warn("children() called outside a module body");
             return Vec::new();
         }
     };
@@ -1032,7 +1110,7 @@ fn instantiate_children(selection: Option<&Value>, ctx: &mut Ctx) -> Vec<Shape> 
             items.iter().map(|v| v.as_num().map(to_index).unwrap_or(-1)).collect()
         }
         Some(other) => {
-            ctx.out.warnings.push(format!(
+            ctx.warn(format!(
                 "children: index must be a number, vector, or range, got {}",
                 other.type_name()
             ));
@@ -1051,7 +1129,7 @@ fn instantiate_children(selection: Option<&Value>, ctx: &mut Ctx) -> Vec<Shape> 
             break;
         }
         if i < 0 || i as usize >= geo.len() {
-            ctx.out.warnings.push(format!(
+            ctx.warn(format!(
                 "children index ({}) out of bounds ({} children)",
                 i,
                 geo.len()
@@ -1108,7 +1186,7 @@ fn call_builtin_module(
                 },
                 Some(Value::Undef) | None => [1.0, 1.0, 1.0],
                 Some(other) => {
-                    ctx.out.warnings.push(format!(
+                    ctx.warn(format!(
                         "cube: size must be a number or vector, got {}",
                         other.type_name()
                     ));
@@ -1145,9 +1223,7 @@ fn call_builtin_module(
             let matrix = match bound.get("v").and_then(Value::as_vec3) {
                 Some(v) => Some(geom::translation(v)),
                 None => {
-                    ctx.out
-                        .warnings
-                        .push("translate: v must be a vector like [x, y, z]".into());
+                    ctx.warn("translate: v must be a vector like [x, y, z]");
                     None
                 }
             };
@@ -1158,7 +1234,7 @@ fn call_builtin_module(
                 Some(Value::Num(s)) => Some(geom::scaling([*s, *s, *s])),
                 Some(v @ Value::Vector(_)) => v.as_vec3().map(geom::scaling),
                 _ => {
-                    ctx.out.warnings.push("scale: v must be a number or vector".into());
+                    ctx.warn("scale: v must be a number or vector");
                     None
                 }
             };
@@ -1169,7 +1245,7 @@ fn call_builtin_module(
                 (Some(Value::Num(deg)), Some(axis @ Value::Vector(_))) => match axis.as_vec3() {
                     Some(axis) => Some(geom::rotation_axis(*deg, axis)),
                     None => {
-                        ctx.out.warnings.push("rotate: v must be a numeric vector".into());
+                        ctx.warn("rotate: v must be a numeric vector");
                         None
                     }
                 },
@@ -1184,7 +1260,7 @@ fn call_builtin_module(
                     }
                 },
                 _ => {
-                    ctx.out.warnings.push("rotate: missing angle".into());
+                    ctx.warn("rotate: missing angle");
                     None
                 }
             };
@@ -1193,12 +1269,12 @@ fn call_builtin_module(
         "mirror" => {
             let matrix = match bound.get("v").and_then(Value::as_vec3) {
                 Some([0.0, 0.0, 0.0]) => {
-                    ctx.out.warnings.push("mirror: v must not be the zero vector".into());
+                    ctx.warn("mirror: v must not be the zero vector");
                     Some(geom::identity()) // pass children through
                 }
                 Some(v) => Some(geom::mirror(v)),
                 None => {
-                    ctx.out.warnings.push("mirror: v must be a vector like [x, y, z]".into());
+                    ctx.warn("mirror: v must be a vector like [x, y, z]");
                     None
                 }
             };
@@ -1213,9 +1289,9 @@ fn call_builtin_module(
                         if m.iter().flatten().all(|v| v.is_finite()) {
                             Some(m)
                         } else {
-                            ctx.out.warnings.push(
+                            ctx.warn(
                                 "multmatrix: matrix contains NaN/Infinity — subtree removed"
-                                    .into(),
+                                    ,
                             );
                             None
                         }
@@ -1228,7 +1304,7 @@ fn call_builtin_module(
                     }
                 },
                 _ => {
-                    ctx.out.warnings.push("multmatrix: m must be a 4x4 (or 3x4) matrix".into());
+                    ctx.warn("multmatrix: m must be a 4x4 (or 3x4) matrix");
                     None
                 }
             };
@@ -1251,9 +1327,7 @@ fn call_builtin_module(
                     shapes
                 }
                 None => {
-                    ctx.out
-                        .warnings
-                        .push("resize: newsize must be a vector like [x, y, z]".into());
+                    ctx.warn("resize: newsize must be a vector like [x, y, z]");
                     shapes
                 }
             }
@@ -1264,14 +1338,12 @@ fn call_builtin_module(
             match (points, faces) {
                 (Some(points), Some(faces)) => {
                     let (mesh, warnings) = geom::polyhedron(&points, &faces);
-                    ctx.out.warnings.extend(warnings);
+                    ctx.warn_all(warnings);
                     no_children(name, children, ctx);
                     leaf(mesh)
                 }
                 _ => {
-                    ctx.out
-                        .warnings
-                        .push("polyhedron: expected points=[[x,y,z],...] and faces=[[i,...],...]".into());
+                    ctx.warn("polyhedron: expected points=[[x,y,z],...] and faces=[[i,...],...]");
                     Vec::new()
                 }
             }
@@ -1283,14 +1355,14 @@ fn call_builtin_module(
                     match (items[0].as_num(), items[1].as_num()) {
                         (Some(x), Some(y)) => [x, y],
                         _ => {
-                            ctx.out.warnings.push("square: size must be numeric".into());
+                            ctx.warn("square: size must be numeric");
                             return Vec::new();
                         }
                     }
                 }
                 Some(Value::Undef) | None => [1.0, 1.0],
                 _ => {
-                    ctx.out.warnings.push("square: size must be a number or [x, y]".into());
+                    ctx.warn("square: size must be a number or [x, y]");
                     return Vec::new();
                 }
             };
@@ -1315,7 +1387,7 @@ fn call_builtin_module(
                 Some(v) => match index_lists(v) {
                     Some(p) => Some(p),
                     None => {
-                        ctx.out.warnings.push("polygon: paths must be a list of index lists".into());
+                        ctx.warn("polygon: paths must be a list of index lists");
                         return Vec::new();
                     }
                 },
@@ -1323,12 +1395,12 @@ fn call_builtin_module(
             match points {
                 Some(points) => {
                     let (poly, warnings) = poly2::polygon(&points, paths.as_deref());
-                    ctx.out.warnings.extend(warnings);
+                    ctx.warn_all(warnings);
                     no_children(name, children, ctx);
                     Shape::flat(poly).into_iter().collect()
                 }
                 None => {
-                    ctx.out.warnings.push("polygon: points must be a list of [x, y]".into());
+                    ctx.warn("polygon: points must be a list of [x, y]");
                     Vec::new()
                 }
             }
@@ -1398,7 +1470,7 @@ fn call_builtin_module(
             match poly2::extrude_rotate(&poly, angle, frags) {
                 Ok((positions, tris)) => leaf(Mesh { positions, tris }),
                 Err(e) => {
-                    ctx.out.warnings.push(format!("ERROR: {}", e));
+                    ctx.warn(format!("ERROR: {}", e));
                     Vec::new()
                 }
             }
@@ -1412,7 +1484,7 @@ fn call_builtin_module(
             }
             let nverts: usize = poly.contours.iter().map(|c| c.len()).sum();
             if nverts > csg2::OFFSET_MAX_VERTS {
-                ctx.out.warnings.push(format!(
+                ctx.warn(format!(
                     "offset(): {} outline vertices exceed the preview cap ({}); reduce $fn \
                      on the children",
                     nverts,
@@ -1437,7 +1509,7 @@ fn call_builtin_module(
         }
         "import" | "import_stl" | "import_off" | "import_dxf" => {
             if name != "import" {
-                ctx.out.warnings.push(format!(
+                ctx.warn(format!(
                     "DEPRECATED: The {}() module will be removed in future releases. \
                      Use import() instead.",
                     name
@@ -1447,7 +1519,7 @@ fn call_builtin_module(
             let path = match bound.get("file").or_else(|| bound.get("filename")) {
                 Some(Value::Str(s)) => s.clone(),
                 _ => {
-                    ctx.out.warnings.push("import(): expected a file name string".into());
+                    ctx.warn("import(): expected a file name string");
                     return Vec::new();
                 }
             };
@@ -1491,9 +1563,7 @@ fn call_builtin_module(
                 }
             }
             if saw_2d {
-                ctx.out
-                    .warnings
-                    .push("Ignoring 2D child object for 3D operation".into());
+                ctx.warn("Ignoring 2D child object for 3D operation");
             }
             if combined.tris.is_empty() {
                 return Vec::new();
@@ -1502,7 +1572,7 @@ fn call_builtin_module(
             // are capped (cut is cheaper, but a huge straddling mesh still
             // stitches an unbounded number of segments).
             if combined.tris.len() > csg2::PROJECT_MAX_TRIS {
-                ctx.out.warnings.push(format!(
+                ctx.warn(format!(
                     "projection(): {} facets exceed the preview cap ({}); reduce $fn on the \
                      children",
                     combined.tris.len(),
@@ -1569,14 +1639,14 @@ fn call_builtin_module(
             let path = match bound.get("file").or_else(|| bound.get("filename")) {
                 Some(Value::Str(s)) => s.clone(),
                 _ => {
-                    ctx.out.warnings.push("WARNING: surface(): expected a file name string".into());
+                    ctx.warn("WARNING: surface(): expected a file name string");
                     return Vec::new();
                 }
             };
             let text = match sandboxed_path(&path).and_then(|p| std::fs::read_to_string(p).ok()) {
                 Some(t) => t,
                 None => {
-                    ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                    ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
                     return Vec::new();
                 }
             };
@@ -1599,9 +1669,7 @@ fn call_builtin_module(
                 Some(Value::Str(s)) => s.clone(),
                 Some(Value::Undef) | None => return Vec::new(),
                 Some(_) => {
-                    ctx.out
-                        .warnings
-                        .push("WARNING: text(): text argument must be a string".into());
+                    ctx.warn("WARNING: text(): text argument must be a string");
                     return Vec::new();
                 }
             };
@@ -1615,7 +1683,7 @@ fn call_builtin_module(
             let valign = as_string(bound.get("valign"));
             if let Some(h) = &halign {
                 if !matches!(h.as_str(), "left" | "center" | "right") {
-                    ctx.out.warnings.push(format!(
+                    ctx.warn(format!(
                         "WARNING: text(): unknown halign '{}'; using \"left\".",
                         h
                     ));
@@ -1623,7 +1691,7 @@ fn call_builtin_module(
             }
             if let Some(v) = &valign {
                 if !matches!(v.as_str(), "baseline" | "top" | "center" | "bottom") {
-                    ctx.out.warnings.push(format!(
+                    ctx.warn(format!(
                         "WARNING: text(): unknown valign '{}'; using \"baseline\".",
                         v
                     ));
@@ -1637,7 +1705,7 @@ fn call_builtin_module(
         "dxf_linear_extrude" | "dxf_rotate_extrude" => {
             // Deprecated aliases: extrude a DXF file loaded via file=/layer=.
             let modern = if name == "dxf_linear_extrude" { "linear_extrude" } else { "rotate_extrude" };
-            ctx.out.warnings.push(format!(
+            ctx.warn(format!(
                 "DEPRECATED: The {}() module will be removed in future releases. Use {}() instead.",
                 name, modern
             ));
@@ -1671,7 +1739,7 @@ fn call_builtin_module(
                 match poly2::extrude_rotate(&poly, 360.0, frags) {
                     Ok((positions, tris)) => leaf(Mesh { positions, tris }),
                     Err(e) => {
-                        ctx.out.warnings.push(format!("ERROR: {}", e));
+                        ctx.warn(format!("ERROR: {}", e));
                         Vec::new()
                     }
                 }
@@ -1697,9 +1765,9 @@ fn call_builtin_module(
                 }
                 shapes
             } else if any_2d(&groups) {
-                ctx.out.warnings.push(
+                ctx.warn(
                     "difference(): mixing 2D and 3D children is unsupported — shown un-combined"
-                        .into(),
+                        ,
                 );
                 groups.into_iter().flatten().collect()
             } else {
@@ -1736,9 +1804,9 @@ fn call_builtin_module(
                 }
                 shapes
             } else if any_2d(&groups) {
-                ctx.out.warnings.push(
+                ctx.warn(
                     "intersection(): mixing 2D and 3D children is unsupported — shown un-combined"
-                        .into(),
+                        ,
                 );
                 groups.into_iter().flatten().collect()
             } else {
@@ -1762,15 +1830,15 @@ fn call_builtin_module(
                 return Shape::flat(csg2::hull2(&regions)).into_iter().collect();
             }
             if any_2d(&groups) {
-                ctx.out.warnings.push(
-                    "hull(): mixing 2D and 3D children is unsupported — shown un-combined".into(),
+                ctx.warn(
+                    "hull(): mixing 2D and 3D children is unsupported — shown un-combined",
                 );
                 return groups.into_iter().flatten().collect();
             }
             let meshes: Vec<Mesh> = groups.into_iter().flatten().map(|s| s.mesh).collect();
             let n: usize = meshes.iter().map(|m| m.positions.len()).sum();
             if n > csg::HULL_MAX_POINTS {
-                ctx.out.warnings.push(format!(
+                ctx.warn(format!(
                     "hull(): {} vertices exceed the preview cap ({}); reduce $fn on the \
                      children",
                     n,
@@ -1792,16 +1860,15 @@ fn call_builtin_module(
                     groups.iter().flatten().filter_map(|s| s.outline.clone()).collect();
                 let nonempty = regions.iter().filter(|r| !r.is_empty()).count();
                 if nonempty >= 2 {
-                    ctx.out.warnings.push(
+                    ctx.warn(
                         "minkowski(): result is exact for convex operands; concave operands \
-                         are approximated by their convex sum"
-                            .into(),
+                         are approximated by their convex sum",
                     );
                 }
                 return match csg2::minkowski2(&regions) {
                     csg2::Minkowski2::Ok(poly) => Shape::flat(poly).into_iter().collect(),
                     csg2::Minkowski2::TooLarge { count, partial } => {
-                        ctx.out.warnings.push(format!(
+                        ctx.warn(format!(
                             "minkowski(): {} pairwise points exceed the preview cap ({}); \
                              reduce $fn on the operands — showing the partial fold",
                             count,
@@ -1812,26 +1879,25 @@ fn call_builtin_module(
                 };
             }
             if any_2d(&groups) {
-                ctx.out.warnings.push(
+                ctx.warn(
                     "minkowski(): mixing 2D and 3D children is unsupported — shown un-combined"
-                        .into(),
+                        ,
                 );
                 return groups.into_iter().flatten().collect();
             }
             let meshes: Vec<Mesh> = groups.iter().map(|g| combine_group(g).0).collect();
             let nonempty = meshes.iter().filter(|m| !m.positions.is_empty()).count();
             if nonempty >= 2 {
-                ctx.out.warnings.push(
+                ctx.warn(
                     "minkowski(): result is exact for convex operands; concave operands \
-                     are approximated by their convex sum"
-                        .into(),
+                     are approximated by their convex sum",
                 );
             }
             // Children colors are DROPPED (reference minkowski EDGE[9]).
             match csg::minkowski(&meshes) {
                 csg::Minkowski::Ok(mesh) => leaf(mesh),
                 csg::Minkowski::TooLarge { count, partial } => {
-                    ctx.out.warnings.push(format!(
+                    ctx.warn(format!(
                         "minkowski(): {} pairwise points exceed the preview cap ({}); \
                          reduce $fn on the operands — showing the partial fold",
                         count,
@@ -1843,9 +1909,9 @@ fn call_builtin_module(
         }
         "children" => instantiate_children(bound.get("index"), ctx),
         "child" => {
-            ctx.out.warnings.push(
+            ctx.warn(
                 "DEPRECATED: child() will be removed in future releases. Use children() instead."
-                    .into(),
+                    ,
             );
             let idx = bound.get("index").cloned().unwrap_or(Value::Num(0.0));
             instantiate_children(Some(&idx), ctx)
@@ -1862,7 +1928,7 @@ fn call_builtin_module(
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            ctx.out.echoes.push(format!("ECHO: {}", line));
+            ctx.echo_line(format!("ECHO: {}", line));
             Vec::new()
         }
         "assert" => {
@@ -1881,7 +1947,7 @@ fn call_builtin_module(
         other => {
             // Per the reference, the statement — children included — is
             // skipped entirely.
-            ctx.out.warnings.push(format!("unknown module '{}' ignored", other));
+            ctx.warn(format!("unknown module '{}' ignored", other));
             Vec::new()
         }
     }
@@ -2288,14 +2354,14 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
         let resolved = match sandboxed_path(path) {
             Some(p) => p,
             None => {
-                ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
                 return Vec::new();
             }
         };
         let text = match std::fs::read_to_string(&resolved) {
             Ok(t) => t,
             Err(_) => {
-                ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
                 return Vec::new();
             }
         };
@@ -2306,7 +2372,7 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
         } else {
             io::read_dxf(&text, fn_, fa, fs)
         };
-        ctx.out.warnings.extend(warns);
+        ctx.warn_all(warns);
         return Shape::flat(poly).into_iter().collect();
     }
     // 3MF is a ZIP+XML mesh container (binary), read from bytes like STL.
@@ -2314,7 +2380,7 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
         let resolved = match sandboxed_path(path) {
             Some(p) => p,
             None => {
-                ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
                 return Vec::new();
             }
         };
@@ -2322,7 +2388,7 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
             Some(Ok(m)) if !m.tris.is_empty() => leaf(m),
             Some(Ok(_)) => Vec::new(),
             _ => {
-                ctx.out.warnings.push(format!("WARNING: Can't open import file '{}'.", path));
+                ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
                 Vec::new()
             }
         };
@@ -2340,9 +2406,7 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
     let resolved = match sandboxed_path(path) {
         Some(p) => p,
         None => {
-            ctx.out
-                .warnings
-                .push(format!("WARNING: Can't open import file '{}'.", path));
+            ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
             return Vec::new();
         }
     };
@@ -2364,9 +2428,7 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
         Ok(m) if !m.tris.is_empty() => leaf(m),
         Ok(_) => Vec::new(), // parsed but empty
         Err(_) => {
-            ctx.out
-                .warnings
-                .push(format!("WARNING: Can't open import file '{}'.", path));
+            ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
             Vec::new()
         }
     }
@@ -2444,7 +2506,7 @@ pub fn render_export(
     format: &str,
 ) -> Result<String, String> {
     let effective = crate::customizer::apply_overrides(source, overrides);
-    let out = evaluate_source_for(&effective, base_dir, format == "csg");
+    let out = evaluate_source_for(&effective, base_dir, format == "csg", Mode::Render);
     // `.echo` captures the console stream regardless of a fatal error.
     if format == "echo" {
         return Ok(echo_stream(&out));
@@ -2472,9 +2534,29 @@ pub fn export_bytes(out: &EvalOutput, format: &str) -> Result<Vec<u8>, String> {
 /// evaluation errored, so a `.echo` of an asserting script still captures the
 /// assert message (matching the reference's console-stream semantics).
 pub fn echo_stream(out: &EvalOutput) -> String {
+    // Walk the recorded emission order, pulling from each buffer in turn, so
+    // a warning raised between two echoes lands between them. Anything the
+    // order does not account for is appended rather than dropped.
     let mut lines: Vec<String> = Vec::new();
-    lines.extend(out.echoes.iter().cloned());
-    lines.extend(out.warnings.iter().cloned());
+    let (mut ei, mut wi) = (0usize, 0usize);
+    for chan in &out.order {
+        match chan {
+            Chan::Echo => {
+                if let Some(l) = out.echoes.get(ei) {
+                    lines.push(l.clone());
+                    ei += 1;
+                }
+            }
+            Chan::Diag => {
+                if let Some(l) = out.warnings.get(wi) {
+                    lines.push(l.clone());
+                    wi += 1;
+                }
+            }
+        }
+    }
+    lines.extend(out.echoes.iter().skip(ei).cloned());
+    lines.extend(out.warnings.iter().skip(wi).cloned());
     if let Some(e) = &out.error {
         lines.push(e.clone());
     }
@@ -2494,7 +2576,7 @@ pub fn render_export_bytes(
     format: &str,
 ) -> Result<Vec<u8>, String> {
     let effective = crate::customizer::apply_overrides(source, overrides);
-    let out = evaluate_source_for(&effective, base_dir, format == "csg");
+    let out = evaluate_source_for(&effective, base_dir, format == "csg", Mode::Render);
     // `.echo` captures the console stream regardless of a fatal error.
     if format == "echo" {
         return Ok(echo_stream(&out).into_bytes());
@@ -2547,8 +2629,8 @@ fn transform_children(
     // read. One rule for all of them, applied where they share a path.
     let matrix = match matrix {
         Some(m) if !m.iter().flatten().all(|v| v.is_finite()) => {
-            ctx.out.warnings.push(
-                "transform: matrix contains NaN/Infinity — subtree removed".into(),
+            ctx.warn(
+                "transform: matrix contains NaN/Infinity — subtree removed",
             );
             None
         }
@@ -2642,6 +2724,24 @@ fn positional_names(module: &str) -> &'static [&'static str] {
     }
 }
 
+/// Is this the name of a module the builtin dispatcher actually handles?
+///
+/// Kept beside `positional_names` deliberately: both are lookup tables over the
+/// same set, and a name missing from here only ever silences a diagnostic —
+/// never changes geometry — so drift degrades gracefully.
+fn is_builtin_module(name: &str) -> bool {
+    matches!(
+        name,
+        "assert" | "child" | "children" | "circle" | "color" | "cube" | "cylinder"
+            | "difference" | "dxf_linear_extrude" | "dxf_rotate_extrude" | "echo"
+            | "group" | "hull" | "import" | "import_dxf" | "import_off" | "import_stl"
+            | "intersection" | "linear_extrude" | "minkowski" | "mirror" | "multmatrix"
+            | "offset" | "polygon" | "polyhedron" | "projection" | "render" | "resize"
+            | "rotate" | "rotate_extrude" | "scale" | "sphere" | "square" | "surface"
+            | "text" | "translate" | "union"
+    )
+}
+
 fn bind_builtin_args(module: &str, ev: &[EvArg], ctx: &mut Ctx) -> HashMap<String, Value> {
     let names = positional_names(module);
     let mut bound = HashMap::new();
@@ -2658,8 +2758,18 @@ fn bind_builtin_args(module: &str, ev: &[EvArg], ctx: &mut Ctx) -> HashMap<Strin
                         bound.insert((*n).to_string(), a.value.clone());
                     }
                     None => {
-                        if !matches!(module, "echo" | "assert") {
-                            ctx.out.warnings.push(format!(
+                        // `echo`/`assert` take arbitrary positionals. An
+                        // UNKNOWN module must stay silent here too: argument
+                        // binding runs before the caller discovers the name is
+                        // unrecognised, and since positional_names() is empty
+                        // for anything it does not know, `translte([1,0,0])`
+                        // emitted one bogus "too many positional arguments"
+                        // per argument AHEAD of the real "unknown module"
+                        // line. The reference calls the exact warning SET a
+                        // compatibility gate, so extra lines are a defect in
+                        // their own right.
+                        if !matches!(module, "echo" | "assert") && is_builtin_module(module) {
+                            ctx.warn(format!(
                                 "{}: too many positional arguments (expected at most {})",
                                 module,
                                 names.len()
@@ -2677,10 +2787,25 @@ fn bind_builtin_args(module: &str, ev: &[EvArg], ctx: &mut Ctx) -> HashMap<Strin
 /// $fn/$fa/$fs resolve through the dynamic environment (per-call $-args
 /// were already layered on top by exec_call).
 fn resolve_fragments(r: f64, ctx: &mut Ctx) -> u32 {
+    let dynv = ctx.dynv.clone();
     let get = |key: &str, default: f64| {
-        ctx.dynv.lookup(key).and_then(|v| v.as_num()).unwrap_or(default)
+        dynv.lookup(key).and_then(|v| v.as_num()).unwrap_or(default)
     };
-    geom::fragments(r, get("$fn", 0.0), get("$fa", 12.0), get("$fs", 2.0))
+    let (fa, fs) = (get("$fa", 12.0), get("$fs", 2.0));
+    // The reference lists "$fa/$fs clamped to 0.01" among the warning
+    // conditions to reproduce, and the clamp was happening silently — so a
+    // user who lowered $fs got neither the finer mesh nor the explanation.
+    // Raised once per run per variable: the alternative, once per
+    // instantiation, buries the console under thousands of identical lines.
+    // (The reference marks the exact text and the fire-once-vs-per-use
+    // question VERIFY; this is the least-noisy reading.)
+    for (name, v) in [("$fa", fa), ("$fs", fs)] {
+        if v < 0.01 && !ctx.clamp_warned.iter().any(|w| w == name) {
+            ctx.clamp_warned.push(name.to_string());
+            ctx.warn(format!("{} too small - clamping to 0.01", name));
+        }
+    }
+    geom::fragments(r, get("$fn", 0.0), fa, fs)
 }
 
 fn parse_color(c: Option<&Value>, alpha: Option<&Value>, ctx: &mut Ctx) -> Option<[f64; 4]> {
@@ -2693,13 +2818,11 @@ fn parse_color(c: Option<&Value>, alpha: Option<&Value>, ctx: &mut Ctx) -> Optio
             v
         }
         Some(Value::Str(name)) => named_color(name).or_else(|| hex_color(name)).or_else(|| {
-            ctx.out.warnings.push(format!("color: unknown color '{}'", name));
+            ctx.warn(format!("color: unknown color '{}'", name));
             None
         })?,
         _ => {
-            ctx.out
-                .warnings
-                .push("color: expected a name, \"#hex\", or [r, g, b(, a)]".into());
+            ctx.warn("color: expected a name, \"#hex\", or [r, g, b(, a)]");
             return None;
         }
     };
@@ -2782,9 +2905,7 @@ fn eval_expr(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Value {
             match scope.lookup(name) {
                 Some(v) => v,
                 None => {
-                    ctx.out
-                        .warnings
-                        .push(format!("unknown variable '{}' (undef)", name));
+                    ctx.warn(format!("unknown variable '{}' (undef)", name));
                     Value::Undef
                 }
             }
@@ -2810,7 +2931,7 @@ fn eval_expr(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Value {
                     Value::Range { start: s, step: st, end: e, implicit_step }
                 }
                 _ => {
-                    ctx.out.warnings.push("range bounds must be numbers".into());
+                    ctx.warn("range bounds must be numbers");
                     Value::Undef
                 }
             }
@@ -2822,9 +2943,7 @@ fn eval_expr(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Value {
         Expr::Pos(inner) => match eval_expr(inner, scope, ctx) {
             Value::Num(n) => Value::Num(n),
             other => {
-                ctx.out
-                    .warnings
-                    .push(format!("undefined operation (+ {})", other.type_name()));
+                ctx.warn(format!("undefined operation (+ {})", other.type_name()));
                 Value::Undef
             }
         },
@@ -2921,9 +3040,7 @@ fn eval_expr(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Value {
                     call_function("<function>", fv.params.clone(), fv.body.clone(), env, ev, ctx)
                 }
                 other => {
-                    ctx.out
-                        .warnings
-                        .push(format!("can't call a {} as a function", other.type_name()));
+                    ctx.warn(format!("can't call a {} as a function", other.type_name()));
                     Value::Undef
                 }
             }
@@ -2969,7 +3086,7 @@ fn emit_echo(args: &[Arg], scope: &Rc<Scope>, ctx: &mut Ctx) {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    ctx.out.echoes.push(format!("ECHO: {}", line));
+    ctx.echo_line(format!("ECHO: {}", line));
 }
 
 /// Recover the captured lexical scope from a function value.
@@ -3145,9 +3262,7 @@ fn eval_tail(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Tail {
                     }
                 }
                 other => {
-                    ctx.out
-                        .warnings
-                        .push(format!("can't call a {} as a function", other.type_name()));
+                    ctx.warn(format!("can't call a {} as a function", other.type_name()));
                     Tail::Done(Value::Undef)
                 }
             }
@@ -3233,7 +3348,7 @@ fn eval_vec_items(items: &[VecItem], scope: &Rc<Scope>, ctx: &mut Ctx, out: &mut
                     cur = next;
                     iters += 1;
                     if iters >= MAX_GENERATOR_ITERS {
-                        ctx.out.warnings.push(format!(
+                        ctx.warn(format!(
                             "generator for: truncated at {} iterations",
                             MAX_GENERATOR_ITERS
                         ));
@@ -3360,9 +3475,7 @@ fn negate(v: Value, ctx: &mut Ctx) -> Value {
             Value::Vector(items.into_iter().map(|item| negate(item, ctx)).collect())
         }
         other => {
-            ctx.out
-                .warnings
-                .push(format!("undefined operation (- {})", other.type_name()));
+            ctx.warn(format!("undefined operation (- {})", other.type_name()));
             Value::Undef
         }
     }
@@ -3377,7 +3490,7 @@ fn add_sub(sub: bool, l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
             x.iter().zip(y).map(|(a, b)| add_sub(sub, a, b, ctx)).collect(),
         ),
         _ => {
-            ctx.out.warnings.push(format!(
+            ctx.warn(format!(
                 "undefined operation ({} {} {})",
                 l.type_name(),
                 if sub { "-" } else { "+" },
@@ -3425,9 +3538,7 @@ fn multiply(l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
                 Value::Vector(items.iter().map(|item| scale(n, item, ctx)).collect())
             }
             other => {
-                ctx.out
-                    .warnings
-                    .push(format!("undefined operation (number * {})", other.type_name()));
+                ctx.warn(format!("undefined operation (number * {})", other.type_name()));
                 Value::Undef
             }
         }
@@ -3468,15 +3579,13 @@ fn multiply(l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
                         .collect(),
                 ),
                 _ => {
-                    ctx.out
-                        .warnings
-                        .push("undefined operation (vector * vector: shape mismatch)".into());
+                    ctx.warn("undefined operation (vector * vector: shape mismatch)");
                     Value::Undef
                 }
             }
         }
         _ => {
-            ctx.out.warnings.push(format!(
+            ctx.warn(format!(
                 "undefined operation ({} * {})",
                 l.type_name(),
                 r.type_name()
@@ -3492,7 +3601,7 @@ fn divide(l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
     match (l, r) {
         (Value::Num(a), Value::Num(b)) => {
             if *b == 0.0 {
-                ctx.out.warnings.push("division by zero".into());
+                ctx.warn("division by zero");
             }
             Value::Num(a / b)
         }
@@ -3503,7 +3612,7 @@ fn divide(l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
             items.iter().map(|item| divide(l, item, ctx)).collect(),
         ),
         _ => {
-            ctx.out.warnings.push(format!(
+            ctx.warn(format!(
                 "undefined operation ({} / {})",
                 l.type_name(),
                 r.type_name()
@@ -3522,7 +3631,7 @@ fn binary_op(op: BinOp, l: Value, r: Value, ctx: &mut Ctx) -> Value {
         BinOp::Mod => match (l.as_num(), r.as_num()) {
             (Some(a), Some(b)) => Value::Num(a % b), // C fmod semantics
             _ => {
-                ctx.out.warnings.push(format!(
+                ctx.warn(format!(
                     "undefined operation ({} % {})",
                     l.type_name(),
                     r.type_name()
@@ -3533,7 +3642,7 @@ fn binary_op(op: BinOp, l: Value, r: Value, ctx: &mut Ctx) -> Value {
         BinOp::Pow => match (l.as_num(), r.as_num()) {
             (Some(a), Some(b)) => Value::Num(a.powf(b)), // C pow: 0^0 == 1
             _ => {
-                ctx.out.warnings.push(format!(
+                ctx.warn(format!(
                     "undefined operation ({} ^ {})",
                     l.type_name(),
                     r.type_name()
@@ -3553,7 +3662,7 @@ fn binary_op(op: BinOp, l: Value, r: Value, ctx: &mut Ctx) -> Value {
             // nan: every relational is false, not undef.
             Ok(None) => Value::Bool(false),
             Err(msg) => {
-                ctx.out.warnings.push(msg);
+                ctx.warn(msg);
                 Value::Undef
             }
         },
@@ -3960,7 +4069,27 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
         match num(0) {
             Some(x) => Value::Num(f(x)),
             None => {
-                ctx.out.warnings.push(format!("{}: expected a number", name));
+                ctx.warn(format!("{}: expected a number", name));
+                Value::Undef
+            }
+        }
+    };
+    // A one-argument math builtin with a DOMAIN. Out-of-domain input yields
+    // nan AND a warning, per the reference: "Domain errors yield nan with
+    // WARNING since 2019.05: sqrt(-1), ln(-1), log(-1), asin(2), acos(-2)."
+    // All five returned a bare nan, so a script that silently poisoned a
+    // dimension got no diagnostic pointing at the call that did it. (The
+    // reference marks the per-function TEXTS VERIFY; the condition is not.)
+    let domain_num = |ctx: &mut Ctx, ok: &dyn Fn(f64) -> bool, f: &dyn Fn(f64) -> f64| -> Value {
+        match num(0) {
+            Some(x) => {
+                if x.is_finite() && !ok(x) {
+                    ctx.warn(format!("{}: {} is out of domain, returning nan", name, x));
+                }
+                Value::Num(f(x))
+            }
+            None => {
+                ctx.warn(format!("{}: expected a number", name));
                 Value::Undef
             }
         }
@@ -3984,13 +4113,13 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
             let (s, c) = (sin_deg(x), cos_deg(x));
             s / c
         }),
-        "asin" => one_num(ctx, &|x| x.asin().to_degrees()),
-        "acos" => one_num(ctx, &|x| x.acos().to_degrees()),
+        "asin" => domain_num(ctx, &|x| (-1.0..=1.0).contains(&x), &|x| x.asin().to_degrees()),
+        "acos" => domain_num(ctx, &|x| (-1.0..=1.0).contains(&x), &|x| x.acos().to_degrees()),
         "atan" => one_num(ctx, &|x| x.atan().to_degrees()),
         "atan2" => match (num(0), num(1)) {
             (Some(y), Some(x)) => Value::Num(y.atan2(x).to_degrees()),
             _ => {
-                ctx.out.warnings.push("atan2: expected two numbers (y, x)".into());
+                ctx.warn("atan2: expected two numbers (y, x)");
                 Value::Undef
             }
         },
@@ -3998,14 +4127,15 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
         "ceil" => one_num(ctx, &f64::ceil),
         // Ties round away from zero: round(2.5)==3, round(-2.5)==-3.
         "round" => one_num(ctx, &f64::round),
-        "ln" => one_num(ctx, &f64::ln),
-        "log" => one_num(ctx, &f64::log10), // base 10 — ln is natural
+        "ln" => domain_num(ctx, &|x| x >= 0.0, &f64::ln),
+        // base 10 — ln is natural
+        "log" => domain_num(ctx, &|x| x >= 0.0, &f64::log10),
         "exp" => one_num(ctx, &f64::exp),
-        "sqrt" => one_num(ctx, &f64::sqrt),
+        "sqrt" => domain_num(ctx, &|x| x >= 0.0, &f64::sqrt),
         "pow" => match (num(0), num(1)) {
             (Some(b), Some(e)) => Value::Num(b.powf(e)), // identical to ^
             _ => {
-                ctx.out.warnings.push("pow: expected two numbers (base, exponent)".into());
+                ctx.warn("pow: expected two numbers (base, exponent)");
                 Value::Undef
             }
         },
@@ -4015,12 +4145,12 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
                 // Naive sum of squares (empty vector → 0).
                 Some(nums) => Value::Num(nums.iter().map(|x| x * x).sum::<f64>().sqrt()),
                 None => {
-                    ctx.out.warnings.push("norm: vector elements must be numbers".into());
+                    ctx.warn("norm: vector elements must be numbers");
                     Value::Undef
                 }
             },
             _ => {
-                ctx.out.warnings.push("norm: expected a vector".into());
+                ctx.warn("norm: expected a vector");
                 Value::Undef
             }
         },
@@ -4045,7 +4175,7 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
                 }
             }
             _ => {
-                ctx.out.warnings.push("cross: expected two vectors".into());
+                ctx.warn("cross: expected two vectors");
                 Value::Undef
             }
         },
@@ -4096,16 +4226,14 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
             let n = match num(0) {
                 Some(n) if n.is_finite() && n >= 0.0 => n.trunc() as usize,
                 _ => {
-                    ctx.out
-                        .warnings
-                        .push("parent_module: expected a non-negative number".into());
+                    ctx.warn("parent_module: expected a non-negative number");
                     return Value::Undef;
                 }
             };
             match ctx.mod_stack.len().checked_sub(n + 1).and_then(|i| ctx.mod_stack.get(i)) {
                 Some(name) => Value::Str(name.clone()),
                 None => {
-                    ctx.out.warnings.push(format!(
+                    ctx.warn(format!(
                         "parent_module: index ({}) out of range ({} modules on the stack)",
                         n,
                         ctx.mod_stack.len()
@@ -4125,7 +4253,7 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
         // No object values exist in this implementation.
         "is_object" => Value::Bool(false),
         other => {
-            ctx.out.warnings.push(format!("unknown function '{}'", other));
+            ctx.warn(format!("unknown function '{}'", other));
             Value::Undef
         }
     }
@@ -4170,14 +4298,14 @@ fn search_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
     let match_value = match vals.first() {
         Some(v) => v,
         None => {
-            ctx.out.warnings.push("search: expected a search term and a target".into());
+            ctx.warn("search: expected a search term and a target");
             return Value::Undef;
         }
     };
     let target = match vals.get(1) {
         Some(v) => v,
         None => {
-            ctx.out.warnings.push("search: expected a target as the second argument".into());
+            ctx.warn("search: expected a target as the second argument");
             return Value::Undef;
         }
     };
@@ -4214,7 +4342,7 @@ fn search_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
             })
             .collect(),
         _ => {
-            ctx.out.warnings.push("search: target must be a string or vector".into());
+            ctx.warn("search: target must be a string or vector");
             return Value::Undef;
         }
     };
@@ -4256,14 +4384,14 @@ fn lookup_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
     let key = match vals.first().and_then(Value::as_num) {
         Some(k) => k,
         None => {
-            ctx.out.warnings.push("lookup: key must be a number".into());
+            ctx.warn("lookup: key must be a number");
             return Value::Undef;
         }
     };
     let table = match vals.get(1) {
         Some(Value::Vector(rows)) => rows,
         _ => {
-            ctx.out.warnings.push("lookup: table must be a vector of [key, value] pairs".into());
+            ctx.warn("lookup: table must be a vector of [key, value] pairs");
             return Value::Undef;
         }
     };
@@ -4279,11 +4407,11 @@ fn lookup_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
                         .push("lookup: table rows must hold numeric [key, value]".into()),
                 }
             }
-            _ => ctx.out.warnings.push("lookup: table rows must be [key, value] pairs".into()),
+            _ => ctx.warn("lookup: table rows must be [key, value] pairs"),
         }
     }
     if pairs.is_empty() {
-        ctx.out.warnings.push("lookup: empty table".into());
+        ctx.warn("lookup: empty table");
         return Value::Undef;
     }
     // Exact hit wins bit-exactly, before any interpolation arithmetic.
@@ -4328,9 +4456,7 @@ fn rands_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
     ) {
         (Some(a), Some(b), Some(c)) => (a, b, c),
         _ => {
-            ctx.out
-                .warnings
-                .push("rands: expected min_value, max_value, value_count".into());
+            ctx.warn("rands: expected min_value, max_value, value_count");
             return Value::Undef;
         }
     };
@@ -4362,14 +4488,12 @@ fn min_max(name: &str, vals: &[Value], ctx: &mut Ctx) -> Value {
         [Value::Vector(items)] => items.clone(),
         _ if vals.len() >= 2 => vals.to_vec(),
         _ => {
-            ctx.out
-                .warnings
-                .push(format!("{}: expected a vector or at least two arguments", name));
+            ctx.warn(format!("{}: expected a vector or at least two arguments", name));
             return Value::Undef;
         }
     };
     if items.is_empty() {
-        ctx.out.warnings.push(format!("{}: empty vector", name));
+        ctx.warn(format!("{}: empty vector", name));
         return Value::Undef;
     }
     let mut best = items[0].clone();
@@ -4383,7 +4507,7 @@ fn min_max(name: &str, vals: &[Value], ctx: &mut Ctx) -> Value {
             }
             Ok(None) => {} // nan never wins a comparison
             Err(msg) => {
-                ctx.out.warnings.push(format!("{}: {}", name, msg));
+                ctx.warn(format!("{}: {}", name, msg));
                 return Value::Undef;
             }
         }
@@ -4659,6 +4783,132 @@ mod tests {
         assert!(err.contains("recording"), "message: {err}");
     }
 
+    // ---- reference-conformance regressions (audit lens: eval_semantics) ----
+
+    #[test]
+    fn non_finite_fragment_counts_do_not_allocate_the_universe() {
+        // REGRESSION. `$fn` = inf passed the `> 0` test, and `INFINITY as i64`
+        // SATURATES to i64::MAX which `as u32` truncates to 4_294_967_295 — so
+        // circle() asked for a 4.29-billion-point polygon and the allocator
+        // ABORTED the process. Not catchable, and no .echo was written, so the
+        // one channel that would have explained it was gone too. `$fn =
+        // 360/steps` with steps == 0 reaches infinity without trying.
+        //
+        // The reference: "NaN or +/-inf $fn instead short-circuits to exactly
+        // 3 fragments (it shares the tiny-radius branch, tested BEFORE
+        // $fn > 0)."
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(geom::fragments(1.0, bad, 12.0, 2.0), 3, "$fn = {bad}");
+        }
+        // A non-finite RADIUS is the same short-circuit.
+        assert_eq!(geom::fragments(f64::NAN, 0.0, 12.0, 2.0), 3);
+        assert_eq!(geom::fragments(f64::INFINITY, 0.0, 12.0, 2.0), 3);
+        // And a merely enormous finite $fn saturates instead of wrapping.
+        assert_eq!(geom::fragments(1.0, 1e30, 12.0, 2.0), u32::MAX);
+        // End to end: the script that aborted now runs and yields a triangle.
+        let out = run("$fn = 1/0;\nlinear_extrude(1) circle(r = 1);");
+        assert!(out.error.is_none(), "error: {:?}", out.error);
+        assert!(!out.shapes.is_empty(), "no geometry");
+    }
+
+    #[test]
+    fn preview_is_false_for_a_render() {
+        // REGRESSION. `$preview` was hard-coded true, so the extremely common
+        // `$fn = $preview ? 24 : 120;` exported the COARSE mesh from the CLI —
+        // preview-resolution geometry silently shipped to a printer.
+        let src = "$fn = $preview ? 8 : 64;\nsphere(10);\necho($preview, $fn);";
+        let base = std::path::Path::new(".");
+        let preview = evaluate_source(src, base);
+        assert_eq!(preview.echoes, vec!["ECHO: true, 8"], "the viewport is a preview");
+        let render = evaluate_source_for(src, base, false, Mode::Render);
+        assert_eq!(render.echoes, vec!["ECHO: false, 64"], "an export is a render");
+        // And the exported mesh really is the fine one.
+        let coarse = render_export(src, base, &[], "stl").unwrap();
+        assert!(
+            coarse.matches("facet normal").count() > 3000,
+            "export used preview tessellation: {} facets",
+            coarse.matches("facet normal").count()
+        );
+    }
+
+    #[test]
+    fn the_console_stream_interleaves_echoes_and_diagnostics() {
+        // REGRESSION. `echoes` and `warnings` were separate vectors emitted
+        // back to back, so every ECHO preceded every WARNING no matter when it
+        // was raised. The reference: messages are "emitted in depth-first
+        // instantiation/evaluation order, interleaved with ECHO lines" — and
+        // `.echo` is meant to be the golden-test oracle, which it cannot be if
+        // a single warning reorders the whole stream.
+        let base = std::path::Path::new(".");
+        let stream = render_export(
+            "echo(\"one\");\nsphere(r = undefined_name);\necho(\"two\");",
+            base, &[], "echo",
+        )
+        .unwrap();
+        let lines: Vec<&str> = stream.lines().collect();
+        assert_eq!(lines.len(), 3, "stream: {stream}");
+        assert!(lines[0].starts_with("ECHO: \"one\""), "{stream}");
+        assert!(lines[1].starts_with("WARNING:"), "the warning must land BETWEEN:\n{stream}");
+        assert!(lines[2].starts_with("ECHO: \"two\""), "{stream}");
+    }
+
+    #[test]
+    fn hex_and_astral_string_escapes_are_supported() {
+        // REGRESSION. `\x##` and `\U######` were unimplemented, and a lex
+        // error is FATAL — so one `"\x41"` anywhere in a file produced no
+        // geometry and no echoes at all. `\U` is also the only spelling that
+        // reaches an astral code point, since surrogate pairs are rejected.
+        let out = run("echo(\"\\x41\", \"\\U01F60A\", \"\\u03A9\");");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.echoes, vec!["ECHO: \"A\", \"\u{1F60A}\", \"\u{03A9}\""]);
+    }
+
+    #[test]
+    fn fatal_errors_carry_their_class_prefix() {
+        // REGRESSION. Runtime fatals built "ERROR:" inline but parse and lex
+        // failures arrived from preproc as bare text, so a `^ERROR:` grep
+        // matched every assert failure and no syntax error at all.
+        let base = std::path::Path::new(".");
+        for src in ["x = ;", "cube(1", "\"unterminated", "echo = 5;"] {
+            let stream = render_export(src, base, &[], "echo").unwrap();
+            assert!(stream.starts_with("ERROR:"), "{src:?} gave: {stream}");
+        }
+        assert!(render_export("assert(false);", base, &[], "echo")
+            .unwrap()
+            .contains("ERROR: Assertion"));
+    }
+
+    #[test]
+    fn the_documented_warning_set_is_emitted() {
+        // The reference calls the exact SET of warnings a compatibility gate:
+        // a missing one AND an extra one both break a conforming CI run.
+        let base = std::path::Path::new(".");
+        let stream = |src: &str| render_export(src, base, &[], "echo").unwrap();
+
+        // Missing: $fa/$fs clamped silently.
+        let s = stream("$fa = 0.001;\n$fs = 0.001;\nlinear_extrude(1) circle(r = 1);");
+        assert!(s.contains("$fa too small"), "no $fa clamp warning: {s}");
+        assert!(s.contains("$fs too small"), "no $fs clamp warning: {s}");
+        // ...and raised once, not once per instantiation.
+        let many = stream("$fs = 0.001;\nfor (i = [0:20]) circle(r = 1);");
+        assert_eq!(many.matches("$fs too small").count(), 1, "clamp warning repeated: {many}");
+
+        // Missing: out-of-domain math yields nan with a warning.
+        let d = stream("echo(sqrt(-1), ln(-1), log(-1), asin(2), acos(-2));");
+        for f in ["sqrt", "ln", "log", "asin", "acos"] {
+            assert!(d.contains(&format!("{}: ", f)), "no {f} domain warning: {d}");
+        }
+        assert!(!stream("echo(sqrt(4), asin(1), ln(1));").contains("out of domain"));
+
+        // Extra: an unknown module warned once per positional argument before
+        // the real "unknown module" line.
+        let u = stream("nosuchmodule(1, 2, 3);");
+        assert_eq!(u.lines().count(), 1, "extra warnings: {u}");
+        assert!(u.contains("unknown module 'nosuchmodule'"), "{u}");
+        // A KNOWN module still reports its surplus positionals.
+        assert!(stream("cube(1, 2, 3);").contains("too many positional"));
+    }
+
     #[test]
     fn echo_export_captures_the_console_stream() {
         let base = std::path::Path::new(".");
@@ -4714,6 +4964,7 @@ mod tests {
             fn_depth: 0,
             cycle_scopes: Vec::new(),
             csg: None,
+            clamp_warned: Vec::new(),
         };
         let root = Scope::root();
         let v = eval_expr(&value, &root, &mut ctx);
@@ -5986,6 +6237,7 @@ mod tests {
             fn_depth: 0,
             cycle_scopes: Vec::new(),
             csg: None,
+            clamp_warned: Vec::new(),
         };
         let root = Scope::root();
         let weak = Rc::downgrade(&root);

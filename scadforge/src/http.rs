@@ -124,7 +124,9 @@ fn export_response(query: &str, source: &str) -> Response {
     // injection the /render path uses, so a downloaded mesh matches the preview.
     let effective = customizer::apply_overrides(source, &overrides_from_query(query));
     // `.csg` needs the evaluator to record the instantiation tree as it runs.
-    let out = eval::evaluate_source_for(&effective, &base, format == "csg");
+    // An export is a RENDER, not a preview: `$preview` must be false so
+    // `$fn = $preview ? 24 : 120` gives the fine mesh in the downloaded file.
+    let out = eval::evaluate_source_for(&effective, &base, format == "csg", eval::Mode::Render);
     // `.echo` returns the console stream (ECHO + diagnostics), and captures it
     // even when a fatal error halted evaluation — so it is handled before the
     // error check that the geometry exports use.

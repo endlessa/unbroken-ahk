@@ -23,23 +23,38 @@ const GRID_FINE: f64 = 1.0 / 1_048_576.0;
 
 /// The single exact tessellation formula from the reference:
 /// fragments(r, $fn, $fa, $fs) =
-///   (r < 2^-20) ? 3
+///   (r < 2^-20 or non-finite r/$fn) ? 3
 ///   : ($fn > 0) ? max(int($fn), 3)
 ///   : ceil(max(min(360/$fa, 2*PI*r/$fs), 5))
-/// $fa/$fs below 0.01 clamp to 0.01 (the reference's WARNING behavior;
-/// the slice clamps silently).
+///
+/// The non-finite test comes BEFORE `$fn > 0`, per the reference: "NaN or
+/// +/-inf $fn instead short-circuits to exactly 3 fragments (it shares the
+/// tiny-radius branch, tested BEFORE $fn > 0)". Order matters enormously
+/// here — infinity passes `> 0`, and `f64::INFINITY as i64` SATURATES to
+/// i64::MAX, which `as u32` then truncates to 4_294_967_295. The caller
+/// duly asked for a 4.29-billion-point circle and the allocator aborted the
+/// process. `$fn = 360/steps` with `steps == 0` reaches infinity without
+/// trying, and an abort is not catchable: no .echo file was written either,
+/// destroying the one channel that would have explained it.
+///
+/// $fa/$fs below 0.01 clamp to 0.01. The clamp WARNING the reference
+/// describes is raised by the caller (`eval::resolve_fragments`), which has
+/// the diagnostic stream; this function stays pure and clamps defensively.
 pub fn fragments(r: f64, fn_: f64, fa: f64, fs: f64) -> u32 {
-    if r < GRID_FINE {
+    if !r.is_finite() || r < GRID_FINE || !fn_.is_finite() {
         return 3;
     }
     if fn_ > 0.0 {
-        return (fn_ as i64).max(3) as u32;
+        // Saturating on both sides: the cast above is exactly where the
+        // 68 GB allocation came from.
+        return (fn_ as i64).clamp(3, u32::MAX as i64) as u32;
     }
     let fa = fa.max(0.01);
     let fs = fs.max(0.01);
     let by_angle = 360.0 / fa;
     let by_arc = 2.0 * std::f64::consts::PI * r / fs;
-    by_angle.min(by_arc).max(5.0).ceil() as u32
+    let n = by_angle.min(by_arc).max(5.0).ceil();
+    if !n.is_finite() { 3 } else { n.clamp(3.0, u32::MAX as f64) as u32 }
 }
 
 // -- Matrices ---------------------------------------------------------------

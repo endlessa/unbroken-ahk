@@ -137,6 +137,54 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                                 s.push('\r');
                                 i += 2;
                             }
+                            Some(b'x') => {
+                                // `\xNN` — exactly two hex digits → one byte.
+                                // Supported since 2015.03 alongside \u/\U; it
+                                // was missing, and because a lex error is
+                                // FATAL a single `"\x41"` anywhere in a file
+                                // produced no geometry and no echoes at all.
+                                match b
+                                    .get(i + 2..i + 4)
+                                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                                    .and_then(|h| std::str::from_utf8(h).ok())
+                                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                    .and_then(char::from_u32)
+                                {
+                                    Some(ch) => {
+                                        s.push(ch);
+                                        i += 4;
+                                    }
+                                    None => {
+                                        return Err(format!(
+                                            "bad \\x escape in string at byte {}",
+                                            i
+                                        ))
+                                    }
+                                }
+                            }
+                            Some(b'U') => {
+                                // `\UNNNNNN` — exactly six hex digits. The only
+                                // spelling that reaches astral code points,
+                                // since surrogate pairs are rejected.
+                                match b
+                                    .get(i + 2..i + 8)
+                                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                                    .and_then(|h| std::str::from_utf8(h).ok())
+                                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                    .and_then(char::from_u32)
+                                {
+                                    Some(ch) => {
+                                        s.push(ch);
+                                        i += 8;
+                                    }
+                                    None => {
+                                        return Err(format!(
+                                            "bad \\U escape in string at byte {}",
+                                            i
+                                        ))
+                                    }
+                                }
+                            }
                             Some(b'u') => {
                                 // `\uXXXX` — exactly four hex digits → one
                                 // Unicode code point (rejecting surrogates and
