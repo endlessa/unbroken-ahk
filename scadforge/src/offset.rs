@@ -108,10 +108,196 @@ fn point_inside(polys: &[Vec<P2>], p: P2) -> bool {
     inside
 }
 
-#[inline]
+/// Distance to the input's boundary, negative inside. Superseded on the hot
+/// path by `EdgeIndex`, but kept as the reference the index is tested against
+/// and as the ground truth for the piece-union oracle.
+#[cfg(test)]
 fn signed_dist(polys: &[Vec<P2>], p: P2) -> f64 {
     let d = dist_to_boundary(polys, p);
     if point_inside(polys, p) { -d } else { d }
+}
+
+// ---------------------------------------------------------------------------
+// edge index
+// ---------------------------------------------------------------------------
+//
+// The trim asks "how far is this point from the input?" once per surviving
+// sub-segment, and both the sub-segment count and the edge count grow with the
+// input. Scanning every edge per query made the whole operation cubic: a
+// 4000-vertex profile — exactly the documented input cap — took 44 seconds,
+// against 0.11s for 500 vertices. A uniform grid over the edges makes each
+// query local instead.
+
+struct EdgeIndex {
+    lo: P2,
+    cell: f64,
+    nx: usize,
+    ny: usize,
+    cells: Vec<Vec<u32>>,
+    ea: Vec<P2>,
+    eb: Vec<P2>,
+}
+
+impl EdgeIndex {
+    fn build(polys: &[Vec<P2>]) -> EdgeIndex {
+        let mut ea = Vec::new();
+        let mut eb = Vec::new();
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        for c in polys {
+            let n = c.len();
+            for i in 0..n {
+                let a = c[i];
+                let b = c[(i + 1) % n];
+                ea.push(a);
+                eb.push(b);
+                for p in [a, b] {
+                    lo[0] = lo[0].min(p[0]); lo[1] = lo[1].min(p[1]);
+                    hi[0] = hi[0].max(p[0]); hi[1] = hi[1].max(p[1]);
+                }
+            }
+        }
+        let e = ea.len();
+        if e == 0 || !lo[0].is_finite() || !hi[0].is_finite() {
+            return EdgeIndex {
+                lo: [0.0, 0.0], cell: 1.0, nx: 1, ny: 1,
+                cells: vec![Vec::new()], ea, eb,
+            };
+        }
+        // Aim for a couple of edges per cell, and cap the grid so a wildly
+        // elongated bounding box cannot allocate unboundedly.
+        let w = (hi[0] - lo[0]).max(1e-300);
+        let h = (hi[1] - lo[1]).max(1e-300);
+        let target = ((w * h) * 2.0 / e as f64).sqrt();
+        let cell = if target.is_finite() && target > 0.0 {
+            target
+        } else {
+            w.max(h)
+        };
+        let nx = (((w / cell).ceil() as usize) + 1).clamp(1, 1024);
+        let ny = (((h / cell).ceil() as usize) + 1).clamp(1, 1024);
+        // Recompute the cell size from the clamped counts so the grid still
+        // covers the whole box.
+        let cell = (w / nx as f64).max(h / ny as f64).max(1e-300);
+        let mut idx = EdgeIndex {
+            lo, cell, nx, ny,
+            cells: vec![Vec::new(); nx * ny],
+            ea, eb,
+        };
+        for k in 0..e {
+            idx.insert_edge(k);
+        }
+        idx
+    }
+
+    /// File edge `k` under every cell the SEGMENT crosses, by walking the
+    /// grid along it. Filing it under every cell of its bounding box instead
+    /// is catastrophic for long diagonal edges: on a 2000-spike star the
+    /// edges run from r=20 to r=100, so each bounding box covered ~324 cells
+    /// and every query landed in a bucket holding hundreds of edges. The walk
+    /// files each edge under ~18 instead.
+    fn insert_edge(&mut self, k: usize) {
+        let a = self.ea[k];
+        let b = self.eb[k];
+        let (mut gx, mut gy) = (self.ix(a[0]) as isize, self.iy(a[1]) as isize);
+        let (ex, ey) = (self.ix(b[0]) as isize, self.iy(b[1]) as isize);
+        let push = |cells: &mut Vec<Vec<u32>>, nx: usize, x: isize, y: isize| {
+            cells[y as usize * nx + x as usize].push(k as u32);
+        };
+        push(&mut self.cells, self.nx, gx, gy);
+        if gx == ex && gy == ey {
+            return;
+        }
+        let d = sub(b, a);
+        let step_x: isize = if d[0] > 0.0 { 1 } else if d[0] < 0.0 { -1 } else { 0 };
+        let step_y: isize = if d[1] > 0.0 { 1 } else if d[1] < 0.0 { -1 } else { 0 };
+        // Parameter t along the segment at which the next cell boundary is
+        // crossed, and the t-increment between successive boundaries.
+        let next_t = |start: f64, origin: f64, g: isize, dd: f64, step: isize| -> f64 {
+            if step == 0 {
+                return f64::INFINITY;
+            }
+            let edge = origin + (if step > 0 { g + 1 } else { g }) as f64 * self.cell;
+            let t = (edge - start) / dd;
+            if t.is_finite() && t >= 0.0 { t } else { f64::INFINITY }
+        };
+        let mut t_x = next_t(a[0], self.lo[0], gx, d[0], step_x);
+        let mut t_y = next_t(a[1], self.lo[1], gy, d[1], step_y);
+        let dt_x = if step_x == 0 { f64::INFINITY } else { (self.cell / d[0]).abs() };
+        let dt_y = if step_y == 0 { f64::INFINITY } else { (self.cell / d[1]).abs() };
+        // Bounded by the grid diameter, so a non-finite coordinate cannot
+        // spin here.
+        for _ in 0..(self.nx + self.ny + 2) {
+            if t_x <= t_y {
+                if t_x > 1.0 { break; }
+                gx += step_x;
+                t_x += dt_x;
+            } else {
+                if t_y > 1.0 { break; }
+                gy += step_y;
+                t_y += dt_y;
+            }
+            if gx < 0 || gy < 0 || gx >= self.nx as isize || gy >= self.ny as isize {
+                break;
+            }
+            push(&mut self.cells, self.nx, gx, gy);
+            if gx == ex && gy == ey {
+                break;
+            }
+        }
+    }
+
+    fn ix(&self, x: f64) -> usize {
+        let v = ((x - self.lo[0]) / self.cell).floor();
+        if !v.is_finite() || v < 0.0 { 0 } else { (v as usize).min(self.nx - 1) }
+    }
+    fn iy(&self, y: f64) -> usize {
+        let v = ((y - self.lo[1]) / self.cell).floor();
+        if !v.is_finite() || v < 0.0 { 0 } else { (v as usize).min(self.ny - 1) }
+    }
+
+    /// Distance from `p` to the nearest input edge. Rings of cells are
+    /// scanned outward; a ring at Chebyshev distance k cannot hold anything
+    /// closer than (k-1)*cell, so the search stops as soon as the best
+    /// distance so far beats that bound.
+    fn dist(&self, p: P2) -> f64 {
+        if self.ea.is_empty() {
+            return f64::INFINITY;
+        }
+        let cx = self.ix(p[0]) as isize;
+        let cy = self.iy(p[1]) as isize;
+        let mut best = f64::INFINITY;
+        let max_ring = (self.nx + self.ny) as isize;
+        for ring in 0..=max_ring {
+            if ring > 0 && best <= (ring - 1) as f64 * self.cell {
+                break;
+            }
+            let mut touched = false;
+            for gy in (cy - ring)..=(cy + ring) {
+                if gy < 0 || gy >= self.ny as isize { continue; }
+                for gx in (cx - ring)..=(cx + ring) {
+                    if gx < 0 || gx >= self.nx as isize { continue; }
+                    // Only the ring's perimeter is new.
+                    if ring > 0
+                        && (gx - cx).abs() != ring
+                        && (gy - cy).abs() != ring
+                    {
+                        continue;
+                    }
+                    touched = true;
+                    for &k in &self.cells[gy as usize * self.nx + gx as usize] {
+                        let d = dist_pt_seg(p, self.ea[k as usize], self.eb[k as usize]);
+                        if d < best { best = d; }
+                    }
+                }
+            }
+            if !touched && ring > max_ring / 2 && best.is_finite() {
+                break;
+            }
+        }
+        best
+    }
+
 }
 
 /// A point strictly inside a single simple contour.
@@ -754,6 +940,9 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64, join:
     // back on a piece edge still counts as covered.
     let probe_step = eps;
     let closed = -0.25 * snap_tol;
+    // One query per surviving sub-segment, against every input edge, is what
+    // made this cubic in the input size. The index answers each locally.
+    let index = EdgeIndex::build(&polys);
     let mut kept: Vec<(u32, u32)> = Vec::new();
     for s in &subs {
         let a = coord(&reg, s.a); let b = coord(&reg, s.b);
@@ -765,7 +954,13 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64, join:
             if l > 1e-15 { m = add(c, scl(d, r / l)); }
         }
         let keep = if join == Join::Round {
-            signed_dist(&polys, m) >= r - eps
+            // `signed_dist >= r - eps` cannot hold for a point INSIDE the
+            // region: inside gives a negative distance, and r - eps is
+            // positive. So the containment test — the expensive half, a ray
+            // cast across the grid — is only needed once the cheap distance
+            // has already cleared the threshold. On a 4000-vertex profile
+            // that is 10,000 calls instead of 1,296,000.
+            index.dist(m) >= r - eps && !point_inside(&polys, m)
         } else {
             let d = sub(b, a);
             let l = norm(d);
@@ -774,8 +969,12 @@ fn offset_once(input: &[Vec<P2>], r: f64, steps_per_turn: usize, mul: f64, join:
             } else {
                 let out = [d[1] / l, -d[0] / l]; // right normal = outward
                 let probe = add(m, scl(out, probe_step));
-                let covered = signed_dist(&polys, probe) <= -closed
-                    || pieces.iter().any(|q| strictly_inside(q, probe, closed));
+                // Same idea: order the three ways a probe can be covered
+                // by cost — distance first, then the bounding-box-filtered
+                // pieces, and the ray cast only if both are inconclusive.
+                let covered = index.dist(probe) <= -closed
+                    || pieces.iter().any(|q| strictly_inside(q, probe, closed))
+                    || point_inside(&polys, probe);
                 !covered
             }
         };
@@ -1048,6 +1247,48 @@ mod tests {
         }
     }
 
+    /// The edge index replaced a linear scan over every input edge; it has to
+    /// answer exactly what the scan did. Distances are compared against the
+    /// brute-force original over a grid of probes on a shape with long
+    /// diagonal edges, a hole, and a concave notch — the cases where a grid is
+    /// easiest to get wrong.
+    #[test]
+    fn the_edge_index_agrees_with_the_linear_scan() {
+        let outer: Vec<P2> = vec![
+            [0.0, 0.0], [60.0, 5.0], [58.0, 40.0], [30.0, 20.0],
+            [28.0, 45.0], [-5.0, 38.0],
+        ];
+        let hole: Vec<P2> = vec![[12.0, 12.0], [22.0, 14.0], [20.0, 24.0], [10.0, 22.0]];
+        // A spiky ring too: long edges crossing many cells at a steep angle.
+        let star: Vec<P2> = (0..120)
+            .map(|i| {
+                let a = std::f64::consts::PI * (i as f64) / 60.0;
+                let rr = if i % 2 == 0 { 90.0 } else { 25.0 };
+                [rr * a.cos() + 25.0, rr * a.sin() + 20.0]
+            })
+            .collect();
+        let polys = normalize(&vec![outer, hole, star], 1e-12);
+        let index = EdgeIndex::build(&polys);
+        let mut checked = 0usize;
+        let mut y = -120.0;
+        while y <= 160.0 {
+            let mut x = -120.0;
+            while x <= 160.0 {
+                let p = [x, y];
+                let want_d = dist_to_boundary(&polys, p);
+                let got_d = index.dist(p);
+                assert!(
+                    (want_d - got_d).abs() <= 1e-9 * want_d.max(1.0),
+                    "dist at {p:?}: index {got_d}, scan {want_d}"
+                );
+                checked += 1;
+                x += 1.7;
+            }
+            y += 1.7;
+        }
+        assert!(checked > 20_000, "only {checked} probes");
+    }
+
     /// The operation must be SCALE-INVARIANT: offsetting a shape magnified by
     /// 10^k, by a distance magnified by 10^k, must give 10^2k the area. Two
     /// hard-coded tolerances broke that in opposite directions — an absolute
@@ -1215,3 +1456,5 @@ mod tests {
         assert_eq!(closed.len(), 1, "the hole is gone");
     }
 }
+
+

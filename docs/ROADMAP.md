@@ -5,8 +5,9 @@ OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
 Standing after Customizer + SVG import + PDF export + 3MF + `.echo` +
-the offset-kernel rewrite + `.csg` export (2026-09-05): **151 full / 22
-partial / 10 untouched — 83% full, 94% touched.** Every geometry and I/O *format* of 2021.01 is implemented.
+the offset-kernel rewrite + `.csg` export + a fourteen-bug audit
+(2026-09-10): **151 full / 22 partial / 10 untouched — 83% full, 94%
+touched.** Every geometry and I/O *format* of 2021.01 is implemented.
 PHASE 4 COMPLETE. Phase 5
 so far:
 modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
@@ -325,6 +326,63 @@ followed). Pinned by an exact emission snapshot; note that the
 set-comparison test alongside it does *not* catch this class of bug,
 because it sorts away the very ordering that breaks — worth remembering
 when writing the next determinism test.
+
+## The audit, and what it says about testing here
+
+An adversarial sweep (2026-09-06..10) found **fourteen reproduced bugs**,
+all in code that had passing tests. Every one was reproduced locally
+before and after its fix. They fall into four groups, and the groups are
+more instructive than the individual defects:
+
+1. **A shipped invariant that was simply false.** The `.csg` export
+   claimed "the export re-imports to the same geometry" and broke eight
+   ways: the recorder SPLICED an unnamed frame's nodes into its parent, so
+   `children()` forwarding two shapes into an `intersection()` became
+   three operands (a 1.1 MB STL re-imported as 61 KB); statements that
+   drew nothing kept no operand slot at all, so a `difference()` lost its
+   minuend; `linear_extrude` recorded `slices = 1` whenever the real count
+   came from `$fa`; `surface()` dropped `invert` and `import()` dropped
+   `dpi`; `inf`/`nan` were spelled as identifiers the lexer cannot read;
+   and `cube`/`square` heads coerced sizes the renderer rejects.
+2. **Tangency, twice.** The straight-join trim asked "is this point
+   strictly inside SOME piece?" — but a point can be interior to the UNION
+   while lying on the shared boundary of two pieces, inside neither. That
+   is the *same* blind spot that sank the original boolean dilation,
+   reintroduced one layer down, and it shattered `offset(delta=6)` on a
+   plus-sign into four slivers. If a construction's pieces meet only in
+   tangencies, assume it is broken until a sweep says otherwise.
+3. **Crashes from plausible input.** Both BSP builders recursed without a
+   bound; `difference() { cube(1e9, center=true); sphere(0.6e9); }` aborted
+   the process with SIGABRT. A model measured in microns reaches 1e9
+   without trying.
+4. **Hidden scale dependence.** An absolute `1e-9` area floor annihilated
+   `offset(r=1e-6) square(1e-5)`; a bounding-box-relative cleanup tolerance
+   let one distant contour dissolve its neighbour.
+
+**The lesson about tests is sharper than the bug list.** In three separate
+cases the test written alongside the code passed on the broken version:
+
+- `hull`'s set-comparison test sorted away the very ordering the
+  nondeterminism perturbed.
+- The offset closed-form test only exercises CONVEX polygons, which have
+  no tangencies to trip over.
+- The piece-union raster oracle used the same flawed predicate as its
+  ground truth — it was checking the bug against itself.
+
+What worked instead was pinning the *property the bug violates*, not the
+output it produces: emission reproducibility (an exact snapshot), area
+continuity in the offset distance (dA/dd is the perimeter, so a collapse
+is a discontinuity), and scale invariance (10^k in, 10^2k of area out).
+Each of those fails loudly on the old code and is indifferent to how the
+right answer is computed.
+
+**Still open from the audit:** `offset` cost is driven by the number of
+self-intersections of the raw curve, which grows with (offset distance /
+feature spacing)², not with vertex count — so `OFFSET_MAX_VERTS` bounds V
+but not work. A 4000-vertex, 2000-spike profile at r=5 produces 1.29M
+sub-segments and takes ~25s (down from 44s after indexing the input edges
+and short-circuiting the containment test). Either the split pass needs a
+spatial index too, or the cap needs to bound work rather than vertices.
 
 ## Working method (established, keep using it)
 
