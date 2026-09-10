@@ -4586,6 +4586,19 @@ mod tests {
     }
 
     #[test]
+    fn csg_does_not_invent_a_colour_the_renderer_refused() {
+        // REGRESSION. An unparseable colour recorded the sentinel
+        // color([-1, -1, -1, 1]), which the re-import accepted as a real
+        // colour — the shape came back tinted and the "unknown color"
+        // diagnostic vanished.
+        let tree = csg_of("color(\"nosuchcolorname\") cube(10);");
+        assert!(!tree.contains("color("), "a colour was invented:\n{}", tree);
+        assert_csg_round_trips("color(\"nosuchcolorname\") cube(10);");
+        // A colour that DOES parse still records, of course.
+        assert!(csg_of("color(\"tomato\") cube(1);").contains("color(["));
+    }
+
+    #[test]
     fn csg_records_resolved_slices_invert_and_dpi() {
         // REGRESSION. These three values are computed by the renderer, not
         // readable off the bound arguments: `slices` comes from $fa when

@@ -434,12 +434,22 @@ pub fn import_head(
     )
 }
 
-/// The `color()` head, built from the already-resolved RGBA. `color()` with
-/// unparseable arguments records the identity colour rather than dropping
-/// the subtree, so the geometry still round-trips.
+/// The `color()` head, built from the already-resolved RGBA.
+///
+/// `None` means the arguments did not parse — an unknown colour name, say —
+/// and the renderer then applies NO colour at all, leaving `color()` a plain
+/// pass-through. So that is what gets recorded. Substituting a sentinel
+/// `[-1, -1, -1, 1]` instead meant the re-import accepted it as a real
+/// colour: the shape came back tinted with nonsense and the
+/// "unknown color" diagnostic disappeared.
 pub fn color_head(rgba: Option<[f64; 4]>) -> String {
-    let c = rgba.unwrap_or([-1.0, -1.0, -1.0, 1.0]);
-    format!("color([{}, {}, {}, {}])", num(c[0]), num(c[1]), num(c[2]), num(c[3]))
+    match rgba {
+        Some(c) => format!(
+            "color([{}, {}, {}, {}])",
+            num(c[0]), num(c[1]), num(c[2]), num(c[3])
+        ),
+        None => "group()".into(),
+    }
 }
 
 /// The `resize()` head. `resize` is kept as itself rather than resolved to
