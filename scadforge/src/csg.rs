@@ -59,10 +59,28 @@ struct Plane {
 }
 
 impl Plane {
+    /// The plane through three points, or `None` if they are collinear.
+    ///
+    /// The degeneracy test is RELATIVE, and that matters more than it looks.
+    /// It used to be `dot(n, n) < EPS * EPS` on the UNNORMALIZED cross
+    /// product — an absolute area floor of 5e-8 square units in a kernel with
+    /// no intrinsic unit. Every triangle smaller than that was silently
+    /// dropped before any boolean ran, so the same model built in millimetres
+    /// and in metres gave different answers: a 0.1 mm cube intersected with
+    /// itself came back EMPTY, a difference returned the minuend with the
+    /// cutter ignored entirely, and a union returned one operand. It also
+    /// fired at ordinary scale on dense input — 8 of 22,496 facets of
+    /// `sphere(r=1, $fn=150)` were below the floor.
+    ///
+    /// `|u x v| / (|u| |v|)` is the sine of the angle between the edges, so
+    /// this rejects SLIVERS (which genuinely have no reliable normal) and
+    /// keeps small-but-well-shaped triangles at any scale.
     fn from_points(a: V3, b: V3, c: V3) -> Option<Plane> {
-        let n = cross(sub(b, a), sub(c, a));
-        if dot(n, n) < EPS * EPS {
-            return None; // degenerate (collinear) triangle
+        let (u, v) = (sub(b, a), sub(c, a));
+        let n = cross(u, v);
+        let denom = (dot(u, u) * dot(v, v)).sqrt();
+        if !(denom > 0.0) || dot(n, n).sqrt() / denom < SLIVER_SINE {
+            return None; // collinear, or a sliver with no usable normal
         }
         let normal = norm(n);
         Some(Plane { w: dot(normal, a), normal })
@@ -231,6 +249,72 @@ struct Node {
 /// shallower; this only bounds pathological input (see `build_at`).
 const MAX_BSP_DEPTH: usize = 4096;
 
+thread_local! {
+    /// Set when a BSP build hit the no-progress guard or the depth cap. Those
+    /// guards exist so pathological coordinates cannot abort the process, but
+    /// the price is a truncated tree — and a truncated tree yields a mesh that
+    /// is merely approximate, and at large magnitudes genuinely open. Silently
+    /// handing back an open mesh is its own defect, so the evaluator reads
+    /// this and says so.
+    static DEGRADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn mark_degraded() {
+    DEGRADED.with(|d| d.set(true));
+}
+
+/// The 2D segment-BSP shares the flag: from the user's side it is one
+/// "the kernel had to approximate" condition.
+pub(crate) fn mark_degraded_2d() {
+    mark_degraded();
+}
+
+/// Is this mesh convex — every vertex on or behind every face plane?
+///
+/// Used only to decide whether minkowski's approximation warning is
+/// warranted. The test is O(V*F), so beyond a budget it answers "not provably
+/// convex", which errs toward warning rather than toward silence.
+pub fn is_convex(m: &Mesh) -> bool {
+    let v = m.positions.len();
+    let f = m.tris.len();
+    if v == 0 || f == 0 || v.saturating_mul(f) > 5_000_000 {
+        return false;
+    }
+    // Tolerance relative to the model's own extent, so this does not repeat
+    // the absolute-threshold mistake `Plane::from_points` just shed.
+    let mut extent: f64 = 0.0;
+    for p in &m.positions {
+        for c in p {
+            extent = extent.max(c.abs());
+        }
+    }
+    let tol = extent.max(1.0) * 1e-9;
+    for t in &m.tris {
+        let (a, b, c) = (
+            m.positions[t[0] as usize],
+            m.positions[t[1] as usize],
+            m.positions[t[2] as usize],
+        );
+        let Some(plane) = Plane::from_points(a, b, c) else { continue };
+        for p in &m.positions {
+            if dot(plane.normal, *p) - plane.w > tol {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Read and clear the degradation flag for this thread.
+pub fn take_degraded() -> bool {
+    DEGRADED.with(|d| d.replace(false))
+}
+
+/// A triangle is degenerate when the sine of the angle between two of its
+/// edges falls below this — i.e. it is a sliver, at any scale. Compare the
+/// absolute-area test this replaced, which made the kernel scale-dependent.
+const SLIVER_SINE: f64 = 1e-12;
+
 impl Node {
     fn new() -> Node {
         Node { plane: None, front: None, back: None, polygons: Vec::new() }
@@ -244,7 +328,15 @@ impl Node {
 
     /// Add polygons, splitting them into this node's half-spaces.
     fn build(&mut self, polygons: Vec<Polygon>) {
-        self.build_at(polygons, 0);
+        // Only a build that starts a FRESH tree can degrade the result. The
+        // merge stage of a boolean re-builds into a node that already has a
+        // plane, and its tree is only ever read back through `all_polygons`,
+        // which collects facets regardless of tree shape — so the guard
+        // firing there changes nothing. Tracking indiscriminately made the
+        // degradation warning appear on six of nine perfectly ordinary demo
+        // scenes, which is worse than not warning at all.
+        let track = self.plane.is_none();
+        self.build_at(polygons, 0, track);
     }
 
     /// Build the tree, refusing to recurse forever.
@@ -260,7 +352,7 @@ impl Node {
     /// The no-progress check is the precise guard (a partition that moved
     /// nothing never will); the depth cap is the backstop for any other route
     /// to the same place. Degrading a boolean beats killing the process.
-    fn build_at(&mut self, polygons: Vec<Polygon>, depth: usize) {
+    fn build_at(&mut self, polygons: Vec<Polygon>, depth: usize, track: bool) {
         if polygons.is_empty() {
             return;
         }
@@ -292,6 +384,9 @@ impl Node {
         self.polygons.extend(coplanar_back);
         let stuck = front.len() == polygons.len() || back.len() == polygons.len();
         if depth >= MAX_BSP_DEPTH || stuck {
+            if track {
+                mark_degraded();
+            }
             self.polygons.extend(front);
             self.polygons.extend(back);
             return;
@@ -299,12 +394,12 @@ impl Node {
         if !front.is_empty() {
             self.front
                 .get_or_insert_with(|| Box::new(Node::new()))
-                .build_at(front, depth + 1);
+                .build_at(front, depth + 1, track);
         }
         if !back.is_empty() {
             self.back
                 .get_or_insert_with(|| Box::new(Node::new()))
-                .build_at(back, depth + 1);
+                .build_at(back, depth + 1, track);
         }
     }
 
@@ -1109,6 +1204,79 @@ mod tests {
             .collect();
         let u = union_all(&many);
         assert!(signed_volume(&u).abs() > signed_volume(&geom::sphere(2.0, 12)).abs());
+    }
+
+    #[test]
+    fn booleans_are_scale_invariant() {
+        // REGRESSION. `Plane::from_points` rejected a triangle by an ABSOLUTE
+        // area floor (|n| < 1e-7 on the unnormalized cross product), so every
+        // facet below ~5e-8 square units was silently dropped before any
+        // boolean ran. The same model in millimetres and in metres gave
+        // different answers: intersections annihilated, unions returned one
+        // operand, differences returned the minuend with the cutter ignored.
+        // It fired at ORDINARY scale too — 8 of 22,496 facets of
+        // sphere(r=1,$fn=150) were below the floor.
+        //
+        // The property: a boolean's volume, divided by scale^3, is constant.
+        let mut reference: Option<f64> = None;
+        for k in [2i32, 0, -2, -4, -6] {
+            let s = 10f64.powi(k);
+            let a = geom::cube([s, s, s], true);
+            let mut b = geom::cube([s, s, s], true);
+            for p in b.positions.iter_mut() {
+                p[0] += s * 0.5;
+            }
+            let out = intersection_all(&[a, b]);
+            assert!(!out.tris.is_empty(), "scale 1e{k}: intersection came back EMPTY");
+            let norm = signed_volume(&out).abs() / (s * s * s);
+            match reference {
+                None => reference = Some(norm),
+                Some(r0) => assert!(
+                    (norm - r0).abs() / r0 < 1e-9,
+                    "scale 1e{k}: normalized volume {norm} != {r0}"
+                ),
+            }
+        }
+        // A sliver — zero area at ANY scale — is still rejected.
+        assert!(Plane::from_points([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]).is_none());
+        // ...while a small, well-shaped triangle is not.
+        assert!(Plane::from_points([0.0, 0.0, 0.0], [1e-9, 0.0, 0.0], [0.0, 1e-9, 0.0]).is_some());
+    }
+
+    #[test]
+    fn a_fresh_build_reports_degradation_and_a_merge_does_not() {
+        // The guards that stop a pathological BSP from aborting the process
+        // truncate the tree, which can leave an open mesh — so the evaluator
+        // warns. But the MERGE stage of every boolean rebuilds into a node
+        // that already has a plane, and its tree is only read back through
+        // all_polygons; the guard firing there changes nothing. Tracking both
+        // put the warning on six of nine ordinary demo scenes.
+        let _ = take_degraded();
+        let out = difference(&geom::cube([10.0, 10.0, 10.0], true), &[geom::sphere(6.0, 12)]);
+        assert!(!out.tris.is_empty());
+        assert!(!take_degraded(), "an ordinary boolean reported degradation");
+
+        let mag = 1.0e11;
+        let mut cube = geom::cube([mag, mag, mag], true);
+        let mut ball = geom::sphere(0.6 * mag, 12);
+        for p in cube.positions.iter_mut().chain(ball.positions.iter_mut()) {
+            p[0] += mag * 0.5;
+        }
+        let _ = difference(&cube, &[ball]);
+        assert!(take_degraded(), "an extreme-magnitude boolean did NOT report degradation");
+    }
+
+    #[test]
+    fn convexity_test_separates_the_minkowski_cases() {
+        assert!(is_convex(&geom::cube([2.0, 3.0, 4.0], true)), "a cube is convex");
+        assert!(is_convex(&geom::sphere(1.0, 12)), "a sphere is convex");
+        assert!(is_convex(&geom::cylinder(3.0, 1.0, 0.0, true, 12)), "a cone is convex");
+        // An L: two boxes unioned is not.
+        let l = union_all(&[
+            geom::cube([10.0, 3.0, 3.0], true),
+            geom::cube([3.0, 10.0, 3.0], true),
+        ]);
+        assert!(!is_convex(&l), "an L-shape is not convex");
     }
 
     #[test]

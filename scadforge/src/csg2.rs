@@ -213,7 +213,12 @@ impl Node {
     }
 
     fn build(&mut self, segs: Vec<Seg>) {
-        self.build_at(segs, 0);
+        // Only a FRESH tree can degrade the result; see the note on
+        // `csg::Node::build`. The merge stage rebuilds into a node that
+        // already has a line, and its tree is read back only through
+        // `all_segments`.
+        let track = self.line.is_none();
+        self.build_at(segs, 0, track);
     }
 
     /// Build the tree, refusing to recurse forever.
@@ -230,7 +235,7 @@ impl Node {
     /// coplanar rather than recursing. The depth cap is the blunt backstop for
     /// any other path to the same place — degrading a boolean's accuracy is
     /// always better than killing the process.
-    fn build_at(&mut self, segs: Vec<Seg>, depth: usize) {
+    fn build_at(&mut self, segs: Vec<Seg>, depth: usize, track: bool) {
         if segs.is_empty() {
             return;
         }
@@ -249,6 +254,9 @@ impl Node {
         self.segs.extend(coplanar_back);
         let stuck = front.len() == segs.len() || back.len() == segs.len();
         if depth >= MAX_BSP_DEPTH || stuck {
+            if track {
+                crate::csg::mark_degraded_2d();
+            }
             self.segs.extend(front);
             self.segs.extend(back);
             return;
@@ -256,12 +264,12 @@ impl Node {
         if !front.is_empty() {
             self.front
                 .get_or_insert_with(|| Box::new(Node::new()))
-                .build_at(front, depth + 1);
+                .build_at(front, depth + 1, track);
         }
         if !back.is_empty() {
             self.back
                 .get_or_insert_with(|| Box::new(Node::new()))
-                .build_at(back, depth + 1);
+                .build_at(back, depth + 1, track);
         }
     }
 

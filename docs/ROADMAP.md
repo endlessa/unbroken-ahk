@@ -376,6 +376,34 @@ is a discontinuity), and scale invariance (10^k in, 10^2k of area out).
 Each of those fails loudly on the old code and is indifferent to how the
 right answer is computed.
 
+**The one-lens-at-a-time rerun (2026-09-10..11).** Three attempts to run the
+audit as a seven-lens fan-out died on token limits without returning
+anything. Run one lens per batch instead, they complete — two lenses, two
+clean reports, fourteen more reproduced bugs. Two of them were defects in
+fixes made EARLIER in the same audit, which is the argument for an
+independent pass rather than more self-review:
+
+- The non-finite `$fn` guard tested only `is_finite`, so a merely large
+  finite `$fn` (40000 — a plausible "max quality" value) still asked for
+  19 GB and aborted.
+- The BSP no-progress guard traded a crash for a silently non-watertight
+  mesh with up to 17% volume error and nothing on the console.
+
+The semantics lens also turned up `$preview` hard-coded true — so
+`$fn = $preview ? 24 : 120;` exported the COARSE mesh, shipping
+preview-resolution geometry to a printer with no trace in the file — and a
+console stream that was not interleaved, which quietly disqualified `.echo`
+from the oracle role the reference assigns it.
+
+The 3D lens found the scale-dependence bug's twin: `Plane::from_points`
+rejected triangles by an ABSOLUTE area floor, so the same model in
+millimetres and in metres gave different booleans, and 8 of 22,496 facets of
+`sphere(r=1,$fn=150)` were dropped at ordinary scale. Third instance of the
+same root cause (after offset's area floor and its cleanup tolerance): **a
+geometry kernel has no intrinsic unit, so every threshold in it must be
+relative to something in the input.** The fix is a sliver test on the sine of
+the angle between edges, which is scale-free by construction.
+
 **Still open from the audit:** `offset` cost is driven by the number of
 self-intersections of the raw curve, which grows with (offset distance /
 feature spacing)², not with vertex count — so `OFFSET_MAX_VERTS` bounds V
@@ -383,6 +411,27 @@ but not work. A 4000-vertex, 2000-spike profile at r=5 produces 1.29M
 sub-segments and takes ~25s (down from 44s after indexing the input edges
 and short-circuiting the containment test). Either the split pass needs a
 spatial index too, or the cap needs to bound work rather than vertices.
+
+Two more, both from the 3D lens and both left deliberately:
+
+- **Sub-EPS features are amplified, not lost.** `split_polygon`'s coplanar
+  test uses an absolute 1e-7. When a solid's opposing faces are closer than
+  2*EPS both classify coplanar with the same plane, so the slab degenerates
+  into a HALF-SPACE and deletes half the other operand — measured: a 1e-7
+  slab turned an intersection of 3.4e-7 into 4.0, and left the difference
+  genuinely open. The correct degradation is to lose the feature. The real
+  fix is a scale-relative epsilon threaded through the BSP, which is the
+  same medicine as `Plane::from_points` but a much larger change; it is
+  NOT a one-line constant edit, because the tolerance has to follow the
+  operand pair, not the module.
+- **BSP output carries T-junctions.** A split polygon's new vertex is not
+  inserted into the neighbour sharing that edge, so after welding, a long
+  edge faces two short ones: on `sphere - cylinder`, 1344 of 2619 welded
+  edges have valence 1. The mesh is watertight in the geometric sense
+  (leak 8e-17, volumes exact, zero valence>2, zero inverted normals) and
+  every viewer renders it correctly, but a consumer demanding an
+  edge-matched 2-manifold will reject it. Fixing it means propagating
+  T-vertices during the split.
 
 ## Working method (established, keep using it)
 

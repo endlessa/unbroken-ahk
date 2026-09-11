@@ -18,6 +18,17 @@ impl Mesh {
     }
 }
 
+/// The most fragments any primitive will tessellate a full circle into.
+///
+/// `sphere` is QUADRATIC in this (rings x n), so the bound is what keeps a
+/// large $fn from turning into an uncatchable allocation abort — and an abort
+/// takes the .echo diagnostic stream down with it. 1024 is the same ceiling
+/// the 2D offset kernel already uses, is visually indistinguishable from
+/// smooth at any sane viewing size, and still yields a 1M-triangle sphere.
+/// `eval::resolve_fragments` warns when it bites, so the clamp is never
+/// silent.
+pub const MAX_FRAGMENTS: u32 = 1024;
+
 /// GRID_FINE from the reference: radii below 2^-20 always get 3 fragments.
 const GRID_FINE: f64 = 1.0 / 1_048_576.0;
 
@@ -46,15 +57,20 @@ pub fn fragments(r: f64, fn_: f64, fa: f64, fs: f64) -> u32 {
     }
     if fn_ > 0.0 {
         // Saturating on both sides: the cast above is exactly where the
-        // 68 GB allocation came from.
-        return (fn_ as i64).clamp(3, u32::MAX as i64) as u32;
+        // 68 GB allocation came from. u32::MAX was still far too generous —
+        // `sphere` allocates ~n^2/2 vertices, so a merely LARGE finite $fn
+        // (40000, a plausible "max quality" value or a trailing-zero typo)
+        // asked for 19 GB and aborted the process just as fatally. An
+        // allocation failure is a Rust abort, not a catchable panic, so the
+        // .echo file explaining it never got written either.
+        return (fn_ as i64).clamp(3, MAX_FRAGMENTS as i64) as u32;
     }
     let fa = fa.max(0.01);
     let fs = fs.max(0.01);
     let by_angle = 360.0 / fa;
     let by_arc = 2.0 * std::f64::consts::PI * r / fs;
     let n = by_angle.min(by_arc).max(5.0).ceil();
-    if !n.is_finite() { 3 } else { n.clamp(3.0, u32::MAX as f64) as u32 }
+    if !n.is_finite() { 3 } else { n.clamp(3.0, MAX_FRAGMENTS as f64) as u32 }
 }
 
 // -- Matrices ---------------------------------------------------------------
@@ -252,7 +268,11 @@ fn det3(m: &Mat4) -> f64 {
 /// on the origin in all three axes. Zero/negative components yield empty
 /// geometry per the reference.
 pub fn cube(size: Vec3, center: bool) -> Mesh {
-    if size.iter().any(|&s| !(s > 0.0)) {
+    // `!(s > 0.0)` rejects 0, negative and NaN but ACCEPTS +inf, so
+    // `cube(1/0)` built a mesh whose vertices were infinite and wrote them
+    // into the STL with no diagnostic. The reference is explicit: "A size
+    // component that is 0, negative, NaN, or inf yields empty geometry."
+    if size.iter().any(|&s| !(s > 0.0) || !s.is_finite()) {
         return Mesh::empty();
     }
     let (o, e) = if center {
@@ -298,7 +318,7 @@ pub fn cube(size: Vec3, center: bool) -> Mesh {
 /// at phi = 180*(i+0.5)/R degrees with R = ceil(N/2) rings of N vertices;
 /// N-gon caps close the poles. No vertex ever sits at (0,0,±r).
 pub fn sphere(r: f64, n: u32) -> Mesh {
-    if !(r > 0.0) {
+    if !(r > 0.0) || !r.is_finite() {
         return Mesh::empty();
     }
     let n = n.max(3) as usize;
@@ -338,7 +358,14 @@ pub fn sphere(r: f64, n: u32) -> Mesh {
 /// cylinder(h, r1, r2, center): along +Z ([0,h], or [-h/2,h/2] centered).
 /// A radius of exactly 0 collapses that end to a single apex vertex.
 pub fn cylinder(h: f64, r1: f64, r2: f64, center: bool, n: u32) -> Mesh {
-    if !(h > 0.0) || r1 < 0.0 || r2 < 0.0 || (r1 == 0.0 && r2 == 0.0) {
+    // The radius tests let NaN through (every comparison with NaN is false)
+    // and both radius and height accepted +inf.
+    if !(h > 0.0)
+        || ![h, r1, r2].iter().all(|v| v.is_finite())
+        || !(r1 >= 0.0)
+        || !(r2 >= 0.0)
+        || (r1 == 0.0 && r2 == 0.0)
+    {
         return Mesh::empty();
     }
     let n = n.max(3) as usize;

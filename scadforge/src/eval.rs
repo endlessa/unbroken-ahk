@@ -204,6 +204,17 @@ fn evaluate_inner(program: &[Stmt], record: bool, mode: Mode) -> EvalOutput {
         shapes.retain(|s| s.rooted);
     }
     ctx.out.shapes.extend(shapes);
+    // A BSP build that hit its no-progress guard or depth cap produced an
+    // approximate — at extreme coordinates, genuinely open — mesh. The guards
+    // are there so pathological input cannot abort the process, but handing
+    // back an open mesh without saying so is its own defect.
+    if csg::take_degraded() {
+        ctx.warn(
+            "the boolean kernel could not partition cleanly at these coordinate \
+             magnitudes and approximated the result; the mesh may not be watertight \
+             (move the model nearer the origin, or work at a smaller scale)",
+        );
+    }
     // The root frame was never closed (nothing to close it into); take it
     // directly as the tree's `group()` root.
     if let Some(st) = &mut ctx.csg {
@@ -1859,10 +1870,9 @@ fn call_builtin_module(
                 let regions: Vec<Poly2> =
                     groups.iter().flatten().filter_map(|s| s.outline.clone()).collect();
                 let nonempty = regions.iter().filter(|r| !r.is_empty()).count();
-                if nonempty >= 2 {
+                if nonempty >= 2 && regions.iter().any(|r| !r.is_empty() && !region_is_convex(r)) {
                     ctx.warn(
-                        "minkowski(): result is exact for convex operands; concave operands \
-                         are approximated by their convex sum",
+                        "minkowski(): a concave operand is approximated by its convex sum",
                     );
                 }
                 return match csg2::minkowski2(&regions) {
@@ -1887,10 +1897,18 @@ fn call_builtin_module(
             }
             let meshes: Vec<Mesh> = groups.iter().map(|g| combine_group(g).0).collect();
             let nonempty = meshes.iter().filter(|m| !m.positions.is_empty()).count();
-            if nonempty >= 2 {
+            // Warn only when the approximation ACTUALLY happens. This used to
+            // fire on every multi-operand minkowski, including the dominant
+            // exact case (rounding a box with a sphere) — an uninformative
+            // diagnostic, and one that would make every minkowski fatal under
+            // the planned --hardwarnings.
+            if nonempty >= 2
+                && meshes
+                    .iter()
+                    .any(|m| !m.positions.is_empty() && !csg::is_convex(m))
+            {
                 ctx.warn(
-                    "minkowski(): result is exact for convex operands; concave operands \
-                     are approximated by their convex sum",
+                    "minkowski(): a concave operand is approximated by its convex sum",
                 );
             }
             // Children colors are DROPPED (reference minkowski EDGE[9]).
@@ -2176,6 +2194,36 @@ fn resize_matrix(shapes: &[Shape], newsize: [f64; 3], auto: Option<&Value>) -> O
 
 /// True if any child group holds a 2D shape — flags a 2D/3D mix in the CSG
 /// arms so it can warn rather than combine incompatible geometry.
+/// A 2D region is convex when it is a single contour that turns the same way
+/// at every vertex. Only used to decide whether minkowski's approximation
+/// warning is warranted.
+fn region_is_convex(r: &Poly2) -> bool {
+    if r.contours.len() != 1 {
+        return false; // a hole or several islands is never convex
+    }
+    let c = &r.contours[0];
+    let n = c.len();
+    if n < 3 {
+        return false;
+    }
+    let mut sign = 0i32;
+    for i in 0..n {
+        let a = c[i];
+        let b = c[(i + 1) % n];
+        let d = c[(i + 2) % n];
+        let cr = (b[0] - a[0]) * (d[1] - b[1]) - (b[1] - a[1]) * (d[0] - b[0]);
+        let s = if cr > 0.0 { 1 } else if cr < 0.0 { -1 } else { 0 };
+        if s != 0 {
+            if sign == 0 {
+                sign = s;
+            } else if sign != s {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn any_2d(groups: &[Vec<Shape>]) -> bool {
     groups.iter().flatten().any(|s| s.outline.is_some())
 }
@@ -2805,7 +2853,19 @@ fn resolve_fragments(r: f64, ctx: &mut Ctx) -> u32 {
             ctx.warn(format!("{} too small - clamping to 0.01", name));
         }
     }
-    geom::fragments(r, get("$fn", 0.0), fa, fs)
+    let fn_ = get("$fn", 0.0);
+    // The clamp exists so a large $fn cannot abort the process on an
+    // allocation it can never satisfy; say so rather than quietly rendering
+    // something coarser than asked for.
+    if fn_.is_finite() && fn_ > geom::MAX_FRAGMENTS as f64 && !ctx.clamp_warned.iter().any(|w| w == "$fn") {
+        ctx.clamp_warned.push("$fn".into());
+        ctx.warn(format!(
+            "$fn of {} exceeds the {} fragment cap; clamping (a sphere is \
+             quadratic in $fn, and the allocation would abort the process)",
+            fn_, geom::MAX_FRAGMENTS
+        ));
+    }
+    geom::fragments(r, fn_, fa, fs)
 }
 
 fn parse_color(c: Option<&Value>, alpha: Option<&Value>, ctx: &mut Ctx) -> Option<[f64; 4]> {
@@ -4803,12 +4863,79 @@ mod tests {
         // A non-finite RADIUS is the same short-circuit.
         assert_eq!(geom::fragments(f64::NAN, 0.0, 12.0, 2.0), 3);
         assert_eq!(geom::fragments(f64::INFINITY, 0.0, 12.0, 2.0), 3);
-        // And a merely enormous finite $fn saturates instead of wrapping.
-        assert_eq!(geom::fragments(1.0, 1e30, 12.0, 2.0), u32::MAX);
+        // And a merely enormous finite $fn clamps instead of wrapping — see
+        // `a_large_finite_fn_clamps_instead_of_aborting` for why the ceiling
+        // has to be far below u32::MAX.
+        assert_eq!(geom::fragments(1.0, 1e30, 12.0, 2.0), geom::MAX_FRAGMENTS);
         // End to end: the script that aborted now runs and yields a triangle.
         let out = run("$fn = 1/0;\nlinear_extrude(1) circle(r = 1);");
         assert!(out.error.is_none(), "error: {:?}", out.error);
         assert!(!out.shapes.is_empty(), "no geometry");
+    }
+
+    #[test]
+    fn non_finite_primitive_arguments_yield_empty_geometry() {
+        // REGRESSION. `!(s > 0.0)` rejects 0, negative and NaN but ACCEPTS
+        // +inf, and cylinder's radius tests let NaN through entirely — so
+        // `cube(1/0)` wrote an STL full of infinite vertices with no
+        // diagnostic. The reference: "A size component that is 0, negative,
+        // NaN, or inf yields empty geometry."
+        for src in [
+            "cube(1/0);",
+            "cube([1, 1/0, 1]);",
+            "sphere(r = 1/0);",
+            "cylinder(h = 5, r = 0/0);",
+            "cylinder(h = 5, r1 = 2, r2 = 0/0);",
+            "cylinder(h = 1/0, r = 2);",
+        ] {
+            let out = run(src);
+            assert!(
+                out.shapes.iter().all(|s| s.mesh.positions.is_empty()),
+                "{src} produced geometry"
+            );
+        }
+        // The finite versions of each still work.
+        assert!(!run("cube(2);").shapes.is_empty());
+        assert!(!run("cylinder(h = 5, r1 = 2, r2 = 1);").shapes.is_empty());
+    }
+
+    #[test]
+    fn a_large_finite_fn_clamps_instead_of_aborting() {
+        // REGRESSION. Guarding only `!is_finite()` left a merely LARGE $fn to
+        // abort the process: sphere allocates ~n^2/2 vertices, so $fn = 40000
+        // asked for 19 GB. An allocation failure is a Rust abort, not a
+        // catchable panic, so the .echo explaining it was never written.
+        let out = run("$fn = 40000;\nsphere(10);");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(!out.shapes.is_empty());
+        assert!(
+            out.warnings.iter().any(|w| w.contains("fragment cap")),
+            "the clamp was silent: {:?}",
+            out.warnings
+        );
+        assert_eq!(geom::fragments(10.0, 1e6, 12.0, 2.0), geom::MAX_FRAGMENTS);
+    }
+
+    #[test]
+    fn minkowski_warns_only_when_it_actually_approximates() {
+        // REGRESSION. The warning fired on every multi-operand minkowski,
+        // including the dominant EXACT case (rounding a box with a sphere) —
+        // uninformative, and fatal for every minkowski under --hardwarnings.
+        let convex = run("minkowski() { cube(10, center = true); sphere(1, $fn = 8); }");
+        assert!(
+            !convex.warnings.iter().any(|w| w.contains("concave operand")),
+            "warned on a convex pair: {:?}",
+            convex.warnings
+        );
+        let concave = run(
+            "minkowski() { union() { cube([10,3,3], center=true); cube([3,10,3], center=true); } \
+             sphere(1, $fn = 8); }",
+        );
+        assert!(
+            concave.warnings.iter().any(|w| w.contains("concave operand")),
+            "no warning on a concave operand: {:?}",
+            concave.warnings
+        );
     }
 
     #[test]
