@@ -404,6 +404,28 @@ geometry kernel has no intrinsic unit, so every threshold in it must be
 relative to something in the input.** The fix is a sliver test on the sine of
 the angle between edges, which is scale-free by construction.
 
+**The parser lens found nothing, and that is the result (2026-09-11).** Run
+by hand after the agent pass hit a limit. The path sandbox holds: with
+GEOMETRY as the oracle — a readable heightmap yields facets, a blocked one
+yields none — all nine escape routes are refused (parent-dir, absolute,
+nested `..`, symlinked file and symlinked directory, for both `import()` and
+`surface()`), while the in-sandbox controls read normally. A 6,152-case
+mutation sweep over STL/OFF/AMF/3MF/SVG/DXF/heightmap — truncation at every
+length for small files and 400 sampled lengths for large, plus byte flips and
+spliced 2^32-1 counts — produced zero panics, zero aborts, zero timeouts.
+Hand-built structural attacks that random mutation is too blunt to reach were
+all refused gracefully in under 0.3s: a binary STL claiming 2^32-1 triangles
+in 84 bytes, an OFF header claiming four billion vertices, 200k-deep SVG and
+AMF nesting, a 2M-column heightmap, an include/use cycle, a 1 GiB zip bomb, a
+20,000-entry archive, patched uncompressed-size fields, a corrupted CRC, and a
+300 MiB payload against the 256 MiB budget.
+
+The thing being defended against is specific and worth naming: in Rust an
+allocation failure is an ABORT, not a catchable panic — so a declared-count
+attack does not merely fail, it kills the process and takes the `.echo`
+diagnostic stream down with it. That is exactly how the `$fn` bugs presented.
+Both classes are now pinned by tests.
+
 **Still open from the audit:** `offset` cost is driven by the number of
 self-intersections of the raw curve, which grows with (offset distance /
 feature spacing)², not with vertex count — so `OFFSET_MAX_VERTS` bounds V

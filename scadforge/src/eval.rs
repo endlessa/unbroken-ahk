@@ -4874,6 +4874,32 @@ mod tests {
     }
 
     #[test]
+    fn the_path_sandbox_holds() {
+        // A .scad file names the files it imports, so this is the one place
+        // where a bug is a security issue rather than a robustness one.
+        // Verified end to end with geometry as the oracle — a readable
+        // heightmap produces facets, a blocked one produces none — across
+        // parent-dir, absolute, symlinked-file and symlinked-directory routes
+        // for both import() and surface(). These pin the predicate itself.
+        for escape in [
+            "../secret.stl",
+            "a/../../secret.stl",
+            "./x/../../secret.stl",
+            "/etc/passwd",
+            "/tmp/loot.stl",
+        ] {
+            assert!(
+                sandboxed_path(escape).is_none(),
+                "{escape} escaped the sandbox"
+            );
+        }
+        // Ordinary relative paths are still allowed.
+        for ok in ["model.stl", "assets/model.stl", "./model.stl"] {
+            assert!(sandboxed_path(ok).is_some(), "{ok} was wrongly blocked");
+        }
+    }
+
+    #[test]
     fn non_finite_primitive_arguments_yield_empty_geometry() {
         // REGRESSION. `!(s > 0.0)` rejects 0, negative and NaN but ACCEPTS
         // +inf, and cylinder's radius tests let NaN through entirely — so

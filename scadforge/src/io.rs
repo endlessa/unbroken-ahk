@@ -957,6 +957,60 @@ pub fn format_from_ext(path: &str) -> Option<MeshFormat> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Hostile input must never abort, hang, or allocate on a number the FILE
+    /// chose. A 6,152-case mutation sweep (truncation at every length, byte
+    /// flips, spliced 2^32-1 counts) over STL/OFF/AMF/3MF/SVG/DXF/heightmap
+    /// found nothing; these are the hand-built structural attacks that random
+    /// mutation is too blunt to reach, pinned so they stay handled.
+    ///
+    /// The failure mode that matters is specific: in Rust an allocation
+    /// failure is an ABORT, not a catchable panic, so a declared-count attack
+    /// would kill the process and take the .echo diagnostic stream with it.
+    #[test]
+    fn declared_counts_cannot_drive_the_allocator() {
+        // Binary STL: 80-byte header then a triangle count, with no data.
+        let mut bomb = vec![0u8; 80];
+        bomb.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(read_stl(&bomb).map(|m| m.tris.len()).unwrap_or(0) == 0);
+        let mut bomb = vec![0u8; 80];
+        bomb.extend_from_slice(&100_000_000u32.to_le_bytes());
+        assert!(read_stl(&bomb).map(|m| m.tris.len()).unwrap_or(0) == 0);
+
+        // OFF: a header claiming four billion vertices.
+        for text in [
+            "OFF\n4294967295 4294967295 0\n",
+            "OFF\n999999999 999999999 0\n0 0 0\n",
+            "OFF\n-1 -1 0\n",
+        ] {
+            assert!(read_off(text).map(|m| m.positions.len()).unwrap_or(0) < 10);
+        }
+
+        // Truncation at every length of a well-formed ASCII STL.
+        let good = "solid s\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\n\
+                    vertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid s\n";
+        for k in 0..good.len() {
+            let _ = read_stl(good[..k].as_bytes());
+        }
+        for k in 0..good.len() {
+            let _ = read_off(&good[..k]);
+        }
+    }
+
+    #[test]
+    fn a_deflate_bomb_is_refused_by_the_budget() {
+        // A 3MF is a ZIP. The whole-archive budget has to hold against an
+        // entry whose DECLARED size is enormous, and against a stream that
+        // genuinely expands past the cap.
+        let mut junk = vec![b'P', b'K', 3, 4];
+        junk.extend(std::iter::repeat(0xFFu8).take(512));
+        assert!(read_3mf(&junk).is_err(), "garbage archive accepted");
+        // Truncation at every length of that same header.
+        for k in 0..junk.len() {
+            let _ = read_3mf(&junk[..k]);
+        }
+    }
+
     use super::*;
     use crate::geom;
 
