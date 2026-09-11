@@ -1289,6 +1289,69 @@ mod tests {
         assert!(checked > 20_000, "only {checked} probes");
     }
 
+    /// The erosion path — and it has to be tested SEPARATELY from dilation,
+    /// which is the whole point of this test existing.
+    ///
+    /// `offset_is_scale_invariant` below sweeps 10^-6..10^6 and passed the
+    /// whole time, because every call in it uses a POSITIVE distance. Only
+    /// the negative path touches the segment BSP, whose EPS and SNAP are
+    /// absolute — so the one code path where scale invariance actually broke
+    /// was the one path the scale-invariance test never exercised. Below
+    /// 1e-5 the eroded holes disappeared; below 1e-6 the result was EMPTY.
+    #[test]
+    fn erosion_is_scale_invariant_too() {
+        let unit: Vec<P2> = vec![
+            [0.0, 0.0], [3.0, 0.0], [3.0, 2.0], [1.0, 2.0], [1.0, 1.0], [0.0, 1.0],
+        ];
+        let mut reference: Option<f64> = None;
+        for k in [-8i32, -6, -5, -4, -2, 0, 2, 4, 6] {
+            let f = 10f64.powi(k);
+            let poly: Vec<P2> = unit.iter().map(|p| [p[0] * f, p[1] * f]).collect();
+            let region = crate::poly2::Poly2::new(vec![poly]);
+            let out = crate::csg2::offset2(&region, -0.2 * f, crate::csg2::Join::Round, 64);
+            assert!(!out.contours.is_empty(), "scale 1e{k}: erosion came back EMPTY");
+            let a: f64 = out
+                .contours
+                .iter()
+                .map(|c| signed_area(c))
+                .sum::<f64>()
+                / (f * f);
+            match reference {
+                None => reference = Some(a),
+                Some(r0) => assert!(
+                    (a - r0).abs() / r0.abs() < 1e-9,
+                    "scale 1e{k}: normalized eroded area {a} != {r0}"
+                ),
+            }
+        }
+    }
+
+    /// A FINER $fn must never make a result WORSE. Once the eroded corner's
+    /// arc chord |dist|*2*pi/$fn fell below the BSP's absolute 1e-6 weld, the
+    /// arc vertices welded together and the hole vanished — so raising
+    /// quality silently destroyed the model, and the threshold moved with
+    /// $fn rather than being a property of the geometry.
+    #[test]
+    fn a_finer_fn_never_makes_an_erosion_worse() {
+        let s = 1e-4;
+        let ring = crate::poly2::Poly2::new(vec![
+            vec![[-10.0 * s, -10.0 * s], [10.0 * s, -10.0 * s], [10.0 * s, 10.0 * s], [-10.0 * s, 10.0 * s]],
+            vec![[-4.0 * s, -4.0 * s], [4.0 * s, -4.0 * s], [4.0 * s, 4.0 * s], [-4.0 * s, 4.0 * s]],
+        ]);
+        // 18s square minus the 8s hole dilated by s with round corners.
+        let exact = 224.858407;
+        let mut prev_err = f64::INFINITY;
+        for f in [16u32, 64, 256, 512, 700, 1024] {
+            let out = crate::csg2::offset2(&ring, -s, crate::csg2::Join::Round, f);
+            assert_eq!(out.contours.len(), 2, "$fn={f}: the eroded hole vanished");
+            let a: f64 = out.contours.iter().map(|c| signed_area(c)).sum::<f64>() / (s * s);
+            let err = (a - exact).abs();
+            assert!(err <= prev_err + 1e-9, "$fn={f}: error grew from {prev_err} to {err}");
+            prev_err = err;
+        }
+        assert!(prev_err < 1e-4, "did not converge: final error {prev_err}");
+    }
+
     /// The operation must be SCALE-INVARIANT: offsetting a shape magnified by
     /// 10^k, by a distance magnified by 10^k, must give 10^2k the area. Two
     /// hard-coded tolerances broke that in opposite directions — an absolute

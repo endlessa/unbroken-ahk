@@ -442,6 +442,28 @@ attack does not merely fail, it kills the process and takes the `.echo`
 diagnostic stream down with it. That is exactly how the `$fn` bugs presented.
 Both classes are now pinned by tests.
 
+**The offset lens (2026-09-11) — the fourth instance, and a test of mine
+with a hole in exactly the wrong place.** Erosion is the only offset path
+that touches the segment BSP, whose `EPS` and `SNAP` are ABSOLUTE. So a
+negative offset lost its holes below ~1e-5 units and returned EMPTY below
+~1e-6, while the positive offset of the identical shape was bit-identical
+from 1e-8 to 1e6. The same constant made a FINER `$fn` produce a WORSE
+result: once the eroded corner's arc chord `|d|*2*pi/$fn` fell under `SNAP`
+the arc welded shut and the hole vanished, so raising quality destroyed the
+model at `$fn` = 700.
+
+The shipped `offset_is_scale_invariant` test swept 10^-6..10^6 and passed
+the whole time — because every call in it used a POSITIVE distance. The one
+code path where scale invariance actually broke was the one path the
+scale-invariance test never exercised. That is a sharper version of the
+testing lesson above: it is not enough to pin the right PROPERTY, the sweep
+has to reach the code that can violate it.
+
+Fixed by normalizing the erosion to unit scale before it enters the BSP and
+scaling the answer back — offsetting commutes with uniform scaling, and a
+POWER-OF-TWO factor makes both scalings exact in binary floating point, so a
+region already near unit scale gets s = 1 and is bit-identical to before.
+
 **Still open from the audit:** `offset` cost is driven by the number of
 self-intersections of the raw curve, which grows with (offset distance /
 feature spacing)², not with vertex count — so `OFFSET_MAX_VERTS` bounds V
@@ -449,6 +471,33 @@ but not work. A 4000-vertex, 2000-spike profile at r=5 produces 1.29M
 sub-segments and takes ~25s (down from 44s after indexing the input edges
 and short-circuiting the containment test). Either the split pass needs a
 spatial index too, or the cap needs to bound work rather than vertices.
+
+**Even-odd resolution of the offset INPUT is missing**, and it is one root
+cause behind three separate reproduced failures. The reference is explicit
+(`offset`, semantics + edge_cases[9]): children are unioned and
+self-intersecting outlines are "resolved by the clipping kernel (even-odd/
+nonzero resolution as per polygon() semantics) BEFORE offsetting". Nothing
+resolves them. Measured:
+
+- A hole whose vertices all lie ON the outer contour casts zero votes in
+  `nesting_depths`, fails the strict-majority test, and is wound as an
+  OUTER — so the offset GROWS the hole instead of shrinking it. 63% area
+  error at r=0.5, and the traced graph is perfectly balanced, so it returns
+  at the first ladder rung with `degree_mismatch = 0`. Reachable from an
+  ordinary SVG import with two filled subpaths.
+- Crossing contours are offset as the UNION, not the even-odd region: the
+  overlap hole is filled (up to 52% error on a negative offset).
+- A self-intersecting contour with zero signed area (any balanced bowtie)
+  is silently DELETED by `normalize`'s area filter — `offset()` returns
+  nothing where the bare `polygon()` renders two triangles. With non-zero
+  signed area it survives but is oriented by WINDING rather than even-odd
+  (17-59% error).
+
+The fix is a resolve pass, not three patches: split the input at all mutual
+and self intersections, keep the edges whose two sides disagree under an
+even-odd crossing count, and re-trace — the same pipeline shape the offset
+itself already uses. It should run only when a cheap detector says the input
+needs it, so well-formed input keeps the current fast path bit-identically.
 
 Two more, both from the 3D lens and both left deliberately:
 

@@ -810,20 +810,69 @@ pub fn offset2(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 
         return region.clone(); // identity (a zero/invalid offset is a no-op)
     }
     if dist > 0.0 {
-        dilate(region, dist, join, frags_full)
-    } else {
-        // Erosion: complement P inside a box padded well beyond reach, dilate
-        // the complement inward by |dist|, then subtract it back from the box.
-        let (lo, hi) = region_bbox(region);
-        let grow = -dist;
-        let pad = grow * 2.0 + 1.0;
-        let bcont = box_contour([lo[0] - pad, lo[1] - pad], [hi[0] + pad, hi[1] + pad]);
-        let mut comp_contours = vec![bcont.clone()];
-        comp_contours.extend(region.contours.iter().cloned());
-        let comp = Poly2::new(comp_contours); // even-odd: box minus P
-        let grown = dilate(&comp, grow, join, frags_full);
-        difference2(&Poly2::new(vec![bcont]), &[grown])
+        return dilate(region, dist, join, frags_full);
     }
+    // EROSION is the only offset path that touches the segment BSP, and that
+    // kernel classifies on an ABSOLUTE EPS = 1e-7 and welds stitched
+    // endpoints on an ABSOLUTE SNAP = 1e-6 grid. So erosion inherited a scale
+    // dependence the dilation does not have: a shape below ~1e-5 units lost
+    // its eroded holes and below ~1e-6 came back EMPTY, while the positive
+    // offset of the identical shape was bit-identical from 1e-8 to 1e6. It
+    // also meant a FINER $fn made a small erosion worse, not better — once
+    // the arc chord |dist|*2*pi/$fn fell under SNAP the rounded corners
+    // welded together and the hole vanished.
+    //
+    // Offsetting commutes with uniform scaling — erode(s*P, s*d) = s*erode(P, d)
+    // — so normalize the problem to unit extent, solve it there where the
+    // absolute tolerances are meaningful, and scale the answer back. The
+    // factor is a POWER OF TWO, which makes both scalings exact in binary
+    // floating point: nothing is lost, and a region already near unit scale
+    // gets s = 1 and is bit-identical to before.
+    let (lo, hi) = region_bbox(region);
+    let span = (hi[0] - lo[0]).abs().max((hi[1] - lo[1]).abs()).max(-dist);
+    let s = if span.is_finite() && span > 0.0 {
+        let e = span.log2().round();
+        if e.is_finite() && e.abs() < 900.0 { 2f64.powi(-(e as i32)) } else { 1.0 }
+    } else {
+        1.0
+    };
+    let scaled = if s == 1.0 {
+        region.clone()
+    } else {
+        Poly2::new(
+            region
+                .contours
+                .iter()
+                .map(|c| c.iter().map(|p| [p[0] * s, p[1] * s]).collect())
+                .collect(),
+        )
+    };
+    let out = erode_at_unit_scale(&scaled, -dist * s, join, frags_full);
+    if s == 1.0 {
+        return out;
+    }
+    Poly2::new(
+        out.contours
+            .iter()
+            .map(|c| c.iter().map(|p| [p[0] / s, p[1] / s]).collect())
+            .collect(),
+    )
+}
+
+/// Erosion proper: complement the region inside a padded box, dilate the
+/// complement inward, and subtract it back. The caller has already
+/// normalized the coordinates, so the box padding is relative to what it is
+/// given rather than carrying an absolute `+ 1`.
+fn erode_at_unit_scale(region: &Poly2, grow: f64, join: Join, frags_full: u32) -> Poly2 {
+    let (lo, hi) = region_bbox(region);
+    let extent = (hi[0] - lo[0]).abs().max((hi[1] - lo[1]).abs()).max(grow);
+    let pad = grow * 2.0 + extent * 0.5;
+    let bcont = box_contour([lo[0] - pad, lo[1] - pad], [hi[0] + pad, hi[1] + pad]);
+    let mut comp_contours = vec![bcont.clone()];
+    comp_contours.extend(region.contours.iter().cloned());
+    let comp = Poly2::new(comp_contours); // even-odd: box minus P
+    let grown = dilate(&comp, grow, join, frags_full);
+    difference2(&Poly2::new(vec![bcont]), &[grown])
 }
 
 fn region_bbox(poly: &Poly2) -> (V2, V2) {
