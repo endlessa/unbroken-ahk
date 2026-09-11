@@ -14,6 +14,7 @@ fn main() {
     let mut defines: Vec<(String, String)> = Vec::new();
     let mut preset_file: Option<String> = None;
     let mut preset_name: Option<String> = None;
+    let mut camera = scadforge::eval::Camera::DEFAULT;
 
     let mut i = 1;
     while i < args.len() {
@@ -61,6 +62,31 @@ fn main() {
                 }
                 i += 2;
             }
+            "--camera" => {
+                // --camera=tx,ty,tz,rx,ry,rz,dist populates $vpt/$vpr/$vpd,
+                // per the reference. Accepted as one argument or as
+                // `--camera=...`; the eye/center form is not supported and
+                // says so rather than guessing.
+                let spec = match args.get(i + 1) {
+                    Some(v) => v.clone(),
+                    None => {
+                        eprintln!("--camera requires tx,ty,tz,rx,ry,rz,dist");
+                        exit(2);
+                    }
+                };
+                match parse_camera(&spec) {
+                    Some(c) => camera = c,
+                    None => {
+                        eprintln!(
+                            "--camera expects seven comma-separated numbers \
+                             (tx,ty,tz,rx,ry,rz,dist); the eye/center form is \
+                             not supported"
+                        );
+                        exit(2);
+                    }
+                }
+                i += 2;
+            }
             "-P" => {
                 // `-P NAME`: the preset set to select from the `-p` file.
                 match args.get(i + 1) {
@@ -83,7 +109,8 @@ fn main() {
             other => {
                 eprintln!(
                     "unknown argument '{}'; usage: scadforge [--port N] | \
-                     scadforge -o OUT [-D name=value ...] INPUT.scad",
+                     scadforge -o OUT [-D name=value ...] \
+                     [--camera tx,ty,tz,rx,ry,rz,dist] INPUT.scad",
                     other
                 );
                 exit(2);
@@ -93,7 +120,7 @@ fn main() {
 
     // Headless render when an input file (or -o) is present; otherwise serve.
     if input.is_some() || output.is_some() {
-        exit(render_headless(input, output, &defines, preset_file, preset_name));
+        exit(render_headless(input, output, &defines, preset_file, preset_name, camera));
     }
 
     if let Err(e) = scadforge::http::serve(port) {
@@ -103,12 +130,30 @@ fn main() {
 }
 
 /// Run the headless render pipeline; returns a process exit code.
+/// `tx,ty,tz,rx,ry,rz,dist` — the rotational `--camera` form.
+fn parse_camera(spec: &str) -> Option<scadforge::eval::Camera> {
+    let n: Vec<f64> = spec
+        .split(',')
+        .map(|t| t.trim().parse::<f64>().ok())
+        .collect::<Option<Vec<f64>>>()?;
+    if n.len() != 7 || !n.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    Some(scadforge::eval::Camera {
+        trans: [n[0], n[1], n[2]],
+        rot: [n[3], n[4], n[5]],
+        dist: n[6],
+        ..scadforge::eval::Camera::DEFAULT
+    })
+}
+
 fn render_headless(
     input: Option<String>,
     output: Option<String>,
     defines: &[(String, String)],
     preset_file: Option<String>,
     preset_name: Option<String>,
+    camera: scadforge::eval::Camera,
 ) -> i32 {
     let (input, output) = match (input, output) {
         (Some(i), Some(o)) => (i, o),
@@ -195,7 +240,7 @@ fn render_headless(
     }
     overrides.extend_from_slice(defines);
 
-    match scadforge::eval::render_export_bytes(&source, &base, &overrides, &format) {
+    match scadforge::eval::render_export_bytes_with_camera(&source, &base, &overrides, &format, camera) {
         Ok(body) => match std::fs::write(&output, &body) {
             Ok(()) => {
                 eprintln!("wrote {}", output);

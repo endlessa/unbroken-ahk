@@ -4,10 +4,8 @@ The yardstick is `docs/openscad_language_reference.json` (183 entries,
 OpenSCAD 2021.01 semantics). Score entries as **full** (implemented with
 edge-case fidelity, pinned by tests), **partial**, or **untouched**.
 
-Standing after Customizer + SVG import + PDF export + 3MF + `.echo` +
-the offset-kernel rewrite + `.csg` export + a fourteen-bug audit
-(2026-09-10): **151 full / 22 partial / 10 untouched — 83% full, 94%
-touched.** Every geometry and I/O *format* of 2021.01 is implemented.
+Standing after the audit and the `$vp*` viewport quartet (2026-09-11):
+**155 full / 22 partial / 6 untouched — 85% full, 97% touched.** Every geometry and I/O *format* of 2021.01 is implemented.
 PHASE 4 COMPLETE. Phase 5
 so far:
 modifier characters `* ! # %` (full); STL + OFF import/export; SVG + DXF
@@ -276,11 +274,29 @@ Landed (2026-09-03):
 
 ## The honest tail
 
-~10 entries remain, and they are the true tail — desktop-application
-surface rather than the modeling language: GUI-viewport PNG export,
-`$vpr`-family viewport variables (camera state), and DXF-era deprecated
-metadata functions (`dxf_dim`/`dxf_cross`). Each gets a per-entry decision
-— web-app equivalent, or documented as intentionally out of scope. Every
+~6 entries remain, and they are the true tail — desktop-application surface
+rather than the modeling language: GUI-viewport PNG export and DXF-era
+deprecated metadata functions (`dxf_dim`/`dxf_cross`). Each gets a per-entry
+decision — web-app equivalent, or documented as intentionally out of scope.
+
+**The `$vp*` quartet now lands (2026-09-11).** `$vpr`/`$vpt`/`$vpd`/`$vpf`
+carry the reference's defaults ([55, 0, 25], origin, 140, 22.5), and the
+read/assign model is the interesting part: the viewport writes its live
+camera into the variables BEFORE evaluation, so a script that reads `$vpr`
+sees where the user actually is; a TOP-LEVEL assignment is reported back so
+the camera moves once the compile finishes — which is what makes the
+reference's camera-animation idiom (`$vpr` driven from `$t`) work. An
+assignment below top level does NOT move the camera, and a wrong-shaped
+assignment leaves the camera alone while the variable still holds what the
+script wrote; both are pinned. The CLI gains `--camera
+tx,ty,tz,rx,ry,rz,dist`, which populates the quartet; the alternate
+eye/center spelling is refused by name rather than guessed at.
+
+Capturing the assignment took two tries: `set_var` writes a `$`-name into
+the CURRENT dynamic layer, and `exec_scope` drops that layer on the way out,
+so reading the camera after evaluation returned the input every time. It has
+to be read on exit from the outermost scope, while the layer is still
+alive — which is also exactly where "top level" is decidable. Every
 geometry and I/O format of 2021.01 is now implemented; 100% of the
 *language* is reachable; 100% of all 183 entries goes through those
 judgment calls.

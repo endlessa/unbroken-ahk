@@ -34,7 +34,7 @@ pub fn handle(method: &str, path: &str, body: &str) -> Response {
         ("POST", "/render") => Response {
             status: "200 OK",
             content_type: "application/json",
-            body: render_json(body, &overrides_from_query(query)),
+            body: render_json_with_camera(body, &overrides_from_query(query), camera_from_query(query)),
         },
         // Export the current source's solid geometry as a downloadable mesh
         // (ASCII STL or OFF). Text formats only over HTTP; binary STL is
@@ -190,12 +190,43 @@ fn export_response(query: &str, source: &str) -> Response {
 /// The `parameters` model is parsed from the ORIGINAL source, so the panel
 /// keeps showing the declared widgets and their defaults while the preview
 /// reflects the overridden values.
+/// The viewport's live camera, as the `$vp*` quartet. The viewer sends where
+/// it currently is so a script that READS `$vpr` sees the real camera, and
+/// the response reports where the camera should end up so a top-level
+/// `$vpr = ...` can move it — the reference's camera-animation idiom.
+fn camera_from_query(query: &str) -> eval::Camera {
+    let num = |key: &str, d: f64| {
+        query_param(query, key).and_then(|v| v.parse::<f64>().ok()).filter(|n| n.is_finite()).unwrap_or(d)
+    };
+    let d = eval::Camera::DEFAULT;
+    eval::Camera {
+        rot: [num("vpr0", d.rot[0]), num("vpr1", d.rot[1]), num("vpr2", d.rot[2])],
+        trans: [num("vpt0", d.trans[0]), num("vpt1", d.trans[1]), num("vpt2", d.trans[2])],
+        dist: num("vpd", d.dist),
+        fov: num("vpf", d.fov),
+    }
+}
+
 pub fn render_json(source: &str, overrides: &[(String, String)]) -> String {
+    render_json_with_camera(source, overrides, eval::Camera::DEFAULT)
+}
+
+pub fn render_json_with_camera(
+    source: &str,
+    overrides: &[(String, String)],
+    camera: eval::Camera,
+) -> String {
     let mut pairs: Vec<(&str, JsonValue)> = Vec::new();
     {
             let base = std::env::current_dir().unwrap_or_else(|_| ".".into());
             let effective = customizer::apply_overrides(source, overrides);
-            let out = eval::evaluate_source(&effective, &base);
+            let out = eval::evaluate_source_with_camera(
+                &effective,
+                &base,
+                false,
+                eval::Mode::Preview,
+                camera,
+            );
             let meshes: Vec<JsonValue> = out
                 .shapes
                 .iter()
@@ -240,6 +271,22 @@ pub fn render_json(source: &str, overrides: &[(String, String)]) -> String {
             pairs.push((
                 "warnings",
                 JsonValue::Array(out.warnings.iter().map(|w| str_val(w)).collect()),
+            ));
+            // Where the camera should be after the compile. Equal to what the
+            // viewer sent unless the script assigned a $vp* at top level.
+            let cam = out.camera.unwrap_or(camera);
+            pairs.push((
+                "camera",
+                JsonValue::Array(vec![
+                    JsonValue::Number(cam.rot[0]),
+                    JsonValue::Number(cam.rot[1]),
+                    JsonValue::Number(cam.rot[2]),
+                    JsonValue::Number(cam.trans[0]),
+                    JsonValue::Number(cam.trans[1]),
+                    JsonValue::Number(cam.trans[2]),
+                    JsonValue::Number(cam.dist),
+                    JsonValue::Number(cam.fov),
+                ]),
             ));
             pairs.push((
                 "echoes",

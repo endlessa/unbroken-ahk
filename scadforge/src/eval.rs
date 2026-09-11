@@ -89,6 +89,10 @@ pub struct EvalOutput {
     /// A fatal diagnostic (assert failure, recursion limit): evaluation
     /// halted here; shapes/echoes hold everything produced before it.
     pub error: Option<String>,
+    /// The camera after evaluation. Equal to the one supplied unless the
+    /// script assigned a `$vp*` variable at top level, in which case the
+    /// viewer should move to it once the compile finishes.
+    pub camera: Option<Camera>,
     /// Emission order across `echoes` and `warnings`, oldest first. Walking
     /// it with a cursor into each vector reconstructs the real console.
     pub order: Vec<Chan>,
@@ -106,6 +110,81 @@ pub struct EvalOutput {
 /// recorded. This is the web viewport's path.
 pub fn evaluate_source(source: &str, base_dir: &std::path::Path) -> EvalOutput {
     evaluate_source_for(source, base_dir, false, Mode::Preview)
+}
+
+/// `evaluate_source_for` with an explicit starting camera — the viewport's
+/// live state in the GUI, or `--camera` on the command line.
+pub fn evaluate_source_with_camera(
+    source: &str,
+    base_dir: &std::path::Path,
+    record_csg: bool,
+    mode: Mode,
+    camera: Camera,
+) -> EvalOutput {
+    evaluate_source_inner(source, base_dir, record_csg, mode, camera)
+}
+
+/// The viewport camera, as the `$vp*` quartet sees it.
+///
+/// `$vpr` rotation in degrees, `$vpt` the look-at point, `$vpd` the distance,
+/// `$vpf` the field of view. Reads reflect the camera at evaluation time; a
+/// TOP-LEVEL assignment repositions the camera once the compile finishes,
+/// which is how the reference's camera-animation idiom (`$vpr` driven from
+/// `$t`) works.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Camera {
+    pub rot: [f64; 3],
+    pub trans: [f64; 3],
+    pub dist: f64,
+    pub fov: f64,
+}
+
+impl Camera {
+    /// The reference's startup view: rotation [55, 0, 25], centred on the
+    /// origin, distance 140, 22.5-degree field of view.
+    pub const DEFAULT: Camera = Camera {
+        rot: [55.0, 0.0, 25.0],
+        trans: [0.0, 0.0, 0.0],
+        dist: 140.0,
+        fov: 22.5,
+    };
+
+    fn bindings(&self) -> [(&'static str, Value); 4] {
+        let v3 = |a: [f64; 3]| {
+            Value::Vector(vec![Value::Num(a[0]), Value::Num(a[1]), Value::Num(a[2])])
+        };
+        [
+            ("$vpr", v3(self.rot)),
+            ("$vpt", v3(self.trans)),
+            ("$vpd", Value::Num(self.dist)),
+            ("$vpf", Value::Num(self.fov)),
+        ]
+    }
+
+    /// Read the quartet back out of a dynamic scope, keeping the current
+    /// value for anything a script left alone or set to the wrong shape.
+    /// Per the reference, a wrong-shaped assignment leaves the camera alone
+    /// while the variable still holds whatever the script wrote.
+    fn read_from(dynv: &Rc<DynScope>, base: Camera) -> Camera {
+        let v3 = |name: &str, fallback: [f64; 3]| -> [f64; 3] {
+            match dynv.lookup(name) {
+                Some(v) => v.as_vec3().filter(|a| a.iter().all(|c| c.is_finite())).unwrap_or(fallback),
+                None => fallback,
+            }
+        };
+        let num = |name: &str, fallback: f64| -> f64 {
+            dynv.lookup(name)
+                .and_then(|v| v.as_num())
+                .filter(|n| n.is_finite())
+                .unwrap_or(fallback)
+        };
+        Camera {
+            rot: v3("$vpr", base.rot),
+            trans: v3("$vpt", base.trans),
+            dist: num("$vpd", base.dist),
+            fov: num("$vpf", base.fov),
+        }
+    }
 }
 
 /// Which mode the pipeline is running in. The reference binds `$preview` from
@@ -127,6 +206,16 @@ pub fn evaluate_source_for(
     record_csg: bool,
     mode: Mode,
 ) -> EvalOutput {
+    evaluate_source_inner(source, base_dir, record_csg, mode, Camera::DEFAULT)
+}
+
+fn evaluate_source_inner(
+    source: &str,
+    base_dir: &std::path::Path,
+    record_csg: bool,
+    mode: Mode,
+    camera: Camera,
+) -> EvalOutput {
     let resolved = crate::preproc::resolve(source, base_dir);
     if let Some(err) = resolved.error {
         let n = resolved.warnings.len();
@@ -139,7 +228,7 @@ pub fn evaluate_source_for(
         stamp_error(&mut out);
         return out;
     }
-    let mut out = evaluate_maybe_recording(&resolved.program, record_csg, mode);
+    let mut out = evaluate_maybe_recording(&resolved.program, record_csg, mode, camera);
     if !resolved.warnings.is_empty() {
         // These are raised before evaluation begins, so they lead the stream —
         // and `order` has to be shifted with them or every index after the
@@ -156,21 +245,26 @@ pub fn evaluate_source_for(
 }
 
 pub fn evaluate(program: &[Stmt]) -> EvalOutput {
-    evaluate_maybe_recording(program, false, Mode::Preview)
+    evaluate_maybe_recording(program, false, Mode::Preview, Camera::DEFAULT)
 }
 
 /// Evaluate while recording the instantiation tree for `.csg` export. The
 /// geometry kernel still runs (so one code path serves both modes and the
 /// tree can never disagree with the render); only the tree is extra.
 pub fn evaluate_recording(program: &[Stmt]) -> EvalOutput {
-    evaluate_maybe_recording(program, true, Mode::Render)
+    evaluate_maybe_recording(program, true, Mode::Render, Camera::DEFAULT)
 }
 
-fn evaluate_maybe_recording(program: &[Stmt], record: bool, mode: Mode) -> EvalOutput {
+fn evaluate_maybe_recording(
+    program: &[Stmt],
+    record: bool,
+    mode: Mode,
+    camera: Camera,
+) -> EvalOutput {
     std::thread::scope(|s| {
         let handle = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
-            .spawn_scoped(s, || evaluate_inner(program, record, mode))
+            .spawn_scoped(s, || evaluate_inner(program, record, mode, camera))
             .expect("failed to spawn the evaluator thread");
         handle.join().unwrap_or_else(|_| EvalOutput {
             error: Some("ERROR: the evaluator crashed (please report this script)".into()),
@@ -179,7 +273,12 @@ fn evaluate_maybe_recording(program: &[Stmt], record: bool, mode: Mode) -> EvalO
     })
 }
 
-fn evaluate_inner(program: &[Stmt], record: bool, mode: Mode) -> EvalOutput {
+fn evaluate_inner(
+    program: &[Stmt],
+    record: bool,
+    mode: Mode,
+    camera: Camera,
+) -> EvalOutput {
     let mut ctx = Ctx {
         out: EvalOutput::default(),
         dynv: DynScope::root(),
@@ -189,11 +288,18 @@ fn evaluate_inner(program: &[Stmt], record: bool, mode: Mode) -> EvalOutput {
         cycle_scopes: Vec::new(),
         csg: record.then(|| vec![CsgFrame { head: Some("group()".into()), nodes: Vec::new() }]),
         clamp_warned: Vec::new(),
+        scope_depth: 0,
+        camera_base: camera,
     };
-    ctx.dynv
-        .vars
-        .borrow_mut()
-        .insert("$preview".into(), Value::Bool(mode == Mode::Preview));
+    {
+        let mut dv = ctx.dynv.vars.borrow_mut();
+        dv.insert("$preview".into(), Value::Bool(mode == Mode::Preview));
+        // The viewport writes its live camera in BEFORE evaluation, so a
+        // script that reads $vpr sees where the user actually is.
+        for (k, v) in camera.bindings() {
+            dv.insert(k.to_string(), v);
+        }
+    }
     let root = Scope::root();
     let mut shapes = exec_scope(program, &root, &mut ctx);
     // Root modifier (`!`): if any shape is root-marked, the design shows ONLY
@@ -382,6 +488,13 @@ impl DynScope {
         vars.insert("$preview".to_string(), Value::Bool(true));
         vars.insert("$children".to_string(), Value::Num(0.0));
         vars.insert("$parent_modules".to_string(), Value::Num(0.0));
+        // The viewport quartet. Reading them returns the live camera in the
+        // GUI; the reference is explicit that a CLI run without --camera sees
+        // these defaults. A top-level assignment moves the camera after the
+        // compile, which `EvalOutput::camera` reports back to the viewer.
+        for (k, v) in Camera::DEFAULT.bindings() {
+            vars.insert(k.to_string(), v);
+        }
         Rc::new(DynScope { vars: RefCell::new(vars), parent: None })
     }
 
@@ -442,6 +555,13 @@ struct Ctx {
     /// `$fa`/`$fs` names already reported as clamped, so the warning is
     /// raised once per run rather than once per instantiation.
     clamp_warned: Vec<String>,
+    /// Nesting depth of `exec_scope`, so the TOP-LEVEL scope can be
+    /// recognised on the way out. Only a top-level `$vp*` assignment moves
+    /// the camera, per the reference.
+    scope_depth: usize,
+    /// The camera evaluation started from; the baseline a `$vp*` the script
+    /// never touched falls back to.
+    camera_base: Camera,
 }
 
 impl Ctx {
@@ -580,6 +700,7 @@ fn exec_scope(stmts: &[Stmt], parent: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
     let scope = build_scope(stmts, parent, ctx);
     let saved_dyn = ctx.dynv.clone();
     ctx.dynv = DynScope::layer(&saved_dyn);
+    ctx.scope_depth += 1;
     eval_slots(stmts, &scope, ctx);
     let mut shapes = Vec::new();
     for stmt in stmts {
@@ -587,6 +708,15 @@ fn exec_scope(stmts: &[Stmt], parent: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
             break;
         }
         shapes.extend(exec_stmt(stmt, &scope, ctx));
+    }
+    // Read the camera back while this scope's dynamic layer is still alive:
+    // `set_var` writes `$vpr` into the CURRENT layer, and the layer is
+    // dropped on the next line. Only the outermost scope counts — the
+    // reference is explicit that an assignment below top level does not move
+    // the camera.
+    ctx.scope_depth -= 1;
+    if ctx.scope_depth == 0 {
+        ctx.out.camera = Some(Camera::read_from(&ctx.dynv, ctx.camera_base));
     }
     ctx.dynv = saved_dyn;
     shapes
@@ -2623,8 +2753,21 @@ pub fn render_export_bytes(
     overrides: &[(String, String)],
     format: &str,
 ) -> Result<Vec<u8>, String> {
+    render_export_bytes_with_camera(source, base_dir, overrides, format, Camera::DEFAULT)
+}
+
+/// `render_export_bytes` with an explicit camera, so the CLI's `--camera`
+/// reaches the `$vp*` variables a script may read.
+pub fn render_export_bytes_with_camera(
+    source: &str,
+    base_dir: &std::path::Path,
+    overrides: &[(String, String)],
+    format: &str,
+    camera: Camera,
+) -> Result<Vec<u8>, String> {
     let effective = crate::customizer::apply_overrides(source, overrides);
-    let out = evaluate_source_for(&effective, base_dir, format == "csg", Mode::Render);
+    let out =
+        evaluate_source_with_camera(&effective, base_dir, format == "csg", Mode::Render, camera);
     // `.echo` captures the console stream regardless of a fatal error.
     if format == "echo" {
         return Ok(echo_stream(&out).into_bytes());
@@ -4874,6 +5017,49 @@ mod tests {
     }
 
     #[test]
+    fn the_viewport_variables_read_and_write_the_camera() {
+        let base = std::path::Path::new(".");
+        // Defaults: the reference's startup view, and what a CLI run without
+        // --camera evaluates with.
+        let out = run("echo($vpr, $vpt, $vpd, $vpf);");
+        assert_eq!(out.echoes, vec!["ECHO: [55, 0, 25], [0, 0, 0], 140, 22.5"]);
+
+        // Reads reflect the camera the caller supplied — the viewport writes
+        // its live state in BEFORE evaluation.
+        let live = Camera { rot: [10.0, 20.0, 30.0], trans: [1.0, 2.0, 3.0], dist: 250.0, fov: 40.0 };
+        let out = evaluate_source_with_camera(
+            "echo($vpr, $vpd);", base, false, Mode::Preview, live,
+        );
+        assert_eq!(out.echoes, vec!["ECHO: [10, 20, 30], 250"]);
+
+        // A TOP-LEVEL assignment moves the camera afterwards.
+        let out = evaluate_source_with_camera(
+            "$vpr = [0, 0, 90];\n$vpd = 300;\ncube(1);", base, false, Mode::Preview,
+            Camera::DEFAULT,
+        );
+        let cam = out.camera.expect("no camera reported");
+        assert_eq!(cam.rot, [0.0, 0.0, 90.0]);
+        assert_eq!(cam.dist, 300.0);
+        assert_eq!(cam.trans, Camera::DEFAULT.trans, "untouched components keep the live value");
+
+        // An assignment BELOW top level does not, per the reference.
+        let out = evaluate_source_with_camera(
+            "module m() { $vpr = [9, 9, 9]; cube(1); }\nm();", base, false, Mode::Preview,
+            Camera::DEFAULT,
+        );
+        assert_eq!(out.camera.unwrap().rot, Camera::DEFAULT.rot);
+
+        // A wrong-shaped assignment leaves the camera alone while the
+        // variable still holds what the script wrote.
+        let out = evaluate_source_with_camera(
+            "$vpr = \"nonsense\";\necho($vpr);\ncube(1);", base, false, Mode::Preview,
+            Camera::DEFAULT,
+        );
+        assert_eq!(out.camera.unwrap().rot, Camera::DEFAULT.rot);
+        assert_eq!(out.echoes, vec!["ECHO: \"nonsense\""]);
+    }
+
+    #[test]
     fn the_path_sandbox_holds() {
         // A .scad file names the files it imports, so this is the one place
         // where a bug is a security issue rather than a robustness one.
@@ -5118,6 +5304,8 @@ mod tests {
             cycle_scopes: Vec::new(),
             csg: None,
             clamp_warned: Vec::new(),
+            scope_depth: 0,
+            camera_base: Camera::DEFAULT,
         };
         let root = Scope::root();
         let v = eval_expr(&value, &root, &mut ctx);
@@ -6391,6 +6579,8 @@ mod tests {
             cycle_scopes: Vec::new(),
             csg: None,
             clamp_warned: Vec::new(),
+            scope_depth: 0,
+            camera_base: Camera::DEFAULT,
         };
         let root = Scope::root();
         let weak = Rc::downgrade(&root);
