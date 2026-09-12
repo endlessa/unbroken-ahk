@@ -436,21 +436,30 @@ pub fn extrude_rotate(poly: &Poly2, angle_deg: f64, frags: usize) -> Result<Mesh
                 positions.push(revolve(contour[jn], th0));
                 positions.push(revolve(contour[jn], th1));
                 positions.push(revolve(contour[j], th1));
-                tris.push([b, b + 1, b + 2]);
-                tris.push([b, b + 2, b + 3]);
+                // Winding: walking the profile CCW puts the outer wall's
+                // edge going +z, and sweeping puts the next edge at +theta;
+                // (+z) x (+theta) points at the axis, so the naive order
+                // gives an inside-out solid. Both triangles are reversed.
+                // Winding: walking the profile CCW puts the outer wall's
+                // edge going +z, and sweeping puts the next edge at +theta;
+                // (+z) x (+theta) points at the axis, so the naive order
+                // gives an inside-out solid. Both triangles are reversed.
+                tris.push([b, b + 2, b + 1]);
+                tris.push([b, b + 3, b + 2]);
             }
         }
     }
     if !full {
         let (cap2, cap_tris) = triangulate(poly);
-        // Cap at θ=0 (reversed to face the -θ side).
+        // Cap at θ=0 faces the -θ side; a CCW cap triangle already maps to
+        // a -y normal there, so it is the θ=angle cap that gets reversed.
         let base = positions.len() as u32;
         positions.extend(cap2.iter().map(|v| revolve(*v, angle_at(0))));
-        tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[2], base + t[1]]));
+        tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[1], base + t[2]]));
         // Cap at θ=angle.
         let base = positions.len() as u32;
         positions.extend(cap2.iter().map(|v| revolve(*v, angle_at(frags))));
-        tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[1], base + t[2]]));
+        tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[2], base + t[1]]));
     }
     Ok((positions, tris))
 }
@@ -521,7 +530,9 @@ mod tests {
             vec![[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]],
         ]);
         let (p, t) = extrude_linear(&ring, 2.0, false, 0.0, 1, [1.0, 1.0]);
-        assert!((signed_volume(&p, &t).abs() - 84.0 * 2.0).abs() < 1e-6);
+        // Signed, not |signed|: an inside-out solid has the right magnitude
+        // and the wrong sign, and comparing magnitudes cannot tell them apart.
+        assert!((signed_volume(&p, &t) - 84.0 * 2.0).abs() < 1e-6, "prism volume {}", signed_volume(&p, &t));
     }
 
     #[test]
@@ -531,7 +542,8 @@ mod tests {
         let rect = Poly2::new(vec![vec![[2.0, 0.0], [4.0, 0.0], [4.0, 1.0], [2.0, 1.0]]]);
         let (p, t) = extrude_rotate(&rect, 360.0, 128).unwrap();
         let want = std::f64::consts::PI * 12.0;
-        assert!((signed_volume(&p, &t).abs() - want).abs() < 0.2, "vol {}", signed_volume(&p, &t));
+        let got = signed_volume(&p, &t);
+        assert!((got - want).abs() < 0.2, "washer volume {got}, want {want}");
         // A profile straddling X=0 is an error.
         let bad = Poly2::new(vec![vec![[-1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]]);
         assert!(extrude_rotate(&bad, 360.0, 16).is_err());

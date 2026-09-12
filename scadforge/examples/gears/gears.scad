@@ -173,3 +173,38 @@ module ring_herring(m,z,h,ro,beta,al=20,x=0,ph=0,sl=20) {
                 polygon(points=concat(o,p), paths=[[for(i=[0:95]) i],[for(i=[0:n-1]) 96+i]]);
     }
 }
+
+// ===================================================================
+//  STRAIGHT BEVEL GEARS
+//  Every pitch cone in a bevel set shares ONE apex.  For a 90 degree
+//  shaft angle the two cone angles are complementary and tan(g1)=z1/z2,
+//  so the pair is fixed by the tooth counts alone.  Both members must
+//  be laid out on the SAME outer cone distance Lo = rp/sin(g): a bevel
+//  pair whose cones do not share an apex does not mesh anywhere along
+//  its face, and that is the single easiest thing to get wrong.
+//  The tooth is the outer profile scaled linearly toward the apex --
+//  depth, thickness and pitch all shrink together, which is what makes
+//  it a bevel tooth rather than a cylindrical one on a slant.
+// ===================================================================
+function bev_gamma(z1,z2) = atan2(z1,z2);        // this gear's cone angle
+function bev_Lo(m,z,gam)  = (m*z/2)/sin(gam);    // outer cone distance
+
+module bevel(m,z,gam,Lo,Li,al=20,ph=0) {
+    k = Li/Lo;
+    rotate([0,0,ph]) translate([0,0,Li*cos(gam)])
+        linear_extrude(height=(Lo-Li)*cos(gam), scale=1/k)
+            polygon([ for (p = gear_poly(m,z,al)) p*k ]);
+}
+
+// Body of revolution: spherical outside, conical back down to the teeth.
+// Winding note, measured not assumed: rotate_extrude here takes the
+// OPPOSITE hand from linear_extrude -- a CLOCKWISE profile in the (r,z)
+// half-plane is what yields outward normals. Get it backwards and the
+// solid still renders, it just shades as though lit from inside, which
+// reads as a muddy dark blob rather than as a bug.
+module bev_body(R, thc, gam, Lo, Li, NA=26) {
+    p = concat(
+        [ for (i=[0:NA]) let(t = thc*i/NA) [R*sin(t), R*cos(t)] ],
+        [ [Lo*sin(gam), Lo*cos(gam)], [Li*sin(gam), Li*cos(gam)], [0, Li*cos(gam)] ] );
+    rotate_extrude($fn=96) polygon(p);
+}
