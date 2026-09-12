@@ -417,3 +417,25 @@ module bev_blank(m, z, gam, Lo, Lh, T, rh, zb, bore=0, NA=18) {
     rotate_extrude($fn=120)
         polygon(concat(fr, bk, [[rh, zb], [bore, zb], [bore, fz]]));
 }
+
+// ---- the other bevel body: a dome ------------------------------------
+// When the apex is the centre of a BALL rather than a point in a
+// gearbox, the blank is not a dish. Its outer surface is a spherical
+// cap of the ball's own radius, running from the gear's pole out to the
+// outer root point, where it meets the teeth. Inside, it is closed by
+// the root cone, exactly as the dish is. The teeth grow from the root
+// cone in +delta -- larger radius, smaller z -- so they emerge from the
+// rim of the dome sideways and the dome never swallows them.
+module bev_dome(m, z, gam, Lo, Lh, NA=24) {
+    d  = 1.25*m;
+    rO = Lo*sin(gam) - d*cos(gam);          // outer root point
+    zO = Lo*cos(gam) + d*sin(gam);
+    R  = sqrt(rO*rO + zO*zO);               // ... which sets the ball radius
+    tc = atan2(rO, zO);
+    rH = Lh*sin(gam) - d*cos(gam);
+    zH = Lh*cos(gam) + d*sin(gam);
+    rotate_extrude($fn=120)
+        polygon(concat(
+            [ for (i=[0:NA]) let(t = tc*i/NA) [R*sin(t), R*cos(t)] ],
+            [ [rH, zH], [0, zH] ] ));
+}
