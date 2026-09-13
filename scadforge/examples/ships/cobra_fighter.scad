@@ -63,7 +63,7 @@ XA   = -12.5;    // stern
 // black against the 0.05 background while still taking a gradient.
 DORS = [0.145, 0.145, 0.165];  // hood and dorsal
 PANL = [0.205, 0.205, 0.225];  // panel steps, one value up
-CHIN = [0.085, 0.085, 0.100];  // chines and shadow lines
+CHIN = [0.085, 0.085, 0.100];  // shadow seams and the throat, kept dark
 VENT = [0.80, 0.755, 0.625];   // cream throat
 GOLD = [0.88, 0.68, 0.17];     // chevrons
 GOLD2= [0.60, 0.44, 0.11];     // deeper gold, for the shadowed side
@@ -75,6 +75,14 @@ MISL = [0.56, 0.57, 0.58];
 DARK = [0.115, 0.115, 0.130];
 GLOW = [0.55, 0.96, 0.42];
 SPAR = [0.215, 0.215, 0.235];  // structure, ONE value above the skin
+// The two strakes ARE the silhouette: the hood's leading edge and the jaw
+// line are the outline the eye traces.  Both were drawn in CHIN, DARKER
+// than the hull, which made the ship's own edge the darkest thing on it --
+// exactly backwards for an asset that lives against a black starfield.  A
+// downscale sheet at 48/64/96/128 px settles it: below about 96 px the
+// hull dissolves and only the gold is left floating.  EDGE is the hull's
+// value doubled, so the outline catches light the way a leading edge does.
+EDGE = [0.300, 0.300, 0.330];  // leading-edge strake and jaw line
 
 // Straight swept leading edge, elliptical cobra trailing edge. They
 // meet at the tip on their own, so the outline closes without a clip.
@@ -127,7 +135,7 @@ module hood() {
 // is the single strongest "this is an aircraft" cue at thumbnail size.
 module chine() {
     for (sgn=[1,-1])
-        color(CHIN) for (j=[0:NB-1]) let(s=j/NB, s2=(j+1)/NB)
+        color(EDGE) for (j=[0:NB-1]) let(s=j/NB, s2=(j+1)/NB)
             rod([XLE0 - LESW*s,  sgn*HB*s,  CURL*s*s + 0.04],
                 [XLE0 - LESW*s2, sgn*HB*s2, CURL*s2*s2 + 0.04], 0.13, 6);
 }
@@ -291,7 +299,7 @@ module intake() {
 // from braincase to snout. A cobra head is angular BECAUSE of this
 // ridge; without it the fuselage is just a lozenge.
 module jawline() {
-    for (sgn=[1,-1]) color(CHIN) for (i=[0:NH-1])
+    for (sgn=[1,-1]) color(EDGE) for (i=[0:NH-1])
         let(u=i/NH, u2=(i+1)/NH)
           rod([XB + (XN-XB)*u,  sgn*sk_w(u)*0.99,  -1.05*pow(u,2.3)],
               [XB + (XN-XB)*u2, sgn*sk_w(u2)*0.99, -1.05*pow(u2,2.3)], 0.155, 6);
@@ -360,7 +368,7 @@ module frames() {
 // section is exactly where this rod goes.
 module body_chine() {
     S = bd_S();
-    for (sgn=[1,-1]) color(CHIN) for (i=[0:NB2-1])
+    for (sgn=[1,-1]) color(EDGE) for (i=[0:NB2-1])
         let(u = i/NB2, u2 = (i+1)/NB2)
           rod([S[i][0],   sgn*bd_w(u)*1.01,  S[i][2]],
               [S[i+1][0], sgn*bd_w(u2)*1.01, S[i+1][2]], 0.17, 6);
