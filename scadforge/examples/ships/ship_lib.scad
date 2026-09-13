@@ -244,3 +244,28 @@ module fin(root_c, tip_c, span, sweep, tc=0.12, dih=0, n=18) {
 module both_y() { children(); mirror([0,1,0]) children(); }
 module both_z() { children(); mirror([0,0,1]) children(); }
 module ring_of(n) { for (i=[0:n-1]) rotate([i*360/n,0,0]) children(); }
+
+// ---- splitting a section for two-tone hulls --------------------------
+// A closed section cut into two closed sub-sections sharing a chord.
+// Each half sweeps as its own solid with its own colour and the shared
+// face is interior, so countershading costs no boolean and leaves no
+// coplanar pair to fight.  Both halves inherit the parent's winding.
+function arc_of(sec, i0, i1) = let(n=len(sec))
+  [ for (k=[0 : (i1-i0+n)%n]) sec[(i0+k)%n] ];
+function span2(P, Q, m) = [ for (i=[1:m]) lerp(P, Q, i/(m+1)) ];
+function part_of(sec, i0, i1, m=3) =
+  concat(arc_of(sec,i0,i1), span2(sec[i1], sec[i0], m));
+
+// ---- tubercled leading edge -----------------------------------------
+// Humpback flippers carry a scalloped leading edge (Fish & Battle
+// 1995); the bumps keep flow attached past the angle where a smooth
+// edge stalls. amp is a fraction of local chord, k the count across
+// the span.
+module tfin(root_c, tip_c, span, sweep, tc=0.12, dih=0, amp=0.045, k=7, n=40) {
+    G = [ for (i=[0:n]) let(s=i/n,
+             c  = lerp(root_c, tip_c, pow(s,0.75)),
+             bump = amp*c*cos(360*k*s),
+             xo = sweep*s - bump, yo = span*s, zo = span*s*tan(dih))
+           [ for (p = foil(c + bump, tc)) [ xo+p[0], yo, zo+p[1] ] ] ];
+    smesh(G);
+}
