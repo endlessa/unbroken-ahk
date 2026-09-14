@@ -1,4 +1,13 @@
 # Winding audit, done properly.
+#
+# Reports SIDES and CAPS separately for swept meshes.  A single
+# whole-mesh volume sign conflates two different faults: a mesh whose
+# side faces are reversed is badly broken and lit wrong everywhere, while
+# a mesh with only its end caps reversed is fine except at two faces that
+# are usually buried anyway.  Worse, a reversed cap's contribution to the
+# signed volume scales with its distance from the origin, so the same cap
+# fault flips the total on one mesh and not on another.  Both were true
+# at once here and the combination is very hard to read from one number.
 # For a CLOSED mesh with outward normals the divergence-theorem volume
 #   V = (1/6) * sum over faces of  a . (b x c)
 # is positive.  Negative means the mesh is inside-out, and since the viewer

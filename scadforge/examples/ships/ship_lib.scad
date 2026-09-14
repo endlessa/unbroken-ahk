@@ -42,8 +42,19 @@ module smesh(grid, cap0=true, cap1=true, conv=10) {
       faces = concat(
         [ for (u=[0:NU-1]) for (v=[0:NV-1])
             [ u*NV+v, u*NV+(v+1)%NV, (u+1)*NV+(v+1)%NV, (u+1)*NV+v ] ],
-        cap0 ? [ for (v=[0:NV-1]) [B0, v, (v+1)%NV] ] : [],
-        cap1 ? [ for (v=[0:NV-1]) [B1, NU*NV+(v+1)%NV, NU*NV+v] ] : [] ),
+        // The cap fans are wound to match the SIDES, which is not the
+        // same as matching each other.  Measured, on a tube of known
+        // volume: with the fans the other way round the sides came out
+        // correct and both caps inside-out, so every capped sweep in
+        // this project was rendering its two ends at the flat ambient
+        // floor.  It stayed hidden for a long time because a hull's
+        // caps are nearly always buried inside the next solid or seen
+        // edge-on.  A limb is what exposed it -- a leg carries a large
+        // cap high up, and a reversed cap's contribution to the signed
+        // volume grows with its distance from the origin, so that one
+        // was big enough to flip the whole mesh's sign.
+        cap0 ? [ for (v=[0:NV-1]) [B0, (v+1)%NV, v] ] : [],
+        cap1 ? [ for (v=[0:NV-1]) [B1, NU*NV+v, NU*NV+(v+1)%NV] ] : [] ),
       convexity = conv);
 }
 
