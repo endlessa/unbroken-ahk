@@ -39,43 +39,49 @@ EYED = [0.130, 0.110, 0.095];
 
 JAW = 0.94; BROW = 0.96; SLIM = 0.93;
 MUZ = 0;
-NP  = 0.16;   // nose projection, in head-heights
+NP  = 0.15;   // nose projection, in head-heights
 HH  = pHH(P);
 
 module face() {
-    FB = head_front(P, 4, JAW, BROW, MUZ);   // brow line, front surface
-    FJ = head_front(P, 3, JAW, BROW, MUZ);   // mid-face, front surface
+    // Features are placed against the skull surface INTERPOLATED to their
+    // own height, never against one station's figure.  On the orc
+    // stations 3 and 4 are 4 cm apart, which is the whole difference
+    // between an eye that reads and one buried in the head.
     ZB = head_z(P, 4); ZJ = head_z(P, 3); ZC = head_z(P, 2);
+    FJ = head_front(P, 3, JAW, BROW, MUZ);
     WJ = head_half(P, 3, JAW, BROW, SLIM);
+    FE = face_x(P, face_t(-0.060), JAW, BROW, MUZ);
+    WE = face_w(P, face_t(-0.060), JAW, BROW, SLIM);
     color(SKIN) smesh(head_G(P, 0, JAW, BROW, MUZ, SLIM));
-    // Brow ridge, sat ON the surface.  With no shadows in this renderer
-    // a deep-set eye can only be made by physically overhanging it.
-    color(SKIN) translate(tipH(P, [FB*0.84, 0, ZB - 0.07*HH]))
-        scale([0.52, 1.00, 0.30]) sphere(r = 0.165*HH, $fn = 20);
-    // Nose.  The spine must descend MONOTONICALLY.  The first version ran
-    // brow -> ZB-0.30 -> ZJ+0.16 -> ZJ+0.02, and ZJ+0.16 is HIGHER than
-    // ZB-0.30, so the sweep doubled back on itself and collapsed into a
-    // crumpled stub sitting between the eyes.  On the elf that was enough
-    // to make the whole face read upside down: the brow ridge became a
-    // mouth above the eyes and the cheekbones became a moustache below.
-    // NP is how far the tip stands proud of the skull, in head-heights.
+    // No brow ridge on any species.  It was there because this renderer
+    // has no shadows, so overhanging the socket is the only way to sink
+    // an eye -- but a lens on a curved skull always reads as a separate
+    // object under flat shading, and on every one of these faces it came
+    // out as a bar laid across the forehead.  The skull's own BROW knob
+    // still widens the supraorbital station, which was the part actually
+    // doing work.
+    //
+    // Nose.  The spine descends MONOTONICALLY -- an earlier version had
+    // station 1 below station 2, so the sweep doubled back and collapsed
+    // into a stub between the eyes.  NP is how far the tip stands proud
+    // of the skull, in head-heights.
     color(SKIN) smesh(limb_G(
-        [ tipH(P,[FB*0.86,              0, ZB - 0.03*HH]),
-          tipH(P,[FB*0.95 + 0.35*NP*HH, 0, ZB - 0.11*HH]),
-          tipH(P,[FJ*0.98 + 1.00*NP*HH, 0, ZB - 0.19*HH]),
-          tipH(P,[FJ*0.92 + 0.55*NP*HH, 0, ZB - 0.27*HH]) ],
+        [ tipH(P,[face_x(P,face_t(-0.03),JAW,BROW,MUZ) - 0.02*HH,    0, ZB - 0.03*HH]),
+          tipH(P,[face_x(P,face_t(-0.11),JAW,BROW,MUZ) + 0.35*NP*HH, 0, ZB - 0.11*HH]),
+          tipH(P,[face_x(P,face_t(-0.19),JAW,BROW,MUZ) + 1.00*NP*HH, 0, ZB - 0.19*HH]),
+          tipH(P,[face_x(P,face_t(-0.27),JAW,BROW,MUZ) + 0.55*NP*HH, 0, ZB - 0.27*HH]) ],
         [ 0.042*HH, 0.058*HH, 0.072*HH, 0.062*HH ], [ 0.046*HH, 0.066*HH, 0.086*HH, 0.076*HH ],
         [ 2.6, 2.7, 2.8, 2.8 ], [0,1,0], 14));
     both_y() {
-        // The eye has to sit PROUD of the skull, and the pupil proud of
-        // the eye.  At FB*0.86 the whole white was inside the head and
-        // only slivers showed; at FB*0.99 the pupil stood clear in front
-        // of the white and hid it, leaving two black dots.  The white's
-        // half-depth in x is about a hundredth of a head-height, so the
-        // two have to be stacked within that.
-        color(EYEW) translate(tipH(P, [FB*0.97, WJ*0.40, ZB - 0.20*HH]))
+        // Level with the TOP QUARTER of the nose.  The nose runs ZB-0.03
+        // to ZB-0.27, so its top quarter centres on ZB-0.06; at ZB-0.20
+        // the eyes sat level with the nose TIP and the whole bridge stood
+        // above them, which reads as a nose mounted over the eyes rather
+        // than between them.  The eye sits just proud of the surface and
+        // the pupil just proud of the eye.
+        color(EYEW) translate(tipH(P, [FE*0.99, WE*0.40, ZB - 0.06*HH]))
             scale([0.55,1,1]) sphere(r = 0.070*HH, $fn = 14);
-        color(EYED) translate(tipH(P, [FB*1.05, WJ*0.42, ZB - 0.21*HH]))
+        color(EYED) translate(tipH(P, [FE*1.06, WE*0.42, ZB - 0.065*HH]))
             scale([0.45,1,1]) sphere(r = 0.040*HH, $fn = 12);
         // Round ear: the one place a human is defined by what it is NOT.
         // No point, no sweep, no lobe past the jawline.

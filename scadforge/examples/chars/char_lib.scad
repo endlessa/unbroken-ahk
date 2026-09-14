@@ -214,6 +214,20 @@ function head_half(P, i, jaw=1, brow=1, slim=1) =
     hh*HEAD_RW[i]*slim*(1 + (jaw-1)*HEAD_JW[i] + (brow-1)*HEAD_BW[i]);
 function head_z(P, i) = pCHIN(P) + pHH(P)*HEAD_FZ[i];
 
+// Every facial feature lives BETWEEN head stations 3 (the jaw) and 4
+// (the brow) -- none of them sits on a station.  head_front() reports
+// one station only, and on a muzzled species the two are four
+// centimetres apart, so placing an eye or a nose against either one
+// alone buries it in the skull or floats it in front.  face_t() converts
+// a height given as an offset from the brow station, in head-heights,
+// into the fraction between the two; face_x() and face_w() then give the
+// interpolated surface and half-width there.
+function face_t(zoff) = (HEAD_FZ[4] + zoff - HEAD_FZ[3]) / (HEAD_FZ[4] - HEAD_FZ[3]);
+function face_x(P, t, jaw=1, brow=1, muzzle=0) =
+    lerp(head_front(P,3,jaw,brow,muzzle), head_front(P,4,jaw,brow,muzzle), t);
+function face_w(P, t, jaw=1, brow=1, slim=1) =
+    lerp(head_half(P,3,jaw,brow,slim), head_half(P,4,jaw,brow,slim), t);
+
 // ---- shared features -------------------------------------------------
 // Hair, as the REAR arc of each head section rather than a full ring.
 // A band that stops at one station leaves a clean horizontal edge across
