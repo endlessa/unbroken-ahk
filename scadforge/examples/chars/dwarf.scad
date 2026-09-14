@@ -34,10 +34,13 @@ include <ship_lib.scad>
 //
 //  PROPORTION.  A fantasy dwarf is not a small human: it is a human
 //  compressed vertically and widened, keeping adult mass.  The read is
-//  the height-to-breadth ratio.  At 1.35 m over 0.58 m of shoulder this
-//  is 0.43 -- a tall human runs about 0.23.  Head is 0.28, so the
-//  figure is 4.8 heads tall where a heroic human is 8.  Short legs
-//  carry it: hip at 42% of standing height, against about 50% human.
+//  the height-to-breadth ratio.  MEASURED off the built mesh, not
+//  estimated: 1.358 m tall, 0.719 m across the deltoids, so 0.53 --
+//  where a tall human runs about 0.23.  The torso alone is 0.468 wide;
+//  it is the arms hung off it that carry the figure out to 0.72.
+//  Short legs do the rest: hip at 42% of standing height against about
+//  50% human.  Skull is 0.26 chin to crown, so 5.2 heads by the bone,
+//  but hair and beard read as head mass and the eye sees nearer four.
 //
 //  LIGHTING is the same single directional light as the ships, with no
 //  specular and a 0.25 ambient floor, so this palette sits mid-value
