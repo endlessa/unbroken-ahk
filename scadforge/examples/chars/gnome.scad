@@ -50,6 +50,7 @@ EYED = [0.130, 0.110, 0.095];
 
 JAW = 1.04; BROW = 1.02; SLIM = 1.02;
 MUZ = 0;
+NP  = 0.34;   // nose projection, in head-heights
 HH  = pHH(P);
 
 module face() {
@@ -60,19 +61,32 @@ module face() {
     color(SKIN) smesh(head_G(P, 0, JAW, BROW, MUZ, SLIM));
     // Brow ridge, sat ON the surface.  With no shadows in this renderer
     // a deep-set eye can only be made by physically overhanging it.
-    color(SKIN) translate(tipH(P, [FB*0.80, 0, ZB]))
+    color(SKIN) translate(tipH(P, [FB*0.80, 0, ZB - 0.07*HH]))
         scale([0.52, 1.05, 0.30]) sphere(r = 0.190*HH, $fn = 20);
-    // Nose: swept from the brow down to the lip so it keeps an edge
-    // along the bridge instead of going soft.
+    // Nose.  The spine must descend MONOTONICALLY.  The first version ran
+    // brow -> ZB-0.30 -> ZJ+0.16 -> ZJ+0.02, and ZJ+0.16 is HIGHER than
+    // ZB-0.30, so the sweep doubled back on itself and collapsed into a
+    // crumpled stub sitting between the eyes.  On the elf that was enough
+    // to make the whole face read upside down: the brow ridge became a
+    // mouth above the eyes and the cheekbones became a moustache below.
+    // NP is how far the tip stands proud of the skull, in head-heights.
     color(SKIN) smesh(limb_G(
-        [ tipH(P,[FB*0.74, 0, ZB - 0.04*HH]), tipH(P,[FB*0.92, 0, ZB - 0.30*HH]),
-          tipH(P,[FJ*1.02, 0, ZJ + 0.16*HH]), tipH(P,[FJ*0.98, 0, ZJ + 0.02*HH]) ],
+        [ tipH(P,[FB*0.86,              0, ZB - 0.03*HH]),
+          tipH(P,[FB*0.95 + 0.35*NP*HH, 0, ZB - 0.11*HH]),
+          tipH(P,[FJ*0.98 + 1.00*NP*HH, 0, ZB - 0.19*HH]),
+          tipH(P,[FJ*0.92 + 0.55*NP*HH, 0, ZB - 0.27*HH]) ],
         [ 0.055*HH, 0.088*HH, 0.125*HH, 0.112*HH ], [ 0.058*HH, 0.098*HH, 0.140*HH, 0.126*HH ],
         [ 2.6, 2.7, 2.8, 2.8 ], [0,1,0], 14));
     both_y() {
-        color(EYEW) translate(tipH(P, [FB*0.86, WJ*0.40, ZB - 0.20*HH]))
+        // The eye has to sit PROUD of the skull, and the pupil proud of
+        // the eye.  At FB*0.86 the whole white was inside the head and
+        // only slivers showed; at FB*0.99 the pupil stood clear in front
+        // of the white and hid it, leaving two black dots.  The white's
+        // half-depth in x is about a hundredth of a head-height, so the
+        // two have to be stacked within that.
+        color(EYEW) translate(tipH(P, [FB*0.97, WJ*0.40, ZB - 0.20*HH]))
             scale([0.55,1,1]) sphere(r = 0.074*HH, $fn = 14);
-        color(EYED) translate(tipH(P, [FB*0.99, WJ*0.43, ZB - 0.21*HH]))
+        color(EYED) translate(tipH(P, [FB*1.05, WJ*0.42, ZB - 0.21*HH]))
             scale([0.45,1,1]) sphere(r = 0.042*HH, $fn = 12);
         // Ears swept UP and out.  The elf's are the same part with the
         // rise and sweep reversed -- there the point travels back along

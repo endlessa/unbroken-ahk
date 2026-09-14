@@ -42,6 +42,7 @@ EYED = [0.135, 0.145, 0.130];
 
 JAW = 0.82; BROW = 0.88; SLIM = 0.86;
 MUZ = 0;
+NP  = 0.13;   // nose projection, in head-heights
 HH  = pHH(P);
 
 module face() {
@@ -50,25 +51,42 @@ module face() {
     ZB = head_z(P, 4); ZJ = head_z(P, 3); ZC = head_z(P, 2);
     WJ = head_half(P, 3, JAW, BROW, SLIM);
     color(SKIN) smesh(head_G(P, 0, JAW, BROW, MUZ, SLIM));
-    // Brow ridge, sat ON the surface.  With no shadows in this renderer
-    // a deep-set eye can only be made by physically overhanging it.
-    color(SKIN) translate(tipH(P, [FB*0.88, 0, ZB]))
-        scale([0.48, 0.92, 0.24]) sphere(r = 0.150*HH, $fn = 20);
-    // Nose: swept from the brow down to the lip so it keeps an edge
-    // along the bridge instead of going soft.
+    // No brow ridge.  Every other species here gets one to overhang the
+    // eye, because this renderer has no shadows and that is the only way
+    // to sink a socket -- but on a face this narrow the ridge reads as a
+    // bar laid across the nose, and the two together made a letter T.
+    // Cheekbone and jaw carry this face instead, which is what the
+    // profile always said.
+    // Nose.  The spine must descend MONOTONICALLY.  The first version ran
+    // brow -> ZB-0.30 -> ZJ+0.16 -> ZJ+0.02, and ZJ+0.16 is HIGHER than
+    // ZB-0.30, so the sweep doubled back on itself and collapsed into a
+    // crumpled stub sitting between the eyes.  On the elf that was enough
+    // to make the whole face read upside down: the brow ridge became a
+    // mouth above the eyes and the cheekbones became a moustache below.
+    // NP is how far the tip stands proud of the skull, in head-heights.
     color(SKIN) smesh(limb_G(
-        [ tipH(P,[FB*0.74, 0, ZB - 0.04*HH]), tipH(P,[FB*0.92, 0, ZB - 0.30*HH]),
-          tipH(P,[FJ*0.98, 0, ZJ + 0.16*HH]), tipH(P,[FJ*0.94, 0, ZJ + 0.02*HH]) ],
+        [ tipH(P,[FB*0.86,              0, ZB - 0.03*HH]),
+          tipH(P,[FB*0.95 + 0.35*NP*HH, 0, ZB - 0.11*HH]),
+          tipH(P,[FJ*0.98 + 1.00*NP*HH, 0, ZB - 0.19*HH]),
+          tipH(P,[FJ*0.92 + 0.55*NP*HH, 0, ZB - 0.27*HH]) ],
         [ 0.034*HH, 0.046*HH, 0.058*HH, 0.049*HH ], [ 0.038*HH, 0.054*HH, 0.070*HH, 0.060*HH ],
         [ 2.6, 2.7, 2.8, 2.8 ], [0,1,0], 14));
     both_y() {
-        color(EYEW) translate(tipH(P, [FB*0.86, WJ*0.40, ZB - 0.20*HH]))
+        // The eye has to sit PROUD of the skull, and the pupil proud of
+        // the eye.  At FB*0.86 the whole white was inside the head and
+        // only slivers showed; at FB*0.99 the pupil stood clear in front
+        // of the white and hid it, leaving two black dots.  The white's
+        // half-depth in x is about a hundredth of a head-height, so the
+        // two have to be stacked within that.
+        color(EYEW) translate(tipH(P, [FB*0.97, WJ*0.40, ZB - 0.20*HH]))
             scale([0.55,1,0.88]) sphere(r = 0.072*HH, $fn = 14);
-        color(EYED) translate(tipH(P, [FB*0.99, WJ*0.43, ZB - 0.21*HH]))
+        color(EYED) translate(tipH(P, [FB*1.05, WJ*0.42, ZB - 0.21*HH]))
             scale([0.45,1,1]) sphere(r = 0.038*HH, $fn = 12);
         // Cheekbones set high and wide, doing the job the jaw is not.
-        color(SKIN) translate(tipH(P, [FJ*0.72, WJ*0.62, ZB - 0.34*HH]))
-            scale([0.80, 0.55, 0.42]) sphere(r = 0.165*HH, $fn = 16);
+        // Level with the eyes, not below the nose base -- sat low they
+        // read as jowls, or worse as a moustache under an inverted face.
+        color(SKIN) translate(tipH(P, [FJ*0.70, WJ*0.78, ZB - 0.235*HH]))
+            scale([0.92, 0.46, 0.36]) sphere(r = 0.165*HH, $fn = 16);
         // Swept back and slightly down: the gnome's ear with rise near
         // zero and sweep large.
         color(SKIN) smesh(ear_G(P, ZB - 0.14*HH, 0.30, 0.26, 0.06, 0.46, 0.070, 0.016));
@@ -83,10 +101,14 @@ module hair() {
     // The hair is load-bearing here: at shld 0.112 this is the narrowest
     // figure in the set, and the mass falling past the shoulders is most
     // of what stops it reading as a pole.
-    color(HAIR) translate(tipH(P, [-0.30*HH, 0, pCHIN(P) - 0.34*HH]))
-        scale([0.60, 1.72, 2.30]) sphere(r = 0.46*HH, $fn = 24);
-    color(HAI2) translate(tipH(P, [-0.34*HH, 0, pCHIN(P) - 1.30*HH]))
-        scale([0.48, 1.40, 1.60]) sphere(r = 0.40*HH, $fn = 20);
+    // Pulled BACK rather than made wider.  At y-scale 1.72 the fall was
+    // 0.35 across against a 0.17 skull, so it closed round the face and
+    // left it a vertical slot with the features stacked in it.  Mass
+    // behind the head reads as long hair; mass beside it reads as a hood.
+    color(HAIR) translate(tipH(P, [-0.46*HH, 0, pCHIN(P) - 0.34*HH]))
+        scale([0.58, 1.16, 2.30]) sphere(r = 0.46*HH, $fn = 24);
+    color(HAI2) translate(tipH(P, [-0.50*HH, 0, pCHIN(P) - 1.30*HH]))
+        scale([0.46, 1.00, 1.60]) sphere(r = 0.40*HH, $fn = 20);
 }
 
 module circlet() {
