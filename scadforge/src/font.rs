@@ -359,6 +359,14 @@ fn flatten_contour(pts: &[(f64, f64, bool)], steps: usize, m: [f64; 6]) -> Vec<[
             }
         }
     }
+    // The walk ends back on the point it started from, so the polyline
+    // closes on a repeat. Callers treat a contour as implicitly closed (the
+    // first point is NOT repeated), and a repeat left in is a zero-length
+    // edge: a wall quad with no area and no normal, and a phantom corner for
+    // the triangulator.
+    while contour.len() > 1 && contour[0] == contour[contour.len() - 1] {
+        contour.pop();
+    }
     contour
 }
 

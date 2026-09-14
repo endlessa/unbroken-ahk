@@ -2473,7 +2473,7 @@ fn text_region(
         }
         pen += font.advance(gid) * spacing;
     }
-    let mut region = Poly2::new(contours);
+    let mut region = Poly2::new_font(contours);
     let width = pen * scale;
     // Horizontal anchor from the total advance width.
     let dx = match halign {
