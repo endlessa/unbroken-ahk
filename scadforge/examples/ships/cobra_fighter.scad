@@ -55,6 +55,10 @@ HHT  =  2.05;    // half height (< HWD: depressed)
 HRZ  =  1.70;
 HTIL =  7;
 XA   = -12.5;    // stern
+XNK  =   1.6;    // fuselage forward station -- the neck takes over here
+NKS  =   1.45;   // S strength: Hermite tangent length, as a chord multiple
+SKU  =   0.18;   // how far into the skull the neck buries its forward end
+NKN  =  26;      // stations along the neck
 
 // KING COBRA (Ophiophagus hannah). The juvenile is jet black with
 // bright chevrons; the adult keeps the banded throat. Near-black needs
@@ -114,21 +118,52 @@ module chevron(G, v0, v1, h=0.10) {
                 [ for (v=[v1:-1:v0]) g[v] + [0,0,0.012] ] ) ]);
 }
 
+// A swept solid's winding follows its direction of SWEEP, and the hood's
+// two halves sweep opposite ways -- +y to port, -y to starboard -- so the
+// starboard half was built inside-out.  Under this shader that is not a
+// subtle error.  The viewer takes one flat normal per triangle straight
+// off the winding, so every visible face on that wing pointed INTO the
+// solid, scored dot(n,L) < 0, clamped to zero, and rendered at the flat
+// ambient floor of 0.25: no gradient anywhere on it.  It is exactly the
+// tell ship_lib documents, and it had been there since v1 -- invisible
+// because a black wing that is merely too flat still looks like a black
+// wing.  What gave it away was the correctly wound parts sitting ON that
+// wing: the insignia ring and the tip pod took the light while the wing
+// underneath them did not.
+//
+// Reversing the STATION order flips the sweep direction back.  Reversing
+// each section would fix the winding too, but it would renumber the chord
+// and the chevrons are indexed BY chord, so every marking would move.
+// Station indices do have to be mirrored, which is what hrow() is for.
+//
+// Signed volume is the test worth keeping: for a closed mesh wound
+// outward, (1/6) sum over faces of a.(b x c) is positive.  Testing
+// whether face normals point away from the centroid does NOT work here --
+// on a thin plate like this wing the in-plane offset dwarfs the
+// thickness, so that test flips sign essentially at random.
+function hside(G, sgn) = sgn > 0 ? G : rev(G);
+function hrow(u, sgn)  = sgn > 0 ? u : NB - u;
+module hband(G, sgn, u0, u1) {
+    a = hrow(u0, sgn); b = hrow(u1, sgn);
+    sband(G, min(a,b), max(a,b));
+}
+
 module hood() {
-    GP = hood_grid(1); GS = hood_grid(-1);
-    color(DORS) smesh(GP);            color(DORS) smesh(GS);
-    color(PANL) sband(GP, 9, 13);     color(PANL) sband(GS, 9, 13);
-    color(PANL) sband(GP, 21, 25);    color(PANL) sband(GS, 21, 25);
-    // Four narrow chevrons, not three fat ones.  foil() spaces its
-    // points by cosine, so a two-index band is ~5% of chord near
-    // mid-chord and less near the edges; v6's three-index bands came
-    // to 32% of the wing between them and the gold stopped being a
-    // marking and became the paint.  The aftmost band fades to GOLD2
-    // the way the juvenile's bands fade down the body.
-    color(GOLD)  { chevron(GP,  4,  5); chevron(GS,  4,  5); }
-    color(GOLD)  { chevron(GP,  8,  9); chevron(GS,  8,  9); }
-    color(GOLD)  { chevron(GP, 12, 13); chevron(GS, 12, 13); }
-    color(GOLD2) { chevron(GP, 16, 17); chevron(GS, 16, 17); }
+    // Four narrow chevrons, not three fat ones.  foil() spaces its points
+    // by cosine, so a two-index band is ~5% of chord near mid-chord and
+    // less near the edges; v6's three-index bands came to 32% of the wing
+    // between them and the gold stopped being a marking and became the
+    // paint.  The aftmost band fades to GOLD2 the way the juvenile's
+    // bands fade down the body.
+    for (sgn = [1,-1]) let (G = hside(hood_grid(sgn), sgn)) {
+        color(DORS)  smesh(G);
+        color(PANL)  hband(G, sgn,  9, 13);
+        color(PANL)  hband(G, sgn, 21, 25);
+        color(GOLD)  chevron(G,  4,  5);
+        color(GOLD)  chevron(G,  8,  9);
+        color(GOLD)  chevron(G, 12, 13);
+        color(GOLD2) chevron(G, 16, 17);
+    }
 }
 
 // Leading-edge chine: a hard bright strake down the swept edge, which
@@ -258,8 +293,10 @@ NH = 26;
 function sk_w(u) = HWD*(1 - 0.72*pow(u,2.1));
 function sk_h(u) = HHT*(1 - 0.62*pow(u,1.8));
 
+function sk_S(u) = [ XB + (XN-XB)*u, 0, -1.05*pow(u,2.3) ];
+
 module skull() {
-    S = [ for (i=[0:NH]) let(u=i/NH) [ XB + (XN-XB)*u, 0, -1.05*pow(u,2.3) ] ];
+    S = [ for (i=[0:NH]) sk_S(i/NH) ];
     G = [ for (i=[0:NH]) let(u=i/NH, F=frame_up(S,i,[0,0,1]))
             [ for (p = lame(sk_w(u), sk_h(u), 3.4, 40))
                 S[i] + F[1]*p[0] + F[2]*p[1] ] ];
@@ -307,10 +344,19 @@ module jawline() {
 
 // Dorsal keel down the neck: snakes carry a raised vertebral ridge, and
 // it gives the spine a highlight the flat lighting can actually catch.
+// The vertebral ridge runs the whole animal, so it runs the whole ship:
+// down the fuselage, then up over the neck's S and into the skull.  It is
+// the line that makes the S legible from the side, where the hood hides
+// most of the hull.
 module keel() {
+    S = bd_S();
     color(PANL) for (i=[0:NB2-1]) let(u=i/NB2, u2=(i+1)/NB2)
-        rod([XB - (XB-XA)*u,  0, HRZ*(1-u)*0.35  + 2.0*(1-0.22*u)],
-            [XB - (XB-XA)*u2, 0, HRZ*(1-u2)*0.35 + 2.0*(1-0.22*u2)], 0.22, 7);
+        rod([S[i][0],   0, S[i][2]   + bd_h(u)],
+            [S[i+1][0], 0, S[i+1][2] + bd_h(u2)], 0.22, 7);
+    N = nk_spine();
+    color(PANL) for (i=[0:NKN-1]) let(t=i/NKN, t2=(i+1)/NKN)
+        rod([N[i][0],   0, N[i][2]   + nk_h(t)],
+            [N[i+1][0], 0, N[i+1][2] + nk_h(t2)], 0.20, 7);
 }
 
 module brow() {
@@ -330,11 +376,82 @@ module fangs() {
     }
 }
 
+// ---- neck ------------------------------------------------------------
+// Before this the skull and the fuselage simply butted end to end: two
+// flat caps meeting at 7 degrees to each other, which reads as a knife
+// cut however good the parts either side of it are.  The head deliberately
+// sits high and forward -- that offset is the whole snake-head read and it
+// stays -- so the join has to be a real neck, not a fillet.
+//
+// A cobra reared to strike holds its head above the coil on an S-bend, so
+// that is what this is: a cubic Hermite from a point INSIDE the fuselage
+// to a point INSIDE the skull, matching each one's tangent where it lands.
+// Both ends are buried, so neither end has a seam to hide.
+//
+// The S is not drawn, it is forced.  The curve has to leave the fuselage
+// almost level, climb two units, and arrive at the skull almost level
+// again; with the tangents held long enough it can only do that by going
+// concave-up and then convex-up.  NKS is how long they are held, as a
+// multiple of the chord -- raise it for more S, drop it toward 1.0 for a
+// plain ramp.
+function ytilt(p, a) = [ p[0]*cos(a) + p[2]*sin(a), p[1], -p[0]*sin(a) + p[2]*cos(a) ];
+function herm(A, TA, B, TB, m, t) =
+      ( 2*t*t*t - 3*t*t + 1)*A
+    + (   t*t*t - 2*t*t + t)*m*TA
+    + (-2*t*t*t + 3*t*t    )*B
+    + (   t*t*t -   t*t    )*m*TB;
+
+// The skull is drawn inside translate(HRZ) rotate(-HTIL), so to meet it
+// the neck has to ask where that transform actually puts things.  Note
+// the frames still agree: a rotation about y leaves cross([0,0,1],T) on
+// +y for any tangent in the xz-plane, so both solids' sections stay
+// coaxial and the buried end really is buried.
+function nk_A()  = bd_S()[2];
+function nk_TA() = -tang(bd_S(), 2);
+function nk_B()  = ytilt(sk_S(SKU), -HTIL) + [0,0,HRZ];
+function nk_TB() = unit3( ytilt(sk_S(SKU+0.02), -HTIL) - ytilt(sk_S(SKU-0.02), -HTIL) );
+
+function nk_spine() =
+  let( A = nk_A(), B = nk_B() )
+    [ for (i=[0:NKN]) herm(A, nk_TA(), B, nk_TB(), NKS*norm(B-A), i/NKN) ];
+
+// Girth, keyed to four stations.  It starts inside the fuselage, swells at
+// the shoulder to swallow the fuselage's forward cap whole, waists behind
+// the jaw the way a cobra's neck does, then grows back just inside the
+// skull's own section.  The swell is what removes the knife cut: the cap
+// is still there, it is simply interior geometry now.
+function ss(t,a,b) = sstep((t-a)/(b-a));
+function nk_w(t) = 2.98 + 0.44*ss(t,0,0.16) - 0.40*ss(t,0.16,0.60) + 0.20*ss(t,0.60,1);
+function nk_h(t) = 1.88 + 0.28*ss(t,0,0.16) - 0.38*ss(t,0.16,0.60) + 0.13*ss(t,0.60,1);
+function nk_e(t) = 2.8 + 0.6*sstep(t);          // lozenge morphs into the skull
+
+function nk_G(d=0) = let(S = nk_spine())
+  [ for (i=[0:NKN]) let(t=i/NKN, F=frame_up(S,i,[0,0,1]))
+      [ for (p = lame(nk_w(t)+d, nk_h(t)+d, nk_e(t), 40))
+          S[i] + F[1]*p[0] + F[2]*p[1] ] ];
+
+module neck() {
+    G = nk_G();
+    color(DORS) smesh([ for (g=G) part_of(g, 20,  0, 3) ]);
+    color(VENT) smesh([ for (g=G) part_of(g,  0, 20, 3) ]);
+}
+
+// The collar sits on the shoulder swell, where the fuselage's cap is
+// buried -- so the one band the eye is drawn to is exactly the station
+// that used to be the cut.  Gold, because an adult king cobra keeps its
+// throat bands after the body chevrons have gone, and they belong here.
+module collar() {
+    F = nk_G(0.10);
+    color(GOLD) sband(F,  3,  5);
+    color(DARK) sband(F, 15, 17);
+    color(PANL) sband(F, 21, 22);
+}
+
 // ---- neck and drive --------------------------------------------------
 NB2 = 20;
 function bd_w(u) = 3.2*(1 - 0.38*u);
 function bd_h(u) = 2.0*(1 - 0.22*u);
-function bd_S()  = [ for (i=[0:NB2]) let(u=i/NB2) [ XB - (XB-XA)*u, 0, HRZ*(1-u)*0.35 ] ];
+function bd_S()  = [ for (i=[0:NB2]) let(u=i/NB2) [ XNK - (XNK-XA)*u, 0, HRZ*(1-u)*0.35 ] ];
 
 // d inflates the section, so a band built from bd_G(d) stands PROUD of
 // the hull instead of lying on it.  v6 drew its body bands straight off
@@ -377,9 +494,9 @@ module body_chine() {
 // Dorsal kit: an avionics blister forward and a sensor window aft, sunk
 // into the spine so only the crowns show.
 module spine_kit() {
-    color(PANL)  translate([ 3.4, 0, 2.24]) scale([1.55, 0.62, 0.44])
+    color(PANL)  translate([ 0.0, 0, 2.20]) scale([1.55, 0.62, 0.44])
         sphere(r=1.0, $fn=16);
-    color(GLASS) translate([-2.2, 0, 1.92]) scale([1.30, 0.55, 0.38])
+    color(GLASS) translate([-4.4, 0, 1.88]) scale([1.30, 0.55, 0.38])
         sphere(r=1.0, $fn=14);
 }
 module drive() {
@@ -401,6 +518,8 @@ tip_pods();
 hardpoints();
 translate([0,0,HRZ]) rotate([0,-HTIL,0]) { skull(); jawline(); canopy(); intake(); brow(); eyes(); fangs(); }
 body();
+neck();
+collar();
 frames();
 body_chine();
 spine_kit();
