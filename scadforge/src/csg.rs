@@ -612,8 +612,113 @@ fn reduce_pairwise(mut items: Vec<Mesh>, op: fn() -> Op) -> Mesh {
     items.into_iter().next().unwrap()
 }
 
+/// The working frame a boolean is solved in.
+///
+/// Every plane carries `w = dot(normal, a)` and classification asks for
+/// `dot(normal, p) - w`, so both terms grow with the coordinates while
+/// their difference stays the small distance being tested. At coordinates
+/// of 1e9 that difference has an ulp near the 1e-7 tolerance itself, and
+/// past that the classification is noise: coincident faces stop reading as
+/// coincident and a boolean of two ordinary cubes returns nonsense. At the
+/// other end a shape of side 1e-7 is entirely inside the tolerance and the
+/// result comes back EMPTY. Both are reachable from ordinary input — a
+/// translate() far out, or a model authored in metres with millimetre
+/// features.
+///
+/// Booleans commute with translation and uniform scaling, so the operands
+/// are moved to the origin and scaled to unit extent, solved there, and put
+/// back. The scale is a POWER OF TWO, so both scalings are exact in binary
+/// floating point; the shift is applied only where the geometry is far
+/// enough out that every coordinate shares an exponent with the centre,
+/// which makes that subtraction exact too. Geometry already near unit scale
+/// at the origin gets the identity and comes back bit-identical to before.
+#[derive(Clone, Copy)]
+struct Frame {
+    c: V3,
+    s: f64,
+}
+
+impl Frame {
+    const ID: Frame = Frame { c: [0.0, 0.0, 0.0], s: 1.0 };
+
+    fn of(meshes: &[Mesh]) -> Frame {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for m in meshes {
+            for p in &m.positions {
+                if !p.iter().all(|v| v.is_finite()) {
+                    continue;
+                }
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+        }
+        let span = (0..3).fold(0.0f64, |a, k| a.max(hi[k] - lo[k]));
+        if !span.is_finite() || span <= 0.0 {
+            return Frame::ID;
+        }
+        let e = span.log2().round();
+        let s = if e.is_finite() && e != 0.0 && e.abs() < 900.0 {
+            2f64.powi(-(e as i32))
+        } else {
+            1.0
+        };
+        let mut c = [0.0; 3];
+        for k in 0..3 {
+            // Recentre an axis only when the geometry sits at least a few of
+            // its own extents away from the origin — exactly the case where
+            // p - c is exact, and the case where the absolute tolerance has
+            // stopped resolving the shape.
+            if lo[k].abs().max(hi[k].abs()) > span * 4.0 {
+                c[k] = (lo[k] + hi[k]) * 0.5;
+            }
+        }
+        Frame { c, s }
+    }
+
+    fn is_identity(&self) -> bool {
+        self.c == [0.0, 0.0, 0.0] && self.s == 1.0
+    }
+
+    fn fwd(&self, m: &Mesh) -> Mesh {
+        let mut q = m.clone();
+        for p in &mut q.positions {
+            for k in 0..3 {
+                p[k] = (p[k] - self.c[k]) * self.s;
+            }
+        }
+        q
+    }
+
+    fn inv(&self, m: &Mesh) -> Mesh {
+        let mut q = m.clone();
+        for p in &mut q.positions {
+            for k in 0..3 {
+                p[k] = p[k] / self.s + self.c[k];
+            }
+        }
+        q
+    }
+}
+
+/// Solve `op` in the operands' own working frame.
+fn framed<F: FnOnce(&[Mesh]) -> Mesh>(meshes: &[Mesh], op: F) -> Mesh {
+    let f = Frame::of(meshes);
+    if f.is_identity() {
+        return op(meshes);
+    }
+    let scaled: Vec<Mesh> = meshes.iter().map(|m| f.fwd(m)).collect();
+    f.inv(&op(&scaled))
+}
+
 /// n-ary union of a list of meshes (empty meshes are skipped).
 pub fn union_all(meshes: &[Mesh]) -> Mesh {
+    framed(meshes, union_all_raw)
+}
+
+fn union_all_raw(meshes: &[Mesh]) -> Mesh {
     let items: Vec<Mesh> =
         meshes.iter().filter(|m| !m.positions.is_empty()).cloned().collect();
     reduce_pairwise(items, || Op::Union)
@@ -624,7 +729,17 @@ pub fn difference(first: &Mesh, rest: &[Mesh]) -> Mesh {
     if first.positions.is_empty() {
         return Mesh::empty(); // empty minuend → empty, always
     }
-    let cutters = union_all(rest);
+    let mut all = Vec::with_capacity(1 + rest.len());
+    all.push(first.clone());
+    all.extend_from_slice(rest);
+    framed(&all, |m| difference_raw(&m[0], &m[1..]))
+}
+
+fn difference_raw(first: &Mesh, rest: &[Mesh]) -> Mesh {
+    if first.positions.is_empty() {
+        return Mesh::empty();
+    }
+    let cutters = union_all_raw(rest);
     if cutters.positions.is_empty() {
         return first.clone();
     }
@@ -634,6 +749,10 @@ pub fn difference(first: &Mesh, rest: &[Mesh]) -> Mesh {
 /// n-ary intersection: the region common to every mesh. An empty operand
 /// annihilates the result (A ∩ ∅ = ∅), so intersection is commutative.
 pub fn intersection_all(meshes: &[Mesh]) -> Mesh {
+    framed(meshes, intersection_all_raw)
+}
+
+fn intersection_all_raw(meshes: &[Mesh]) -> Mesh {
     if meshes.is_empty() {
         return Mesh::empty();
     }
@@ -701,6 +820,14 @@ pub fn minkowski(meshes: &[Mesh]) -> Minkowski {
 /// children are discarded by construction. A degenerate point set (fewer
 /// than 4 non-coplanar points) has no 3D volume and yields an empty mesh.
 pub fn hull(meshes: &[Mesh]) -> Mesh {
+    // The incremental hull rejects a candidate point with an absolute
+    // distance test, so a solid of side 1e-6 came back 9% short and one of
+    // 1e-9 came back EMPTY. Solved in the same normalised frame as the
+    // booleans.
+    framed(meshes, hull_raw)
+}
+
+fn hull_raw(meshes: &[Mesh]) -> Mesh {
     let mut pts: Vec<V3> = Vec::new();
     for m in meshes {
         pts.extend(m.positions.iter().cloned());
@@ -1244,26 +1371,121 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_build_reports_degradation_and_a_merge_does_not() {
+    fn a_merge_does_not_report_degradation() {
         // The guards that stop a pathological BSP from aborting the process
         // truncate the tree, which can leave an open mesh — so the evaluator
         // warns. But the MERGE stage of every boolean rebuilds into a node
         // that already has a plane, and its tree is only read back through
         // all_polygons; the guard firing there changes nothing. Tracking both
         // put the warning on six of nine ordinary demo scenes.
+        //
+        // This test used to prove the flag CAN fire by running a boolean at a
+        // magnitude of 1e11, where the plane tolerance stopped resolving
+        // anything and every split came back stuck. Magnitude is no longer
+        // pathological input — booleans are solved in a normalised frame now
+        // — so that half is gone, and `booleans_hold_their_shape_at_any_
+        // magnitude` asserts the opposite and stronger thing in its place.
         let _ = take_degraded();
         let out = difference(&geom::cube([10.0, 10.0, 10.0], true), &[geom::sphere(6.0, 12)]);
         assert!(!out.tris.is_empty());
         assert!(!take_degraded(), "an ordinary boolean reported degradation");
+    }
 
-        let mag = 1.0e11;
-        let mut cube = geom::cube([mag, mag, mag], true);
-        let mut ball = geom::sphere(0.6 * mag, 12);
-        for p in cube.positions.iter_mut().chain(ball.positions.iter_mut()) {
-            p[0] += mag * 0.5;
+    /// A boolean must give the same answer wherever the geometry sits and
+    /// whatever it is measured in — a model authored in metres with
+    /// millimetre features, or one a translate() has put a long way out,
+    /// is not a harder problem, only a differently written one.
+    ///
+    /// It used to be a much harder problem. Every plane carries
+    /// `w = dot(normal, a)` and classification asks for `dot(normal, p) - w`,
+    /// so both terms grow with the coordinates while their difference stays
+    /// the small distance being tested: at 1e9 that difference has an ulp
+    /// near the 1e-7 tolerance itself and the classification becomes noise,
+    /// while at a side of 1e-7 the whole solid is inside the tolerance and
+    /// the result comes back EMPTY.
+    ///
+    /// The geometry is built ONCE and its vertices moved, so the primitives'
+    /// own fragment counts cannot vary with scale and the boolean is the only
+    /// thing under test.
+    #[test]
+    fn booleans_hold_their_shape_at_any_magnitude() {
+        fn vol(m: &Mesh) -> f64 {
+            if m.positions.is_empty() {
+                return 0.0;
+            }
+            // Measured about a local origin: summing products of raw
+            // coordinates is itself unstable far from it.
+            let o = m.positions[0];
+            m.tris
+                .iter()
+                .map(|t| {
+                    let r = |i: u32| sub(m.positions[i as usize], o);
+                    let (a, b, c) = (r(t[0]), r(t[1]), r(t[2]));
+                    dot(a, cross(b, c)) / 6.0
+                })
+                .sum::<f64>()
+                .abs()
         }
-        let _ = difference(&cube, &[ball]);
-        assert!(take_degraded(), "an extreme-magnitude boolean did NOT report degradation");
+        let cube = geom::cube([1.0, 1.0, 1.0], true);
+        let ball = geom::sphere(0.6, 12);
+        let place = |m: &Mesh, s: f64, d: f64| {
+            let mut q = m.clone();
+            for p in &mut q.positions {
+                for k in 0..3 {
+                    p[k] = p[k] * s + d;
+                }
+            }
+            q
+        };
+        let mut far = ball.clone();
+        for p in &mut far.positions {
+            p[0] += 2.0; // clear of the cube, so the hull spans both
+        }
+        let base = [
+            vol(&union_all(&[cube.clone(), ball.clone()])),
+            vol(&difference(&cube, &[ball.clone()])),
+            vol(&intersection_all(&[cube.clone(), ball.clone()])),
+            vol(&hull(&[cube.clone(), far.clone()])),
+        ];
+        assert!(base.iter().all(|v| *v > 0.0), "reference volumes {:?}", base);
+        for (s, d) in [
+            (1e-9, 0.0),
+            (1e-6, 0.0),
+            (1e-3, 0.0),
+            (1e6, 0.0),
+            (1e11, 0.0),
+            (1.0, 1e6),
+            (1.0, 1e9),
+            (1.0, 1e12),
+            (1e-6, 1e-3),
+            (1e6, 1e11),
+        ] {
+            let (a, b) = (place(&cube, s, d), place(&ball, s, d));
+            let h = place(&far, s, d);
+            let got = [
+                vol(&union_all(&[a.clone(), b.clone()])),
+                vol(&difference(&a, &[b.clone()])),
+                vol(&intersection_all(&[a.clone(), b.clone()])),
+                vol(&hull(&[a.clone(), h])),
+            ];
+            // Moving a shape out to `d` quantises its vertices onto the grid
+            // of representable numbers there, so the shape itself can only be
+            // held to ulp(d)/s in relative terms. That is the input's limit,
+            // not the kernel's; below it the boolean must be exact.
+            let grain = (d.abs() / s) * f64::EPSILON * 16.0;
+            for k in 0..4 {
+                let scaled = got[k] / (s * s * s);
+                assert!(
+                    (scaled - base[k]).abs() <= base[k] * (1e-9 + grain),
+                    "op {} at side {:e} offset {:e}: {} vs {}",
+                    ["union", "difference", "intersection", "hull"][k],
+                    s,
+                    d,
+                    scaled,
+                    base[k]
+                );
+            }
+        }
     }
 
     #[test]

@@ -96,8 +96,13 @@ const FRONT: u8 = 1;
 const BACK: u8 = 2;
 const SPANNING: u8 = 3;
 
+/// Signed distance from `line` to `p`: positive in front, negative behind.
+fn signed_dist(line: &Line, p: V2) -> f64 {
+    dot(line.normal, p) - line.w
+}
+
 fn classify_point(line: &Line, p: V2) -> u8 {
-    let t = dot(line.normal, p) - line.w;
+    let t = signed_dist(line, p);
     if t < -EPS {
         BACK
     } else if t > EPS {
@@ -132,8 +137,18 @@ fn split_segment(
         BACK => back.push(seg.clone()),
         _ => {
             // SPANNING: one endpoint front, one back — cut at the crossing.
-            let denom = dot(line.normal, sub(seg.b, seg.a));
-            let t = (line.w - dot(line.normal, seg.a)) / denom;
+            //
+            // The crossing parameter comes from the SAME two distances the
+            // classification used, so the two cannot disagree: with da < 0 <
+            // db, da/(da-db) lies in (0,1) by the signs alone. Computing the
+            // denominator independently, as dot(normal, b-a), is a different
+            // expression on differently-rounded operands, and at large
+            // coordinates it can come out near zero or even the wrong sign
+            // while the classification still says SPANNING — which sent the
+            // cut point off to 1e300 and overflowed the stitcher's grid key.
+            let da = signed_dist(line, seg.a);
+            let db = signed_dist(line, seg.b);
+            let t = (da / (da - db)).clamp(0.0, 1.0);
             let mid = lerp(seg.a, seg.b, t);
             let (fa, fb, ba, bb) = if ta == FRONT {
                 (seg.a, mid, mid, seg.b)
@@ -548,10 +563,13 @@ fn segments_to_poly(segs: &[Seg]) -> Poly2 {
 /// Look up or register a canonical vertex id for `p`, merging any existing
 /// vertex within SNAP (checked across the 3×3 neighbourhood of grid cells).
 fn canon(p: V2, verts: &mut Vec<V2>, grid: &mut HashMap<(i64, i64), Vec<usize>>) -> usize {
+    // A coordinate far past what the grid can index saturates the cast, and
+    // stepping off the end of the range would then wrap. Saturating keeps the
+    // lookup well defined; such a point simply finds no neighbour to weld to.
     let cell = ((p[0] / SNAP).round() as i64, (p[1] / SNAP).round() as i64);
-    for dx in -1..=1 {
-        for dy in -1..=1 {
-            if let Some(list) = grid.get(&(cell.0 + dx, cell.1 + dy)) {
+    for dx in -1i64..=1 {
+        for dy in -1i64..=1 {
+            if let Some(list) = grid.get(&(cell.0.saturating_add(dx), cell.1.saturating_add(dy))) {
                 for &vi in list {
                     if dist2(verts[vi], p) <= SNAP * SNAP {
                         return vi;
@@ -610,9 +628,133 @@ fn cw_angle(from: V2, to: V2) -> f64 {
 
 // -- Public API -------------------------------------------------------------
 
+/// The working frame a boolean is solved in.
+///
+/// The BSP classifies on an absolute EPS and the stitcher welds on an
+/// absolute SNAP, both sized for the unit-to-hundreds coordinates this
+/// kernel targets. Outside that range they stop describing anything: at a
+/// side of 1e-6 the whole shape is finer than the weld grid and a boolean
+/// comes back EMPTY, while a unit shape 1e10 from the origin has
+/// coordinates quantised COARSER than the weld tolerance, so its vertices
+/// never weld and most of the area is lost. Both were reachable from
+/// ordinary input — a translate() far out, or a model authored in metres
+/// where the features are microns.
+///
+/// Booleans commute with translation and with uniform scaling, so the
+/// operands are moved to the origin and scaled to unit extent, solved
+/// there, and put back. The scale is a POWER OF TWO, so both scalings are
+/// exact in binary floating point; the shift is applied only when the
+/// geometry is far enough out that every coordinate shares an exponent with
+/// the centre, which makes that subtraction exact too. A region already
+/// near unit scale at the origin gets the identity and comes back
+/// bit-identical to before.
+#[derive(Clone, Copy)]
+struct Frame {
+    c: V2,
+    s: f64,
+}
+
+impl Frame {
+    const ID: Frame = Frame { c: [0.0, 0.0], s: 1.0 };
+
+    fn of(regions: &[Poly2]) -> Frame {
+        Frame::of_len(regions, 0.0)
+    }
+
+    /// As `of`, but `extra` is a length the caller also needs resolvable —
+    /// an offset distance far larger than the shape still has to land on the
+    /// tolerances' scale, not the shape's.
+    fn of_len(regions: &[Poly2], extra: f64) -> Frame {
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        for r in regions {
+            for c in &r.contours {
+                for p in c {
+                    if !p[0].is_finite() || !p[1].is_finite() {
+                        continue;
+                    }
+                    for k in 0..2 {
+                        lo[k] = lo[k].min(p[k]);
+                        hi[k] = hi[k].max(p[k]);
+                    }
+                }
+            }
+        }
+        let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(extra.abs());
+        if !span.is_finite() || span <= 0.0 {
+            return Frame::ID;
+        }
+        // Per axis: recentre only when the geometry sits at least a few of
+        // its own extents away from the origin. That is exactly the case
+        // where p - c is exact, and the case where the absolute tolerances
+        // have stopped resolving the shape.
+        let shift = |l: f64, h: f64| {
+            if l.abs().max(h.abs()) > span * 4.0 {
+                (l + h) * 0.5
+            } else {
+                0.0
+            }
+        };
+        let e = span.log2().round();
+        let s = if e.is_finite() && e != 0.0 && e.abs() < 900.0 {
+            2f64.powi(-(e as i32))
+        } else {
+            1.0
+        };
+        Frame { c: [shift(lo[0], hi[0]), shift(lo[1], hi[1])], s }
+    }
+
+    fn is_identity(&self) -> bool {
+        self.c[0] == 0.0 && self.c[1] == 0.0 && self.s == 1.0
+    }
+
+    fn fwd(&self, p: &Poly2) -> Poly2 {
+        let mut q = p.clone(); // clone, so the region's fill rule rides along
+        for c in &mut q.contours {
+            for v in c {
+                v[0] = (v[0] - self.c[0]) * self.s;
+                v[1] = (v[1] - self.c[1]) * self.s;
+            }
+        }
+        q
+    }
+
+    fn inv(&self, p: &Poly2) -> Poly2 {
+        let mut q = p.clone();
+        for c in &mut q.contours {
+            for v in c {
+                v[0] = v[0] / self.s + self.c[0];
+                v[1] = v[1] / self.s + self.c[1];
+            }
+        }
+        q
+    }
+}
+
+/// Solve `op` in the operands' own working frame.
+fn framed<F: FnOnce(&[Poly2]) -> Poly2>(regions: &[Poly2], op: F) -> Poly2 {
+    let f = Frame::of(regions);
+    if f.is_identity() {
+        return op(regions);
+    }
+    let scaled: Vec<Poly2> = regions.iter().map(|r| f.fwd(r)).collect();
+    f.inv(&op(&scaled))
+}
+
 /// n-ary union of 2D regions (the boundary of the combined filled area).
 /// A single region passes through unchanged; empty regions are skipped.
 pub fn union2(regions: &[Poly2]) -> Poly2 {
+    // A single region passes through untouched — no frame, no round trip.
+    let live: Vec<&Poly2> = regions.iter().filter(|r| !r.is_empty()).collect();
+    match live.len() {
+        0 => return Poly2::new(Vec::new()),
+        1 => return live[0].clone(),
+        _ => {}
+    }
+    framed(regions, union2_raw)
+}
+
+fn union2_raw(regions: &[Poly2]) -> Poly2 {
     let mut items: Vec<Vec<Seg>> =
         regions.iter().filter(|r| !r.is_empty()).map(region_segments).collect();
     if items.is_empty() {
@@ -643,6 +785,16 @@ pub fn difference2(first: &Poly2, rest: &[Poly2]) -> Poly2 {
     if first.is_empty() {
         return Poly2::new(Vec::new());
     }
+    let mut all = Vec::with_capacity(1 + rest.len());
+    all.push(first.clone());
+    all.extend_from_slice(rest);
+    framed(&all, |r| difference2_raw(&r[0], &r[1..]))
+}
+
+fn difference2_raw(first: &Poly2, rest: &[Poly2]) -> Poly2 {
+    if first.is_empty() {
+        return Poly2::new(Vec::new());
+    }
     let cutters = union2(rest);
     if cutters.is_empty() {
         return first.clone();
@@ -653,6 +805,10 @@ pub fn difference2(first: &Poly2, rest: &[Poly2]) -> Poly2 {
 /// n-ary intersection: the region common to every operand. An empty
 /// operand annihilates the result (A ∩ ∅ = ∅).
 pub fn intersection2(regions: &[Poly2]) -> Poly2 {
+    framed(regions, intersection2_raw)
+}
+
+fn intersection2_raw(regions: &[Poly2]) -> Poly2 {
     if regions.is_empty() || regions.iter().any(|r| r.is_empty()) {
         return Poly2::new(Vec::new());
     }
@@ -814,54 +970,34 @@ pub fn offset2(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 
     if dist == 0.0 || !dist.is_finite() {
         return region.clone(); // identity (a zero/invalid offset is a no-op)
     }
-    if dist > 0.0 {
-        return dilate(region, dist, join, frags_full);
-    }
-    // EROSION is the only offset path that touches the segment BSP, and that
-    // kernel classifies on an ABSOLUTE EPS = 1e-7 and welds stitched
-    // endpoints on an ABSOLUTE SNAP = 1e-6 grid. So erosion inherited a scale
-    // dependence the dilation does not have: a shape below ~1e-5 units lost
-    // its eroded holes and below ~1e-6 came back EMPTY, while the positive
-    // offset of the identical shape was bit-identical from 1e-8 to 1e6. It
-    // also meant a FINER $fn made a small erosion worse, not better — once
-    // the arc chord |dist|*2*pi/$fn fell under SNAP the rounded corners
-    // welded together and the hole vanished.
+    // Offsetting inherits the kernel's absolute tolerances: erosion goes
+    // through the segment BSP (EPS = 1e-7) and the stitcher (SNAP = 1e-6),
+    // and dilation through a boundary test on the offset curve. A shape
+    // below ~1e-5 units lost its eroded holes and below ~1e-6 came back
+    // EMPTY, and a FINER $fn made a small erosion worse rather than better —
+    // once the arc chord |dist|*2*pi/$fn fell under SNAP the rounded corners
+    // welded together and the hole vanished. A shape merely FAR from the
+    // origin failed the same way: a unit square at 1e9 dilated to nothing
+    // and eroded to thirty-five times its own area.
     //
-    // Offsetting commutes with uniform scaling — erode(s*P, s*d) = s*erode(P, d)
-    // — so normalize the problem to unit extent, solve it there where the
-    // absolute tolerances are meaningful, and scale the answer back. The
-    // factor is a POWER OF TWO, which makes both scalings exact in binary
-    // floating point: nothing is lost, and a region already near unit scale
-    // gets s = 1 and is bit-identical to before.
-    let (lo, hi) = region_bbox(region);
-    let span = (hi[0] - lo[0]).abs().max((hi[1] - lo[1]).abs()).max(-dist);
-    let s = if span.is_finite() && span > 0.0 {
-        let e = span.log2().round();
-        if e.is_finite() && e.abs() < 900.0 { 2f64.powi(-(e as i32)) } else { 1.0 }
-    } else {
-        1.0
-    };
-    let scaled = if s == 1.0 {
-        region.clone()
-    } else {
-        Poly2::new(
-            region
-                .contours
-                .iter()
-                .map(|c| c.iter().map(|p| [p[0] * s, p[1] * s]).collect())
-                .collect(),
-        )
-    };
-    let out = erode_at_unit_scale(&scaled, -dist * s, join, frags_full);
-    if s == 1.0 {
-        return out;
+    // Offsetting commutes with translation and with uniform scaling, so it
+    // is solved in the same normalised frame the booleans use. The distance
+    // is part of the problem's extent, so it sizes the frame too: an offset
+    // far larger than the shape must still land on the tolerances' scale.
+    let f = Frame::of_len(std::slice::from_ref(region), dist);
+    if f.is_identity() {
+        return offset_in_frame(region, dist, join, frags_full);
     }
-    Poly2::new(
-        out.contours
-            .iter()
-            .map(|c| c.iter().map(|p| [p[0] / s, p[1] / s]).collect())
-            .collect(),
-    )
+    f.inv(&offset_in_frame(&f.fwd(region), dist * f.s, join, frags_full))
+}
+
+/// Grow or shrink, with the caller having already normalised the frame.
+fn offset_in_frame(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 {
+    if dist > 0.0 {
+        dilate(region, dist, join, frags_full)
+    } else {
+        erode_at_unit_scale(region, -dist, join, frags_full)
+    }
 }
 
 /// Erosion proper: complement the region inside a padded box, dilate the
@@ -942,11 +1078,45 @@ pub const PROJECT_MAX_TRIS: usize = 4_000;
 /// than 3D-unioned first — correct for a single or nested solid (the common
 /// case), approximate for a partial overlap.
 pub fn project(mesh: &Mesh, cut: bool) -> Poly2 {
-    if cut {
-        project_cut(mesh)
-    } else {
-        project_silhouette(mesh)
+    // Both modes end in the stitcher or a per-facet union, so both inherit
+    // the absolute SNAP: a solid of side 1e-6 projected to nothing at all.
+    // A uniform scale about the origin leaves the z = 0 cut plane exactly
+    // where it is, and a power of two makes the round trip exact.
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in &mesh.positions {
+        if !p.iter().all(|v| v.is_finite()) {
+            continue;
+        }
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
     }
+    let span = (0..3).fold(0.0f64, |a, k| a.max(hi[k] - lo[k]));
+    let e = if span.is_finite() && span > 0.0 { span.log2().round() } else { 0.0 };
+    let s = if e.is_finite() && e != 0.0 && e.abs() < 900.0 {
+        2f64.powi(-(e as i32))
+    } else {
+        1.0
+    };
+    if s == 1.0 {
+        return if cut { project_cut(mesh) } else { project_silhouette(mesh) };
+    }
+    let mut m = mesh.clone();
+    for p in &mut m.positions {
+        for v in p.iter_mut() {
+            *v *= s;
+        }
+    }
+    let mut out = if cut { project_cut(&m) } else { project_silhouette(&m) };
+    for c in &mut out.contours {
+        for p in c {
+            p[0] /= s;
+            p[1] /= s;
+        }
+    }
+    out
 }
 
 fn project_silhouette(mesh: &Mesh) -> Poly2 {
@@ -1372,6 +1542,156 @@ mod tests {
     /// contour does not — half its edges face the wrong way, so the fold
     /// added the overlap instead of cancelling it and a bowtie came back
     /// empty while the 'R' glyph came back LARGER than the sum of its parts.
+    /// The 2D analogue, and the same failure: the BSP classifies on an
+    /// absolute EPS and the stitcher welds on an absolute SNAP, so at a side
+    /// of 1e-6 a boolean came back EMPTY and 1e10 from the origin its
+    /// vertices were quantised coarser than the weld tolerance and never
+    /// welded at all. Solved in a normalised frame, all of it is exact.
+    #[test]
+    fn booleans_hold_their_shape_at_any_magnitude() {
+        fn area(p: &Poly2) -> f64 {
+            let (v, t) = poly2::triangulate(p);
+            t.iter()
+                .map(|tr| {
+                    let (a, b, c) = (v[tr[0] as usize], v[tr[1] as usize], v[tr[2] as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+                })
+                .sum()
+        }
+        let place = |x: f64, y: f64, w: f64| {
+            Poly2::new(vec![vec![[x, y], [x + w, y], [x + w, y + w], [x, y + w]]])
+        };
+        for (s, d) in [
+            (1e-12, 0.0),
+            (1e-6, 0.0),
+            (1e-3, 0.0),
+            (1e6, 0.0),
+            (1e12, 0.0),
+            (1.0, 1e6),
+            (1.0, 1e10),
+            (1.0, 1e14),
+            (1e-6, 1e-3),
+            (1e6, 1e12),
+        ] {
+            let a = place(d, d, s);
+            let b = place(d + s * 0.5, d, s);
+            for (name, got, want) in [
+                ("union", area(&union2(&[a.clone(), b.clone()])), 1.5 * s * s),
+                ("difference", area(&difference2(&a, &[b.clone()])), 0.5 * s * s),
+                ("intersection", area(&intersection2(&[a.clone(), b.clone()])), 0.5 * s * s),
+            ] {
+                assert!(
+                    (got - want).abs() <= want * 1e-9,
+                    "{} of two squares of side {:e} at offset {:e}: {} vs {}",
+                    name,
+                    s,
+                    d,
+                    got,
+                    want
+                );
+            }
+        }
+    }
+
+    /// Everything built on the BSP's tolerances shares its scale
+    /// sensitivity, not just the booleans: offset goes through the stitcher,
+    /// projection ends in a per-facet union, and the hull tests candidate
+    /// points against an absolute distance. Measured before the fix: a unit
+    /// square at 1e9 DILATED TO NOTHING and eroded to thirty-five times its
+    /// own area, and a solid of side 1e-6 projected to nothing at all.
+    #[test]
+    fn derived_2d_operations_hold_their_shape_at_any_magnitude() {
+        fn area(p: &Poly2) -> f64 {
+            let (v, t) = poly2::triangulate(p);
+            t.iter()
+                .map(|tr| {
+                    let (a, b, c) = (v[tr[0] as usize], v[tr[1] as usize], v[tr[2] as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+                })
+                .sum()
+        }
+        let tri = |s: f64, d: f64| Poly2::new(vec![vec![[d, d], [d + s, d], [d, d + s]]]);
+        let sq = |s: f64, d: f64| {
+            Poly2::new(vec![vec![[d, d], [d + s, d], [d + s, d + s], [d, d + s]]])
+        };
+        let mink = |a: Poly2, b: Poly2| match minkowski2(&[a, b]) {
+            Minkowski2::Ok(r) => area(&r),
+            _ => f64::NAN,
+        };
+        let cube = |s: f64, d: f64| {
+            let mut m = crate::geom::cube([1.0, 1.0, 1.0], true);
+            for p in &mut m.positions {
+                for k in 0..3 {
+                    p[k] = p[k] * s + d;
+                }
+            }
+            m
+        };
+        let base = [
+            area(&hull2(&[tri(1.0, 0.0), sq(1.0, 0.0)])),
+            area(&offset2(&sq(1.0, 0.0), 0.25, Join::Round, 32)),
+            area(&offset2(&sq(1.0, 0.0), -0.25, Join::Round, 32)),
+            mink(sq(1.0, 0.0), tri(0.3, 0.0)),
+            area(&project(&cube(1.0, 0.0), false)),
+        ];
+        assert!(base.iter().all(|v| *v > 0.0), "reference areas {:?}", base);
+        for (s, d) in [
+            (1e-9, 0.0),
+            (1e-6, 0.0),
+            (1e-3, 0.0),
+            (1e6, 0.0),
+            (1e9, 0.0),
+            (1.0, 1e6),
+            (1.0, 1e9),
+            (1e-6, 1e-3),
+        ] {
+            let got = [
+                area(&hull2(&[tri(s, d), sq(s, d)])),
+                area(&offset2(&sq(s, d), 0.25 * s, Join::Round, 32)),
+                area(&offset2(&sq(s, d), -0.25 * s, Join::Round, 32)),
+                mink(sq(s, d), tri(0.3 * s, 0.0)),
+                area(&project(&cube(s, d), false)),
+            ];
+            // See the boolean test: moving out to `d` quantises the shape
+            // onto the grid of representable numbers there, and that is the
+            // input's limit rather than the kernel's.
+            let grain = (d.abs() / s) * f64::EPSILON * 16.0;
+            for k in 0..5 {
+                let scaled = got[k] / (s * s);
+                assert!(
+                    (scaled - base[k]).abs() <= base[k] * (1e-9 + grain),
+                    "{} at side {:e} offset {:e}: {} vs {}",
+                    ["hull2", "dilate", "erode", "minkowski", "projection"][k],
+                    s,
+                    d,
+                    scaled,
+                    base[k]
+                );
+            }
+        }
+    }
+
+
+    /// A spanning segment's crossing must land BETWEEN its endpoints. The
+    /// denominator used to be computed independently, as dot(normal, b - a),
+    /// which is a different expression on differently-rounded operands: at
+    /// large coordinates it came out near zero while the classification still
+    /// said SPANNING, sending the cut point to 1e300 and overflowing the
+    /// stitcher's grid key — an arithmetic panic, straight out of a
+    /// translate() far from the origin.
+    #[test]
+    fn a_far_flung_boolean_does_not_panic() {
+        let f = |d: f64| Poly2::new(vec![vec![[d, d], [d + 1.0, d], [d + 1.0, d + 1.0], [d, d + 1.0]]]);
+        for e in [10i32, 12, 14, 16, 18, 20] {
+            let d = 10f64.powi(e);
+            let (a, b) = (f(d), f(d + 0.5));
+            let _ = union2(&[a.clone(), b.clone()]);
+            let _ = difference2(&a, &[b.clone()]);
+            let _ = intersection2(&[a, b]);
+        }
+    }
+
+
     #[test]
     fn crossing_outlines_survive_a_boolean() {
         let area = |p: &Poly2| -> f64 {

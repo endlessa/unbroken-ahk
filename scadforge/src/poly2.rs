@@ -54,11 +54,25 @@ fn sub(a: Vec2, b: Vec2) -> Vec2 {
 }
 
 /// Twice the signed area of a contour (positive = CCW).
+///
+/// Summed about the contour's own first vertex rather than the origin. The
+/// shoelace terms are PRODUCTS of coordinates, so a polygon far from the
+/// origin makes them enormous and near-cancelling: a 0.5-by-1 rectangle at
+/// x = 1e12 has terms of 1e24, whose sum has an ulp around 1e8, and its
+/// area came back as -134217728. Everything that asks which way a contour
+/// winds goes through here, so that noise decided orientation by coin flip
+/// and turned walls inside out. Translating first changes no area at all
+/// and is exact between neighbouring vertices.
 pub fn signed_area2(contour: &[Vec2]) -> f64 {
+    let n = contour.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let o = contour[0];
     let mut s = 0.0;
-    for i in 0..contour.len() {
-        let a = contour[i];
-        let b = contour[(i + 1) % contour.len()];
+    for i in 1..n - 1 {
+        let a = sub(contour[i], o);
+        let b = sub(contour[i + 1], o);
         s += a[0] * b[1] - b[0] * a[1];
     }
     s
