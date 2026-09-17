@@ -404,7 +404,12 @@ fn boolean(a: Vec<Seg>, b: Vec<Seg>, op: Op) -> Vec<Seg> {
 /// The oriented boundary segments of a region (filled on the left).
 fn region_segments(poly: &Poly2) -> Vec<Seg> {
     let mut segs = Vec::new();
-    for contour in poly2::oriented_contours(poly) {
+    // Resolve crossings first. The BSP assumes each segment has the filled
+    // area on its left, and a contour that crosses itself (or a sibling it
+    // only half-overlaps) does not: half its edges face the wrong way, and
+    // the fold then adds the overlap instead of cancelling it. A region
+    // that does not cross comes back from sanitize untouched.
+    for contour in poly2::oriented_contours(&poly2::sanitize(poly)) {
         // Drop any contour carrying a non-finite coordinate (e.g. a user
         // 1/0 reaching a vertex) so a NaN/inf can't poison the BSP.
         if contour.iter().any(|p| !p[0].is_finite() || !p[1].is_finite()) {
@@ -908,8 +913,15 @@ fn dilate(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 {
     // resulting cycles, returning an EMPTY region on many concave profiles.
     // It failed the standard corner-rounding idiom on 15 of 24 star cases and
     // on every gear profile at every radius. See `crate::offset`.
+    //
+    // The offset curve is only on the region's boundary if the INPUT
+    // contours are too, so a crossing outline (a bowtie, a glyph) is
+    // resolved first — otherwise every piece of the curve fails the
+    // boundary test and the dilation comes back empty. A region that does
+    // not cross passes through sanitize untouched.
     let steps = frags_full.clamp(8, 1024) as usize;
-    let (contours, _stats) = crate::offset::offset_polygon(&region.contours, dist, steps, join);
+    let src = poly2::sanitize(region);
+    let (contours, _stats) = crate::offset::offset_polygon(&src.contours, dist, steps, join);
     Poly2::new(contours)
 }
 
@@ -1355,6 +1367,47 @@ mod tests {
         assert!(offset2(&Poly2::new(Vec::new()), 3.0, Join::Round, 16).is_empty());
     }
 
+    /// A crossing outline must survive a boolean. The BSP assumes each
+    /// segment carries the filled area on its left, which a self-crossing
+    /// contour does not — half its edges face the wrong way, so the fold
+    /// added the overlap instead of cancelling it and a bowtie came back
+    /// empty while the 'R' glyph came back LARGER than the sum of its parts.
+    #[test]
+    fn crossing_outlines_survive_a_boolean() {
+        let area = |p: &Poly2| -> f64 {
+            let (v, t) = poly2::triangulate(p);
+            t.iter()
+                .map(|tr| {
+                    let (a, b, c) = (v[tr[0] as usize], v[tr[1] as usize], v[tr[2] as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+                })
+                .sum()
+        };
+        let bowtie = Poly2::new(vec![vec![[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]]]);
+        let far = sq(30.0, 30.0, 1.0);
+        let u = area(&union2(&[bowtie.clone(), far.clone()]));
+        assert!((u - 51.0).abs() < 1e-6, "bowtie U far square = {}, want 51", u);
+        // Growing it must grow it: the old path returned an empty region.
+        let grown = area(&offset2(&bowtie, 1.0, Join::Round, 64));
+        assert!(grown > 50.0 && grown < 120.0, "offset(bowtie, +1) = {}", grown);
+        // A glyph is the same shape of problem at full complexity: 'R' is a
+        // stem-and-bowl path plus a leg, and the union can never exceed the
+        // sum of the parts (it used to, by the whole area of the counter).
+        let f = crate::font::default_font().expect("bundled font");
+        for ch in ['R', '@', 'B', '4', 'e'] {
+            let cs = f.glyph_contours(f.glyph_id(ch), 6);
+            let truth = area(&Poly2::new_font(cs.clone()));
+            let got = area(&union2(&[Poly2::new_font(cs), far.clone()]));
+            assert!(
+                (got - (truth + 1.0)).abs() < truth * 1e-6,
+                "glyph '{}' through union2 = {}, want {}",
+                ch,
+                got,
+                truth + 1.0
+            );
+        }
+    }
+
     #[test]
     fn union_result_extrudes_cleanly() {
         // A boolean result must round-trip through the extruder: union of two
@@ -1375,3 +1428,4 @@ mod tests {
 
 
 }
+

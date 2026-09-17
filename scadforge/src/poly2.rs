@@ -411,6 +411,16 @@ pub fn triangulate(poly: &Poly2) -> (Vec<Vec2>, Vec<[u32; 3]>) {
     if poly.fill == Fill::Font {
         return sweep_fill(&clean);
     }
+    // The nesting classifier below cannot describe contours that CROSS, so
+    // they are resolved into equivalent nested ones first. A region that
+    // does not cross comes back unchanged.
+    let resolved;
+    let clean = if has_crossing(&clean) {
+        resolved = sanitize(poly);
+        clean_contours(&resolved)
+    } else {
+        clean
+    };
     let mut positions: Vec<Vec2> = Vec::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
     for (i, holes) in groups(&clean) {
@@ -772,21 +782,6 @@ pub fn oriented_contours(poly: &Poly2) -> Vec<Vec<Vec2>> {
         .collect()
 }
 
-/// Signed winding number of the outline set at `p`.
-fn winding_at(segs: &[[Vec2; 2]], p: Vec2) -> i32 {
-    let mut w = 0;
-    for [a, b] in segs {
-        if a[1] <= p[1] {
-            if b[1] > p[1] && cross(*a, *b, p) > 0.0 {
-                w += 1;
-            }
-        } else if b[1] <= p[1] && cross(*a, *b, p) < 0.0 {
-            w -= 1;
-        }
-    }
-    w
-}
-
 /// Parameter of a proper crossing of segment `e` by segment `o`, plus the
 /// parameters of `o`'s endpoints where they land in the middle of `e` (one
 /// stroke's corner meeting another's flank).
@@ -818,54 +813,116 @@ fn split_params(e: &[Vec2; 2], o: &[Vec2; 2], tol: f64, out: &mut Vec<f64>) {
     }
 }
 
-/// Directed wall segments for an extrusion, ink always on the LEFT.
-///
-/// An even-odd region's contours already ARE its boundary, so they pass
-/// straight through. A font's are not. Glyphs are drawn as overlapping
-/// strokes and self-crossing paths — the stem of 'B' ends inside the bowl,
-/// the bar of 'A' runs through both diagonals, '4' crosses itself six times
-/// — so stretches of outline lie buried in solid ink. Left in, each buried
-/// stretch raises a wall inside the letter whose top edge sits exactly in
-/// the cap plane, and the two then fight for the same depth: that is the
-/// hairline seen ruled across a letter's face. So every edge is cut at its
-/// crossings and only the pieces with empty space on their right survive.
-pub fn wall_segments(poly: &Poly2) -> Vec<[Vec2; 2]> {
-    let clean = clean_contours(poly);
-    if clean.is_empty() {
-        return Vec::new();
-    }
-    let mut segs: Vec<[Vec2; 2]> = Vec::new();
-    if poly.fill != Fill::Font {
-        for c in oriented_contours(poly) {
-            let n = c.len();
-            for i in 0..n {
-                segs.push([c[i], c[(i + 1) % n]]);
+/// Is `p` in the filled region, under `fill`?
+fn filled_at(clean: &[Vec<Vec2>], fill: Fill, p: Vec2) -> bool {
+    match fill {
+        // "Covered by an odd number of boundaries is inside" — and a single
+        // contour that crosses itself already answers even-odd for its own
+        // lobes, because point_in_one counts ray crossings.
+        Fill::EvenOdd => clean.iter().filter(|c| point_in_one(c, p)).count() % 2 == 1,
+        Fill::Font => {
+            let mut w = 0;
+            for c in clean {
+                let n = c.len();
+                for i in 0..n {
+                    let (a, b) = (c[i], c[(i + 1) % n]);
+                    if a[1] <= p[1] {
+                        if b[1] > p[1] && cross(a, b, p) > 0.0 {
+                            w += 1;
+                        }
+                    } else if b[1] <= p[1] && cross(a, b, p) < 0.0 {
+                        w -= 1;
+                    }
+                }
             }
+            w != 0
         }
-        return segs;
     }
-    // Ink on the left: TrueType runs its outer contours clockwise, which
-    // puts the ink on the right, so the whole set turns over together. The
-    // direction is read from the WHOLE set, since one letter of a line can
-    // be a lone counter-wound piece, but the work is done letter by letter.
-    let total: f64 = clean.iter().map(|c| signed_area2(c)).sum();
-    let mut out = Vec::new();
-    for g in components(&clean) {
-        let part: Vec<Vec<Vec2>> = g.into_iter().map(|i| clean[i].clone()).collect();
-        out.extend(font_walls(&part, total < 0.0));
-    }
-    out
 }
 
-/// The wall pass for one group of outlines that can actually touch.
-fn font_walls(clean: &[Vec<Vec2>], flip: bool) -> Vec<[Vec2; 2]> {
+/// Do two segments cross strictly inside both? Endpoint touches don't count
+/// — a contour nested in another may touch it, and nesting handles that
+/// perfectly well. A genuine crossing is the thing nesting cannot describe.
+fn seg_cross(p: &[Vec2; 2], q: &[Vec2; 2]) -> bool {
+    let o = |a: Vec2, b: Vec2, c: Vec2| {
+        let v = cross(a, b, c);
+        if v > 0.0 {
+            1
+        } else if v < 0.0 {
+            -1
+        } else {
+            0
+        }
+    };
+    let (a, b) = (o(p[0], p[1], q[0]), o(p[0], p[1], q[1]));
+    let (c, d) = (o(q[0], q[1], p[0]), o(q[0], q[1], p[1]));
+    a != 0 && b != 0 && c != 0 && d != 0 && a != b && c != d
+}
+
+/// Does any edge of the region cross any other? A sweep ordered by the
+/// edges' lower y, so the common clean region costs about a sort rather
+/// than every pair.
+fn has_crossing(clean: &[Vec<Vec2>]) -> bool {
     let mut segs: Vec<[Vec2; 2]> = Vec::new();
     for c in clean {
         let n = c.len();
         for i in 0..n {
-            let (a, b) = (c[i], c[(i + 1) % n]);
-            segs.push(if flip { [b, a] } else { [a, b] });
+            segs.push([c[i], c[(i + 1) % n]]);
         }
+    }
+    let ylo = |s: &[Vec2; 2]| s[0][1].min(s[1][1]);
+    let yhi = |s: &[Vec2; 2]| s[0][1].max(s[1][1]);
+    let mut order: Vec<usize> = (0..segs.len()).collect();
+    order.sort_by(|&a, &b| {
+        ylo(&segs[a]).partial_cmp(&ylo(&segs[b])).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (k, &i) in order.iter().enumerate() {
+        let top = yhi(&segs[i]);
+        for &j in &order[k + 1..] {
+            if ylo(&segs[j]) > top {
+                break; // everything later starts above this edge
+            }
+            if segs[i][0][0].min(segs[i][1][0]) > segs[j][0][0].max(segs[j][1][0])
+                || segs[i][0][0].max(segs[i][1][0]) < segs[j][0][0].min(segs[j][1][0])
+            {
+                continue;
+            }
+            if seg_cross(&segs[i], &segs[j]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The region's true boundary as directed segments, ink always on the LEFT.
+///
+/// Every edge is cut at its crossings with every other, and each piece is
+/// kept only where the fill actually CHANGES across it — which settles both
+/// the question of whether it is boundary at all and which way round it
+/// goes, without ever asking whether one contour is nested in another. That
+/// matters because nesting is not a question a crossing has an answer to:
+/// of two sibling squares laid half across each other, neither is inside
+/// the other, and of a path that crosses itself there are not two contours
+/// to compare. Glyphs are the extreme case — 'B' is a stem rectangle laid
+/// across a bowl path, '4' crosses itself six times — but polygon() allows
+/// exactly the same thing and the reference pins the answer (a bowtie is
+/// two triangles).
+///
+/// A piece buried in ink is dropped, which is what keeps an extrusion from
+/// raising a wall inside its own solid whose top edge lies in the cap plane
+/// — the two then fight for the same depth and the seam shows as a hairline
+/// ruled across the face.
+fn boundary_segments(clean: &[Vec<Vec2>], fill: Fill) -> Vec<[Vec2; 2]> {
+    let mut segs: Vec<[Vec2; 2]> = Vec::new();
+    for c in clean {
+        let n = c.len();
+        for i in 0..n {
+            segs.push([c[i], c[(i + 1) % n]]);
+        }
+    }
+    if segs.is_empty() {
+        return segs;
     }
     let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
     for s in &segs {
@@ -878,10 +935,9 @@ fn font_walls(clean: &[Vec<Vec2>], flip: bool) -> Vec<[Vec2; 2]> {
     }
     let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-12);
     let tol = span * 1e-9;
-    let probe = span * 1e-5;
-    // Per-segment bounds, so the quadratic pass skips everything but the
-    // handful of edges that could actually meet this one. Without it a whole
-    // line of text is one O(n^2) sweep over every glyph against every other.
+    let probe = span * 1e-6;
+    // Per-segment bounds, so the quadratic pass skips all but the handful of
+    // edges that could actually meet this one.
     let bbox: Vec<[f64; 4]> = segs
         .iter()
         .map(|s| {
@@ -918,31 +974,31 @@ fn font_walls(clean: &[Vec<Vec2>], flip: bool) -> Vec<[Vec2; 2]> {
         if len <= 0.0 {
             continue;
         }
-        // Ink is on the left, so the right-hand normal points out of the
-        // letter — a piece with ink on that side is inside the solid.
-        let n = [dy / len, -dx / len];
+        let nl = [-dy / len, dx / len]; // left-hand normal
         for w in ts.windows(2) {
             let (t0, t1) = (w[0], w[1]);
             if (t1 - t0) * len <= tol {
                 continue;
             }
             let tm = 0.5 * (t0 + t1);
-            let m = [a[0] + tm * dx + n[0] * probe, a[1] + tm * dy + n[1] * probe];
-            if winding_at(&segs, m) != 0 {
-                continue; // buried in ink
+            let m = [a[0] + tm * dx, a[1] + tm * dy];
+            let left = filled_at(clean, fill, [m[0] + nl[0] * probe, m[1] + nl[1] * probe]);
+            let right = filled_at(clean, fill, [m[0] - nl[0] * probe, m[1] - nl[1] * probe]);
+            if left == right {
+                continue; // ink on both sides, or neither: not boundary
             }
-            out.push([
+            let (p0, p1) = (
                 [a[0] + t0 * dx, a[1] + t0 * dy],
                 [a[0] + t1 * dx, a[1] + t1 * dy],
-            ]);
+            );
+            out.push(if left { [p0, p1] } else { [p1, p0] });
         }
     }
-    // Two strokes can share a stretch of boundary exactly — the top bar of
+    // Two contours can share a stretch of boundary exactly — the top bar of
     // 'F' lies flush with the top of its stem — and each contributes the
-    // same wall. Kept twice the wall is built twice and the solid no longer
-    // closes; kept once in each direction there is ink on both sides and it
-    // was never boundary at all. Folding by direction settles both: a
-    // repeat collapses to one, a reversed pair cancels.
+    // same piece. Kept twice the wall is built twice and the solid no longer
+    // closes; kept once in each direction the ink is on both sides and it
+    // was never boundary at all. Folding by direction settles both.
     let snap = span * 1e-7;
     let key = |p: Vec2| [(p[0] / snap).round() as i64, (p[1] / snap).round() as i64];
     let mut at: std::collections::HashMap<[i64; 4], usize> = std::collections::HashMap::new();
@@ -968,6 +1024,161 @@ fn font_walls(clean: &[Vec<Vec2>], flip: bool) -> Vec<[Vec2; 2]> {
             _ => Some([s[1], s[0]]),
         })
         .collect()
+}
+
+/// Chain directed boundary segments (ink on the left) into closed contours.
+/// Where more than one edge leaves a junction, take the sharpest RIGHT turn:
+/// that hugs the filled side and traces loops that do not cross each other.
+fn chain_loops(segs: &[[Vec2; 2]], snap: f64) -> Vec<Vec<Vec2>> {
+    let mut verts: Vec<Vec2> = Vec::new();
+    let mut ids: std::collections::HashMap<[i64; 2], usize> = std::collections::HashMap::new();
+    let id = |p: Vec2, verts: &mut Vec<Vec2>, ids: &mut std::collections::HashMap<[i64; 2], usize>| {
+        let k = [(p[0] / snap).round() as i64, (p[1] / snap).round() as i64];
+        *ids.entry(k).or_insert_with(|| {
+            verts.push(p);
+            verts.len() - 1
+        })
+    };
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for s in segs {
+        let (u, v) = (id(s[0], &mut verts, &mut ids), id(s[1], &mut verts, &mut ids));
+        if u != v {
+            edges.push((u, v));
+        }
+    }
+    let mut out_of: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (i, &(u, _)) in edges.iter().enumerate() {
+        out_of.entry(u).or_default().push(i);
+    }
+    // Clockwise angle in [0, tau) to rotate `from` onto `to`.
+    let cw = |from: Vec2, to: Vec2| {
+        let mut d = from[1].atan2(from[0]) - to[1].atan2(to[0]);
+        while d < 0.0 {
+            d += std::f64::consts::TAU;
+        }
+        d
+    };
+    let mut used = vec![false; edges.len()];
+    let mut loops: Vec<Vec<Vec2>> = Vec::new();
+    for seed in 0..edges.len() {
+        if used[seed] {
+            continue;
+        }
+        let start = edges[seed].0;
+        let mut cur = seed;
+        used[cur] = true;
+        let mut pts = vec![verts[start]];
+        let mut steps = 0usize;
+        loop {
+            let (from, v) = edges[cur];
+            if v == start {
+                break;
+            }
+            pts.push(verts[v]);
+            // Sharpest right turn from the way we came.
+            let r = sub(verts[from], verts[v]);
+            let mut best: Option<usize> = None;
+            let mut best_score = f64::INFINITY;
+            for &e in out_of.get(&v).map(|v| &v[..]).unwrap_or(&[]) {
+                if used[e] {
+                    continue;
+                }
+                let mut a = cw(r, sub(verts[edges[e].1], verts[v]));
+                if a < 1e-9 {
+                    a = std::f64::consts::TAU; // doubling straight back: last resort
+                }
+                if a < best_score {
+                    best_score = a;
+                    best = Some(e);
+                }
+            }
+            match best {
+                Some(e) => {
+                    used[e] = true;
+                    cur = e;
+                }
+                None => {
+                    pts.clear(); // an open chain: no loop to keep
+                    break;
+                }
+            }
+            steps += 1;
+            if steps > edges.len() + 1 {
+                pts.clear();
+                break;
+            }
+        }
+        if pts.len() >= 3 && signed_area2(&pts).abs() > 0.0 {
+            loops.push(pts);
+        }
+    }
+    loops
+}
+
+/// Resolve a region into simple, properly nested contours enclosing exactly
+/// the same filled area, each wound with the fill on its LEFT.
+///
+/// Everything downstream of a 2D region — the nesting classifier, the
+/// boolean BSP, offset — assumes contours that do not cross. Crossing ones
+/// are legal input: the reference says self-intersecting outlines are
+/// resolved by the 2D kernel even-odd, a bowtie becoming two triangles. So
+/// the crossings are cut in and the boundary re-traced. A region that does
+/// not cross itself is already nested and comes back untouched, vertex for
+/// vertex, so the common case pays only for the sweep that proves it.
+pub fn sanitize(poly: &Poly2) -> Poly2 {
+    let clean = clean_contours(poly);
+    if clean.is_empty() {
+        return Poly2::new(Vec::new());
+    }
+    if poly.fill == Fill::EvenOdd && !has_crossing(&clean) {
+        return Poly2::new(clean);
+    }
+    let mut loops = Vec::new();
+    for g in components(&clean) {
+        let part: Vec<Vec<Vec2>> = g.into_iter().map(|i| clean[i].clone()).collect();
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for c in &part {
+            for q in c {
+                for k in 0..2 {
+                    lo[k] = lo[k].min(q[k]);
+                    hi[k] = hi[k].max(q[k]);
+                }
+            }
+        }
+        let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-12);
+        loops.extend(chain_loops(&boundary_segments(&part, poly.fill), span * 1e-7));
+    }
+    Poly2::new(loops)
+}
+
+/// Directed wall segments for an extrusion, ink always on the LEFT.
+///
+/// A region whose contours do not cross already carries its own boundary,
+/// so it passes straight through. One whose contours DO cross — a font's
+/// always, a self-intersecting polygon() sometimes — has its boundary
+/// re-derived, which both orients each piece and drops the stretches that
+/// run buried through ink.
+pub fn wall_segments(poly: &Poly2) -> Vec<[Vec2; 2]> {
+    let clean = clean_contours(poly);
+    if clean.is_empty() {
+        return Vec::new();
+    }
+    if poly.fill == Fill::EvenOdd && !has_crossing(&clean) {
+        let mut segs = Vec::new();
+        for c in oriented_contours(poly) {
+            let n = c.len();
+            for i in 0..n {
+                segs.push([c[i], c[(i + 1) % n]]);
+            }
+        }
+        return segs;
+    }
+    let mut out = Vec::new();
+    for g in components(&clean) {
+        let part: Vec<Vec<Vec2>> = g.into_iter().map(|i| clean[i].clone()).collect();
+        out.extend(boundary_segments(&part, poly.fill));
+    }
+    out
 }
 
 /// Emit one wall triangle, unless it has collapsed. A face with no area has
@@ -1121,6 +1332,72 @@ mod tests {
                 cross(v[t[0] as usize], v[t[1] as usize], v[t[2] as usize]).abs() / 2.0
             })
             .sum()
+    }
+
+    /// The reference pins this: "Self-intersection resolution is even-odd,
+    /// not nonzero — polygon(bowtie) yields two triangles" (/7/edge_cases/8),
+    /// and "a point covered by an odd number of boundaries is inside"
+    /// (/7/semantics). Neither is a question the NESTING classifier can
+    /// answer — of a path that crosses itself there are not two contours to
+    /// compare, and of two squares laid half across each other neither is
+    /// inside the other — so both used to come back with the overlap added
+    /// instead of cancelled.
+    #[test]
+    fn crossing_contours_resolve_even_odd() {
+        let area = |p: &Poly2| -> f64 {
+            let (v, t) = triangulate(p);
+            t.iter()
+                .map(|tr| {
+                    let (a, b, c) = (v[tr[0] as usize], v[tr[1] as usize], v[tr[2] as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+                })
+                .sum()
+        };
+        // A bowtie: two triangles of 25, not one 100-unit square.
+        let bowtie = Poly2::new(vec![vec![[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]]]);
+        assert!((area(&bowtie) - 50.0).abs() < 1e-9, "bowtie filled {}", area(&bowtie));
+        // Two sibling squares overlapping by 25: union 175, less the overlap
+        // counted a second time = 150.
+        let pair = Poly2::new(vec![
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            vec![[5.0, 5.0], [15.0, 5.0], [15.0, 15.0], [5.0, 15.0]],
+        ]);
+        assert!((area(&pair) - 150.0).abs() < 1e-9, "overlapping pair filled {}", area(&pair));
+        // And they extrude to a closed solid of exactly that area times height.
+        for (name, region, want) in [("bowtie", bowtie, 50.0), ("pair", pair, 150.0)] {
+            let h = 4.0;
+            let (p, t) = extrude_linear(&region, h, false, 0.0, 1, [1.0, 1.0]);
+            let vol: f64 = t
+                .iter()
+                .map(|tr| {
+                    let (a, b, c) = (p[tr[0] as usize], p[tr[1] as usize], p[tr[2] as usize]);
+                    (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                        / 6.0
+                })
+                .sum();
+            assert!(
+                (vol - want * h).abs() < 1e-6,
+                "{} extrudes to {}, not {}",
+                name,
+                vol,
+                want * h
+            );
+        }
+    }
+
+    /// A region whose contours do not cross is already nested, and must come
+    /// back from the sanitizer vertex for vertex — the reference observes
+    /// square()'s outline as exactly four vertices, and every clean region
+    /// pays only for the sweep that proves it needs nothing.
+    #[test]
+    fn sanitize_leaves_a_clean_region_alone() {
+        let p = Poly2::new(vec![
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            vec![[3.0, 3.0], [3.0, 7.0], [7.0, 7.0], [7.0, 3.0]],
+        ]);
+        assert_eq!(sanitize(&p).contours, p.contours);
+        assert_eq!(sanitize(&circle(5.0, 12)).contours, circle(5.0, 12).contours);
     }
 
     /// Glyph outlines are not the clean nested contours a 2D primitive
