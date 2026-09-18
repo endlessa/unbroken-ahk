@@ -24,5 +24,6 @@ pub mod preproc;
 pub mod offset;
 pub mod poly2;
 pub mod svg;
+pub mod trig;
 pub mod value;
 pub mod zip;

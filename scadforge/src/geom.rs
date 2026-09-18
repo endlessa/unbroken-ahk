@@ -110,7 +110,7 @@ pub fn scaling(v: Vec3) -> Mat4 {
 }
 
 fn rot_x(deg: f64) -> Mat4 {
-    let (s, c) = deg.to_radians().sin_cos();
+    let (s, c) = crate::trig::sin_cos_deg(deg);
     let mut m = identity();
     m[1][1] = c;
     m[1][2] = -s;
@@ -120,7 +120,7 @@ fn rot_x(deg: f64) -> Mat4 {
 }
 
 fn rot_y(deg: f64) -> Mat4 {
-    let (s, c) = deg.to_radians().sin_cos();
+    let (s, c) = crate::trig::sin_cos_deg(deg);
     let mut m = identity();
     m[0][0] = c;
     m[0][2] = s;
@@ -130,7 +130,7 @@ fn rot_y(deg: f64) -> Mat4 {
 }
 
 fn rot_z(deg: f64) -> Mat4 {
-    let (s, c) = deg.to_radians().sin_cos();
+    let (s, c) = crate::trig::sin_cos_deg(deg);
     let mut m = identity();
     m[0][0] = c;
     m[0][1] = -s;
@@ -154,7 +154,7 @@ pub fn rotation_axis(deg: f64, v: Vec3) -> Mat4 {
         return rot_z(deg);
     }
     let (x, y, z) = (v[0] / len, v[1] / len, v[2] / len);
-    let (s, c) = deg.to_radians().sin_cos();
+    let (s, c) = crate::trig::sin_cos_deg(deg);
     let t = 1.0 - c;
     [
         [t * x * x + c, t * x * y - s * z, t * x * z + s * y, 0.0],
@@ -218,6 +218,36 @@ pub fn polyhedron(points: &[Vec3], faces: &[Vec<usize>]) -> (Mesh, Vec<String>) 
             // Reversed fan (face[0], face[k+1], face[k]) → CCW outward.
             tris.push([face[0] as u32, face[k + 1] as u32, face[k] as u32]);
         }
+    }
+    // Points no face refers to are legal and "silently ignored" per the
+    // reference — but kept in `positions` they are not ignored at all:
+    // positions is what bounds(), hull() and the boolean kernels' framing
+    // all measure. One stray point made resize([10,10,10]) scale a unit
+    // tetrahedron by 0.1 instead of 10.
+    let used: Vec<bool> = {
+        let mut u = vec![false; points.len()];
+        for t in &tris {
+            for &i in t {
+                u[i as usize] = true;
+            }
+        }
+        u
+    };
+    if used.iter().any(|u| !u) {
+        let mut remap = vec![u32::MAX; points.len()];
+        let mut kept: Vec<Vec3> = Vec::with_capacity(points.len());
+        for (i, p) in points.iter().enumerate() {
+            if used[i] {
+                remap[i] = kept.len() as u32;
+                kept.push(*p);
+            }
+        }
+        for t in &mut tris {
+            for i in t.iter_mut() {
+                *i = remap[*i as usize];
+            }
+        }
+        return (Mesh { positions: kept, tris }, warnings);
     }
     (Mesh { positions: points.to_vec(), tris }, warnings)
 }

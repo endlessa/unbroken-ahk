@@ -85,6 +85,26 @@ impl Value {
         }
     }
 
+    /// Exactly three numeric components — no zero padding.
+    ///
+    /// `as_vec3` pads a short vector, which is right for translate() (the
+    /// reference gives it a fill value of 0) and wrong for cube(), where a
+    /// 2-vector is a conversion failure rather than [x, y, 0]. Padded
+    /// silently, cube([3,4]) became a zero-thickness box: empty geometry
+    /// and not one word about why.
+    pub fn as_vec3_exact(&self) -> Option<[f64; 3]> {
+        match self {
+            Value::Vector(items) if items.len() == 3 => {
+                let mut out = [0.0; 3];
+                for (i, item) in items.iter().enumerate() {
+                    out[i] = item.as_num()?;
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Num(_) => "number",

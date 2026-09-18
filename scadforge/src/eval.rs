@@ -12,6 +12,7 @@
 use crate::ast::{Arg, BinOp, Expr, Modifier, Param, Stmt, VecItem};
 use crate::csg;
 use crate::csg2;
+use crate::trig;
 use crate::geom::{self, Mesh};
 use crate::io;
 use crate::poly2::{self, Poly2};
@@ -936,7 +937,7 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
                     (name.clone(), iterate(&v, ctx))
                 })
                 .collect();
-            let mut operands: Vec<Mesh> = Vec::new();
+            let mut operands: Vec<Vec<Shape>> = Vec::new();
             let mut color = None;
             // `intersection_for` records as a plain `intersection()` over
             // one `group()` per iteration — the resolved form of the loop.
@@ -953,14 +954,31 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
                 if color.is_none() {
                     color = shapes.iter().find_map(|s| s.color);
                 }
-                operands.push(combine_group(&shapes).0);
+                operands.push(shapes);
                 ctx.dynv = saved_dyn;
             }, ctx);
             ctx.csg_close();
             if operands.is_empty() {
                 Vec::new()
+            } else if all_2d(&operands) {
+                // The reference gives intersection_for the iteration semantics
+                // of for() and the combining semantics of intersection(), and
+                // intersection() has a 2D arm. Without one here, a 2D
+                // intersection_for was reduced with combine_group -- which
+                // keeps only the mesh -- and handed to the 3D kernel, so it
+                // came back as a flat triangle soup carrying no outline: the
+                // SVG/DXF export rejected it and an enclosing linear_extrude
+                // or offset() saw a 3D child and ignored it.
+                let regions: Vec<Poly2> = operands.iter().map(|g| group_region(g)).collect();
+                let mut shapes: Vec<Shape> =
+                    Shape::flat(csg2::intersection2(&regions)).into_iter().collect();
+                for s in &mut shapes {
+                    s.color = color;
+                }
+                shapes
             } else {
-                leaf_colored(csg::intersection_all(&operands), color)
+                let meshes: Vec<Mesh> = operands.iter().map(|g| combine_group(g).0).collect();
+                leaf_colored(csg::intersection_all(&meshes), color)
             }
         }
         Stmt::Call { name, args, children } => exec_call(name, args, children, scope, ctx),
@@ -1031,8 +1049,8 @@ fn iterate(v: &Value, ctx: &mut Ctx) -> Vec<Value> {
             // NOT swap — [10:1:0] simply yields zero iterations.
             let (start, end) = if *implicit_step && start > end {
                 ctx.warn(
-                    "DEPRECATED: using ranges of the form [begin:end] with begin \
-                     greater than end; bounds swapped",
+                    "DEPRECATED: Using ranges of the form [begin:end] with begin \
+                     value greater than the end value is deprecated.",
                 );
                 (*end, *start)
             } else {
@@ -1316,12 +1334,10 @@ fn call_builtin_module(
         "cube" => {
             let size = match bound.get("size") {
                 Some(Value::Num(s)) => [*s, *s, *s],
-                Some(v @ Value::Vector(_)) => match v.as_vec3() {
+                Some(v @ Value::Vector(_)) => match v.as_vec3_exact() {
                     Some(s) => s,
                     None => {
-                        ctx.out
-                            .warnings
-                            .push("cube: size must be a number or [x, y, z]".into());
+                        ctx.warn("cube: size must be a number or [x, y, z]");
                         return Vec::new();
                     }
                 },
@@ -1339,11 +1355,29 @@ fn call_builtin_module(
             leaf(geom::cube(size, center))
         }
         "sphere" => {
-            // d overrides r per the reference.
-            let r = match (bound.get("d"), bound.get("r")) {
-                (Some(Value::Num(d)), _) => d / 2.0,
-                (_, Some(Value::Num(r))) => *r,
-                _ => 1.0,
+            let given = |k: &str| !matches!(bound.get(k), None | Some(Value::Undef));
+            let numv = |k: &str| bound.get(k).and_then(Value::as_num);
+            if given("d") && given("r") {
+                ctx.warn("Ignoring radius variable 'r' as diameter 'd' is defined too");
+            }
+            // The diameter form wins where it is given. A parameter that IS
+            // given but is not a number is a conversion failure, which the
+            // reference makes empty geometry — falling through to the
+            // default radius instead, sphere("a") drew a full unit sphere
+            // and said nothing.
+            let r = if given("d") {
+                numv("d").map(|d| d / 2.0)
+            } else if given("r") {
+                numv("r")
+            } else {
+                Some(1.0)
+            };
+            let r = match r {
+                Some(r) => r,
+                None => {
+                    ctx.warn("sphere: radius must be a number");
+                    return Vec::new();
+                }
             };
             let n = resolve_fragments(r, ctx);
             no_children(name, children, ctx);
@@ -1351,9 +1385,29 @@ fn call_builtin_module(
         }
         "cylinder" => {
             let num = |key: &str| bound.get(key).and_then(Value::as_num);
-            let r_both = num("d").map(|d| d / 2.0).or_else(|| num("r"));
-            let r1 = num("d1").map(|d| d / 2.0).or_else(|| num("r1")).or(r_both).unwrap_or(1.0);
-            let r2 = num("d2").map(|d| d / 2.0).or_else(|| num("r2")).or(r_both).unwrap_or(1.0);
+            let given = |k: &str| !matches!(bound.get(k), None | Some(Value::Undef));
+            for (d, r) in [("d", "r"), ("d1", "r1"), ("d2", "r2")] {
+                if given(d) && given(r) {
+                    ctx.warn(format!(
+                        "Ignoring radius variable '{r}' as diameter '{d}' is defined too"
+                    ));
+                }
+            }
+            // Per END, the reference orders it: the diameter form first (d1
+            // or d for the bottom, d2 or d for the top), then the radius
+            // form (r1 or r), then the default. The radius form used to be
+            // tried before the shared diameter, so cylinder(d=8, r1=2) came
+            // out a FRUSTUM — bottom 2, top 4 — instead of a plain cylinder.
+            let end = |dia: &str, rad: &str| -> f64 {
+                num(dia)
+                    .or_else(|| num("d"))
+                    .map(|d| d / 2.0)
+                    .or_else(|| num(rad))
+                    .or_else(|| num("r"))
+                    .unwrap_or(1.0)
+            };
+            let r1 = end("d1", "r1");
+            let r2 = end("d2", "r2");
             let h = num("h").unwrap_or(1.0);
             let center = bound.get("center").and_then(Value::as_bool).unwrap_or(false);
             let n = resolve_fragments(r1.max(r2), ctx);
@@ -1394,9 +1448,7 @@ fn call_builtin_module(
                 (Some(vec @ Value::Vector(_)), _) => match vec.as_vec3() {
                     Some(deg) => Some(geom::rotation_xyz(deg)),
                     None => {
-                        ctx.out
-                            .warnings
-                            .push("rotate: a must be a scalar or [x, y, z] degrees".into());
+                        ctx.warn("rotate: a must be a scalar or [x, y, z] degrees");
                         None
                     }
                 },
@@ -1438,9 +1490,7 @@ fn call_builtin_module(
                         }
                     }
                     None => {
-                        ctx.out
-                            .warnings
-                            .push("multmatrix: m must be a list of numeric rows".into());
+                        ctx.warn("multmatrix: m must be a list of numeric rows");
                         None
                     }
                 },
@@ -1475,7 +1525,24 @@ fn call_builtin_module(
         }
         "polyhedron" => {
             let points = bound.get("points").and_then(vec3_list);
-            let faces = bound.get("faces").and_then(index_lists);
+            // `triangles=` is the pre-2014.03 spelling of `faces=`: still
+            // accepted, with a DEPRECATED line pointing at the replacement,
+            // and it flows into the same face pipeline. It was being
+            // rejected outright — while the .csg export happily recorded
+            // the faces it had refused to build.
+            let faces = match bound.get("faces").and_then(index_lists) {
+                Some(f) => Some(f),
+                None => match bound.get("triangles").and_then(index_lists) {
+                    Some(f) => {
+                        ctx.warn(
+                            "DEPRECATED: polyhedron(triangles=[]) will be removed in future \
+                             releases. Use polyhedron(faces=[]) instead.",
+                        );
+                        Some(f)
+                    }
+                    None => None,
+                },
+            };
             match (points, faces) {
                 (Some(points), Some(faces)) => {
                     let (mesh, warnings) = geom::polyhedron(&points, &faces);
@@ -2104,9 +2171,7 @@ fn call_builtin_module(
 /// A leaf primitive given children warns and ignores them.
 fn no_children(name: &str, children: &[Stmt], ctx: &mut Ctx) {
     if !geometry_stmts(children).is_empty() {
-        ctx.out
-            .warnings
-            .push(format!("module {}() does not support child modules", name));
+        ctx.warn(format!("module {}() does not support child modules", name));
     }
 }
 
@@ -2132,11 +2197,44 @@ fn assert_args(ev: &[EvArg]) -> (Value, Option<Value>) {
     (cond, msg)
 }
 
+/// Is `s` already wrapped in ONE matching pair of parentheses? "(a + b)" is;
+/// "(a) + (b)" is not, because the first pair closes before the end.
+fn wrapped_in_parens(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'(') || b.last() != Some(&b')') {
+        return false;
+    }
+    let mut depth = 0i32;
+    for (i, c) in b.iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && i + 1 < b.len() {
+            return false;
+        }
+    }
+    depth == 0
+}
+
+/// The reference pins the failure line as `Assertion '<condition>' failed`,
+/// where the condition is the AST RE-SERIALIZATION rather than the source
+/// text, and gives both shapes: a bare condition appears parenthesized,
+/// while `assert(1+1==3)` renders as '((1 + 1) == 3)'. Those two only agree
+/// if the pair is added when the serializer has not already supplied one —
+/// it parenthesizes every binary operator, so adding one unconditionally
+/// printed '(((1 + 1) == 3))' with a level to spare.
 fn assert_failure_message(cond_text: Option<&str>, msg: Option<&Value>) -> String {
     let cond = cond_text.unwrap_or("false");
+    let cond = if wrapped_in_parens(cond) {
+        cond.to_string()
+    } else {
+        format!("({})", cond)
+    };
     match msg {
-        Some(m) => format!("ERROR: Assertion '({})' failed: {}", cond, fmt_value(m, true)),
-        None => format!("ERROR: Assertion '({})' failed", cond),
+        Some(m) => format!("ERROR: Assertion '{}' failed: {}", cond, fmt_value(m, true)),
+        None => format!("ERROR: Assertion '{}' failed", cond),
     }
 }
 
@@ -2426,9 +2524,7 @@ fn collect_2d(children: &[Stmt], scope: &Rc<Scope>, ctx: &mut Ctx) -> Poly2 {
         }
     }
     if saw_3d {
-        ctx.out
-            .warnings
-            .push("Ignoring 3D child object for 2D operation".into());
+        ctx.warn("Ignoring 3D child object for 2D operation");
     }
     csg2::union2(&regions)
 }
@@ -2882,6 +2978,46 @@ fn apply_2d(m: &geom::Mat4, poly: &mut Poly2, mesh: &mut Mesh) {
     }
 }
 
+/// The FULL set of plain named parameters a builtin module accepts —
+/// positional ones included, since they may also be passed by name. Used
+/// only to decide whether an unknown named argument deserves the
+/// warn-and-ignore the reference's uniform call convention requires.
+/// `None` means "not checked": echo/assert take arbitrary arguments, and a
+/// module absent from this table gets the benefit of the doubt rather than
+/// a bogus warning.
+fn named_params(module: &str) -> Option<&'static [&'static str]> {
+    Some(match module {
+        "cube" | "square" => &["size", "center"],
+        "sphere" | "circle" => &["r", "d"],
+        "cylinder" => &["h", "r", "r1", "r2", "d", "d1", "d2", "center"],
+        "translate" | "scale" | "mirror" => &["v"],
+        "rotate" => &["a", "v"],
+        "multmatrix" => &["m"],
+        "resize" => &["newsize", "auto", "convexity"],
+        "polyhedron" => &["points", "faces", "triangles", "convexity"],
+        "polygon" => &["points", "paths", "convexity"],
+        "linear_extrude" => {
+            &["height", "center", "convexity", "twist", "slices", "scale"]
+        }
+        "rotate_extrude" => &["angle", "convexity"],
+        "offset" => &["r", "delta", "chamfer"],
+        "projection" => &["cut"],
+        "import" | "import_stl" | "import_off" | "import_dxf" => {
+            &["file", "filename", "convexity", "layer", "dpi", "origin", "scale", "center"]
+        }
+        "surface" => &["file", "filename", "center", "convexity", "invert"],
+        "render" => &["convexity"],
+        "text" => &[
+            "text", "size", "font", "halign", "valign", "spacing", "direction", "language",
+            "script",
+        ],
+        "color" => &["c", "alpha"],
+        "children" | "child" => &["index"],
+        "union" | "difference" | "intersection" | "hull" | "minkowski" | "group" => &[],
+        _ => return None,
+    })
+}
+
 /// Positional-parameter names per builtin module, per the reference
 /// signatures.
 fn positional_names(module: &str) -> &'static [&'static str] {
@@ -2941,6 +3077,18 @@ fn bind_builtin_args(module: &str, ev: &[EvArg], ctx: &mut Ctx) -> HashMap<Strin
         match &a.name {
             Some(n) if n.starts_with('$') => {} // dynamic, already bound
             Some(n) => {
+                // The reference makes this the uniform call convention:
+                // "unknown named arguments warn and are ignored — EXCEPT
+                // $-prefixed arguments". Builtin MODULES were the one place
+                // that skipped it, so cylinder(h=10, radius=5) quietly
+                // rendered a default-radius cylinder and said nothing.
+                // Unknown modules stay silent for the same reason the
+                // positional arm does: the caller reports the name itself.
+                if let Some(ok) = named_params(module) {
+                    if !ok.contains(&n.as_str()) {
+                        ctx.warn(format!("{}: unknown parameter '{}' ignored", module, n));
+                    }
+                }
                 bound.insert(n.clone(), a.value.clone());
             }
             None => {
@@ -4120,50 +4268,6 @@ fn serialize_bindings(b: &[(String, Expr)]) -> String {
 /// Trig is in DEGREES with exact values at every multiple of 30 and 45
 /// (degree-exact trig, 2019.05+): the angle folds mod 360 first, so
 /// sin(36000) == 0 exactly and sin(30) == 0.5 exactly.
-fn exact_sin_deg(x: f64) -> Option<f64> {
-    let mut r = x % 360.0;
-    if r < 0.0 {
-        r += 360.0;
-    }
-    let table: &[(f64, f64)] = &[
-        (0.0, 0.0),
-        (30.0, 0.5),
-        (45.0, std::f64::consts::FRAC_1_SQRT_2),
-        (60.0, 3.0_f64.sqrt() / 2.0),
-        (90.0, 1.0),
-        (120.0, 3.0_f64.sqrt() / 2.0),
-        (135.0, std::f64::consts::FRAC_1_SQRT_2),
-        (150.0, 0.5),
-        (180.0, 0.0),
-        (210.0, -0.5),
-        (225.0, -std::f64::consts::FRAC_1_SQRT_2),
-        (240.0, -(3.0_f64.sqrt()) / 2.0),
-        (270.0, -1.0),
-        (300.0, -(3.0_f64.sqrt()) / 2.0),
-        (315.0, -std::f64::consts::FRAC_1_SQRT_2),
-        (330.0, -0.5),
-    ];
-    table.iter().find(|(deg, _)| *deg == r).map(|(_, v)| *v)
-}
-
-/// Total-precision-loss guard from the reference: |angle| ≥ 2^52 * 360
-/// returns NaN for sin/cos/tan.
-const TRIG_MAX: f64 = 4_503_599_627_370_496.0 * 360.0; // 2^52 * 360
-
-fn sin_deg(x: f64) -> f64 {
-    if !x.is_finite() || x.abs() >= TRIG_MAX {
-        return f64::NAN;
-    }
-    exact_sin_deg(x).unwrap_or_else(|| x.to_radians().sin())
-}
-
-fn cos_deg(x: f64) -> f64 {
-    if !x.is_finite() || x.abs() >= TRIG_MAX {
-        return f64::NAN;
-    }
-    exact_sin_deg(x + 90.0).unwrap_or_else(|| x.to_radians().cos())
-}
-
 /// A small deterministic PRNG for rands(): splitmix64 seeding a
 /// xorshift64* stream. Not OpenSCAD's exact stream (that is
 /// implementation-defined per platform anyway), but seeded calls are
@@ -4236,10 +4340,7 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
                 Some(n) if n.starts_with('$') => {}
                 Some(n) => match names.iter().position(|p| p == n) {
                     Some(i) => slots[i] = Some(a.value.clone()),
-                    None => ctx
-                        .out
-                        .warnings
-                        .push(format!("{}: unknown parameter '{}' ignored", name, n)),
+                    None => ctx.warn(format!("{}: unknown parameter '{}' ignored", name, n)),
                 },
                 None => {
                     while pos < names.len() && slots[pos].is_some() {
@@ -4287,7 +4388,15 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
         match num(0) {
             Some(x) => {
                 if x.is_finite() && !ok(x) {
-                    ctx.warn(format!("{}: {} is out of domain, returning nan", name, x));
+                    // Through the shared 6-significant-digit formatter, which
+                    // the reference gives to "echo, str(), assert messages,
+                    // and value-embedding warnings" alike — the raw Display
+                    // printed sqrt(-1e21)'s argument as a 22-digit integer.
+                    ctx.warn(format!(
+                        "{}: {} is out of domain, returning nan",
+                        name,
+                        fmt_num(x)
+                    ));
                 }
                 Value::Num(f(x))
             }
@@ -4310,17 +4419,14 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
                 0.0
             }
         }),
-        "sin" => one_num(ctx, &sin_deg),
-        "cos" => one_num(ctx, &cos_deg),
-        "tan" => one_num(ctx, &|x| {
-            let (s, c) = (sin_deg(x), cos_deg(x));
-            s / c
-        }),
-        "asin" => domain_num(ctx, &|x| (-1.0..=1.0).contains(&x), &|x| x.asin().to_degrees()),
-        "acos" => domain_num(ctx, &|x| (-1.0..=1.0).contains(&x), &|x| x.acos().to_degrees()),
-        "atan" => one_num(ctx, &|x| x.atan().to_degrees()),
+        "sin" => one_num(ctx, &trig::sin_deg),
+        "cos" => one_num(ctx, &trig::cos_deg),
+        "tan" => one_num(ctx, &trig::tan_deg),
+        "asin" => domain_num(ctx, &|x| (-1.0..=1.0).contains(&x), &trig::asin_deg),
+        "acos" => domain_num(ctx, &|x| (-1.0..=1.0).contains(&x), &trig::acos_deg),
+        "atan" => one_num(ctx, &trig::atan_deg),
         "atan2" => match (num(0), num(1)) {
-            (Some(y), Some(x)) => Value::Num(y.atan2(x).to_degrees()),
+            (Some(y), Some(x)) => Value::Num(trig::atan2_deg(y, x)),
             _ => {
                 ctx.warn("atan2: expected two numbers (y, x)");
                 Value::Undef
@@ -4370,9 +4476,7 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
                         Value::Num(a[0] * b[1] - a[1] * b[0])
                     }
                     _ => {
-                        ctx.out
-                            .warnings
-                            .push("cross: expected two numeric vectors of length 2 or 3".into());
+                        ctx.warn("cross: expected two numeric vectors of length 2 or 3");
                         Value::Undef
                     }
                 }
@@ -4564,10 +4668,7 @@ fn search_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
             // flat result can be shorter than the term list).
             match matches.first() {
                 Some(first) => flat.push(first.clone()),
-                None => ctx
-                    .out
-                    .warnings
-                    .push(format!("search term not found: {}", fmt_value(term, true))),
+                None => ctx.warn(format!("search term not found: {}", fmt_value(term, true))),
             }
         } else {
             let take = if per_match == 0 { matches.len() } else { per_match };
@@ -4604,10 +4705,7 @@ fn lookup_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
             Value::Vector(kv) if kv.len() >= 2 => {
                 match (kv[0].as_num(), kv[1].as_num()) {
                     (Some(k), Some(v)) => pairs.push((k, v)),
-                    _ => ctx
-                        .out
-                        .warnings
-                        .push("lookup: table rows must hold numeric [key, value]".into()),
+                    _ => ctx.warn("lookup: table rows must hold numeric [key, value]"),
                 }
             }
             _ => ctx.warn("lookup: table rows must be [key, value] pairs"),
@@ -4664,12 +4762,23 @@ fn rands_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
         }
     };
     if !count.is_finite() || count < 0.0 {
-        ctx.out
-            .warnings
-            .push("rands: cannot create a negative number of random values".into());
+        ctx.warn("rands: cannot create a negative number of random values");
         return Value::Vector(Vec::new());
     }
-    let n = count.trunc() as usize;
+    // Capped like every other unbounded generator here. Uncapped,
+    // rands(0, 1, 1e10) asked for 320 GB in one allocation and ABORTED the
+    // process — which on the preview server takes the server with it, from
+    // one line of user input.
+    let mut count = count.trunc();
+    if count > MAX_RANGE_ITEMS as f64 {
+        ctx.warn(format!(
+            "rands: {} elements truncated at {}",
+            fmt_num(count),
+            MAX_RANGE_ITEMS
+        ));
+        count = MAX_RANGE_ITEMS as f64;
+    }
+    let n = count as usize;
     let (lo, hi) = if min_v <= max_v { (min_v, max_v) } else { (max_v, min_v) };
     let mut rng = match vals.get(3).and_then(Value::as_num) {
         Some(seed) => Prng::seeded(seed),
@@ -4689,7 +4798,22 @@ fn rands_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
 fn min_max(name: &str, vals: &[Value], ctx: &mut Ctx) -> Value {
     let items: Vec<Value> = match vals {
         [Value::Vector(items)] => items.clone(),
-        _ if vals.len() >= 2 => vals.to_vec(),
+        // "the n-ary form min(a,b,...) is numbers-only (a non-number
+        // argument yields the conversion WARNING + undef), but the
+        // single-vector form uses the generic relational less-than, so
+        // min(["b","a"]) returns "a" (lexicographic)". Both forms used the
+        // relational path, so max("a","b") quietly returned "b".
+        _ if vals.len() >= 2 => {
+            if let Some(bad) = vals.iter().find(|v| !matches!(v, Value::Num(_))) {
+                ctx.warn(format!(
+                    "{}: expected numbers, got {}",
+                    name,
+                    bad.type_name()
+                ));
+                return Value::Undef;
+            }
+            vals.to_vec()
+        }
         _ => {
             ctx.warn(format!("{}: expected a vector or at least two arguments", name));
             return Value::Undef;
@@ -6153,6 +6277,213 @@ mod tests {
         assert_eq!(ev("-[[1, -2], [3, 4]]").0, ev("[[-1, 2], [-3, -4]]").0);
     }
 
+    /// Every diagnostic must go through Ctx::warn, which is what keeps its
+    /// position in the console stream. Ten of them pushed straight onto
+    /// out.warnings and so left no marker in `order`: echo_stream then
+    /// pulled the WRONG warning at each marker (shifted by one) and flushed
+    /// the remainder to the very end. The reference calls the emission order
+    /// "depth-first instantiation order", and --hardwarnings makes the whole
+    /// warning surface compatibility-critical.
+    #[test]
+    fn diagnostics_keep_their_place_in_the_console_stream() {
+        let out = run("echo(search(\"e\", \"abcd\"));\necho(1/0);");
+        let stream = echo_stream(&out);
+        let lines: Vec<&str> = stream.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "WARNING: search term not found: \"e\"",
+                "ECHO: []",
+                "WARNING: division by zero",
+                "ECHO: inf",
+            ],
+            "console stream out of order: {lines:#?}"
+        );
+        // A module-level diagnostic, likewise before the echo that follows it.
+        let out = run("cube(1) sphere(1);\necho(\"after\");");
+        let stream = echo_stream(&out);
+        let lines: Vec<&str> = stream.lines().collect();
+        assert!(
+            lines[0].starts_with("WARNING: module cube()") && lines[1] == "ECHO: \"after\"",
+            "{lines:#?}"
+        );
+        // Every warning has a marker: as many Diag entries as warnings.
+        let out = run(
+            "cylinder(h=1, radius=2);\necho(sqrt(-1));\ncross([1],[2]);\nlookup(1, [[1]]);\n",
+        );
+        let diags = out.order.iter().filter(|c| matches!(c, Chan::Diag)).count();
+        assert_eq!(diags, out.warnings.len(), "{:?}", out.warnings);
+    }
+
+    /// intersection_for has the iteration semantics of for() and the
+    /// combining semantics of intersection() — and intersection() has a 2D
+    /// arm. Without one, a 2D intersection_for was reduced to a mesh, so it
+    /// came back as a flat triangle soup with no outline: an enclosing
+    /// linear_extrude saw a 3D child and ignored it.
+    #[test]
+    fn intersection_for_keeps_2d_children_2d() {
+        let out = run("linear_extrude(5) intersection_for (a = [0]) square(10);");
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_eq!(out.shapes.len(), 1);
+        assert!(!out.shapes[0].mesh.tris.is_empty(), "extruded nothing");
+        // Two overlapping squares intersect to their common 6x6 corner.
+        let out = run(
+            "intersection_for (d = [0, 4]) translate([d, d]) square(10);",
+        );
+        let a = out.shapes.iter().filter_map(|s| s.outline.as_ref()).count();
+        assert_eq!(a, 1, "intersection_for produced no 2D outline");
+    }
+
+    /// The reference resolves each cylinder end as "diameter form if defined
+    /// (d1 or d for bottom; d2 or d for top), else radius form (r1 or r)",
+    /// and warns when a diameter is given alongside its radius counterpart.
+    /// r1 used to be tried before the shared d, so cylinder(d=8, r1=2) built
+    /// a FRUSTUM instead of a plain cylinder.
+    #[test]
+    fn diameter_beats_radius_on_every_end() {
+        let radii = |src: &str| -> Vec<f64> {
+            let out = run(src);
+            let m = &out.shapes[0].mesh;
+            let mut rs: Vec<f64> = m
+                .positions
+                .iter()
+                .map(|p| (p[0] * p[0] + p[1] * p[1]).sqrt())
+                .map(|r| (r * 1e6).round() / 1e6)
+                .collect();
+            rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            rs.dedup();
+            rs
+        };
+        assert_eq!(radii("cylinder(h=10, d=8, r1=2, $fn=8);"), vec![4.0]);
+        assert_eq!(radii("cylinder(h=10, d=8, $fn=8);"), vec![4.0]);
+        assert_eq!(radii("cylinder(h=10, r1=2, r2=4, $fn=8);"), vec![2.0, 4.0]);
+        assert_eq!(radii("cylinder(h=10, d1=4, d2=8, $fn=8);"), vec![2.0, 4.0]);
+        let w = run("cylinder(h=10, d=8, r=3, $fn=8);").warnings;
+        assert!(
+            w.iter().any(|m| m.contains("Ignoring radius variable 'r'")),
+            "{w:?}"
+        );
+        let w = run("sphere(r=5, d=8, $fn=6);").warnings;
+        assert!(w.iter().any(|m| m.contains("Ignoring radius variable 'r'")), "{w:?}");
+    }
+
+    /// A parameter that is GIVEN but not a number is a conversion failure.
+    /// The reference makes a non-numeric sphere radius empty geometry;
+    /// falling through to the default instead, sphere("a") silently drew a
+    /// full unit sphere. A short vector is a conversion failure too — cube
+    /// does not zero-pad the way translate does.
+    #[test]
+    fn a_bad_primitive_parameter_is_not_silently_defaulted() {
+        let out = run("sphere(\"a\");");
+        assert!(out.shapes.is_empty(), "sphere(\"a\") built geometry");
+        assert!(!out.warnings.is_empty(), "and said nothing about it");
+        let out = run("cube([3, 4]);");
+        assert!(!out.warnings.is_empty(), "cube([3,4]) padded to [3,4,0] in silence");
+        // The valid forms stay quiet.
+        for src in ["sphere(5);", "cube(10);", "cube([1,2,3]);", "cylinder(h=2, r=1);"] {
+            assert!(run(src).warnings.is_empty(), "{src} warned");
+        }
+    }
+
+    /// The uniform call convention: "unknown named arguments warn and are
+    /// ignored — EXCEPT $-prefixed arguments". Builtin modules were the one
+    /// place that skipped it.
+    #[test]
+    fn an_unknown_named_argument_warns() {
+        let w = run("cylinder(h=10, radius=5);").warnings;
+        assert!(w.iter().any(|m| m.contains("radius")), "{w:?}");
+        // $-specials and every real parameter stay silent.
+        let quiet = "cylinder(h=1, r=2, $fn=8); cube(size=1, center=true); \
+                     text(\"x\", size=4, font=\"f\"); color(c=\"red\", alpha=0.5) cube(1); \
+                     linear_extrude(height=1, twist=90, slices=4) square(1);";
+        assert!(run(quiet).warnings.is_empty(), "{:?}", run(quiet).warnings);
+    }
+
+    /// Texts the reference pins verbatim, and the shared 6-digit formatter
+    /// it gives to "echo, str(), assert messages, and value-embedding
+    /// warnings" alike.
+    #[test]
+    fn pinned_diagnostic_texts() {
+        let w = run("for (i = [4:1]) echo(i);").warnings;
+        assert!(
+            w.iter().any(|m| m
+                == "DEPRECATED: Using ranges of the form [begin:end] with begin value \
+                    greater than the end value is deprecated."),
+            "{w:?}"
+        );
+        let w = run("echo(sqrt(-1e21));").warnings;
+        assert!(w.iter().any(|m| m.contains("-1e+21")), "raw Display leaked: {w:?}");
+        // assert(): the condition is the AST re-serialization, parenthesized
+        // once — not once by the serializer and again by the template.
+        let e = run("assert(1 + 1 == 3);").error.unwrap_or_default();
+        assert!(e.contains("Assertion '((1 + 1) == 3)' failed"), "{e}");
+        let e = run("assert(false);").error.unwrap_or_default();
+        assert!(e.contains("Assertion '(false)' failed"), "{e}");
+    }
+
+    /// No user input may abort the process. rands() was the one unbounded
+    /// generator left: rands(0, 1, 1e10) asked for 320 GB in a single
+    /// allocation and died, taking the preview server with it.
+    #[test]
+    fn rands_is_capped_like_every_other_generator() {
+        let out = run("v = rands(0, 1, 1e10); echo(len(v));");
+        assert!(
+            out.warnings.iter().any(|m| m.contains("truncated")),
+            "{:?}",
+            out.warnings
+        );
+        assert_eq!(out.echoes, vec![format!("ECHO: {}", fmt_num(MAX_RANGE_ITEMS as f64))]);
+    }
+
+    /// triangles= is the pre-2014.03 spelling of faces=: still accepted,
+    /// with a DEPRECATED line. It was rejected outright, while the .csg
+    /// export recorded the faces it had refused to build.
+    #[test]
+    fn polyhedron_still_accepts_the_triangles_spelling() {
+        let src = "polyhedron(points=[[0,0,0],[1,0,0],[0,1,0],[0,0,1]], \
+                   triangles=[[0,2,1],[0,1,3],[1,2,3],[0,3,2]]);";
+        let out = run(src);
+        assert_eq!(out.shapes.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.shapes[0].mesh.tris.len(), 4);
+        assert!(out.warnings.iter().any(|m| m.starts_with("DEPRECATED")), "{:?}", out.warnings);
+    }
+
+    /// "Unreferenced points are allowed and silently ignored" — but kept in
+    /// the mesh they are not ignored at all: positions is what bounds(),
+    /// hull() and the boolean kernels' framing measure. One stray point made
+    /// resize() scale a unit tetrahedron by 0.1 instead of 10, a millionfold
+    /// volume error.
+    #[test]
+    fn an_unreferenced_polyhedron_point_changes_nothing() {
+        let vol = |src: &str| -> f64 {
+            let m = &run(src).shapes[0].mesh;
+            let o = m.positions[0];
+            m.tris
+                .iter()
+                .map(|t| {
+                    let r = |i: u32| {
+                        let p = m.positions[i as usize];
+                        [p[0] - o[0], p[1] - o[1], p[2] - o[2]]
+                    };
+                    let (a, b, c) = (r(t[0]), r(t[1]), r(t[2]));
+                    (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                        / 6.0
+                })
+                .sum::<f64>()
+                .abs()
+        };
+        let faces = "faces=[[0,2,1],[0,1,3],[1,2,3],[0,3,2]]";
+        let plain = format!(
+            "resize([10,10,10]) polyhedron(points=[[0,0,0],[1,0,0],[0,1,0],[0,0,1]], {faces});"
+        );
+        let stray = format!(
+            "resize([10,10,10]) polyhedron(points=[[0,0,0],[1,0,0],[0,1,0],[0,0,1],[100,100,100]], {faces});"
+        );
+        let (a, b) = (vol(&plain), vol(&stray));
+        assert!(a > 0.0 && (a - b).abs() < a * 1e-9, "stray point moved the mesh: {a} vs {b}");
+    }
+
     #[test]
     fn builtin_functions_follow_reference_semantics() {
         assert_eq!(n("min(5, 3, 8)"), 3.0);
@@ -6160,7 +6491,16 @@ mod tests {
         let (v, w) = ev("min([])");
         assert_eq!(v, Value::Undef);
         assert!(w.iter().any(|m| m.contains("empty")));
-        assert_eq!(ev("max(\"a\", \"b\")").0, Value::Str("b".into())); // generic ordering
+        // The two forms differ, and the reference is explicit about it: "the
+        // n-ary form min(a,b,...) is numbers-only (a non-number argument
+        // yields the conversion WARNING + undef), but the single-vector form
+        // uses the generic relational less-than, so min(["b","a"]) returns
+        // "a" (lexicographic)". This used to assert the n-ary form returned
+        // "b" — the generic ordering — which is the vector form's rule.
+        let (v, w) = ev("max(\"a\", \"b\")");
+        assert_eq!(v, Value::Undef, "the n-ary form is numbers-only");
+        assert!(w.iter().any(|m| m.contains("max")), "and says so: {w:?}");
+        assert_eq!(ev("min([\"b\", \"a\"])").0, Value::Str("a".into())); // generic ordering
         assert_eq!(n("norm([3, 4])"), 5.0);
         assert_eq!(n("norm([])"), 0.0);
         assert_eq!(ev("cross([1, 0, 0], [0, 1, 0])").0, ev("[0, 0, 1]").0);
