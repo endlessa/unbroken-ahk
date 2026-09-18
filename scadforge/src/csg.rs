@@ -642,24 +642,50 @@ impl Frame {
     const ID: Frame = Frame { c: [0.0, 0.0, 0.0], s: 1.0 };
 
     fn of(meshes: &[Mesh]) -> Frame {
+        // Two different questions, and they need two different answers.
+        //
+        // REACH — how far the whole scene sits from the origin — decides
+        // whether to recentre, and the shift is exact only when every
+        // coordinate shares an exponent with the centre, which is what the
+        // "further out than a few of its own extents" test establishes.
+        //
+        // DETAIL — the SMALLEST extent any one operand has — decides the
+        // scale, because that is the finest structure the tolerance must
+        // still resolve. Scaling by the JOINT span instead was a bug of its
+        // own making: a cutter 1e8 away stretched the span to 1e8, the unit
+        // cube it was meant to miss was scaled to 1e-8, and it vanished
+        // inside the plane tolerance. difference() { cube(1);
+        // translate([1e8,0,0]) cube(1); } rendered NOTHING.
         let mut lo = [f64::INFINITY; 3];
         let mut hi = [f64::NEG_INFINITY; 3];
+        let mut detail = f64::INFINITY;
         for m in meshes {
+            let mut mlo = [f64::INFINITY; 3];
+            let mut mhi = [f64::NEG_INFINITY; 3];
             for p in &m.positions {
                 if !p.iter().all(|v| v.is_finite()) {
                     continue;
                 }
                 for k in 0..3 {
+                    mlo[k] = mlo[k].min(p[k]);
+                    mhi[k] = mhi[k].max(p[k]);
                     lo[k] = lo[k].min(p[k]);
                     hi[k] = hi[k].max(p[k]);
                 }
             }
+            let mspan = (0..3).fold(0.0f64, |a, k| a.max(mhi[k] - mlo[k]));
+            if mspan.is_finite() && mspan > 0.0 {
+                detail = detail.min(mspan);
+            }
         }
-        let span = (0..3).fold(0.0f64, |a, k| a.max(hi[k] - lo[k]));
-        if !span.is_finite() || span <= 0.0 {
+        let reach = (0..3).fold(0.0f64, |a, k| a.max(hi[k] - lo[k]));
+        if !reach.is_finite() || reach <= 0.0 {
             return Frame::ID;
         }
-        let e = span.log2().round();
+        if !detail.is_finite() || detail <= 0.0 {
+            detail = reach;
+        }
+        let e = detail.log2().round();
         let s = if e.is_finite() && e != 0.0 && e.abs() < 900.0 {
             2f64.powi(-(e as i32))
         } else {
@@ -667,11 +693,7 @@ impl Frame {
         };
         let mut c = [0.0; 3];
         for k in 0..3 {
-            // Recentre an axis only when the geometry sits at least a few of
-            // its own extents away from the origin — exactly the case where
-            // p - c is exact, and the case where the absolute tolerance has
-            // stopped resolving the shape.
-            if lo[k].abs().max(hi[k].abs()) > span * 4.0 {
+            if lo[k].abs().max(hi[k].abs()) > reach * 4.0 {
                 c[k] = (lo[k] + hi[k]) * 0.5;
             }
         }
@@ -806,7 +828,12 @@ pub fn minkowski(meshes: &[Mesh]) -> Minkowski {
                 pts.push([pa[0] + pb[0], pa[1] + pb[1], pa[2] + pb[2]]);
             }
         }
-        acc = convex_hull(&pts);
+        // Through hull(), not convex_hull() directly: hull() is wrapped in
+        // the frame precisely because the incremental hull rejects a
+        // candidate point with an ABSOLUTE distance test. Minkowski skipped
+        // the wrapper and kept the scale dependence — a 1e-6 operand came
+        // back 18% short, a 1e-7 one nearly 80% short.
+        acc = hull(&[Mesh { positions: pts, tris: Vec::new() }]);
     }
     Minkowski::Ok(acc)
 }
@@ -1389,6 +1416,45 @@ mod tests {
         let out = difference(&geom::cube([10.0, 10.0, 10.0], true), &[geom::sphere(6.0, 12)]);
         assert!(!out.tris.is_empty());
         assert!(!take_degraded(), "an ordinary boolean reported degradation");
+    }
+
+    /// minkowski() built its point cloud and called convex_hull directly,
+    /// skipping the frame that hull() is wrapped in — and so kept the exact
+    /// scale dependence that wrapper exists to remove. A 1e-6 operand came
+    /// back 18% short and a 1e-7 one nearly 80% short.
+    #[test]
+    fn minkowski_holds_its_shape_at_any_magnitude() {
+        fn vol(m: &Mesh) -> f64 {
+            if m.positions.is_empty() {
+                return 0.0;
+            }
+            let o = m.positions[0];
+            m.tris
+                .iter()
+                .map(|t| {
+                    let r = |i: u32| sub(m.positions[i as usize], o);
+                    dot(r(t[0]), cross(r(t[1]), r(t[2]))) / 6.0
+                })
+                .sum::<f64>()
+                .abs()
+        }
+        let at = |s: f64| -> f64 {
+            let c = geom::cube([10.0 * s, 10.0 * s, 10.0 * s], false);
+            let b = geom::sphere(2.0 * s, 12);
+            match minkowski(&[c, b]) {
+                Minkowski::Ok(m) => vol(&m) / (s * s * s),
+                Minkowski::TooLarge { .. } => panic!("hit the pair cap"),
+            }
+        };
+        let base = at(1.0);
+        assert!(base > 0.0, "reference minkowski volume {base}");
+        for s in [1e-2, 1e-4, 1e-5, 1e-6, 1e-7, 1e3, 1e6] {
+            let got = at(s);
+            assert!(
+                (got - base).abs() <= base * 1e-9,
+                "minkowski at scale {s:e}: {got} vs {base}"
+            );
+        }
     }
 
     /// A boolean must give the same answer wherever the geometry sits and

@@ -665,37 +665,55 @@ impl Frame {
     /// an offset distance far larger than the shape still has to land on the
     /// tolerances' scale, not the shape's.
     fn of_len(regions: &[Poly2], extra: f64) -> Frame {
+        // REACH (how far the scene sits from the origin) decides the shift;
+        // DETAIL (the smallest extent any ONE operand has) decides the
+        // scale, since that is the finest structure the tolerances must
+        // still resolve. Scaling by the joint span instead lets a distant
+        // operand shrink a near one into the tolerance and annihilate it.
         let mut lo = [f64::INFINITY; 2];
         let mut hi = [f64::NEG_INFINITY; 2];
+        let mut detail = f64::INFINITY;
         for r in regions {
+            let mut rlo = [f64::INFINITY; 2];
+            let mut rhi = [f64::NEG_INFINITY; 2];
             for c in &r.contours {
                 for p in c {
                     if !p[0].is_finite() || !p[1].is_finite() {
                         continue;
                     }
                     for k in 0..2 {
+                        rlo[k] = rlo[k].min(p[k]);
+                        rhi[k] = rhi[k].max(p[k]);
                         lo[k] = lo[k].min(p[k]);
                         hi[k] = hi[k].max(p[k]);
                     }
                 }
             }
+            let rspan = (rhi[0] - rlo[0]).max(rhi[1] - rlo[1]);
+            if rspan.is_finite() && rspan > 0.0 {
+                detail = detail.min(rspan);
+            }
         }
-        let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(extra.abs());
-        if !span.is_finite() || span <= 0.0 {
+        let reach = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(extra.abs());
+        if !reach.is_finite() || reach <= 0.0 {
             return Frame::ID;
         }
-        // Per axis: recentre only when the geometry sits at least a few of
-        // its own extents away from the origin. That is exactly the case
-        // where p - c is exact, and the case where the absolute tolerances
-        // have stopped resolving the shape.
+        // An offset distance is part of the problem's detail as well as its
+        // reach: an offset far smaller than the shape still has to resolve.
+        if extra != 0.0 && extra.abs().is_finite() {
+            detail = detail.min(extra.abs());
+        }
+        if !detail.is_finite() || detail <= 0.0 {
+            detail = reach;
+        }
         let shift = |l: f64, h: f64| {
-            if l.abs().max(h.abs()) > span * 4.0 {
+            if l.abs().max(h.abs()) > reach * 4.0 {
                 (l + h) * 0.5
             } else {
                 0.0
             }
         };
-        let e = span.log2().round();
+        let e = detail.log2().round();
         let s = if e.is_finite() && e != 0.0 && e.abs() < 900.0 {
             2f64.powi(-(e as i32))
         } else {
@@ -1009,8 +1027,13 @@ fn erode_at_unit_scale(region: &Poly2, grow: f64, join: Join, frags_full: u32) -
     let extent = (hi[0] - lo[0]).abs().max((hi[1] - lo[1]).abs()).max(grow);
     let pad = grow * 2.0 + extent * 0.5;
     let bcont = box_contour([lo[0] - pad, lo[1] - pad], [hi[0] + pad, hi[1] + pad]);
+    // Through sanitize, so the region's OWN fill rule decides what is solid
+    // before the complement is taken. Extending straight from the raw
+    // contours re-read them as even-odd, which for a font region punched a
+    // hole through every place two glyph strokes cross — the positive arm
+    // sanitizes, and the two arms of one operation must agree.
     let mut comp_contours = vec![bcont.clone()];
-    comp_contours.extend(region.contours.iter().cloned());
+    comp_contours.extend(poly2::sanitize(region).contours);
     let comp = Poly2::new(comp_contours); // even-odd: box minus P
     let grown = dilate(&comp, grow, join, frags_full);
     difference2(&Poly2::new(vec![bcont]), &[grown])
@@ -1055,7 +1078,10 @@ fn dilate(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 {
     // resolved first — otherwise every piece of the curve fails the
     // boundary test and the dilation comes back empty. A region that does
     // not cross passes through sanitize untouched.
-    let steps = frags_full.clamp(8, 1024) as usize;
+    // The fragment formula's own minimum is 3 ($fn > 0 gives max(int($fn), 3)
+    // and the $fa/$fs path floors at 5). Clamping the low end to 8 gave a
+    // corner FINER than $fn asked for, which is still a divergence.
+    let steps = frags_full.clamp(3, 1024) as usize;
     let src = poly2::sanitize(region);
     let (contours, _stats) = crate::offset::offset_polygon(&src.contours, dist, steps, join);
     Poly2::new(contours)
@@ -1093,7 +1119,12 @@ pub fn project(mesh: &Mesh, cut: bool) -> Poly2 {
             hi[k] = hi[k].max(p[k]);
         }
     }
-    let span = (0..3).fold(0.0f64, |a, k| a.max(hi[k] - lo[k]));
+    // Only the XY extent may set the scale: the result is 2D, and cut=false
+    // "ignores Z entirely". Sizing from all three axes let a tall thin solid
+    // scale its own footprint below the absolute tolerances that follow —
+    // projection() cube([1,1,100000]) culled every facet and returned an
+    // empty region, silently.
+    let span = (hi[0] - lo[0]).max(hi[1] - lo[1]);
     let e = if span.is_finite() && span > 0.0 { span.log2().round() } else { 0.0 };
     let s = if e.is_finite() && e != 0.0 && e.abs() < 900.0 {
         2f64.powi(-(e as i32))
@@ -1202,7 +1233,12 @@ fn project_cut(mesh: &Mesh) -> Poly2 {
             e1[2] * e2[0] - e1[0] * e2[2],
             e1[0] * e2[1] - e1[1] * e2[0],
         ];
-        let dir = [n[1], -n[0]];
+        // Ink on the LEFT, as everywhere else in this kernel: the outward
+        // normal is the RIGHT perpendicular of the direction, [d.y, -d.x],
+        // so d = (-Ny, Nx). Using (Ny, -Nx) put the solid on the segments'
+        // right, and a section with a four-valent vertex then stitched into
+        // one pinched figure-eight instead of two separate loops.
+        let dir = [-n[1], n[0]];
         let (pa, pb) = (pts[0], pts[1]);
         let along = (pb[0] - pa[0]) * dir[0] + (pb[1] - pa[1]) * dir[1];
         let (a, b) = if along >= 0.0 { (pa, pb) } else { (pb, pa) };
@@ -1535,6 +1571,149 @@ mod tests {
         let s = sq(0.0, 0.0, 5.0);
         assert!((area(&offset2(&s, 0.0, Join::Round, 16)) - 25.0).abs() < 1e-9);
         assert!(offset2(&Poly2::new(Vec::new()), 3.0, Join::Round, 16).is_empty());
+    }
+
+    /// The frame has two different questions to answer and needs two
+    /// different measurements. REACH — how far the scene sits from the
+    /// origin — decides whether to recentre. DETAIL — the smallest extent
+    /// any ONE operand has — decides the scale, because that is the finest
+    /// structure the tolerances must still resolve. Scaling by the JOINT
+    /// span let a distant operand shrink a near one into the tolerance and
+    /// annihilate it: difference() { cube(1); translate([1e8,0,0]) cube(1); }
+    /// rendered NOTHING, and intersection() of a 1e8 cube with a unit cube
+    /// came back as half the big one.
+    #[test]
+    fn a_distant_operand_does_not_shrink_a_near_one_away() {
+        let area = |p: &Poly2| -> f64 {
+            let (v, t) = poly2::triangulate(p);
+            t.iter()
+                .map(|tr| {
+                    let (a, b, c) = (v[tr[0] as usize], v[tr[1] as usize], v[tr[2] as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+                })
+                .sum()
+        };
+        let far = sq(1e8, 0.0, 1.0);
+        // A cutter that far away cuts nothing, and must leave the square whole.
+        assert!((area(&difference2(&sq(0.0, 0.0, 1.0), &[far.clone()])) - 1.0).abs() < 1e-9);
+        // A union keeps both.
+        assert!((area(&union2(&[sq(0.0, 0.0, 1.0), far.clone()])) - 2.0).abs() < 1e-9);
+        // And a huge operand must not swallow a small one.
+        let huge = sq(-5e7, -5e7, 1e8);
+        assert!((area(&intersection2(&[huge, sq(0.0, 0.0, 1.0)])) - 1.0).abs() < 1e-9);
+    }
+
+    /// projection() produces a 2D result, so only the XY extent may set its
+    /// working scale. Sizing from all three axes let a tall thin solid
+    /// scale its own footprint below the tolerances that follow, and every
+    /// facet was culled: projection() cube([1,1,100000]) returned an empty
+    /// region, silently.
+    ///
+    /// The section's segments must also carry the solid on their LEFT like
+    /// every other boundary segment in this kernel. Oriented the other way,
+    /// a section with a four-valent vertex stitched into one pinched
+    /// figure-eight instead of two separate loops.
+    #[test]
+    fn projection_holds_up_for_thin_solids_and_touching_sections() {
+        let area = |p: &Poly2| -> f64 {
+            let (v, t) = poly2::triangulate(p);
+            t.iter()
+                .map(|tr| {
+                    let (a, b, c) = (v[tr[0] as usize], v[tr[1] as usize], v[tr[2] as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+                })
+                .sum()
+        };
+        for (x, z, want) in [(1.0, 10.0, 1.0), (1.0, 1e5, 1.0), (0.01, 1e3, 1e-4)] {
+            let m = crate::geom::cube([x, x, z], false);
+            let got = area(&project(&m, false));
+            assert!(
+                (got - want).abs() <= want * 1e-9,
+                "silhouette of a {x} x {x} x {z} box: {got}, want {want}"
+            );
+        }
+        // Two boxes meeting at a corner: the section is two squares, not one
+        // pinched loop. Both straddle z=0.
+        let mut a = crate::geom::cube([10.0, 10.0, 2.0], false);
+        let mut b = crate::geom::cube([10.0, 10.0, 2.0], false);
+        for p in &mut a.positions {
+            p[2] -= 1.0;
+        }
+        for p in &mut b.positions {
+            p[0] += 10.0;
+            p[1] += 10.0;
+            p[2] -= 1.0;
+        }
+        let mut both = a.clone();
+        let base = both.positions.len() as u32;
+        both.positions.extend(b.positions.iter().cloned());
+        both.tris.extend(b.tris.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));
+        let cut = project(&both, true);
+        assert!((area(&cut) - 200.0).abs() < 1e-6, "corner-touching section: {}", area(&cut));
+    }
+
+    /// The two arms of one operation must agree about what the region IS.
+    /// dilate sanitizes with the region's own fill rule; erosion built its
+    /// complement straight from the raw contours, which re-read a font
+    /// region as even-odd and punched a hole through every place two glyph
+    /// strokes cross.
+    #[test]
+    fn both_offset_arms_honour_the_regions_fill_rule() {
+        let f = crate::font::default_font().expect("bundled font");
+        let area = |q: &Poly2| -> f64 {
+            let (v, t) = poly2::triangulate(q);
+            t.iter()
+                .map(|tr| {
+                    let (a, b, c) = (v[tr[0] as usize], v[tr[1] as usize], v[tr[2] as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+                })
+                .sum()
+        };
+        for ch in ['A', 'B', '4', 'e', '8'] {
+            let s = 100.0 / f.units_per_em;
+            let scaled: Vec<Vec<[f64; 2]>> = f
+                .glyph_contours(f.glyph_id(ch), 6)
+                .iter()
+                .map(|c| c.iter().map(|p| [p[0] * s, p[1] * s]).collect())
+                .collect();
+            let region = Poly2::new_font(scaled);
+            // sanitize() is the same region written out in even-odd terms,
+            // so offsetting either must give the same answer.
+            let sane = poly2::sanitize(&region);
+            for d in [-1.5f64, 1.5] {
+                let a = area(&offset2(&region, d, Join::Round, 24));
+                let b = area(&offset2(&sane, d, Join::Round, 24));
+                assert!(
+                    (a - b).abs() <= b * 1e-6,
+                    "'{ch}' offset {d}: font rule {a}, even-odd equivalent {b}"
+                );
+            }
+        }
+    }
+
+    /// Round-join arcs are tessellated from the standard fragment formula
+    /// applied to |r|, whose own minimum is 3. Clamping the low end to 8
+    /// gave a corner FINER than $fn asked for.
+    #[test]
+    fn round_joins_use_the_fragment_count_they_are_given() {
+        let area = |p: &Poly2| -> f64 {
+            let (v, t) = poly2::triangulate(p);
+            t.iter()
+                .map(|tr| {
+                    let (a, b, c) = (v[tr[0] as usize], v[tr[1] as usize], v[tr[2] as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+                })
+                .sum()
+        };
+        // 20x20 square, r=10, $fn=4: one chord per 90-degree corner, so each
+        // corner is a single flat cut of area r^2/2.
+        let got = area(&offset2(&sq(0.0, 0.0, 20.0), 10.0, Join::Round, 4));
+        let want = 400.0 + 4.0 * 20.0 * 10.0 + 4.0 * 0.5 * 100.0;
+        assert!((got - want).abs() < want * 1e-9, "$fn=4 round join: {got}, want {want}");
+        // And a fine count still approaches the true rounded rectangle.
+        let fine = area(&offset2(&sq(0.0, 0.0, 20.0), 10.0, Join::Round, 256));
+        let truth = 400.0 + 800.0 + std::f64::consts::PI * 100.0;
+        assert!((fine - truth).abs() < truth * 1e-4, "$fn=256 round join: {fine}");
     }
 
     /// A crossing outline must survive a boolean. The BSP assumes each

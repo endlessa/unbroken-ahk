@@ -311,12 +311,12 @@ fn crossing_y(a: &SwEdge, b: &SwEdge) -> Option<f64> {
 /// consecutive scanlines no edge begins, ends or crosses another, so the
 /// band is cut cleanly into trapezoids by the edges spanning it sorted by
 /// x, and the running winding says which gaps are ink.
-fn sweep_fill(contours: &[Vec<Vec2>]) -> (Vec<Vec2>, Vec<[u32; 3]>) {
+fn sweep_fill(contours: &[Vec<Vec2>], fill: Fill) -> (Vec<Vec2>, Vec<[u32; 3]>) {
     let mut positions: Vec<Vec2> = Vec::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
     for group in components(contours) {
         let part: Vec<Vec<Vec2>> = group.into_iter().map(|i| contours[i].clone()).collect();
-        let (p, t) = sweep_component(&part);
+        let (p, t) = sweep_component(&part, fill);
         let base = positions.len() as u32;
         positions.extend_from_slice(&p);
         tris.extend(t.into_iter().map(|x| [base + x[0], base + x[1], base + x[2]]));
@@ -324,7 +324,7 @@ fn sweep_fill(contours: &[Vec<Vec2>]) -> (Vec<Vec2>, Vec<[u32; 3]>) {
     (positions, tris)
 }
 
-fn sweep_component(contours: &[Vec<Vec2>]) -> (Vec<Vec2>, Vec<[u32; 3]>) {
+fn sweep_component(contours: &[Vec<Vec2>], fill: Fill) -> (Vec<Vec2>, Vec<[u32; 3]>) {
     let mut edges: Vec<SwEdge> = Vec::new();
     let (mut ylo, mut yhi) = (f64::INFINITY, f64::NEG_INFINITY);
     for c in contours {
@@ -384,7 +384,13 @@ fn sweep_component(contours: &[Vec<Vec2>]) -> (Vec<Vec2>, Vec<[u32; 3]>) {
         let mut wind = 0i32;
         for k in 0..act.len().saturating_sub(1) {
             wind += edges[act[k].1].dir;
-            if wind == 0 {
+            let inside = match fill {
+                Fill::Font => wind != 0,
+                // Even-odd counts crossings, not direction: after k+1 edges
+                // an odd count is inside.
+                Fill::EvenOdd => (k + 1) % 2 == 1,
+            };
+            if !inside {
                 continue; // a gap in the ink
             }
             let (l, r) = (&edges[act[k].1], &edges[act[k + 1].1]);
@@ -423,30 +429,35 @@ pub fn triangulate(poly: &Poly2) -> (Vec<Vec2>, Vec<[u32; 3]>) {
         return (Vec::new(), Vec::new());
     }
     if poly.fill == Fill::Font {
-        return sweep_fill(&clean);
+        return sweep_fill(&clean, Fill::Font);
     }
-    // The nesting classifier below cannot describe contours that CROSS, so
-    // they are resolved into equivalent nested ones first. A region that
-    // does not cross comes back unchanged.
+    // A lone contour that does not cross itself is a simple polygon, and
+    // ear clipping gives the most compact triangulation there is for one.
+    if clean.len() == 1 && !has_crossing(&clean) {
+        let ring = ccw(clean[0].clone());
+        let tris = ear_clip(&ring);
+        return (ring, tris);
+    }
+    // Everything else — holes, islands, crossings — goes to the sweep.
+    //
+    // The alternative is to cut a bridge from each hole out to the outline
+    // and ear-clip the merged ring, and that is what this did. It does not
+    // survive contact with an ordinary plate: two holes in the same x range
+    // bridge to the SAME outline vertex, so the ring carries two chords
+    // radiating from one point, and clipping an ear on one side amputates
+    // the other. A 10x10 plate with two stacked 2x2 holes came back with
+    // both holes filled in. Tightening the ear test got it to 94 of the
+    // right 92 — the failure has as many shapes as there are ways for
+    // bridges to interact, and chasing them one at a time is not a fix.
+    // The sweep asks no question about nesting or visibility at all.
     let resolved;
-    let clean = if has_crossing(&clean) {
+    let src = if has_crossing(&clean) {
         resolved = sanitize(poly);
         clean_contours(&resolved)
     } else {
         clean
     };
-    let mut positions: Vec<Vec2> = Vec::new();
-    let mut tris: Vec<[u32; 3]> = Vec::new();
-    for (i, holes) in groups(&clean) {
-        let hs: Vec<Vec<Vec2>> = holes.iter().map(|&j| clean[j].clone()).collect();
-        let merged = bridge_holes(ccw(clean[i].clone()), hs);
-        let base = positions.len() as u32;
-        positions.extend_from_slice(&merged);
-        for t in ear_clip(&merged) {
-            tris.push([base + t[0], base + t[1], base + t[2]]);
-        }
-    }
-    (positions, tris)
+    sweep_fill(&src, Fill::EvenOdd)
 }
 
 /// Ensure CCW orientation (positive area).
@@ -457,109 +468,6 @@ fn ccw(mut c: Vec<Vec2>) -> Vec<Vec2> {
     c
 }
 
-/// Merge holes into an outer contour by cutting a bridge from each hole's
-/// rightmost vertex to a visible outer vertex, producing one weakly-simple
-/// CCW polygon. Holes are inserted CW (reversed) so the bridge seams close.
-fn bridge_holes(outer: Vec<Vec2>, mut holes: Vec<Vec<Vec2>>) -> Vec<Vec2> {
-    if holes.is_empty() {
-        return outer;
-    }
-    // Process holes right-to-left by their rightmost vertex, so earlier
-    // bridges don't block later ones.
-    holes.sort_by(|a, b| rightmost(b).partial_cmp(&rightmost(a)).unwrap_or(std::cmp::Ordering::Equal));
-    let mut poly = outer;
-    for hole in holes {
-        let hole = cw(hole); // holes wind opposite the outer
-        let hi = rightmost_index(&hole);
-        let hp = hole[hi];
-        let oi = visible_index(&poly, hp);
-        // Splice: outer[0..=oi], hole[hi..]+hole[..=hi], outer[oi..].
-        let mut merged = Vec::with_capacity(poly.len() + hole.len() + 2);
-        merged.extend_from_slice(&poly[..=oi]);
-        for k in 0..=hole.len() {
-            merged.push(hole[(hi + k) % hole.len()]);
-        }
-        merged.extend_from_slice(&poly[oi..]);
-        poly = merged;
-    }
-    poly
-}
-
-/// Index of a vertex of CCW `poly` that the hole vertex `m` can see.
-///
-/// Shoot +x from `m`, take the edge the ray first hits, and use that edge's
-/// farther-right endpoint P — unless a reflex vertex of the outline falls
-/// inside triangle (m, I, P), in which case the reflex vertex at the
-/// smallest angle off the ray is the one in the way and the one to bridge
-/// to. Picking the NEAREST vertex instead (what this did) cuts the bridge
-/// straight through the outline whenever the nearest vertex is across a
-/// bowl from the counter, and the ear clipper then triangulates a polygon
-/// that crosses itself: that is the flap over the 'G' and the cross-hatch
-/// through the counters of '8'.
-fn visible_index(poly: &[Vec2], m: Vec2) -> usize {
-    let n = poly.len();
-    let mut best_x = f64::INFINITY;
-    let mut hit: Option<usize> = None; // index of the edge's far-right end
-    for i in 0..n {
-        let (a, b) = (poly[i], poly[(i + 1) % n]);
-        // Half-open straddle, so a vertex exactly at m's height counts once.
-        if (a[1] > m[1]) == (b[1] > m[1]) {
-            continue;
-        }
-        let t = (m[1] - a[1]) / (b[1] - a[1]);
-        let x = a[0] + t * (b[0] - a[0]);
-        if x >= m[0] && x < best_x {
-            best_x = x;
-            hit = Some(if a[0] > b[0] { i } else { (i + 1) % n });
-        }
-    }
-    let p = match hit {
-        Some(p) => p,
-        // The hole is not enclosed (shouldn't happen once classified), so
-        // fall back to the nearest vertex rather than failing to bridge.
-        None => {
-            return (0..n)
-                .min_by(|&a, &b| {
-                    dist2(poly[a], m).partial_cmp(&dist2(poly[b], m)).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap()
-        }
-    };
-    let ray = [best_x, m[1]];
-    if dist2(ray, poly[p]) <= 1e-18 {
-        return p; // the ray ran straight into a vertex
-    }
-    // Reflex vertices inside (m, I, P) block the straight bridge to P.
-    let mut chosen = p;
-    let mut best_cos = f64::NEG_INFINITY;
-    let mut best_d = f64::INFINITY;
-    for i in 0..n {
-        if i == p {
-            continue;
-        }
-        let v = poly[i];
-        let (a, c) = (poly[(i + n - 1) % n], poly[(i + 1) % n]);
-        if cross(a, v, c) > 0.0 {
-            continue; // convex, cannot block
-        }
-        if !in_triangle(v, m, ray, poly[p]) {
-            continue;
-        }
-        let d = sub(v, m);
-        let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
-        if l <= 0.0 {
-            continue;
-        }
-        let cos = d[0] / l;
-        if cos > best_cos || (cos == best_cos && l < best_d) {
-            best_cos = cos;
-            best_d = l;
-            chosen = i;
-        }
-    }
-    chosen
-}
-
 fn cw(c: Vec<Vec2>) -> Vec<Vec2> {
     let mut c = c;
     if signed_area2(&c) > 0.0 {
@@ -568,14 +476,9 @@ fn cw(c: Vec<Vec2>) -> Vec<Vec2> {
     c
 }
 
-fn rightmost(c: &[Vec2]) -> f64 {
-    c.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max)
-}
-
-fn rightmost_index(c: &[Vec2]) -> usize {
-    (0..c.len()).max_by(|&a, &b| c[a][0].partial_cmp(&c[b][0]).unwrap_or(std::cmp::Ordering::Equal)).unwrap()
-}
-
+/// Only the tests measure distances now; the boundary passes all work in
+/// cross products and parameters.
+#[cfg(test)]
 fn dist2(a: Vec2, b: Vec2) -> f64 {
     let d = sub(a, b);
     d[0] * d[0] + d[1] * d[1]
@@ -637,12 +540,34 @@ fn ear_clip(poly: &[Vec2]) -> Vec<[u32; 3]> {
             if cross(a, b, c) <= eps {
                 return false;
             }
-            !idx.iter().any(|&j| {
+            if idx.iter().any(|&j| {
                 if j == ia || j == ib || j == ic {
                     return false;
                 }
                 let pj = poly[j];
                 pj != a && pj != b && pj != c && in_triangle(pj, a, b, c)
+            }) {
+                return false;
+            }
+            // And nothing may CROSS the diagonal the ear cuts. Testing only
+            // for vertices inside the triangle is not enough once a ring
+            // carries two bridge seams: two holes in the same x range bridge
+            // to the SAME outer vertex, and the second bridge's chord starts
+            // at that shared vertex — which the coincident-position
+            // exemption just above deliberately ignores — and ends outside
+            // the ear. No vertex is found inside, the ear passes, and
+            // clipping it AMPUTATES the second bridge: a plate with two
+            // stacked holes came out with both holes filled in and an
+            // inverted triangle over the top. The exemption is still needed
+            // (a single seam would otherwise block every ear along it), so
+            // the diagonal is checked directly instead.
+            let diag = [a, c];
+            !(0..m).any(|j| {
+                let (u, v) = (idx[j], idx[(j + 1) % m]);
+                if u == ia || u == ib || u == ic || v == ia || v == ib || v == ic {
+                    return false;
+                }
+                seg_cross(&diag, &[poly[u], poly[v]])
             })
         });
         if let Some(i) = ear {
@@ -949,7 +874,14 @@ fn boundary_segments(clean: &[Vec<Vec2>], fill: Fill) -> Vec<[Vec2; 2]> {
     }
     let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-12);
     let tol = span * 1e-9;
-    let probe = span * 1e-6;
+    // The probe steps off a boundary piece to ask which side the ink is on,
+    // so it has to be SHORTER than the thinnest thing the region contains —
+    // at span*1e-6 a sliver narrower than that got both probes on the same
+    // side, the piece was dropped as "not boundary", and with the boundary
+    // no longer closed the whole region's fill disappeared. Seven decades
+    // above the coordinate ulp is still far more than the exact ray casting
+    // in filled_at needs.
+    let probe = span * 1e-9;
     // Per-segment bounds, so the quadratic pass skips all but the handful of
     // edges that could actually meet this one.
     let bbox: Vec<[f64; 4]> = segs
@@ -1292,6 +1224,12 @@ pub fn extrude_rotate(poly: &Poly2, angle_deg: f64, frags: usize) -> Result<Mesh
     }
     let full = angle_deg.abs() >= 360.0 - 1e-9;
     let sweep = if full { 360.0 } else { angle_deg };
+    // Walls are wound for a profile on +X swept toward +theta. Either of
+    // those reversing turns the solid inside out, and both reversing turns
+    // it back: rotate_extrude(angle=-90) and a profile at negative X each
+    // came out with every face inverted, which the viewer shades as flat
+    // ambient grey and an exporter writes as an inside-out solid.
+    let flip = (sweep < 0.0) != (maxx <= 0.0 && minx < 0.0);
     let angle_at = |k: usize| (sweep * k as f64 / frags as f64).to_radians();
     let revolve = |p: Vec2, theta: f64| [p[0] * theta.cos(), p[0] * theta.sin(), p[1]];
     let mut positions: Vec<[f64; 3]> = Vec::new();
@@ -1316,8 +1254,13 @@ pub fn extrude_rotate(poly: &Poly2, angle_deg: f64, frags: usize) -> Result<Mesh
                 // edge going +z, and sweeping puts the next edge at +theta;
                 // (+z) x (+theta) points at the axis, so the naive order
                 // gives an inside-out solid. Both triangles are reversed.
-                push_tri(&mut tris, &q, b, [0, 2, 1]);
-                push_tri(&mut tris, &q, b, [0, 3, 2]);
+                if flip {
+                    push_tri(&mut tris, &q, b, [0, 1, 2]);
+                    push_tri(&mut tris, &q, b, [0, 2, 3]);
+                } else {
+                    push_tri(&mut tris, &q, b, [0, 2, 1]);
+                    push_tri(&mut tris, &q, b, [0, 3, 2]);
+                }
             }
         }
     }
@@ -1327,11 +1270,23 @@ pub fn extrude_rotate(poly: &Poly2, angle_deg: f64, frags: usize) -> Result<Mesh
         // a -y normal there, so it is the θ=angle cap that gets reversed.
         let base = positions.len() as u32;
         positions.extend(cap2.iter().map(|v| revolve(*v, angle_at(0))));
-        tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[1], base + t[2]]));
+        tris.extend(cap_tris.iter().map(|t| {
+            if flip {
+                [base + t[0], base + t[2], base + t[1]]
+            } else {
+                [base + t[0], base + t[1], base + t[2]]
+            }
+        }));
         // Cap at θ=angle.
         let base = positions.len() as u32;
         positions.extend(cap2.iter().map(|v| revolve(*v, angle_at(frags))));
-        tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[2], base + t[1]]));
+        tris.extend(cap_tris.iter().map(|t| {
+            if flip {
+                [base + t[0], base + t[1], base + t[2]]
+            } else {
+                [base + t[0], base + t[2], base + t[1]]
+            }
+        }));
     }
     Ok((positions, tris))
 }
@@ -1346,6 +1301,120 @@ mod tests {
                 cross(v[t[0] as usize], v[t[1] as usize], v[t[2] as usize]).abs() / 2.0
             })
             .sum()
+    }
+
+    /// A plate with bolt holes is the most ordinary shape there is, and it
+    /// was wrong. Holes used to be cut by bridging each one out to the
+    /// outline and ear-clipping the merged ring; two holes in the same x
+    /// range bridge to the SAME outline vertex, so the ring carried two
+    /// chords radiating from one point and clipping an ear on one side
+    /// amputated the other. A 10x10 plate with two stacked 2x2 holes came
+    /// back with BOTH holes filled in (area 100 of the right 92) and an
+    /// inverted triangle over the top.
+    #[test]
+    fn holes_are_cut_wherever_they_sit() {
+        let area = |p: &Poly2| -> f64 {
+            let (v, t) = triangulate(p);
+            t.iter()
+                .map(|tr| {
+                    let (a, b, c) = (v[tr[0] as usize], v[tr[1] as usize], v[tr[2] as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+                })
+                .sum()
+        };
+        let outer = || vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let hole = |x: f64, y: f64| vec![[x, y], [x + 2.0, y], [x + 2.0, y + 2.0], [x, y + 2.0]];
+        // One hole, two stacked in one x range, two side by side, three
+        // stacked, and an island inside a hole.
+        let cases: Vec<(Vec<Vec<Vec2>>, f64)> = vec![
+            (vec![outer(), hole(2.0, 2.0)], 96.0),
+            (vec![outer(), hole(2.0, 2.0), hole(2.0, 6.0)], 92.0),
+            (vec![outer(), hole(2.0, 2.0), hole(6.0, 2.0)], 92.0),
+            (vec![outer(), hole(2.0, 1.0), hole(2.0, 4.0), hole(2.0, 7.0)], 88.0),
+            (
+                vec![
+                    outer(),
+                    vec![[2.0, 2.0], [8.0, 2.0], [8.0, 8.0], [2.0, 8.0]],
+                    vec![[4.0, 4.0], [5.0, 4.0], [5.0, 5.0], [4.0, 5.0]],
+                ],
+                65.0, // 100 - 36 + 1: the island is inside the hole
+            ),
+        ];
+        for (contours, want) in cases {
+            let p = Poly2::new(contours);
+            let got = area(&p);
+            assert!((got - want).abs() < 1e-9, "filled {got}, want {want}");
+            // And it must extrude to a closed solid of exactly that volume.
+            let (pos, tris) = extrude_linear(&p, 3.0, false, 0.0, 1, [1.0, 1.0]);
+            let vol: f64 = tris
+                .iter()
+                .map(|tr| {
+                    let (a, b, c) = (pos[tr[0] as usize], pos[tr[1] as usize], pos[tr[2] as usize]);
+                    (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                        / 6.0
+                })
+                .sum();
+            assert!((vol - want * 3.0).abs() < 1e-6, "extruded {vol}, want {}", want * 3.0);
+        }
+    }
+
+    /// The probe that asks which side of a boundary piece the ink is on has
+    /// to be SHORTER than the thinnest thing the region contains. At a fixed
+    /// fraction of the bounding box, a sliver narrower than the probe put
+    /// both probes on the same side, the piece was dropped as "not
+    /// boundary", and with the boundary no longer closed the region's whole
+    /// fill disappeared — a 10x10 square with a hairline slit rendered as
+    /// NOTHING.
+    #[test]
+    fn a_hairline_feature_does_not_erase_the_region() {
+        let p = Poly2::new(vec![
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            vec![[5.0, -5.0], [5.00001, -5.0], [5.0, 15.0]],
+        ]);
+        let (v, t) = triangulate(&p);
+        let a: f64 = t
+            .iter()
+            .map(|tr| {
+                let (x, y, z) = (v[tr[0] as usize], v[tr[1] as usize], v[tr[2] as usize]);
+                ((y[0] - x[0]) * (z[1] - x[1]) - (y[1] - x[1]) * (z[0] - x[0])).abs() * 0.5
+            })
+            .sum();
+        assert!((a - 100.0).abs() < 0.01, "hairline slit erased the square: area {a}");
+    }
+
+    /// Walls are wound for a profile on +X swept toward +theta. Either of
+    /// those reversing turns the solid inside out, and both reversing turns
+    /// it back — a negative angle and a profile at negative X each produced
+    /// the right washer with every face inverted.
+    #[test]
+    fn rotate_extrude_faces_outward_whichever_way_it_sweeps() {
+        let vol = |profile: Vec<Vec2>, angle: f64| -> f64 {
+            let (p, t) = extrude_rotate(&Poly2::new(vec![profile]), angle, 128).unwrap();
+            t.iter()
+                .map(|tr| {
+                    let (a, b, c) = (p[tr[0] as usize], p[tr[1] as usize], p[tr[2] as usize]);
+                    (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                        / 6.0
+                })
+                .sum()
+        };
+        let pos = vec![[2.0, 0.0], [4.0, 0.0], [4.0, 1.0], [2.0, 1.0]];
+        let neg = vec![[-4.0, 0.0], [-2.0, 0.0], [-2.0, 1.0], [-4.0, 1.0]];
+        let full = vol(pos.clone(), 360.0);
+        assert!(full > 0.0, "the ordinary case is inside out: {full}");
+        assert!((vol(neg, 360.0) - full).abs() < full * 1e-9, "a -X profile is inside out");
+        // A 90-degree sweep at the same fragment count is FINER faceted than
+        // a quarter of a 360-degree one, so it measures slightly closer to
+        // the true quarter washer pi*(16-4)/4 rather than to full/4.
+        let quarter = vol(pos.clone(), 90.0);
+        let truth = std::f64::consts::PI * 12.0 / 4.0;
+        assert!((quarter - truth).abs() < truth * 1e-3, "quarter washer {quarter}");
+        assert!(
+            (vol(pos, -90.0) - quarter).abs() < full * 1e-9,
+            "a negative angle is inside out"
+        );
     }
 
     /// The reference pins this: "Self-intersection resolution is even-odd,
