@@ -40,27 +40,72 @@ fn mul(a: &Xform, b: &Xform) -> Xform {
     ]
 }
 
-/// Read an SVG document into one even-odd 2D region plus warnings. Malformed or
+/// The fill rule an element paints under. SVG's default is NONZERO; only an
+/// explicit `fill-rule="evenodd"`, on the element or inherited from an
+/// ancestor `<g>`, switches it.
+#[derive(Clone, Copy, PartialEq)]
+enum Rule {
+    NonZero,
+    EvenOdd,
+}
+
+/// The `fill-rule` an element declares, as a presentation attribute or inside
+/// an inline `style`. `None` means it declares none and inherits.
+fn fill_rule_of(attrs: &str) -> Option<Rule> {
+    let read = |v: &str| match v.trim() {
+        "evenodd" => Some(Rule::EvenOdd),
+        "nonzero" => Some(Rule::NonZero),
+        _ => None,
+    };
+    if let Some(v) = attr(attrs, "fill-rule") {
+        if let Some(r) = read(&v) {
+            return Some(r);
+        }
+    }
+    // "presentation attributes and inline style fill/fill-rule/display honored"
+    let style = attr(attrs, "style")?;
+    style.split(';').find_map(|decl| {
+        let (k, v) = decl.split_once(':')?;
+        if k.trim().eq_ignore_ascii_case("fill-rule") { read(v) } else { None }
+    })
+}
+
+/// Read an SVG document into one 2D region plus warnings. Malformed or
 /// unsupported constructs are skipped (with a warning for `<text>`); a document
 /// with no fillable geometry yields an empty region, never an error.
+///
+/// The result is even-odd, but it is RESOLVED to that from each element's own
+/// fill rule first. The reference: "fill-rule (nonzero vs evenodd) is
+/// respected when resolving self-intersections and holes", and SVG's default
+/// is nonzero. Filling everything even-odd turned a pentagram's inner
+/// pentagon into a hole — 1571 units of area where the picture has 2274 —
+/// and did the same to any hole drawn with the same winding as its outline,
+/// which is how fonts and most logos draw them.
 pub fn read_svg(text: &str, dpi: f64, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) {
     let mut warnings = Vec::new();
     let scale = viewport_scale(text, dpi);
     // Walk elements, maintaining a transform stack for nested <g>.
     let mut stack: Vec<Xform> = vec![IDENTITY];
-    let mut contours: Vec<Vec<Vec2>> = Vec::new();
+    // The inherited fill rule, one entry per open <g>.
+    let mut rules: Vec<Rule> = vec![Rule::NonZero];
+    // Contours kept per rule: each element's own subpaths resolve together
+    // under the rule that element declared, never across elements.
+    let mut groups: Vec<(Rule, Vec<Vec<Vec2>>)> = Vec::new();
     let frag = |r: f64| fragments(r.abs().max(1e-6), fn_, fa, fs).max(3) as usize;
 
     for tok in ElementScanner::new(text) {
         let cur = *stack.last().unwrap();
+        let cur_rule = *rules.last().unwrap();
         match tok {
             Element::GroupOpen(attrs) => {
                 let t = attr(&attrs, "transform").map(|s| parse_transform(&s)).unwrap_or(IDENTITY);
                 stack.push(mul(&cur, &t));
+                rules.push(fill_rule_of(&attrs).unwrap_or(cur_rule));
             }
             Element::GroupClose => {
                 if stack.len() > 1 {
                     stack.pop();
+                    rules.pop();
                 }
             }
             Element::Shape(name, attrs) => {
@@ -71,25 +116,50 @@ pub fn read_svg(text: &str, dpi: f64, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec
                     warnings.push("SVG <text> is ignored on import (convert text to paths)".into());
                     continue;
                 }
+                let rule = fill_rule_of(&attrs).unwrap_or(cur_rule);
+                let mut own: Vec<Vec<Vec2>> = Vec::new();
                 for c in shape_contours(&name, &attrs, &frag) {
                     if c.len() >= 2 {
-                        contours.push(c.into_iter().map(|p| apply(&local, p)).collect());
+                        own.push(c.into_iter().map(|p| apply(&local, p)).collect());
                     }
+                }
+                if !own.is_empty() {
+                    groups.push((rule, own));
                 }
             }
         }
     }
 
     // Global viewport transform: user units → mm, Y flipped.
-    for c in &mut contours {
-        for p in c.iter_mut() {
-            *p = [p[0] * scale, -p[1] * scale];
+    for (_, cs) in &mut groups {
+        for c in cs.iter_mut() {
+            for p in c.iter_mut() {
+                *p = [p[0] * scale, -p[1] * scale];
+            }
         }
+        // Keep only real fillable contours: at least a triangle, and every
+        // point finite (a NaN/inf coordinate from a malformed attribute is
+        // dropped).
+        cs.retain(|c| c.len() >= 3 && c.iter().all(|p| p[0].is_finite() && p[1].is_finite()));
     }
-    // Keep only real fillable contours: at least a triangle, and every point
-    // finite (a `NaN`/`inf` coordinate from a malformed attribute is dropped).
-    contours.retain(|c| c.len() >= 3 && c.iter().all(|p| p[0].is_finite() && p[1].is_finite()));
-    (Poly2::new(contours), warnings)
+    // Resolve each element under ITS OWN rule, then union the results. A
+    // single flat even-odd region could not express this: two separately
+    // filled shapes that overlap must union, not cancel.
+    let resolved: Vec<Poly2> = groups
+        .into_iter()
+        .filter(|(_, cs)| !cs.is_empty())
+        .map(|(rule, cs)| {
+            let region = match rule {
+                Rule::NonZero => Poly2::new_font(cs),
+                Rule::EvenOdd => Poly2::new(cs),
+            };
+            crate::poly2::sanitize(&region)
+        })
+        .collect();
+    if resolved.is_empty() {
+        return (Poly2::new(Vec::new()), warnings);
+    }
+    (crate::csg2::union2(&resolved), warnings)
 }
 
 /// The user-unit → millimetre scale from the root `<svg>` width/height/viewBox.
@@ -156,6 +226,48 @@ struct ElementScanner<'a> {
 impl<'a> ElementScanner<'a> {
     fn new(text: &'a str) -> Self {
         ElementScanner { s: text.as_bytes(), i: 0 }
+    }
+
+    /// Consume everything up to and including the matching close tag of
+    /// `name`, counting nested opens of the same name so a `<defs>` holding
+    /// another `<defs>` still ends in the right place. An unclosed container
+    /// swallows the rest of the document, which is the safe direction: its
+    /// content is definitions either way.
+    fn skip_subtree(&mut self, name: &str) {
+        let open = format!("<{}", name);
+        let close = format!("</{}", name);
+        let mut depth = 1usize;
+        while self.i < self.s.len() {
+            let rest = match std::str::from_utf8(&self.s[self.i..]) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let lower = rest.to_ascii_lowercase();
+            let next_open = lower.find(&open);
+            let next_close = lower.find(&close);
+            match (next_open, next_close) {
+                (Some(o), Some(c)) if o < c => {
+                    depth += 1;
+                    self.i += o + open.len();
+                }
+                (_, Some(c)) => {
+                    depth -= 1;
+                    self.i += c + close.len();
+                    if depth == 0 {
+                        // Step past the '>' so the scan resumes after the tag.
+                        while self.i < self.s.len() && self.s[self.i] != b'>' {
+                            self.i += 1;
+                        }
+                        self.i = (self.i + 1).min(self.s.len());
+                        return;
+                    }
+                }
+                _ => {
+                    self.i = self.s.len();
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -226,6 +338,17 @@ impl<'a> Iterator for ElementScanner<'a> {
                 "path" | "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon"
                 | "text" => {
                     return Some(Element::Shape(name, attrs.to_string()));
+                }
+                // Definition-only containers. Their content is a template no
+                // renderer ever paints, and Inkscape and Illustrator put clip
+                // paths and arrow markers in them constantly — treating an
+                // unknown tag as transparent meant a real-world SVG imported
+                // phantom geometry that appears nowhere in the picture.
+                "defs" | "clippath" | "mask" | "symbol" | "marker" | "pattern" => {
+                    if !self_closing {
+                        self.skip_subtree(&name);
+                    }
+                    continue;
                 }
                 _ => continue,
             }
@@ -736,7 +859,17 @@ fn parse_transform(s: &str) -> Xform {
     let mut t = IDENTITY;
     let mut rest = s.trim();
     while let Some(open) = rest.find('(') {
-        let name = rest[..open].trim().rsplit(|c: char| c.is_whitespace() || c == ')').next().unwrap_or("").trim();
+        // The separator between two transform functions is SVG's comma-wsp:
+        // whitespace, a comma, or both. Leaving ',' out of this split made
+        // the head of "translate(5,5),scale(2)" the single piece ",scale",
+        // which matched no function name and silently became the identity —
+        // every function after the first was dropped.
+        let name = rest[..open]
+            .trim()
+            .rsplit(|c: char| c.is_whitespace() || c == ')' || c == ',')
+            .next()
+            .unwrap_or("")
+            .trim();
         let close = match rest[open..].find(')') {
             Some(c) => open + c,
             None => break,
@@ -795,6 +928,110 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Total filled area of a region, by triangulating it.
+    fn area_of(p: &Poly2) -> f64 {
+        let (pts, tris) = crate::poly2::triangulate(p);
+        tris.iter()
+            .map(|t| {
+                let (a, b, c) = (pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]);
+                ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0
+            })
+            .sum()
+    }
+
+    fn svg_area(doc: &str) -> f64 {
+        area_of(&read_svg(doc, 96.0, 64.0, 12.0, 2.0).0)
+    }
+
+    /// A pentagram drawn as one self-crossing subpath — the canonical
+    /// fill-rule probe. Rasterised ground truth: 2273.9 nonzero, 1571.2
+    /// even-odd.
+    const STAR: &str = "M50,5 L76.4503,86.4058 L7.2025,36.0942 L92.7975,36.0942 L23.5497,86.4058 Z";
+
+    #[test]
+    fn the_fill_rule_is_respected_and_defaults_to_nonzero() {
+        // Everything was filled even-odd, so a pentagram's inner pentagon came
+        // back as a HOLE. The reference: "fill-rule (nonzero vs evenodd) is
+        // respected when resolving self-intersections and holes", and SVG's
+        // default is nonzero.
+        let doc = |extra: &str| {
+            format!(
+                "<svg width=\"100mm\" height=\"100mm\" viewBox=\"0 0 100 100\">\
+                 <path {} d=\"{}\"/></svg>",
+                extra, STAR
+            )
+        };
+        assert!((svg_area(&doc("")) - 2273.9).abs() < 2.0, "default must be nonzero: {}", svg_area(&doc("")));
+        assert!((svg_area(&doc("fill-rule=\"nonzero\"")) - 2273.9).abs() < 2.0);
+        for spell in ["fill-rule=\"evenodd\"", "style=\"fill-rule:evenodd\""] {
+            let a = svg_area(&doc(spell));
+            assert!((a - 1571.2).abs() < 2.0, "{spell} gave {a}");
+        }
+        // ...and it inherits from an enclosing <g>.
+        let inherited = format!(
+            "<svg width=\"100mm\" height=\"100mm\" viewBox=\"0 0 100 100\">\
+             <g fill-rule=\"evenodd\"><path d=\"{}\"/></g></svg>",
+            STAR
+        );
+        assert!((svg_area(&inherited) - 1571.2).abs() < 2.0);
+
+        // A genuine hole still reads as a hole under even-odd...
+        let ring = "<svg width=\"20mm\" height=\"20mm\" viewBox=\"0 0 20 20\">\
+             <path fill-rule=\"evenodd\" d=\"M0,0 H10 V10 H0 Z M3,3 H7 V7 H3 Z\"/></svg>";
+        assert!((svg_area(ring) - 84.0).abs() < 1e-6);
+        // ...and two SEPARATE overlapping shapes union rather than cancelling,
+        // which one flat even-odd region could never express.
+        let two = "<svg width=\"30mm\" height=\"30mm\" viewBox=\"0 0 30 30\">\
+             <rect x=\"0\" y=\"0\" width=\"10\" height=\"10\"/>\
+             <rect x=\"6\" y=\"6\" width=\"10\" height=\"10\"/></svg>";
+        assert!((svg_area(two) - 184.0).abs() < 1e-6, "{}", svg_area(two));
+    }
+
+    #[test]
+    fn definition_containers_paint_nothing() {
+        // An unknown tag was transparent, so <defs>/<clipPath>/<marker>
+        // content — which Inkscape and Illustrator emit constantly — imported
+        // as real geometry that is nowhere in the picture.
+        for tag in ["defs", "clipPath", "mask", "symbol", "marker", "pattern"] {
+            let doc = format!(
+                "<svg width=\"20mm\" height=\"20mm\" viewBox=\"0 0 20 20\">\
+                 <{t}><rect x=\"0\" y=\"0\" width=\"10\" height=\"10\"/></{t}>\
+                 <rect x=\"10\" y=\"10\" width=\"5\" height=\"5\"/></svg>",
+                t = tag
+            );
+            assert!((svg_area(&doc) - 25.0).abs() < 1e-6, "{tag} leaked: {}", svg_area(&doc));
+        }
+        // Nested containers end in the right place, and the scan resumes.
+        let nested = "<svg width=\"20mm\" height=\"20mm\" viewBox=\"0 0 20 20\">\
+             <defs><defs><rect x=\"0\" y=\"0\" width=\"8\" height=\"8\"/></defs>\
+             <rect x=\"0\" y=\"0\" width=\"9\" height=\"9\"/></defs>\
+             <rect x=\"10\" y=\"10\" width=\"5\" height=\"5\"/></svg>";
+        assert!((svg_area(nested) - 25.0).abs() < 1e-6, "{}", svg_area(nested));
+    }
+
+    #[test]
+    fn a_transform_list_may_be_comma_separated() {
+        // SVG's transform-list separator is comma-wsp, so a bare ',' is legal.
+        // The name split left ',' out, so the head of "translate(5,5),scale(2)"
+        // was ",scale" — an unknown function, silently the identity — and every
+        // function after the first was dropped.
+        let doc = |sep: &str| {
+            format!(
+                "<svg width=\"20mm\" height=\"20mm\" viewBox=\"0 0 20 20\">\
+                 <g transform=\"translate(5,5){}scale(2)\">\
+                 <rect x=\"0\" y=\"0\" width=\"3\" height=\"3\"/></g></svg>",
+                sep
+            )
+        };
+        for sep in [" ", ",", ", ", " , "] {
+            let (p, _) = read_svg(&doc(sep), 96.0, 64.0, 12.0, 2.0);
+            let maxx = p.contours.iter().flatten().map(|q| q[0]).fold(f64::NEG_INFINITY, f64::max);
+            assert!((area_of(&p) - 36.0).abs() < 1e-6, "sep {sep:?}: area {}", area_of(&p));
+            assert!((maxx - 11.0).abs() < 1e-6, "sep {sep:?}: maxx {maxx}");
+        }
+    }
+
     use crate::poly2::signed_area2;
 
     // Total unsigned area of a region's contours (even-odd: holes subtract).
@@ -902,7 +1139,12 @@ mod tests {
         // contour dips to a clearly-negative-in-model y near the 2nd segment
         // (t=0.5 y = -1.5 model, i.e. +1.5 after flip). The buggy version's
         // t=0.5 was -0.75 → +0.75. Check the extreme flipped-y magnitude.
-        let max_y = p.contours[0].iter().map(|q| q[1]).fold(f64::NEG_INFINITY, f64::max);
+        // Over ALL contours: the path crosses itself, so resolving it under
+        // the fill rule splits it into the two lobes it really is (this used
+        // to be one raw self-crossing contour, and contours[0] is now the
+        // lower one).
+        let max_y = p.contours.iter().flatten().map(|q| q[1]).fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!(p.contours.len(), 2, "a figure-eight resolves to two lobes");
         assert!(max_y > 1.2, "reflected control shapes the 2nd segment: max_y={}", max_y);
     }
 

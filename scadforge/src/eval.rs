@@ -850,7 +850,14 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
             // in the .csg is not the same statement — re-imported, that
             // group DOES take a slot, and an intersection() whose disabled
             // child became an empty group came back empty.
-            if *modifier == Modifier::Disable {
+            // `is_disabled(stmt)` as well as the direct case: for `%*x` the
+            // outer arm used to run on, and `csg_modify` prefixes the LAST
+            // node recorded in the enclosing frame — which for a statement
+            // that recorded nothing is the PRECEDING SIBLING. `cube(10);
+            // %*sphere(5);` exported `%cube(...)`, and since `%` is
+            // background and export_mesh skips background shapes, the
+            // re-import of a design that rendered a cube produced nothing.
+            if *modifier == Modifier::Disable || is_disabled(stmt) {
                 return Vec::new();
             }
             // The others fully instantiate the subtree (side effects run),
@@ -2432,8 +2439,12 @@ fn eval_children_grouped(children: &[Stmt], parent: &Rc<Scope>, ctx: &mut Ctx) -
             // FIRST child of a difference() promote the second to minuend.
             // Pushing an empty group for it made difference() { *cube(20);
             // cube(10); } an empty minuend, and the whole thing vanished.
-            // It is still executed, so the export records its empty frame.
-            Stmt::Modified { modifier: Modifier::Disable, .. } => {
+            //
+            // Modifiers stack, so `%*x` is disabled too. Matching only a
+            // DIRECT Disable let those push an empty operand that the
+            // recorder wrote no node for, and the render and the export then
+            // disagreed about how many operands the enclosing boolean had.
+            s if is_disabled(s) => {
                 exec_stmt(stmt, &scope, ctx);
             }
             _ => groups.push(exec_stmt(stmt, &scope, ctx)),
@@ -2441,6 +2452,21 @@ fn eval_children_grouped(children: &[Stmt], parent: &Rc<Scope>, ctx: &mut Ctx) -
     }
     ctx.dynv = saved_dyn;
     groups
+}
+
+/// Does this statement's modifier stack contain `*`?
+///
+/// Modifiers are grammar-recursive — `%*x`, `!*x` and `#*x` all parse — and
+/// the reference is explicit that "when * is present it dominates: the
+/// subtree is simply gone" and that "* wins over !, #, % on the same
+/// statement". Both places that act on a disabled statement matched only a
+/// DIRECT `Modifier::Disable` and so missed every stacked spelling.
+fn is_disabled(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Modified { modifier: Modifier::Disable, .. } => true,
+        Stmt::Modified { stmt, .. } => is_disabled(stmt),
+        _ => false,
+    }
 }
 
 /// A matrix's rows as f64 (each row a Value::Vector of numbers).
@@ -5360,6 +5386,56 @@ mod tests {
         assert!(tree.contains("%sphere("), "background kept:\n{}", tree);
         assert!(!tree.contains("r = 3"), "disabled subtree must not appear:\n{}", tree);
         assert!(csg_of("!cube(2); sphere(1);").contains("!cube("), "root kept");
+    }
+
+    #[test]
+    fn a_star_anywhere_in_a_modifier_stack_dominates() {
+        // The reference: modifiers are grammar-recursive, "when * is present
+        // it dominates — the subtree is simply gone", and "* wins over !, #,
+        // % on the same statement". Both places that act on a disabled
+        // statement matched only a DIRECT Modifier::Disable.
+        //
+        // csg_modify prefixes the LAST node recorded in the enclosing frame,
+        // so for `%*x` — which records nothing — the % landed on the
+        // PRECEDING SIBLING. `cube(10); %*sphere(5);` exported `%cube(...)`,
+        // and since export_mesh skips background shapes the re-import of a
+        // design that rendered a cube produced nothing at all.
+        for stack in ["%*", "!*", "#*", "*"] {
+            let src = format!("cube(10);\n{stack}sphere(5);\n");
+            let tree = csg_of(&src);
+            assert!(!tree.contains('%'), "{stack}: modifier leaked onto a sibling:\n{tree}");
+            assert!(!tree.contains("sphere"), "{stack}: disabled subtree recorded:\n{tree}");
+            let out = run(&src);
+            assert!((total_volume(&out) - 1000.0).abs() < 1e-9, "{stack}: {}", total_volume(&out));
+            assert!(
+                (total_volume(&run(&tree)) - 1000.0).abs() < 1e-9,
+                "{stack}: re-import disagrees with the render"
+            );
+        }
+
+        // ...and a disabled child takes NO operand slot, whatever it is
+        // stacked with: "disabling the FIRST child of a difference() promotes
+        // the next child to minuend". The nested spellings used to push an
+        // empty operand that the recorder wrote no node for, so the render
+        // and the export disagreed about how many operands the boolean had.
+        for stack in ["%*", "!*", "#*", "*"] {
+            let src = format!("difference() {{\n  {stack}cube(20);\n  sphere(10, $fn = 16);\n}}\n");
+            let out = run(&src);
+            let lone = total_volume(&run("sphere(10, $fn = 16);"));
+            assert!(
+                (total_volume(&out) - lone).abs() < 1e-6,
+                "{stack}: the sphere must be promoted to minuend, got {}",
+                total_volume(&out)
+            );
+            assert!(
+                (total_volume(&run(&csg_of(&src))) - lone).abs() < 1e-6,
+                "{stack}: re-import disagrees"
+            );
+        }
+
+        // The unstacked modifiers still mark their own node.
+        assert!(csg_of("%sphere(5);").contains("%sphere"));
+        assert!(csg_of("cube(1); #sphere(5);").contains("#sphere"));
     }
 
     #[test]
