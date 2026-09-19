@@ -47,6 +47,21 @@ pub struct Token {
     pub pos: usize,
 }
 
+/// Exactly `n` hex digits at `at`, as a number — or None if they are not
+/// there or not all hex.
+fn hex_at(b: &[u8], at: usize, n: usize) -> Option<u32> {
+    b.get(at..at + n)
+        .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+        .and_then(|h| std::str::from_utf8(h).ok())
+        .and_then(|h| u32::from_str_radix(h, 16).ok())
+}
+
+/// Append one code point's UTF-8 bytes.
+fn push_utf8(buf: &mut Vec<u8>, c: char) {
+    let mut tmp = [0u8; 4];
+    buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     let b = src.as_bytes();
     let mut out = Vec::new();
@@ -109,7 +124,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b'"' => {
                 let start = i;
                 i += 1;
-                let mut s = String::new();
+                // BYTES, not chars. `\x##` is a BYTE escape per the reference
+                // ("two hex digits, one byte"), which is what makes a UTF-8
+                // sequence spelled out byte by byte — "\xc3\xa9" for "é" —
+                // come back as ONE code point. Pushing char::from_u32(0xC3)
+                // instead produced two, and the code's own comment said
+                // "one byte" while doing otherwise.
+                let mut buf: Vec<u8> = Vec::new();
                 loop {
                     match b.get(i) {
                         Some(b'"') => {
@@ -118,113 +139,89 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         }
                         Some(b'\\') => match b.get(i + 1) {
                             Some(b'"') => {
-                                s.push('"');
+                                buf.push(b'"');
                                 i += 2;
                             }
                             Some(b'\\') => {
-                                s.push('\\');
+                                buf.push(b'\\');
                                 i += 2;
                             }
                             Some(b'n') => {
-                                s.push('\n');
+                                buf.push(b'\n');
                                 i += 2;
                             }
                             Some(b't') => {
-                                s.push('\t');
+                                buf.push(b'\t');
                                 i += 2;
                             }
                             Some(b'r') => {
-                                s.push('\r');
+                                buf.push(b'\r');
                                 i += 2;
                             }
-                            Some(b'x') => {
-                                // `\xNN` — exactly two hex digits → one byte.
-                                // Supported since 2015.03 alongside \u/\U; it
-                                // was missing, and because a lex error is
-                                // FATAL a single `"\x41"` anywhere in a file
-                                // produced no geometry and no echoes at all.
-                                match b
-                                    .get(i + 2..i + 4)
-                                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
-                                    .and_then(|h| std::str::from_utf8(h).ok())
-                                    .and_then(|h| u32::from_str_radix(h, 16).ok())
-                                    .and_then(char::from_u32)
-                                {
-                                    Some(ch) => {
-                                        s.push(ch);
-                                        i += 4;
-                                    }
-                                    None => {
-                                        return Err(format!(
-                                            "bad \\x escape in string at byte {}",
-                                            i
-                                        ))
-                                    }
+                            // `\xNN` — exactly two hex digits → ONE byte.
+                            Some(b'x') => match hex_at(b, i + 2, 2) {
+                                Some(v) => {
+                                    buf.push(v as u8);
+                                    i += 4;
                                 }
-                            }
-                            Some(b'U') => {
-                                // `\UNNNNNN` — exactly six hex digits. The only
-                                // spelling that reaches astral code points,
-                                // since surrogate pairs are rejected.
-                                match b
-                                    .get(i + 2..i + 8)
-                                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
-                                    .and_then(|h| std::str::from_utf8(h).ok())
-                                    .and_then(|h| u32::from_str_radix(h, 16).ok())
-                                    .and_then(char::from_u32)
-                                {
-                                    Some(ch) => {
-                                        s.push(ch);
-                                        i += 8;
-                                    }
-                                    None => {
-                                        return Err(format!(
-                                            "bad \\U escape in string at byte {}",
-                                            i
-                                        ))
-                                    }
+                                None => {
+                                    buf.push(b'\\');
+                                    i += 1;
                                 }
-                            }
-                            Some(b'u') => {
-                                // `\uXXXX` — exactly four hex digits → one
-                                // Unicode code point (rejecting surrogates and
-                                // non-hex, per the reference's escape set).
-                                match b
-                                    .get(i + 2..i + 6)
-                                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
-                                    .and_then(|h| std::str::from_utf8(h).ok())
-                                    .and_then(|h| u32::from_str_radix(h, 16).ok())
-                                    .and_then(char::from_u32)
-                                {
-                                    Some(ch) => {
-                                        s.push(ch);
-                                        i += 6;
-                                    }
-                                    None => {
-                                        return Err(format!(
-                                            "bad \\u escape in string at byte {}",
-                                            i
-                                        ))
-                                    }
+                            },
+                            // `\uXXXX` / `\UXXXXXX` — a code point, encoded.
+                            Some(b'u') => match hex_at(b, i + 2, 4).and_then(char::from_u32) {
+                                Some(c) => {
+                                    push_utf8(&mut buf, c);
+                                    i += 6;
                                 }
+                                None => {
+                                    buf.push(b'\\');
+                                    i += 1;
+                                }
+                            },
+                            Some(b'U') => match hex_at(b, i + 2, 6).and_then(char::from_u32) {
+                                Some(c) => {
+                                    push_utf8(&mut buf, c);
+                                    i += 8;
+                                }
+                                None => {
+                                    buf.push(b'\\');
+                                    i += 1;
+                                }
+                            },
+                            // An unrecognized escape KEEPS ITS CHARACTERS: the
+                            // backslash goes in here and the next turn of the
+                            // loop copies the character after it. A lex error
+                            // is fatal to the entire file, so one stray `\q` —
+                            // or the backslashes in
+                            // import("C:\Users\me\part.stl") — used to produce
+                            // no geometry, no echoes and no output at all. The
+                            // reference lists exactly ONE string-literal error,
+                            // the unterminated string, and believes an unknown
+                            // escape keeps the character.
+                            Some(_) => {
+                                buf.push(b'\\');
+                                i += 1;
                             }
-                            _ => return Err(format!("bad escape in string at byte {}", i)),
+                            None => return Err(format!("unterminated string at byte {}", start)),
                         },
-                        Some(&ch) if ch < 0x80 => {
-                            s.push(ch as char);
+                        Some(&ch) => {
+                            // Every other byte is copied through, so a
+                            // multi-byte character survives intact without
+                            // being decoded and re-encoded.
+                            buf.push(ch);
                             i += 1;
-                        }
-                        Some(_) => {
-                            // Multi-byte UTF-8: decode the whole character so
-                            // string values hold code points, not raw bytes.
-                            let ch = src[i..].chars().next().unwrap();
-                            s.push(ch);
-                            i += ch.len_utf8();
                         }
                         None => return Err(format!("unterminated string at byte {}", start)),
                     }
                 }
-                out.push(Token { tok: Tok::Str(s), pos: start });
+                // `\x` can spell a byte that is not valid UTF-8 on its own;
+                // replace such a run rather than losing the whole string.
+                out.push(Token {
+                    tok: Tok::Str(String::from_utf8_lossy(&buf).into_owned()),
+                    pos: start,
+                });
             }
             b'0'..=b'9' | b'.' => {
                 let start = i;
@@ -257,6 +254,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     && (b[i].is_ascii_alphanumeric() || b[i] == b'_')
                 {
                     i += 1;
+                }
+                // "$ alone is not an identifier" — the reference states it
+                // flatly. A bare `$` was lexed as the identifier "$", and
+                // since every $-name resolves to a silent undef it was then
+                // accepted both as an expression and as an assignment target
+                // with no diagnostic anywhere.
+                if b[start] == b'$' && i == start + 1 {
+                    return Err(format!("'$' alone is not an identifier, at byte {}", start));
                 }
                 out.push(Token { tok: Tok::Ident(src[start..i].to_string()), pos: start });
             }
@@ -315,10 +320,49 @@ mod tests {
             Tok::Str(s) => assert_eq!(s, "Ωé"),
             other => panic!("expected string, got {:?}", other),
         }
-        // Malformed \u (short / non-hex) and an unknown escape are errors.
-        assert!(lex("\"\\u03z9\";").is_err());
-        assert!(lex("\"\\u03\";").is_err());
-        assert!(lex("\"\\q\";").unwrap_err().contains("bad escape"));
+        // `\x##` is a BYTE escape, so a UTF-8 sequence spelled out byte by
+        // byte comes back as one code point.
+        match &lex("\"\\xc3\\xa9\";").unwrap()[0].tok {
+            Tok::Str(s) => assert_eq!(s, "é"),
+            other => panic!("expected string, got {:?}", other),
+        }
+        match &lex("\"\\x41\";").unwrap()[0].tok {
+            Tok::Str(s) => assert_eq!(s, "A"),
+            other => panic!("expected string, got {:?}", other),
+        }
+        // A malformed or unknown escape KEEPS ITS CHARACTERS. It used to be a
+        // fatal lex error, and a lex error kills the whole file: one stray
+        // `\q`, or the backslashes in a Windows path, produced no geometry, no
+        // echoes and no output at all. The reference lists exactly one
+        // string-literal error, the unterminated string.
+        for (src, want) in [
+            ("\"\\u03z9\";", "\\u03z9"),
+            ("\"\\u03\";", "\\u03"),
+            ("\"\\q\";", "\\q"),
+            ("\"C:\\Users\\me\\part.stl\";", "C:\\Users\\me\\part.stl"),
+            ("\"\\xzz\";", "\\xzz"),
+        ] {
+            match &lex(src).unwrap_or_else(|e| panic!("{src} must lex, got {e}"))[0].tok {
+                Tok::Str(s) => assert_eq!(s, want, "{src}"),
+                other => panic!("expected string, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn a_bare_dollar_is_not_an_identifier() {
+        // The reference states it flatly, with no VERIFY marker. A bare `$`
+        // lexed as the identifier "$", and since every $-name resolves to a
+        // silent undef it was then accepted both as an expression and as an
+        // assignment target with no diagnostic anywhere.
+        for src in ["echo($);", "$ = 7;", "x = $ + 1;"] {
+            let e = lex(src).unwrap_err();
+            assert!(e.contains("'$' alone"), "{src} gave: {e}");
+        }
+        // Real $-names are untouched.
+        for src in ["echo($fn);", "$t = 1;", "f($_a);", "$fn2 = 3;"] {
+            assert!(lex(src).is_ok(), "{src} must lex");
+        }
     }
 
     #[test]

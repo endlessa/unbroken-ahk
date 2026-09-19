@@ -169,7 +169,14 @@ impl Camera {
     fn read_from(dynv: &Rc<DynScope>, base: Camera) -> Camera {
         let v3 = |name: &str, fallback: [f64; 3]| -> [f64; 3] {
             match dynv.lookup(name) {
-                Some(v) => v.as_vec3().filter(|a| a.iter().all(|c| c.is_finite())).unwrap_or(fallback),
+                // as_vec3_EXACT: `as_vec3` accepts a vector of length 0..3 and
+                // zero-fills, so `$vpt = [10, 20];` moved the camera to
+                // [10, 20, 0] — the exact wrong shape the doc comment above
+                // promises to leave alone.
+                Some(v) => v
+                    .as_vec3_exact()
+                    .filter(|a| a.iter().all(|c| c.is_finite()))
+                    .unwrap_or(fallback),
                 None => fallback,
             }
         };
@@ -1437,21 +1444,22 @@ fn call_builtin_module(
         "translate" => {
             let matrix = match bound.get("v").and_then(Value::as_vec3) {
                 Some(v) => Some(geom::translation(v)),
-                None => {
-                    ctx.warn("translate: v must be a vector like [x, y, z]");
-                    None
-                }
+                None => degrade(ctx, cannot_convert("translate", bound.get("v"))),
             };
             transform_children(children, scope, ctx, matrix)
         }
         "scale" => {
             let matrix = match bound.get("v") {
                 Some(Value::Num(s)) => Some(geom::scaling([*s, *s, *s])),
-                Some(v @ Value::Vector(_)) => v.as_vec3_fill(1.0).map(geom::scaling),
-                _ => {
-                    ctx.warn("scale: v must be a number or vector");
-                    None
-                }
+                // `.map()` here swallowed the failure whole: a vector holding
+                // a non-number, or one longer than 3, produced None and
+                // control never reached the `_` arm, so the subtree vanished
+                // with NO diagnostic of any kind.
+                Some(v @ Value::Vector(_)) => match v.as_vec3_fill(1.0) {
+                    Some(f) => Some(geom::scaling(f)),
+                    None => degrade(ctx, cannot_convert("scale", bound.get("v"))),
+                },
+                _ => degrade(ctx, cannot_convert("scale", bound.get("v"))),
             };
             transform_children(children, scope, ctx, matrix)
         }
@@ -1459,23 +1467,14 @@ fn call_builtin_module(
             let matrix = match (bound.get("a"), bound.get("v")) {
                 (Some(Value::Num(deg)), Some(axis @ Value::Vector(_))) => match axis.as_vec3() {
                     Some(axis) => Some(geom::rotation_axis(*deg, axis)),
-                    None => {
-                        ctx.warn("rotate: v must be a numeric vector");
-                        None
-                    }
+                    None => degrade(ctx, rotate_problem(bound.get("v"))),
                 },
                 (Some(Value::Num(deg)), _) => Some(geom::rotation_xyz([0.0, 0.0, *deg])),
                 (Some(vec @ Value::Vector(_)), _) => match vec.as_vec3() {
                     Some(deg) => Some(geom::rotation_xyz(deg)),
-                    None => {
-                        ctx.warn("rotate: a must be a scalar or [x, y, z] degrees");
-                        None
-                    }
+                    None => degrade(ctx, rotate_problem(bound.get("a"))),
                 },
-                _ => {
-                    ctx.warn("rotate: missing angle");
-                    None
-                }
+                _ => degrade(ctx, rotate_problem(bound.get("a"))),
             };
             transform_children(children, scope, ctx, matrix)
         }
@@ -1486,10 +1485,7 @@ fn call_builtin_module(
                     Some(geom::identity()) // pass children through
                 }
                 Some(v) => Some(geom::mirror(v)),
-                None => {
-                    ctx.warn("mirror: v must be a vector like [x, y, z]");
-                    None
-                }
+                None => degrade(ctx, cannot_convert("mirror", bound.get("v"))),
             };
             transform_children(children, scope, ctx, matrix)
         }
@@ -1509,15 +1505,9 @@ fn call_builtin_module(
                             None
                         }
                     }
-                    None => {
-                        ctx.warn("multmatrix: m must be a list of numeric rows");
-                        None
-                    }
+                    None => degrade(ctx, cannot_convert("multmatrix", bound.get("m"))),
                 },
-                _ => {
-                    ctx.warn("multmatrix: m must be a 4x4 (or 3x4) matrix");
-                    None
-                }
+                _ => degrade(ctx, cannot_convert("multmatrix", bound.get("m"))),
             };
             transform_children(children, scope, ctx, matrix)
         }
@@ -3090,6 +3080,44 @@ pub fn export_string(out: &EvalOutput, format: &str) -> Result<String, String> {
         other => Err(format!("unsupported export format '{}'", other)),
     }
 }
+
+/// A transform whose argument will not convert degrades to the IDENTITY and
+/// still instantiates its children. The reference says so for every one of
+/// them — translate: "conversion WARNING + identity; children still
+/// rendered"; scale: "children rendered untransformed"; mirror: "conversion
+/// WARNING + identity, children still rendered"; multmatrix: "warning +
+/// identity" — and none of those bullets is VERIFY-marked. Dropping the
+/// subtree instead turned a typo into an empty export with nothing but one
+/// warning to explain where the model went.
+///
+/// Only a matrix that comes out NON-FINITE removes geometry, and
+/// `transform_children` handles that case; these two must not be conflated,
+/// which is exactly what a bare `None` did.
+fn degrade(ctx: &mut Ctx, msg: String) -> Option<geom::Mat4> {
+    ctx.warn(msg);
+    Some(geom::identity())
+}
+
+/// The reference's approximate wording for a transform argument that will not
+/// convert, quoted the way the value was written.
+fn cannot_convert(module: &str, v: Option<&Value>) -> String {
+    format!(
+        "WARNING: Unable to convert {}({}) parameter to a vec3 or vec2 of numbers",
+        module,
+        v.map(|v| fmt_value(v, true)).unwrap_or_else(|| "undef".into())
+    )
+}
+
+/// rotate's conversion warning reads differently from the others, per the
+/// reference ("transform-conversion warnings for rotate historically differ
+/// in wording from translate's").
+fn rotate_problem(v: Option<&Value>) -> String {
+    format!(
+        "WARNING: Problem converting rotate({}) parameter",
+        v.map(|v| fmt_value(v, true)).unwrap_or_else(|| "undef".into())
+    )
+}
+
 
 fn transform_children(
     children: &[Stmt],
@@ -5311,11 +5339,21 @@ mod tests {
 
     #[test]
     fn csg_drops_a_subtree_the_render_dropped() {
-        // A bad transform argument drops its children from the render. The
-        // export must drop them too — an unnamed frame that spliced its
-        // children upward would draw a cube the preview never showed.
-        let tree = csg_of("translate(\"nope\") cube(3);");
+        // A non-finite matrix drops its children from the render. The export
+        // must drop them too — an unnamed frame that spliced its children
+        // upward would draw a cube the preview never showed.
+        let tree = csg_of("translate([0, 0, 0/0]) cube(3);");
         assert!(!tree.contains("cube"), "dropped subtree leaked into the export:\n{}", tree);
+        // An argument that merely fails to CONVERT is not a drop: the child
+        // renders at the identity, so the export has to carry it.
+        let tree = csg_of("translate(\"nope\") cube(3);");
+        assert!(tree.contains("cube"), "identity-degraded child lost from the export:\n{}", tree);
+
+        // Same rule one level down: `cube([3, 4])` is a conversion failure the
+        // RENDERER rejects outright, so the export records the empty operand.
+        // csgfmt used the padding `as_vec3` and exported cube(size=[3,4,0]).
+        let tree = csg_of("cube([3, 4]);");
+        assert!(!tree.contains("cube"), "cube([3,4]) drew nothing but exported:\n{}", tree);
     }
 
     #[test]
@@ -6438,6 +6476,26 @@ mod tests {
     }
 
     #[test]
+    fn the_viewport_camera_ignores_a_wrong_shaped_assignment() {
+        // `as_vec3` accepts a vector of length 0..3 and zero-fills, so
+        // `$vpt = [10, 20];` moved the camera to [10, 20, 0] — the exact
+        // wrong shape read_from's own doc comment promises to leave alone.
+        let cam = |src: &str| {
+            evaluate(&parse(src).unwrap()).camera.unwrap_or(Camera::DEFAULT)
+        };
+        let d = Camera::DEFAULT;
+        assert_eq!(cam("$vpt = [10, 20]; cube(1);").trans, d.trans);
+        assert_eq!(cam("$vpr = [55]; cube(1);").rot, d.rot);
+        assert_eq!(cam("$vpt = 5; cube(1);").trans, d.trans);
+        assert_eq!(cam("$vpt = [1, 2, 3, 4]; cube(1);").trans, d.trans);
+        // A well-shaped one still moves it, and the variable reads back
+        // whatever the script wrote either way.
+        assert_eq!(cam("$vpt = [1, 2, 3]; cube(1);").trans, [1.0, 2.0, 3.0]);
+        let out = run("$vpt = [10, 20]; echo($vpt);");
+        assert!(echo_stream(&out).contains("[10, 20]"), "{}", echo_stream(&out));
+    }
+
+    #[test]
     fn a_bare_semicolon_is_an_empty_statement() {
         // The reference: "';' alone is an empty instantiation". Rejecting it
         // failed the WHOLE file over one stray character.
@@ -6635,10 +6693,50 @@ mod tests {
     }
 
     #[test]
-    fn bad_transform_args_drop_the_subtree_not_misplace_it() {
-        let out = run("translate(5) cube(1);");
-        assert!(out.shapes.is_empty());
-        assert!(out.warnings.iter().any(|w| w.contains("translate")));
+    fn a_transform_that_cannot_convert_degrades_to_the_identity() {
+        // This test used to assert the opposite — that the subtree is DROPPED
+        // — which is the implementation's old behaviour, not the reference's.
+        // The reference says for each of these, without a VERIFY marker, that
+        // the children are still rendered untransformed: translate
+        // "conversion WARNING + identity; children still rendered", scale
+        // "children rendered untransformed", mirror "conversion WARNING +
+        // identity, children still rendered", multmatrix "warning + identity".
+        for (src, vol) in [
+            ("translate(5) cube(10);", 1000.0),
+            ("translate([1, 2, \"a\"]) cube(10);", 1000.0),
+            ("scale([2, \"a\"]) cube(10);", 1000.0),
+            ("scale([1, 2, 3, 4]) cube(10);", 1000.0),
+            ("mirror(\"x\") cube(3);", 27.0),
+            ("rotate(\"x\") cube(2);", 8.0),
+            ("multmatrix(5) cube(4);", 64.0),
+        ] {
+            let out = run(src);
+            assert!(!out.warnings.is_empty(), "{src} must warn");
+            assert!(
+                (total_volume(&out) - vol).abs() < 1e-6,
+                "{src}: expected the child at the identity (volume {vol}), got {}",
+                total_volume(&out)
+            );
+        }
+        // `scale` reached its conversion failure through a `.map()` that
+        // swallowed it whole, so it dropped the subtree with NO warning at all.
+        let out = run("scale([2, \"a\"]) cube(10);");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("scale")),
+            "a silent drop is the worst outcome: {:?}",
+            out.warnings
+        );
+        // A NON-FINITE matrix is the other failure mode and still removes the
+        // subtree — the two must not be conflated, which is what the bare
+        // `None` did.
+        for src in [
+            "translate([0, 0, 0/0]) cube(10);",
+            "multmatrix([[1,0,0,1/0],[0,1,0,0],[0,0,1,0]]) cube(5);",
+        ] {
+            let out = run(src);
+            assert_eq!(total_volume(&out), 0.0, "{src} must drop");
+            assert!(out.warnings.iter().any(|w| w.contains("NaN/Infinity")), "{src}");
+        }
     }
 
     #[test]

@@ -257,7 +257,12 @@ pub fn builtin_head(module: &str, b: &HashMap<String, Value>, f: Frags) -> Optio
             let size = match b.get("size") {
                 Some(Value::Num(s)) => [*s, *s, *s],
                 Some(Value::Undef) | None => [1.0, 1.0, 1.0],
-                Some(v @ Value::Vector(_)) => match v.as_vec3() {
+                // as_vec3_EXACT, like the renderer: `as_vec3` zero-pads a
+                // 2-vector, so `cube([3, 4]);` — which the renderer warns
+                // about and draws nothing for — exported
+                // `cube(size = [3, 4, 0])`. That is the very failure the
+                // comment above says was fixed, still live one call over.
+                Some(v @ Value::Vector(_)) => match v.as_vec3_exact() {
                     Some(s) => s,
                     None => return None,
                 },
