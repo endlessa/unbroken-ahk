@@ -3315,26 +3315,50 @@ fn resolve_fragments(r: f64, ctx: &mut Ctx) -> u32 {
     geom::fragments(r, fn_, fa, fs)
 }
 
+/// The reference's wording for a colour argument it cannot read, Wikipedia
+/// link and all. `shown` is the value as it would echo.
+fn unparseable_color(shown: &str) -> String {
+    format!(
+        "WARNING: Unable to parse color \"{}\". \
+         Please see https://en.wikipedia.org/wiki/Web_colors for supported values.",
+        shown
+    )
+}
+
 fn parse_color(c: Option<&Value>, alpha: Option<&Value>, ctx: &mut Ctx) -> Option<[f64; 4]> {
     let mut rgba = match c {
+        // c omitted or undef is a no-op grouping node with NO warning: the
+        // children keep whatever colour they inherited. Warning here made
+        // `color(undef)` — the idiom for "colour only sometimes" — noisy.
+        None | Some(Value::Undef) => return None,
         Some(Value::Vector(items)) if items.len() == 3 || items.len() == 4 => {
             let mut v = [0.0, 0.0, 0.0, 1.0];
             for (i, item) in items.iter().enumerate() {
-                v[i] = item.as_num()?;
+                match item.as_num() {
+                    Some(n) => v[i] = n,
+                    // A non-numeric component used to propagate `None` out of
+                    // the function through `?`, SILENTLY swallowing the
+                    // parameter: color([1, "a", 0]) warned about nothing at
+                    // all and the child came out uncoloured.
+                    None => {
+                        ctx.warn(unparseable_color(&fmt_value(c?, true)));
+                        return None;
+                    }
+                }
             }
             v
         }
-        Some(Value::Str(name)) => named_color(name).or_else(|| hex_color(name)).or_else(|| {
-            // The reference's wording, Wikipedia link and all.
-            ctx.warn(format!(
-                "WARNING: Unable to parse color \"{}\". \
-                 Please see https://en.wikipedia.org/wiki/Web_colors for supported values.",
-                name
-            ));
-            None
-        })?,
-        _ => {
-            ctx.warn("color: expected a name, \"#hex\", or [r, g, b(, a)]");
+        Some(Value::Str(name)) => named_color(name)
+            .or_else(|| hex_color(name))
+            .or_else(|| {
+                ctx.warn(unparseable_color(name));
+                None
+            })?,
+        // A number, boolean, range, or a vector of the wrong length: the same
+        // "Unable to parse color" the reference gives, not a message of our
+        // own invention.
+        Some(v) => {
+            ctx.warn(unparseable_color(&fmt_value(v, true)));
             return None;
         }
     };
@@ -6339,6 +6363,45 @@ mod tests {
                 out.warnings
             );
             assert!((total_volume(&out) - 8.0).abs() < 1e-9, "the child is still rendered");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_color_warns_once_in_the_references_words() {
+        // Three separate defects lived in this one match: `color()` and
+        // `color(undef)` — documented as a silent no-op grouping node —
+        // warned; a vector with a NON-NUMERIC component propagated None out
+        // through `?` and warned about nothing at all; and every non-string
+        // value got a message of our own invention instead of the
+        // reference's "Unable to parse color".
+        for quiet in ["color() cube(2);", "color(undef) cube(2);"] {
+            let out = run(quiet);
+            assert!(out.warnings.is_empty(), "{quiet} must be silent: {:?}", out.warnings);
+            assert!((total_volume(&out) - 8.0).abs() < 1e-9);
+        }
+        for bad in [
+            "[1, 0]",
+            "[1, 0, 0, 0.5, 9]",
+            "[1, \"a\", 0]",
+            "true",
+            "42",
+            "[0:2]",
+        ] {
+            let out = run(&format!("color({}) cube(2);", bad));
+            assert_eq!(out.warnings.len(), 1, "exactly one warning for {bad}: {:?}", out.warnings);
+            assert!(
+                out.warnings[0].starts_with("WARNING: Unable to parse color \"")
+                    && out.warnings[0].contains("en.wikipedia.org/wiki/Web_colors"),
+                "{bad} gave: {}",
+                out.warnings[0]
+            );
+            // The child is still rendered, uncoloured.
+            assert!((total_volume(&out) - 8.0).abs() < 1e-9, "{bad} drew nothing");
+        }
+        // The readable forms stay silent.
+        for good in ["\"red\"", "\"#f00\"", "\"#ff000080\"", "[1, 0, 0]", "[1, 0, 0, 0.5]"] {
+            let out = run(&format!("color({}) cube(2);", good));
+            assert!(out.warnings.is_empty(), "{good}: {:?}", out.warnings);
         }
     }
 
