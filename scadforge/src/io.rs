@@ -39,6 +39,17 @@ fn regions_bbox(regions: &[Poly2]) -> ([f64; 2], [f64; 2]) {
 /// the drawing appears upright in an SVG viewer, matching the import
 /// convention. Coordinates are millimetres.
 pub fn write_svg(regions: &[Poly2]) -> String {
+    // Resolve every region to its true filled area FIRST, then combine.
+    // The contours are written into one even-odd path, which is only a
+    // faithful drawing of what was rendered if the set really is even-odd:
+    // a text() region is filled by the font's winding, so its overlapping
+    // strokes came out with holes punched where they crossed, and two
+    // separate top-level squares that overlapped exported with their
+    // overlap cut away.
+    let merged = crate::csg2::union2(
+        &regions.iter().map(crate::poly2::sanitize).collect::<Vec<_>>(),
+    );
+    let regions: &[Poly2] = std::slice::from_ref(&merged);
     let (lo, hi) = regions_bbox(regions);
     let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
     let mut d = String::new();
@@ -180,6 +191,9 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
             pairs.push((c, val.trim().to_string()));
         }
     }
+    // A POLYLINE run in progress: its closed flag and the vertices gathered
+    // from the VERTEX entities that follow it.
+    let mut open_polyline: Option<(bool, Vec<[f64; 2]>)> = None;
     // Walk entities: an entity starts at a `0` code naming its type.
     let mut i = 0;
     while i < pairs.len() {
@@ -189,6 +203,13 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
         }
         let etype = pairs[i].1.to_ascii_uppercase();
         i += 1;
+        // Any entity other than the run's own VERTEX/SEQEND ends the run,
+        // so a file that omits SEQEND still yields its polyline.
+        if open_polyline.is_some() && etype != "VERTEX" && etype != "SEQEND" {
+            if let Some((closed, verts)) = open_polyline.take() {
+                emit_polyline(verts, closed, &mut contours, &mut segs);
+            }
+        }
         // Collect this entity's codes until the next `0`.
         let start = i;
         while i < pairs.len() && pairs[i].0 != 0 {
@@ -210,7 +231,7 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
                 }
                 segs.push(([x1, y1], [x2, y2]));
             }
-            "LWPOLYLINE" | "POLYLINE" => {
+            "LWPOLYLINE" => {
                 let mut verts: Vec<[f64; 2]> = Vec::new();
                 let mut closed = false;
                 let mut cur_x = None;
@@ -227,14 +248,39 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
                         _ => {}
                     }
                 }
-                if verts.len() >= 2 {
-                    if closed && verts.len() >= 3 {
-                        contours.push(verts);
-                    } else {
-                        for w in verts.windows(2) {
-                            segs.push((w[0], w[1]));
-                        }
+                emit_polyline(verts, closed, &mut contours, &mut segs);
+            }
+            // The old-style POLYLINE carries NO vertices of its own: each one
+            // is a separate VERTEX entity that FOLLOWS it, the run ending at
+            // SEQEND. Reading it like an LWPOLYLINE found an empty body, so
+            // every such polyline vanished and each VERTEX was then reported
+            // as an unsupported entity.
+            "POLYLINE" => {
+                let mut closed = false;
+                for (c, v) in body {
+                    if *c == 70 {
+                        closed = (v.parse::<f64>().unwrap_or(0.0) as i64) & 1 != 0;
                     }
+                }
+                open_polyline = Some((closed, Vec::new()));
+            }
+            "VERTEX" if open_polyline.is_some() => {
+                let (mut x, mut y) = (0.0, 0.0);
+                for (c, v) in body {
+                    let f = v.parse::<f64>().unwrap_or(0.0);
+                    match c {
+                        10 => x = f,
+                        20 => y = f,
+                        _ => {}
+                    }
+                }
+                if let Some((_, verts)) = open_polyline.as_mut() {
+                    verts.push([x, y]);
+                }
+            }
+            "SEQEND" => {
+                if let Some((closed, verts)) = open_polyline.take() {
+                    emit_polyline(verts, closed, &mut contours, &mut segs);
                 }
             }
             "CIRCLE" => {
@@ -252,8 +298,8 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
                     let n = crate::geom::fragments(r, fn_, fa, fs).max(3);
                     let ring = (0..n)
                         .map(|k| {
-                            let a = std::f64::consts::TAU * k as f64 / n as f64;
-                            [cx + r * a.cos(), cy + r * a.sin()]
+                            let (sa, ca) = crate::trig::sin_cos_deg(360.0 * k as f64 / n as f64);
+                            [cx + r * ca, cy + r * sa]
                         })
                         .collect();
                     contours.push(ring);
@@ -279,8 +325,8 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
                         .max(1.0) as u32;
                     let mut prev: Option<[f64; 2]> = None;
                     for k in 0..=n {
-                        let a = (a0 + sweep * k as f64 / n as f64).to_radians();
-                        let p = [cx + r * a.cos(), cy + r * a.sin()];
+                        let (sa, ca) = crate::trig::sin_cos_deg(a0 + sweep * k as f64 / n as f64);
+                        let p = [cx + r * ca, cy + r * sa];
                         if let Some(q) = prev {
                             segs.push((q, p));
                         }
@@ -288,12 +334,17 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
                     }
                 }
             }
-            "SECTION" | "ENDSEC" | "EOF" | "TABLE" | "ENDTAB" | "VERTEX" | "SEQEND"
+            // A VERTEX outside any POLYLINE run has nothing to attach to.
+            "SECTION" | "ENDSEC" | "EOF" | "TABLE" | "ENDTAB" | "VERTEX"
             | "BLOCK" | "ENDBLK" | "" => {}
             other => {
                 unsupported.insert(other.to_string());
             }
         }
+    }
+    // A POLYLINE whose run reached end-of-file without a SEQEND.
+    if let Some((closed, verts)) = open_polyline.take() {
+        emit_polyline(verts, closed, &mut contours, &mut segs);
     }
     // Stitch the loose segments (LINE / ARC / open polylines) into closed loops.
     contours.extend(stitch_loops(&segs));
@@ -301,6 +352,28 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
         warnings.push(format!("WARNING: DXF entity '{}' is not supported; skipped.", u));
     }
     (Poly2::new(contours), warnings)
+}
+
+/// File a finished polyline: a closed one with at least three vertices is a
+/// contour outright; anything else contributes its edges to the segment soup
+/// that `stitch_loops` chains. Shared by LWPOLYLINE and POLYLINE, which differ
+/// only in where their vertices come from.
+fn emit_polyline(
+    verts: Vec<[f64; 2]>,
+    closed: bool,
+    contours: &mut Vec<Vec<[f64; 2]>>,
+    segs: &mut Vec<([f64; 2], [f64; 2])>,
+) {
+    if verts.len() < 2 {
+        return;
+    }
+    if closed && verts.len() >= 3 {
+        contours.push(verts);
+    } else {
+        for w in verts.windows(2) {
+            segs.push((w[0], w[1]));
+        }
+    }
 }
 
 /// Chain undirected segments into closed loops by endpoint matching (grid-
@@ -494,40 +567,55 @@ pub fn write_amf(mesh: &Mesh) -> String {
 /// Read an AMF mesh with a minimal tag scanner (no XML dependency): every
 /// `<vertex>` contributes a point, every `<triangle>` a face; all objects and
 /// volumes union into one mesh. Out-of-range triangle indices are dropped.
+///
+/// A triangle's `v1`/`v2`/`v3` index the enclosing `<mesh>`'s OWN `<vertices>`
+/// list, not the file. So the scan walks the document in order and rebases at
+/// each `<mesh>`; one flat index space made a two-object file draw object 1
+/// twice and object 2 not at all.
 pub fn read_amf(text: &str) -> Mesh {
     fn between(s: &str, open: &str, close: &str) -> Option<f64> {
         let a = s.find(open)? + open.len();
         let b = s[a..].find(close)? + a;
         s[a..b].trim().parse().ok()
     }
-    let mut positions = Vec::new();
-    let mut scan = text;
-    while let Some(p) = scan.find("<vertex>") {
-        let rest = &scan[p + 8..];
-        let end = rest.find("</vertex>").unwrap_or(rest.len());
-        let chunk = &rest[..end];
-        match (between(chunk, "<x>", "</x>"), between(chunk, "<y>", "</y>"), between(chunk, "<z>", "</z>")) {
-            (Some(x), Some(y), Some(z)) if x.is_finite() && y.is_finite() && z.is_finite() => {
-                positions.push([x, y, z]);
-            }
-            _ => {}
-        }
-        scan = &rest[end..];
-    }
-    let n = positions.len();
+    let mut positions: Vec<[f64; 3]> = Vec::new();
     let mut tris = Vec::new();
+    let mut base = 0usize;
     let mut scan = text;
-    while let Some(p) = scan.find("<triangle>") {
-        let rest = &scan[p + 10..];
-        let end = rest.find("</triangle>").unwrap_or(rest.len());
-        let chunk = &rest[..end];
-        let idx = |tag_o: &str, tag_c: &str| between(chunk, tag_o, tag_c).map(|v| v as usize);
-        if let (Some(a), Some(b), Some(c)) = (idx("<v1>", "</v1>"), idx("<v2>", "</v2>"), idx("<v3>", "</v3>")) {
-            if a < n && b < n && c < n && a != b && b != c && a != c {
-                tris.push([a as u32, b as u32, c as u32]);
+    loop {
+        let at_mesh = scan.find("<mesh");
+        let at_vert = scan.find("<vertex>");
+        let at_tri = scan.find("<triangle>");
+        let Some(p) = [at_mesh, at_vert, at_tri].into_iter().flatten().min() else { break };
+        if at_mesh == Some(p) {
+            base = positions.len(); // a new mesh restarts vertex numbering
+            scan = &scan[p + 5..];
+        } else if at_vert == Some(p) {
+            let rest = &scan[p + 8..];
+            let end = rest.find("</vertex>").unwrap_or(rest.len());
+            let chunk = &rest[..end];
+            match (between(chunk, "<x>", "</x>"), between(chunk, "<y>", "</y>"), between(chunk, "<z>", "</z>")) {
+                (Some(x), Some(y), Some(z)) if x.is_finite() && y.is_finite() && z.is_finite() => {
+                    positions.push([x, y, z]);
+                }
+                _ => {}
             }
+            scan = &rest[end..];
+        } else {
+            let rest = &scan[p + 10..];
+            let end = rest.find("</triangle>").unwrap_or(rest.len());
+            let chunk = &rest[..end];
+            let idx = |tag_o: &str, tag_c: &str| between(chunk, tag_o, tag_c).map(|v| v as usize);
+            if let (Some(a), Some(b), Some(c)) = (idx("<v1>", "</v1>"), idx("<v2>", "</v2>"), idx("<v3>", "</v3>")) {
+                // Compare against the LOCAL count, which also keeps a wild
+                // index (f64 -> usize saturates) from overflowing `base + a`.
+                let local = positions.len() - base;
+                if a < local && b < local && c < local && a != b && b != c && a != c {
+                    tris.push([(base + a) as u32, (base + b) as u32, (base + c) as u32]);
+                }
+            }
+            scan = &rest[end..];
         }
-        scan = &rest[end..];
     }
     Mesh { positions, tris }
 }
@@ -603,33 +691,45 @@ fn parse_3mf_model(xml: &str) -> Mesh {
     let attr = crate::svg::attr;
     let num = |chunk: &str, k: &str| attr(chunk, k).and_then(|v| v.trim().parse::<f64>().ok());
 
-    let mut positions = Vec::new();
-    let mut scan = xml;
-    while let Some(p) = scan.find("<vertex") {
-        let rest = &scan[p + 7..];
-        let end = rest.find('>').unwrap_or(rest.len());
-        let chunk = &rest[..end];
-        if let (Some(x), Some(y), Some(z)) = (num(chunk, "x"), num(chunk, "y"), num(chunk, "z")) {
-            if x.is_finite() && y.is_finite() && z.is_finite() {
-                positions.push([x, y, z]);
-            }
-        }
-        scan = &rest[end..];
-    }
-    let n = positions.len();
+    let mut positions: Vec<[f64; 3]> = Vec::new();
     let mut tris = Vec::new();
+    // As in AMF, a triangle indexes its own `<mesh>`'s vertices, so walk the
+    // document in order and rebase at each mesh.
+    let mut base = 0usize;
     let mut scan = xml;
-    while let Some(p) = scan.find("<triangle") {
-        let rest = &scan[p + 9..];
-        let end = rest.find('>').unwrap_or(rest.len());
-        let chunk = &rest[..end];
-        let idx = |k: &str| attr(chunk, k).and_then(|v| v.trim().parse::<usize>().ok());
-        if let (Some(a), Some(b), Some(c)) = (idx("v1"), idx("v2"), idx("v3")) {
-            if a < n && b < n && c < n && a != b && b != c && a != c {
-                tris.push([a as u32, b as u32, c as u32]);
+    loop {
+        let at_mesh = scan.find("<mesh");
+        let at_vert = scan.find("<vertex");
+        let at_tri = scan.find("<triangle");
+        let Some(p) = [at_mesh, at_vert, at_tri].into_iter().flatten().min() else { break };
+        if at_mesh == Some(p) {
+            base = positions.len();
+            scan = &scan[p + 5..];
+        } else if at_vert == Some(p) {
+            let rest = &scan[p + 7..];
+            let end = rest.find('>').unwrap_or(rest.len());
+            let chunk = &rest[..end];
+            if let (Some(x), Some(y), Some(z)) = (num(chunk, "x"), num(chunk, "y"), num(chunk, "z")) {
+                if x.is_finite() && y.is_finite() && z.is_finite() {
+                    positions.push([x, y, z]);
+                }
             }
+            scan = &rest[end..];
+        } else {
+            // `<triangles>` also matches the `<triangle` prefix; its chunk
+            // carries no v1/v2/v3, so it falls through harmlessly.
+            let rest = &scan[p + 9..];
+            let end = rest.find('>').unwrap_or(rest.len());
+            let chunk = &rest[..end];
+            let idx = |k: &str| attr(chunk, k).and_then(|v| v.trim().parse::<usize>().ok());
+            if let (Some(a), Some(b), Some(c)) = (idx("v1"), idx("v2"), idx("v3")) {
+                let local = positions.len() - base;
+                if a < local && b < local && c < local && a != b && b != c && a != c {
+                    tris.push([(base + a) as u32, (base + b) as u32, (base + c) as u32]);
+                }
+            }
+            scan = &rest[end..];
         }
-        scan = &rest[end..];
     }
     Mesh { positions, tris }
 }
@@ -649,7 +749,11 @@ impl Welder {
         Welder { map: HashMap::new(), positions: Vec::new() }
     }
     fn intern(&mut self, p: [f64; 3]) -> u32 {
-        let key = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
+        // Key on the bits, but fold -0.0 onto 0.0 first: they are the same
+        // POSITION and must weld, yet their bit patterns differ, so a mesh
+        // whose two halves spelled the seam differently came apart.
+        let bits = |v: f64| if v == 0.0 { 0f64.to_bits() } else { v.to_bits() };
+        let key = [bits(p[0]), bits(p[1]), bits(p[2])];
         if let Some(&i) = self.map.get(&key) {
             return i;
         }
@@ -675,21 +779,29 @@ fn looks_like_binary_stl(bytes: &[u8]) -> bool {
 /// triangles are dropped. Stored normals are ignored.
 pub fn read_stl(bytes: &[u8]) -> Result<Mesh, String> {
     if looks_like_binary_stl(bytes) {
-        read_stl_binary(bytes)
-    } else if bytes.len() >= 5 && &bytes[..5] == b"solid" {
-        // Try ASCII; a mis-sniffed binary that happens to start with "solid"
-        // but failed the size check falls back to binary — including the case
-        // where the ASCII parse "succeeds" but finds no facets (a binary body).
-        match read_stl_ascii(bytes) {
-            Ok(m) if !m.tris.is_empty() => Ok(m),
-            _ => match read_stl_binary(bytes) {
-                Ok(b) if !b.tris.is_empty() => Ok(b),
-                _ => read_stl_ascii(bytes), // neither found geometry; keep ASCII result
-            },
-        }
-    } else {
-        read_stl_binary(bytes)
+        return read_stl_binary(bytes);
     }
+    // Valid UTF-8 beginning "solid" is an ASCII STL, and the file COMMITS to
+    // that reading. A parse error in it is a corrupt ASCII file, to be
+    // reported: reinterpreting the same text as binary reads the letters as
+    // little-endian floats and invents geometry, which is how a two-facet
+    // file with one mistyped line imported as three triangles enclosing a
+    // volume of 6e87. A binary body that merely BEGINS "solid" is not valid
+    // UTF-8 in any realistic case, and is caught by the branch below.
+    if bytes.len() >= 5 && &bytes[..5] == b"solid" && std::str::from_utf8(bytes).is_ok() {
+        return match read_stl_ascii(bytes) {
+            Ok(m) if !m.tris.is_empty() => Ok(m),
+            // Parsed cleanly but found no facets: an empty ASCII solid, or a
+            // binary body that happens to be valid UTF-8. Try binary, and
+            // keep the empty ASCII result if that finds nothing either.
+            Ok(empty) => match read_stl_binary(bytes) {
+                Ok(b) if !b.tris.is_empty() => Ok(b),
+                _ => Ok(empty),
+            },
+            Err(e) => Err(e),
+        };
+    }
+    read_stl_binary(bytes)
 }
 
 fn read_stl_binary(bytes: &[u8]) -> Result<Mesh, String> {
@@ -736,9 +848,19 @@ fn read_stl_ascii(bytes: &[u8]) -> Result<Mesh, String> {
                 loop_verts.push([c[0], c[1], c[2]]);
             }
             Some("endloop") => {
-                if loop_verts.len() == 3 {
-                    push_triangle(&mut w, &mut tris, loop_verts[0], loop_verts[1], loop_verts[2]);
+                // A loop that did not collect three vertices means a line
+                // inside the facet was not understood — it fell through the
+                // catch-all arm below. Dropping the facet silently loses
+                // geometry from a file the user believes imported cleanly:
+                // one mistyped `vertex` in a 2-facet file imported ONE.
+                if loop_verts.len() != 3 {
+                    return Err(format!(
+                        "malformed STL facet: {} vertices in the loop ending at {:?}",
+                        loop_verts.len(),
+                        line.trim()
+                    ));
                 }
+                push_triangle(&mut w, &mut tris, loop_verts[0], loop_verts[1], loop_verts[2]);
                 loop_verts.clear();
             }
             _ => {}
@@ -750,67 +872,80 @@ fn read_stl_ascii(bytes: &[u8]) -> Result<Mesh, String> {
 /// Read an OFF text mesh. Comments (`#`) and blank lines are skipped;
 /// polygonal faces are fan-triangulated.
 pub fn read_off(text: &str) -> Result<Mesh, String> {
-    // Tokenize, dropping comments and blank lines. The optional leading 'OFF'
-    // may be glued to the counts line (e.g. "OFF") on its own.
-    let mut toks: Vec<f64> = Vec::new();
+    // Kept LINE BY LINE, not flattened into one token stream. A face line
+    // may carry a trailing per-face colour ("3 0 1 2 255 0 0"), which is
+    // legal OFF; read from a flat stream those three extra numbers become
+    // the next face's vertex count and indices, and every face after the
+    // first is lost. Here each face reads exactly its own line.
+    let mut lines: Vec<Vec<&str>> = Vec::new();
     let mut saw_off = false;
-    let mut raw: Vec<&str> = Vec::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
+        let mut toks: Vec<&str> = Vec::new();
         for t in line.split_whitespace() {
             if !saw_off && t.eq_ignore_ascii_case("OFF") {
                 saw_off = true;
                 continue;
             }
-            raw.push(t);
+            toks.push(t);
+        }
+        if !toks.is_empty() {
+            lines.push(toks);
         }
     }
-    for t in &raw {
-        toks.push(t.parse().unwrap_or(f64::NAN));
+    let num = |t: &str| t.parse::<f64>().unwrap_or(f64::NAN);
+    let count = |t: f64| if t.is_finite() && t >= 0.0 { t as usize } else { 0 };
+    let mut flat: Vec<&str> = Vec::new();
+    for l in &lines {
+        flat.extend(l.iter().copied());
     }
-    if toks.len() < 3 {
+    if flat.len() < 3 {
         return Err("OFF: missing counts line".into());
     }
-    // `f64 as usize` saturates (inf/huge → usize::MAX), so the declared counts
-    // are untrusted; never reserve more than the token stream can supply (each
-    // vertex needs 3 tokens, each face ≥ 4). This bounds the allocation to the
-    // input size — a "4000000000 0 0" header can't OOM the process.
-    let count = |t: f64| if t.is_finite() && t >= 0.0 { t as usize } else { 0 };
-    let nv = count(toks[0]);
-    let nf = count(toks[1]);
-    let mut idx = 3; // vertices start after "nv nf ne"
-    let mut positions = Vec::with_capacity(nv.min(toks.len() / 3));
+    let nv = count(num(flat[0]));
+    let nf = count(num(flat[1]));
+
+    // Vertices are three numbers each and may share or span lines, so they
+    // still read from the flat stream — but only the first `nv` of them.
+    let mut idx = 3;
+    let mut positions = Vec::with_capacity(nv.min(flat.len() / 3));
     for _ in 0..nv {
-        if idx + 3 > toks.len() {
+        if idx + 3 > flat.len() {
             return Err("OFF: truncated vertex list".into());
         }
         let fin = |x: f64| if x.is_finite() { x } else { 0.0 };
-        positions.push([fin(toks[idx]), fin(toks[idx + 1]), fin(toks[idx + 2])]);
+        positions.push([fin(num(flat[idx])), fin(num(flat[idx + 1])), fin(num(flat[idx + 2]))]);
         idx += 3;
     }
-    let mut tris = Vec::with_capacity(nf.min(toks.len() / 4));
-    for _ in 0..nf {
-        if idx >= toks.len() {
+    // Faces resume at the line containing token `idx`.
+    let mut seen = 0usize;
+    let mut first_face_line = lines.len();
+    for (li, l) in lines.iter().enumerate() {
+        if seen >= idx {
+            first_face_line = li;
             break;
         }
-        let k = count(toks[idx]);
-        idx += 1;
-        // Checked against remaining tokens (idx + k can overflow if k saturates
-        // to usize::MAX, wrapping the bound and forcing an OOB index).
-        if k > toks.len().saturating_sub(idx) {
+        seen += l.len();
+        if seen >= idx {
+            first_face_line = li + 1;
             break;
         }
-        let face: Vec<u32> = (0..k).map(|j| toks[idx + j] as u32).collect();
-        idx += k;
-        // Fan-triangulate, bounds-checking indices.
-        for j in 1..k.saturating_sub(1) {
-            let (a, b, c) = (face[0], face[j], face[j + 1]);
-            if (a as usize) < nv && (b as usize) < nv && (c as usize) < nv {
-                tris.push([a, b, c]);
-            }
+    }
+    let mut tris = Vec::new();
+    for l in lines.iter().skip(first_face_line).take(nf) {
+        let k = count(num(l[0]));
+        if k < 3 || k > l.len() - 1 {
+            continue; // not a usable face line
+        }
+        let face: Vec<u32> = (0..k).map(|j| num(l[1 + j]) as u32).collect();
+        if face.iter().any(|&i| i as usize >= positions.len()) {
+            continue; // index out of range: drop the face, keep the mesh
+        }
+        for j in 1..k - 1 {
+            tris.push([face[0], face[j], face[j + 1]]);
         }
     }
     Ok(Mesh { positions, tris })
@@ -861,7 +996,7 @@ pub fn parse_surface_text(text: &str) -> Vec<Vec<f64>> {
 /// the origin; `invert` negates the heights. The first row maps to the largest
 /// Y (text top = far side), matching the reference. Output is OUTWARD-wound
 /// (positive signed volume), like every other primitive.
-pub fn heightmap_solid(grid: &[Vec<f64>], center: bool, invert: bool) -> Mesh {
+pub fn heightmap_solid(grid: &[Vec<f64>], center: bool) -> Mesh {
     let rows = grid.len();
     let cols = grid.first().map_or(0, |r| r.len());
     if rows < 2 || cols < 2 {
@@ -869,8 +1004,7 @@ pub fn heightmap_solid(grid: &[Vec<f64>], center: bool, invert: bool) -> Mesh {
     }
     let h = |r: usize, c: usize| {
         let v = grid[r].get(c).copied().unwrap_or(0.0);
-        let v = if v.is_finite() { v } else { 0.0 }; // a NaN/inf sample → 0
-        if invert { -v } else { v }
+        if v.is_finite() { v } else { 0.0 } // a NaN/inf sample → 0
     };
     let mut min_h = f64::INFINITY;
     for r in 0..rows {
@@ -880,8 +1014,10 @@ pub fn heightmap_solid(grid: &[Vec<f64>], center: bool, invert: bool) -> Mesh {
     }
     // The base plane sits strictly BELOW the lowest sample so boundary cells at
     // the minimum still get non-degenerate walls (a flat grid would otherwise
-    // collapse the solid to zero-area triangles).
-    let base = min_h - 1.0;
+    // collapse the solid to zero-area triangles) — but never above z = 0: the
+    // reference's base is min(0, min_sample - 1), so an all-positive heightmap
+    // sits ON the ground plane instead of floating one unit above it.
+    let base = (min_h - 1.0).min(0.0);
     let (ox, oy) = if center {
         ((cols - 1) as f64 / 2.0, (rows - 1) as f64 / 2.0)
     } else {
@@ -1094,6 +1230,85 @@ mod tests {
     }
 
     #[test]
+    fn amf_and_3mf_triangle_indices_are_local_to_their_mesh() {
+        // Two objects, each a lone triangle numbering its own vertices 0,1,2.
+        // A single flat index space drew object 1 twice and object 2 never.
+        let amf = "<amf>\
+ <object><mesh><vertices>\
+  <vertex><coordinates><x>0</x><y>0</y><z>0</z></coordinates></vertex>\
+  <vertex><coordinates><x>1</x><y>0</y><z>0</z></coordinates></vertex>\
+  <vertex><coordinates><x>0</x><y>1</y><z>0</z></coordinates></vertex>\
+ </vertices><volume><triangle><v1>0</v1><v2>1</v2><v3>2</v3></triangle></volume></mesh></object>\
+ <object><mesh><vertices>\
+  <vertex><coordinates><x>0</x><y>0</y><z>9</z></coordinates></vertex>\
+  <vertex><coordinates><x>1</x><y>0</y><z>9</z></coordinates></vertex>\
+  <vertex><coordinates><x>0</x><y>1</y><z>9</z></coordinates></vertex>\
+ </vertices><volume><triangle><v1>0</v1><v2>1</v2><v3>2</v3></triangle></volume></mesh></object>\
+</amf>";
+        let xmf = "<model><resources>\
+ <object><mesh>\
+  <vertices><vertex x=\"0\" y=\"0\" z=\"0\"/><vertex x=\"1\" y=\"0\" z=\"0\"/><vertex x=\"0\" y=\"1\" z=\"0\"/></vertices>\
+  <triangles><triangle v1=\"0\" v2=\"1\" v3=\"2\"/></triangles></mesh></object>\
+ <object><mesh>\
+  <vertices><vertex x=\"0\" y=\"0\" z=\"9\"/><vertex x=\"1\" y=\"0\" z=\"9\"/><vertex x=\"0\" y=\"1\" z=\"9\"/></vertices>\
+  <triangles><triangle v1=\"0\" v2=\"1\" v3=\"2\"/></triangles></mesh></object>\
+</resources></model>";
+        for m in [read_amf(amf), parse_3mf_model(xmf)] {
+            assert_eq!(m.positions.len(), 6);
+            assert_eq!(m.tris.len(), 2, "both objects must survive");
+            let mut zs: Vec<f64> = m
+                .tris
+                .iter()
+                .map(|t| m.positions[t[0] as usize][2])
+                .collect();
+            zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(zs, vec![0.0, 9.0], "object 2 sits at z = 9, not on top of object 1");
+        }
+        // An index past the end of its OWN mesh is still dropped, and cannot
+        // reach backwards into the previous mesh's points.
+        let reach_back = "<amf><mesh><vertices>\
+  <vertex><coordinates><x>0</x><y>0</y><z>0</z></coordinates></vertex>\
+  <vertex><coordinates><x>1</x><y>0</y><z>0</z></coordinates></vertex>\
+  <vertex><coordinates><x>0</x><y>1</y><z>0</z></coordinates></vertex>\
+ </vertices></mesh><mesh><vertices>\
+  <vertex><coordinates><x>0</x><y>0</y><z>9</z></coordinates></vertex>\
+ </vertices><volume><triangle><v1>0</v1><v2>1</v2><v3>2</v3></triangle></volume></mesh></amf>";
+        assert!(read_amf(reach_back).tris.is_empty());
+    }
+
+    #[test]
+    fn dxf_polyline_takes_its_vertices_from_the_following_vertex_entities() {
+        // The old-style POLYLINE carries no coordinates of its own; reading it
+        // like an LWPOLYLINE found an empty body and dropped the shape.
+        let mut dxf = String::from("0\nSECTION\n2\nENTITIES\n0\nPOLYLINE\n70\n1\n");
+        for (x, y) in [(0, 0), (6, 0), (6, 4), (0, 4)] {
+            dxf.push_str(&format!("0\nVERTEX\n10\n{}\n20\n{}\n", x, y));
+        }
+        let closed = format!("{}0\nSEQEND\n0\nENDSEC\n0\nEOF\n", dxf);
+        for text in [closed.as_str(), dxf.as_str()] {
+            // The second case omits SEQEND: end-of-file must still flush it.
+            let (poly, warns) = read_dxf(text, 0.0, 12.0, 2.0);
+            assert_eq!(poly.contours.len(), 1, "one rectangle");
+            assert_eq!(poly.contours[0].len(), 4);
+            let a = crate::poly2::signed_area2(&poly.contours[0]).abs() / 2.0;
+            assert!((a - 24.0).abs() < 1e-9, "6x4 = 24, got {}", a);
+            // VERTEX/SEQEND belong to the polyline; they are not unsupported
+            // entities to be reported.
+            assert!(warns.is_empty(), "unexpected warnings: {:?}", warns);
+        }
+    }
+
+    #[test]
+    fn the_welder_treats_negative_zero_as_zero() {
+        // -0.0 and 0.0 are the same POSITION but not the same bits, so a mesh
+        // whose two halves spelled a seam coordinate differently came apart.
+        let mut w = Welder::new();
+        assert_eq!(w.intern([-0.0, 0.0, 1.0]), w.intern([0.0, -0.0, 1.0]));
+        assert_eq!(w.positions.len(), 1);
+        assert_ne!(w.intern([0.0, 0.0, 1.0]), w.intern([0.0, 0.0, 2.0]));
+    }
+
+    #[test]
     fn reads_a_deflate_compressed_3mf_from_python() {
         // A real .3mf produced by Python's zipfile with ZIP_DEFLATED — a
         // tetrahedron (4 vertices, 4 triangles). Pins the full import stack:
@@ -1221,20 +1436,28 @@ mod tests {
         let grid = parse_surface_text("# a little hill\n0 0 0\n0 3 0\n0 0 0\n");
         assert_eq!(grid.len(), 3);
         assert_eq!(grid[1], vec![0.0, 3.0, 0.0]);
-        let m = heightmap_solid(&grid, false, false);
+        let m = heightmap_solid(&grid, false);
         assert!(is_closed_manifold(&m), "surface must be a closed 2-manifold");
         // OUTWARD-wound: the raw signed volume must be POSITIVE, like every
         // other primitive (the earlier winding was inside-out / negative).
         assert!(raw_signed_volume(&m) > 0.0, "outward-wound, got {}", raw_signed_volume(&m));
         // A FLAT grid must still be a non-degenerate closed solid (the base sits
         // below the samples, so walls have height).
-        let flat = heightmap_solid(&parse_surface_text("2 2\n2 2\n"), false, false);
+        let flat = heightmap_solid(&parse_surface_text("2 2\n2 2\n"), false);
         assert!(is_closed_manifold(&flat) && raw_signed_volume(&flat) > 0.0, "flat grid non-degenerate");
         // Ragged rows pad with zeros to a rectangular grid.
         assert_eq!(parse_surface_text("1 2 3\n4 5\n")[1], vec![4.0, 5.0, 0.0]);
-        // invert stays a valid outward closed solid.
-        let mi = heightmap_solid(&grid, true, true);
+        // center stays a valid outward closed solid, shifted in XY only.
+        let mi = heightmap_solid(&grid, true);
         assert!(is_closed_manifold(&mi) && raw_signed_volume(&mi) > 0.0);
+        // The base plane is min(0, min_sample - 1): an all-positive heightmap
+        // rests ON the ground plane rather than floating one unit above it,
+        // and a negative one still gets its unit of wall.
+        let low = |m: &Mesh| m.positions.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min);
+        assert_eq!(low(&heightmap_solid(&parse_surface_text("5 5\n5 5\n"), false)), 0.0);
+        assert_eq!(low(&heightmap_solid(&parse_surface_text("-3 -3\n-3 -3\n"), false)), -4.0);
+        // A sub-unit minimum sits just under it, not at zero.
+        assert_eq!(low(&heightmap_solid(&parse_surface_text("0.5 2\n2 2\n"), false)), -0.5);
     }
 
     #[test]

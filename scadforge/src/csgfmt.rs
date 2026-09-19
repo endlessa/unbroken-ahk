@@ -273,9 +273,21 @@ pub fn builtin_head(module: &str, b: &HashMap<String, Value>, f: Frags) -> Optio
         }
         "sphere" => format!("sphere({}, r = {})", f.spell(), num(radius("r", "d", 1.0))),
         "cylinder" => {
-            let both = num_of("d").map(|d| d / 2.0).or_else(|| num_of("r"));
-            let r1 = num_of("d1").map(|d| d / 2.0).or_else(|| num_of("r1")).or(both).unwrap_or(1.0);
-            let r2 = num_of("d2").map(|d| d / 2.0).or_else(|| num_of("r2")).or(both).unwrap_or(1.0);
+            // Per END, the diameter form first (d1 or d for the bottom, d2
+            // or d for the top), then the radius form — the same order the
+            // renderer resolves. Trying r1 before the shared d recorded a
+            // FRUSTUM for the plain cylinder the renderer drew, so the .csg
+            // and the render disagreed about the same source.
+            let end = |dia: &str, rad: &str| -> f64 {
+                num_of(dia)
+                    .or_else(|| num_of("d"))
+                    .map(|d| d / 2.0)
+                    .or_else(|| num_of(rad))
+                    .or_else(|| num_of("r"))
+                    .unwrap_or(1.0)
+            };
+            let r1 = end("d1", "r1");
+            let r2 = end("d2", "r2");
             format!(
                 "cylinder({}, h = {}, r1 = {}, r2 = {}, center = {})",
                 f.spell(),
@@ -345,12 +357,9 @@ pub fn builtin_head(module: &str, b: &HashMap<String, Value>, f: Frags) -> Optio
         // from the bound arguments alone.
         "linear_extrude" | "surface" | "import" | "import_stl" | "import_off"
         | "import_dxf" => return None,
-        "rotate_extrude" => format!(
-            "rotate_extrude(angle = {}, convexity = {}, {})",
-            num(num_of("angle").unwrap_or(360.0)),
-            num(num_of("convexity").unwrap_or(2.0)),
-            f.spell()
-        ),
+        "rotate_extrude" => {
+            rotate_extrude_head(num_of("angle").unwrap_or(360.0), num_of("convexity").unwrap_or(2.0), f)
+        }
         "offset" => {
             // The reference records this one in RESOLVED form — as
             // `offset(r = …)` or `offset(delta = …)`, never both — which
@@ -399,6 +408,17 @@ pub fn linear_extrude_head(
         num(slices),
         num(scale[0]),
         num(scale[1]),
+        f.spell()
+    )
+}
+
+/// The `rotate_extrude()` head. Broken out of `builtin_head` because the
+/// deprecated `dxf_rotate_extrude()` records the same modern node.
+pub fn rotate_extrude_head(angle: f64, convexity: f64, f: Frags) -> String {
+    format!(
+        "rotate_extrude(angle = {}, convexity = {}, {})",
+        num(angle),
+        num(convexity),
         f.spell()
     )
 }

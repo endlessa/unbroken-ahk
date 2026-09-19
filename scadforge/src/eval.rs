@@ -404,6 +404,9 @@ const MAX_GENERATOR_ITERS: usize = 10_000_000;
 /// but still a bounded backstop for a public render endpoint.
 const MAX_RANGE_ITEMS: usize = 4_000_000;
 
+/// Wall-quad budget for one linear_extrude: slices times outline points.
+const MAX_EXTRUDE_QUADS: usize = 1_000_000;
+
 // ---------------------------------------------------------------------------
 // Environments
 
@@ -648,6 +651,19 @@ impl Ctx {
     /// Forget everything recorded in the open frame. Used when a builtin
     /// drops its subtree (a bad transform argument), so the export does not
     /// hoist children the render never drew.
+    /// Forget the name this frame was given, so it closes as a plain
+    /// `group()` — the empty operand the renderer counted. For a leaf whose
+    /// arguments the renderer REJECTED, the head was already built from
+    /// those arguments and would otherwise record geometry that was never
+    /// drawn (sphere("a") exported `sphere(r = 1)`).
+    fn csg_unhead(&mut self) {
+        if let Some(st) = &mut self.csg {
+            if let Some(f) = st.last_mut() {
+                f.head = None;
+            }
+        }
+    }
+
     fn csg_clear(&mut self) {
         if let Some(st) = &mut self.csg {
             if let Some(f) = st.last_mut() {
@@ -821,13 +837,13 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
         Stmt::Modified { modifier, stmt } => {
             // `*` disables: the subtree is not instantiated at all, so its
             // echo/assert side effects never fire (an early-out, not a
-            // post-hoc filter). It still OCCUPIES its operand slot though —
-            // the renderer pushes an empty group for the statement — so the
-            // export records that empty group rather than nothing.
+            // post-hoc filter), and it is "dropped from the design in BOTH
+            // F5 preview and F6 render and from ALL EXPORTS". It records
+            // nothing, because it takes no operand slot: an empty group()
+            // in the .csg is not the same statement — re-imported, that
+            // group DOES take a slot, and an intersection() whose disabled
+            // child became an empty group came back empty.
             if *modifier == Modifier::Disable {
-                if ctx.csg_on() {
-                    csg_grouped(ctx, "group()", |_| ());
-                }
                 return Vec::new();
             }
             // The others fully instantiate the subtree (side effects run),
@@ -1376,6 +1392,10 @@ fn call_builtin_module(
                 Some(r) => r,
                 None => {
                     ctx.warn("sphere: radius must be a number");
+                    // Drop it from the export too: the head was recorded
+                    // from the bound arguments before this arm ran, so it
+                    // said r = 1 for a sphere the renderer refused.
+                    ctx.csg_unhead();
                     return Vec::new();
                 }
             };
@@ -1427,7 +1447,7 @@ fn call_builtin_module(
         "scale" => {
             let matrix = match bound.get("v") {
                 Some(Value::Num(s)) => Some(geom::scaling([*s, *s, *s])),
-                Some(v @ Value::Vector(_)) => v.as_vec3().map(geom::scaling),
+                Some(v @ Value::Vector(_)) => v.as_vec3_fill(1.0).map(geom::scaling),
                 _ => {
                     ctx.warn("scale: v must be a number or vector");
                     None
@@ -1512,7 +1532,17 @@ fn call_builtin_module(
                 Some(newsize) => {
                     if let Some(m) = resize_matrix(&shapes, newsize, bound.get("auto")) {
                         for s in &mut shapes {
-                            geom::apply(&m, &mut s.mesh);
+                            // Through the same 2D-aware path every other
+                            // transform uses. Applying the matrix to the
+                            // mesh alone left a 2D child's OUTLINE at its
+                            // original size, so the flat fill scaled and the
+                            // region it carries did not — and the region is
+                            // what an enclosing extrude, offset or SVG
+                            // export actually reads.
+                            match &mut s.outline {
+                                Some(poly) => apply_2d(&m, poly, &mut s.mesh),
+                                None => geom::apply(&m, &mut s.mesh),
+                            }
                         }
                     }
                     shapes
@@ -1621,26 +1651,84 @@ fn call_builtin_module(
                 .and_then(Value::as_num)
                 .filter(|h| h.is_finite())
                 .unwrap_or(100.0);
-            if height <= 0.0 || poly.is_empty() {
-                return Vec::new(); // height ≤ 0 clamps to empty, silently
-            }
             let center = bound.get("center").and_then(Value::as_bool).unwrap_or(false);
-            let twist = bound.get("twist").and_then(Value::as_num).unwrap_or(0.0);
+            // Non-finite twist and scale keep their defaults. Left through,
+            // a NaN twist put NaN in every vertex and the STL writer emitted
+            // `facet normal NaN NaN NaN`, which no slicer will read.
+            let twist = bound
+                .get("twist")
+                .and_then(Value::as_num)
+                .filter(|t| t.is_finite())
+                .unwrap_or(0.0);
             let scale = match bound.get("scale") {
-                Some(Value::Num(s)) => [*s, *s],
-                Some(v @ Value::Vector(_)) => {
-                    v.as_vec3().map(|a| [a[0], a[1]]).unwrap_or([1.0, 1.0])
-                }
+                Some(Value::Num(s)) if s.is_finite() => [*s, *s],
+                Some(v @ Value::Vector(_)) => v
+                    .as_vec3_fill(1.0)
+                    .map(|a| [a[0], a[1]])
+                    .filter(|a| a.iter().all(|v| v.is_finite()))
+                    .unwrap_or([1.0, 1.0]),
                 _ => [1.0, 1.0],
             };
-            let slices = match bound.get("slices").and_then(Value::as_num) {
-                Some(s) if s >= 1.0 => s.trunc() as usize,
-                _ if twist != 0.0 => {
-                    let fa = ctx.dynv.lookup("$fa").and_then(|v| v.as_num()).unwrap_or(12.0);
-                    (twist.abs() / fa.max(1.0)).ceil().max(1.0) as usize
+            // The default slice count follows the reference's geometry-aware
+            // heuristic: never more than 120 degrees of twist per slice, and
+            // $fn (else $fa against the twist, and $fs against the helix the
+            // outermost vertex actually travels) setting the rest. It used
+            // to read $fa alone, so $fn had no effect on a twisted sweep at
+            // all.
+            let fa = ctx.dynv.lookup("$fa").and_then(|v| v.as_num()).unwrap_or(12.0);
+            let fs = ctx.dynv.lookup("$fs").and_then(|v| v.as_num()).unwrap_or(2.0);
+            let fn_ = ctx.dynv.lookup("$fn").and_then(|v| v.as_num()).unwrap_or(0.0);
+            let rmax = poly
+                .contours
+                .iter()
+                .flatten()
+                .fold(0.0f64, |a, p| a.max((p[0] * p[0] + p[1] * p[1]).sqrt()));
+            let auto_slices = || -> usize {
+                let mut n = 1.0f64;
+                if twist != 0.0 {
+                    let minimum = (twist.abs() / 120.0).ceil().max(1.0);
+                    n = if fn_ > 0.0 {
+                        (twist.abs() / 360.0 * fn_).ceil().max(minimum)
+                    } else {
+                        let helix =
+                            ((rmax * twist.abs().to_radians()).powi(2) + height * height).sqrt();
+                        let by_fa = (twist.abs() / fa.max(0.01)).ceil();
+                        let by_fs = (helix / fs.max(0.01)).ceil();
+                        by_fa.min(by_fs).max(minimum)
+                    };
                 }
-                _ => 1,
+                if scale[0] != scale[1] {
+                    // Non-uniform scale gets its own "diagonal" estimate, and
+                    // with twist as well the larger of the two wins.
+                    let delta = rmax * (scale[0] - scale[1]).abs();
+                    let diag = if fn_ > 0.0 {
+                        fn_.trunc()
+                    } else {
+                        ((delta * delta + height * height).sqrt() / fs.max(0.01)).ceil()
+                    };
+                    n = n.max(diag);
+                }
+                n.max(1.0) as usize
             };
+            let mut slices = match bound.get("slices").and_then(Value::as_num) {
+                Some(s) if s.is_finite() && s >= 1.0 => s.trunc() as usize,
+                Some(s) if s.is_finite() => 1, // slices <= 0 is one slice
+                _ => auto_slices(),
+            };
+            // Capped on emitted quads, not on slices: the wall cost is
+            // slices times outline points. Uncapped, slices=1e9 asked for
+            // enough vertices to be OOM-KILLED — one line of user input
+            // taking the preview server with it.
+            let pts: usize = poly.contours.iter().map(|c| c.len()).sum::<usize>().max(1);
+            let cap = (MAX_EXTRUDE_QUADS / pts).max(1);
+            if slices > cap {
+                ctx.warn(format!(
+                    "linear_extrude: {} slices truncated at {}",
+                    fmt_num(slices as f64),
+                    cap
+                ));
+                slices = cap;
+            }
             // Record the slice count the sweep ACTUALLY used. With `twist`
             // set and `slices` omitted it comes from $fa, and printing the
             // literal argument (or 1) exported a flat prism instead of the
@@ -1653,6 +1741,14 @@ fn call_builtin_module(
                     twist, slices as f64, scale, frags,
                 ));
             }
+            // Only NOW may it bail. Returning before the head was set left
+            // the frame unnamed, and an unnamed frame splices its children
+            // into the parent: linear_extrude(height=0) square(10) exported
+            // a bare square, so the re-import drew a 2D square where the
+            // render had drawn nothing at all.
+            if height <= 0.0 || poly.is_empty() {
+                return Vec::new(); // height <= 0 clamps to empty, silently
+            }
             let (positions, tris) =
                 poly2::extrude_linear(&poly, height, center, twist, slices, scale);
             leaf(Mesh { positions, tris })
@@ -1662,7 +1758,19 @@ fn call_builtin_module(
             if poly.is_empty() {
                 return Vec::new();
             }
-            let angle = bound.get("angle").and_then(Value::as_num).unwrap_or(360.0);
+            // "angle > 360 becomes 360, and angle <= -360 also becomes a
+            // full 360 revolution"; a non-finite angle keeps the default.
+            // Unclamped, a NaN angle produced a mesh of NaN vertices.
+            let angle = match bound.get("angle").and_then(Value::as_num) {
+                Some(a) if a.is_finite() => {
+                    if a > 360.0 || a <= -360.0 {
+                        360.0
+                    } else {
+                        a
+                    }
+                }
+                _ => 360.0,
+            };
             if angle == 0.0 {
                 return Vec::new();
             }
@@ -1859,6 +1967,10 @@ fn call_builtin_module(
                 }
             };
             let center = bound.get("center").and_then(Value::as_bool).unwrap_or(false);
+            // `invert` flips the luminance-to-height mapping of a PNG heightmap
+            // and is silently ignored for a text grid, which is the only mode
+            // this build reads. It still goes into the .csg head: the export
+            // has to carry the argument the script wrote.
             let invert = bound.get("invert").and_then(Value::as_bool).unwrap_or(false);
             if ctx.csg_on() {
                 ctx.csg_head(crate::csgfmt::surface_head(
@@ -1867,7 +1979,7 @@ fn call_builtin_module(
                 ));
             }
             let grid = io::parse_surface_text(&text);
-            leaf(io::heightmap_solid(&grid, center, invert))
+            leaf(io::heightmap_solid(&grid, center))
         }
         "text" => {
             no_children(name, children, ctx);
@@ -1927,6 +2039,21 @@ fn call_builtin_module(
                 Some(p) if !p.is_empty() => p,
                 _ => return Vec::new(),
             };
+            // These record the MODERN node they are aliases of, wrapping an
+            // `import()` of the same file — the form that re-imports to the
+            // geometry just rendered. Recording no head at all left the frame
+            // unnamed, so the whole extrusion exported as an empty `group()`.
+            let convexity = bound.get("convexity").and_then(Value::as_num).unwrap_or(1.0);
+            let record_import = |ctx: &mut Ctx| {
+                if ctx.csg_on() {
+                    let frags = ctx.csg_frags();
+                    ctx.csg_open();
+                    ctx.csg_head(crate::csgfmt::import_head(
+                        &path, bound.get("layer"), convexity, 96.0, frags,
+                    ));
+                    ctx.csg_close();
+                }
+            };
             if name == "dxf_linear_extrude" {
                 let height = bound
                     .get("height")
@@ -1938,10 +2065,22 @@ fn call_builtin_module(
                 }
                 let center = bound.get("center").and_then(Value::as_bool).unwrap_or(false);
                 let twist = bound.get("twist").and_then(Value::as_num).unwrap_or(0.0);
+                if ctx.csg_on() {
+                    let frags = ctx.csg_frags();
+                    ctx.csg_head(crate::csgfmt::linear_extrude_head(
+                        height, center, convexity, twist, 1.0, [1.0, 1.0], frags,
+                    ));
+                    record_import(ctx);
+                }
                 let (positions, tris) =
                     poly2::extrude_linear(&poly, height, center, twist, 1, [1.0, 1.0]);
                 leaf(Mesh { positions, tris })
             } else {
+                if ctx.csg_on() {
+                    let frags = ctx.csg_frags();
+                    ctx.csg_head(crate::csgfmt::rotate_extrude_head(360.0, convexity, frags));
+                    record_import(ctx);
+                }
                 let max_r = poly.contours.iter().flatten().map(|p| p[0].abs()).fold(0.0, f64::max);
                 let frags = resolve_fragments(max_r, ctx).max(1) as usize;
                 match poly2::extrude_rotate(&poly, 360.0, frags) {
@@ -2298,6 +2437,15 @@ fn eval_children_grouped(children: &[Stmt], parent: &Rc<Scope>, ctx: &mut Ctx) -
         }
         match stmt {
             Stmt::Assign { .. } | Stmt::ModuleDef { .. } | Stmt::FunctionDef { .. } => {}
+            // A `*`-disabled statement is dropped from the design, so it
+            // takes no operand slot either: the reference has the disabled
+            // FIRST child of a difference() promote the second to minuend.
+            // Pushing an empty group for it made difference() { *cube(20);
+            // cube(10); } an empty minuend, and the whole thing vanished.
+            // It is still executed, so the export records its empty frame.
+            Stmt::Modified { modifier: Modifier::Disable, .. } => {
+                exec_stmt(stmt, &scope, ctx);
+            }
             _ => groups.push(exec_stmt(stmt, &scope, ctx)),
         }
     }
@@ -2701,8 +2849,16 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
     match mesh {
         Ok(m) if !m.tris.is_empty() => leaf(m),
         Ok(_) => Vec::new(), // parsed but empty
-        Err(_) => {
+        // An unreadable file and a CORRUPT one are different problems and
+        // the user needs to be told which. The readers' own message was
+        // being thrown away, so a malformed STL reported "Can't open import
+        // file" about a file that had opened perfectly well.
+        Err(e) if e.is_empty() => {
             ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
+            Vec::new()
+        }
+        Err(e) => {
+            ctx.warn(format!("WARNING: import file '{}': {}", path, e));
             Vec::new()
         }
     }
@@ -3169,7 +3325,12 @@ fn parse_color(c: Option<&Value>, alpha: Option<&Value>, ctx: &mut Ctx) -> Optio
             v
         }
         Some(Value::Str(name)) => named_color(name).or_else(|| hex_color(name)).or_else(|| {
-            ctx.warn(format!("color: unknown color '{}'", name));
+            // The reference's wording, Wikipedia link and all.
+            ctx.warn(format!(
+                "WARNING: Unable to parse color \"{}\". \
+                 Please see https://en.wikipedia.org/wiki/Web_colors for supported values.",
+                name
+            ));
             None
         })?,
         _ => {
@@ -3184,30 +3345,171 @@ fn parse_color(c: Option<&Value>, alpha: Option<&Value>, ctx: &mut Ctx) -> Optio
     Some(rgba)
 }
 
+/// The CSS3/SVG extended colour keywords, which is exactly the set
+/// `color("name")` accepts: case-insensitive, both the gray/grey spellings,
+/// and the aqua/cyan and fuchsia/magenta aliases. Sorted, so the lookup is a
+/// binary search. A partial table was worse than none: a script naming any
+/// shade outside it got a warning and an UNCOLOURED object.
+const NAMED_COLORS: [(&str, [u8; 3]); 147] = [
+    ("aliceblue", [240, 248, 255]),
+    ("antiquewhite", [250, 235, 215]),
+    ("aqua", [0, 255, 255]),
+    ("aquamarine", [127, 255, 212]),
+    ("azure", [240, 255, 255]),
+    ("beige", [245, 245, 220]),
+    ("bisque", [255, 228, 196]),
+    ("black", [0, 0, 0]),
+    ("blanchedalmond", [255, 235, 205]),
+    ("blue", [0, 0, 255]),
+    ("blueviolet", [138, 43, 226]),
+    ("brown", [165, 42, 42]),
+    ("burlywood", [222, 184, 135]),
+    ("cadetblue", [95, 158, 160]),
+    ("chartreuse", [127, 255, 0]),
+    ("chocolate", [210, 105, 30]),
+    ("coral", [255, 127, 80]),
+    ("cornflowerblue", [100, 149, 237]),
+    ("cornsilk", [255, 248, 220]),
+    ("crimson", [220, 20, 60]),
+    ("cyan", [0, 255, 255]),
+    ("darkblue", [0, 0, 139]),
+    ("darkcyan", [0, 139, 139]),
+    ("darkgoldenrod", [184, 134, 11]),
+    ("darkgray", [169, 169, 169]),
+    ("darkgreen", [0, 100, 0]),
+    ("darkgrey", [169, 169, 169]),
+    ("darkkhaki", [189, 183, 107]),
+    ("darkmagenta", [139, 0, 139]),
+    ("darkolivegreen", [85, 107, 47]),
+    ("darkorange", [255, 140, 0]),
+    ("darkorchid", [153, 50, 204]),
+    ("darkred", [139, 0, 0]),
+    ("darksalmon", [233, 150, 122]),
+    ("darkseagreen", [143, 188, 143]),
+    ("darkslateblue", [72, 61, 139]),
+    ("darkslategray", [47, 79, 79]),
+    ("darkslategrey", [47, 79, 79]),
+    ("darkturquoise", [0, 206, 209]),
+    ("darkviolet", [148, 0, 211]),
+    ("deeppink", [255, 20, 147]),
+    ("deepskyblue", [0, 191, 255]),
+    ("dimgray", [105, 105, 105]),
+    ("dimgrey", [105, 105, 105]),
+    ("dodgerblue", [30, 144, 255]),
+    ("firebrick", [178, 34, 34]),
+    ("floralwhite", [255, 250, 240]),
+    ("forestgreen", [34, 139, 34]),
+    ("fuchsia", [255, 0, 255]),
+    ("gainsboro", [220, 220, 220]),
+    ("ghostwhite", [248, 248, 255]),
+    ("gold", [255, 215, 0]),
+    ("goldenrod", [218, 165, 32]),
+    ("gray", [128, 128, 128]),
+    ("green", [0, 128, 0]),
+    ("greenyellow", [173, 255, 47]),
+    ("grey", [128, 128, 128]),
+    ("honeydew", [240, 255, 240]),
+    ("hotpink", [255, 105, 180]),
+    ("indianred", [205, 92, 92]),
+    ("indigo", [75, 0, 130]),
+    ("ivory", [255, 255, 240]),
+    ("khaki", [240, 230, 140]),
+    ("lavender", [230, 230, 250]),
+    ("lavenderblush", [255, 240, 245]),
+    ("lawngreen", [124, 252, 0]),
+    ("lemonchiffon", [255, 250, 205]),
+    ("lightblue", [173, 216, 230]),
+    ("lightcoral", [240, 128, 128]),
+    ("lightcyan", [224, 255, 255]),
+    ("lightgoldenrodyellow", [250, 250, 210]),
+    ("lightgray", [211, 211, 211]),
+    ("lightgreen", [144, 238, 144]),
+    ("lightgrey", [211, 211, 211]),
+    ("lightpink", [255, 182, 193]),
+    ("lightsalmon", [255, 160, 122]),
+    ("lightseagreen", [32, 178, 170]),
+    ("lightskyblue", [135, 206, 250]),
+    ("lightslategray", [119, 136, 153]),
+    ("lightslategrey", [119, 136, 153]),
+    ("lightsteelblue", [176, 196, 222]),
+    ("lightyellow", [255, 255, 224]),
+    ("lime", [0, 255, 0]),
+    ("limegreen", [50, 205, 50]),
+    ("linen", [250, 240, 230]),
+    ("magenta", [255, 0, 255]),
+    ("maroon", [128, 0, 0]),
+    ("mediumaquamarine", [102, 205, 170]),
+    ("mediumblue", [0, 0, 205]),
+    ("mediumorchid", [186, 85, 211]),
+    ("mediumpurple", [147, 112, 219]),
+    ("mediumseagreen", [60, 179, 113]),
+    ("mediumslateblue", [123, 104, 238]),
+    ("mediumspringgreen", [0, 250, 154]),
+    ("mediumturquoise", [72, 209, 204]),
+    ("mediumvioletred", [199, 21, 133]),
+    ("midnightblue", [25, 25, 112]),
+    ("mintcream", [245, 255, 250]),
+    ("mistyrose", [255, 228, 225]),
+    ("moccasin", [255, 228, 181]),
+    ("navajowhite", [255, 222, 173]),
+    ("navy", [0, 0, 128]),
+    ("oldlace", [253, 245, 230]),
+    ("olive", [128, 128, 0]),
+    ("olivedrab", [107, 142, 35]),
+    ("orange", [255, 165, 0]),
+    ("orangered", [255, 69, 0]),
+    ("orchid", [218, 112, 214]),
+    ("palegoldenrod", [238, 232, 170]),
+    ("palegreen", [152, 251, 152]),
+    ("paleturquoise", [175, 238, 238]),
+    ("palevioletred", [219, 112, 147]),
+    ("papayawhip", [255, 239, 213]),
+    ("peachpuff", [255, 218, 185]),
+    ("peru", [205, 133, 63]),
+    ("pink", [255, 192, 203]),
+    ("plum", [221, 160, 221]),
+    ("powderblue", [176, 224, 230]),
+    ("purple", [128, 0, 128]),
+    ("red", [255, 0, 0]),
+    ("rosybrown", [188, 143, 143]),
+    ("royalblue", [65, 105, 225]),
+    ("saddlebrown", [139, 69, 19]),
+    ("salmon", [250, 128, 114]),
+    ("sandybrown", [244, 164, 96]),
+    ("seagreen", [46, 139, 87]),
+    ("seashell", [255, 245, 238]),
+    ("sienna", [160, 82, 45]),
+    ("silver", [192, 192, 192]),
+    ("skyblue", [135, 206, 235]),
+    ("slateblue", [106, 90, 205]),
+    ("slategray", [112, 128, 144]),
+    ("slategrey", [112, 128, 144]),
+    ("snow", [255, 250, 250]),
+    ("springgreen", [0, 255, 127]),
+    ("steelblue", [70, 130, 180]),
+    ("tan", [210, 180, 140]),
+    ("teal", [0, 128, 128]),
+    ("thistle", [216, 191, 216]),
+    ("tomato", [255, 99, 71]),
+    ("turquoise", [64, 224, 208]),
+    ("violet", [238, 130, 238]),
+    ("wheat", [245, 222, 179]),
+    ("white", [255, 255, 255]),
+    ("whitesmoke", [245, 245, 245]),
+    ("yellow", [255, 255, 0]),
+    ("yellowgreen", [154, 205, 50]),
+];
+
 fn named_color(name: &str) -> Option<[f64; 4]> {
-    // A small starter set of the CSS keywords; the full ~147-name table
-    // comes with the color milestone.
-    let rgb: [f64; 3] = match name.to_ascii_lowercase().as_str() {
-        "red" => [1.0, 0.0, 0.0],
-        "green" => [0.0, 0.5, 0.0],
-        "lime" => [0.0, 1.0, 0.0],
-        "blue" => [0.0, 0.0, 1.0],
-        "yellow" => [1.0, 1.0, 0.0],
-        "orange" => [1.0, 0.647, 0.0],
-        "purple" => [0.5, 0.0, 0.5],
-        "cyan" | "aqua" => [0.0, 1.0, 1.0],
-        "magenta" | "fuchsia" => [1.0, 0.0, 1.0],
-        "white" => [1.0, 1.0, 1.0],
-        "black" => [0.0, 0.0, 0.0],
-        "gray" | "grey" => [0.5, 0.5, 0.5],
-        "silver" => [0.753, 0.753, 0.753],
-        "gold" => [1.0, 0.843, 0.0],
-        "goldenrod" => [0.855, 0.647, 0.125],
-        "steelblue" => [0.275, 0.51, 0.706],
-        "tomato" => [1.0, 0.388, 0.278],
-        _ => return None,
-    };
-    Some([rgb[0], rgb[1], rgb[2], 1.0])
+    let lower = name.to_ascii_lowercase();
+    // "transparent" is alpha 0: invisible in preview, yet still present in
+    // the CSG result and every export.
+    if lower == "transparent" {
+        return Some([0.0, 0.0, 0.0, 0.0]);
+    }
+    let i = NAMED_COLORS.binary_search_by(|(n, _)| (*n).cmp(lower.as_str())).ok()?;
+    let [r, g, b] = NAMED_COLORS[i].1;
+    Some([r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0, 1.0])
 }
 
 fn hex_color(s: &str) -> Option<[f64; 4]> {
@@ -5995,6 +6297,105 @@ mod tests {
         let out = run(&format!("linear_extrude(height = 2) import(\"{}\");", ps));
         std::fs::remove_file(ps).ok();
         assert!((total_volume(&out) - 200.0).abs() < 1e-3, "SVG round-trip vol {}", total_volume(&out));
+    }
+
+    #[test]
+    fn the_whole_css_keyword_set_is_accepted() {
+        // The table used to hold 18 of the ~147 CSS/SVG keywords, so a script
+        // naming any other shade got a warning and an UNCOLOURED object.
+        assert_eq!(NAMED_COLORS.len(), 147);
+        let mut names: Vec<&str> = NAMED_COLORS.iter().map(|(n, _)| *n).collect();
+        let sorted = {
+            let mut c = names.clone();
+            c.sort_unstable();
+            c
+        };
+        assert_eq!(names, sorted, "the table must stay sorted for binary_search");
+        names.dedup();
+        assert_eq!(names.len(), NAMED_COLORS.len(), "no duplicate keywords");
+
+        let c = |n: &str| named_color(n);
+        assert_eq!(c("darkseagreen"), Some([143.0 / 255.0, 188.0 / 255.0, 143.0 / 255.0, 1.0]));
+        assert_eq!(c("DarkSeaGreen"), c("darkseagreen"), "case-insensitive");
+        assert_eq!(c("gray"), c("grey"));
+        assert_eq!(c("darkslategray"), c("darkslategrey"));
+        assert_eq!(c("aqua"), c("cyan"));
+        assert_eq!(c("fuchsia"), c("magenta"));
+        assert_eq!(c("red"), Some([1.0, 0.0, 0.0, 1.0]));
+        assert_eq!(c("white"), Some([1.0, 1.0, 1.0, 1.0]));
+        // "transparent" is alpha 0 but still real geometry.
+        assert_eq!(c("transparent"), Some([0.0, 0.0, 0.0, 0.0]));
+        assert!((total_volume(&run("color(\"transparent\") cube(2);")) - 8.0).abs() < 1e-9);
+        // Not in the SVG/CSS3 set, and plain nonsense: both warn, and the
+        // child still renders, uncoloured.
+        for bad in ["rebeccapurple", "notacolor"] {
+            assert_eq!(c(bad), None);
+            let out = run(&format!("color(\"{}\") cube(2);", bad));
+            assert!(
+                out.warnings.iter().any(|w| w.contains("Unable to parse color")
+                    && w.contains(bad)
+                    && w.contains("en.wikipedia.org/wiki/Web_colors")),
+                "{:?}",
+                out.warnings
+            );
+            assert!((total_volume(&out) - 8.0).abs() < 1e-9, "the child is still rendered");
+        }
+    }
+
+    #[test]
+    fn a_bare_semicolon_is_an_empty_statement() {
+        // The reference: "';' alone is an empty instantiation". Rejecting it
+        // failed the WHOLE file over one stray character.
+        let out = run("cube(1);;\nfor (i = [0:2]) ;\ncube(2);\n");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!((total_volume(&out) - 9.0).abs() < 1e-9, "vol {}", total_volume(&out));
+        // It draws nothing on its own, and a modifier cannot prefix one.
+        assert_eq!(total_volume(&run(";;;")), 0.0);
+        assert!(parse("*;").is_err());
+    }
+
+    #[test]
+    fn surface_ignores_invert_for_a_text_grid() {
+        // Per the reference, `invert` flips a PNG heightmap's luminance and is
+        // silently ignored in text mode — but the .csg head still carries the
+        // argument the script wrote.
+        let p = "scadforge_test_surf.dat";
+        std::fs::write(p, "0 0 0\n0 3 0\n0 0 0\n").unwrap();
+        let plain = run(&format!("surface(file = \"{}\");", p));
+        let inverted = run(&format!("surface(file = \"{}\", invert = true);", p));
+        let tree = csg_of(&format!("surface(file = \"{}\", invert = true);", p));
+        std::fs::remove_file(p).ok();
+        assert!(
+            (total_volume(&plain) - total_volume(&inverted)).abs() < 1e-9,
+            "invert must not change a text-mode heightmap: {} vs {}",
+            total_volume(&plain),
+            total_volume(&inverted)
+        );
+        assert!(tree.contains("invert = true"), "the head still records it: {}", tree);
+    }
+
+    #[test]
+    fn the_deprecated_dxf_extrudes_record_their_modern_node() {
+        // They used to record no head at all, so the whole extrusion exported
+        // as an empty group() and the .csg round-trip lost the geometry.
+        let p = "scadforge_test_dxfcsg.dxf";
+        std::fs::write(p, crate::http::handle("POST", "/export?format=dxf", "square(8);").body)
+            .unwrap();
+        let src = format!("dxf_linear_extrude(file = \"{}\", height = 5);", p);
+        let tree = csg_of(&src);
+        let rsrc = format!("dxf_rotate_extrude(file = \"{}\");", p);
+        let rtree = csg_of(&rsrc);
+        let before = total_volume(&run(&src));
+        let after = total_volume(&run(&tree));
+        let rbefore = total_volume(&run(&rsrc));
+        let rafter = total_volume(&run(&rtree));
+        std::fs::remove_file(p).ok();
+        assert!(tree.contains("linear_extrude(height = 5"), "{}", tree);
+        assert!(tree.contains("import(file = "), "the profile source survives: {}", tree);
+        assert!(rtree.contains("rotate_extrude(angle = 360"), "{}", rtree);
+        assert!((before - after).abs() < 1e-9, "linear round-trip {} vs {}", before, after);
+        assert!((rbefore - rafter).abs() < 1e-9, "rotate round-trip {} vs {}", rbefore, rafter);
+        assert!(before > 0.0 && rbefore > 0.0);
     }
 
     #[test]

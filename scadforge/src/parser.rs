@@ -68,8 +68,13 @@ fn parse_inner(src: &str) -> Result<Vec<Stmt>, String> {
     Ok(stmts)
 }
 
-/// Graceful bound on nesting depth; far above any real script, well below
-/// what the large parser stack can hold.
+/// Graceful bound on AST depth: parenthesised nesting, chained statements,
+/// AND left-associative operator chains, which are just as deep.
+///
+/// The fold loops used not to count, so the guard never saw them: a flat
+/// `1+1+1+...` of 200,000 terms parsed happily into a 200,000-deep tree and
+/// then OVERFLOWED THE STACK — abort, SIGABRT, no diagnostic — when
+/// something walked it. Depth is depth however it is spelled.
 const MAX_PARSE_DEPTH: usize = 2000;
 
 struct Parser {
@@ -142,6 +147,13 @@ impl Parser {
         self.depth -= 1;
     }
 
+    /// Give back every level a left-associative fold loop took. The chain it
+    /// built is real AST depth while it is being built — that is the point
+    /// of counting it — but it is not depth its SIBLINGS inherit.
+    fn unwind(&mut self, to: usize) {
+        self.depth = to;
+    }
+
     /// Statement nesting shares the depth guard with expressions —
     /// chained bare children (translate() translate() ... cube();) and
     /// nested blocks must error gracefully, not overflow the stack.
@@ -179,6 +191,14 @@ impl Parser {
         if self.peek() == Some(&Tok::LBrace) {
             self.pos += 1;
             return Ok(Stmt::Block(self.block_body()?));
+        }
+        // A bare `;` is an empty instantiation — legal, and it draws nothing.
+        // It is what `for (i = [0:3]) ;` and a stray extra semicolon after a
+        // call amount to, and rejecting it failed the WHOLE file over one
+        // character. Recorded as the same empty group a bare `{ }` records.
+        if self.peek() == Some(&Tok::Semi) {
+            self.pos += 1;
+            return Ok(Stmt::Block(Vec::new()));
         }
         let name = match self.peek() {
             Some(Tok::Ident(s)) => s.clone(),
@@ -458,26 +478,33 @@ impl Parser {
     }
 
     fn or_expr(&mut self) -> Result<Expr, String> {
+        let start = self.depth;
         let mut lhs = self.and_expr()?;
         while self.peek() == Some(&Tok::OrOr) {
             self.pos += 1;
             let rhs = self.and_expr()?;
+            self.enter()?; // each fold deepens the tree by one level
             lhs = Expr::Binary { op: BinOp::Or, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
+        self.unwind(start);
         Ok(lhs)
     }
 
     fn and_expr(&mut self) -> Result<Expr, String> {
+        let start = self.depth;
         let mut lhs = self.equality()?;
         while self.peek() == Some(&Tok::AndAnd) {
             self.pos += 1;
             let rhs = self.equality()?;
+            self.enter()?; // each fold deepens the tree by one level
             lhs = Expr::Binary { op: BinOp::And, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
+        self.unwind(start);
         Ok(lhs)
     }
 
     fn equality(&mut self) -> Result<Expr, String> {
+        let start = self.depth;
         let mut lhs = self.relational()?;
         loop {
             let op = match self.peek() {
@@ -487,12 +514,15 @@ impl Parser {
             };
             self.pos += 1;
             let rhs = self.relational()?;
+            self.enter()?; // each fold deepens the tree by one level
             lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
+        self.unwind(start);
         Ok(lhs)
     }
 
     fn relational(&mut self) -> Result<Expr, String> {
+        let start = self.depth;
         let mut lhs = self.additive()?;
         loop {
             let op = match self.peek() {
@@ -504,12 +534,15 @@ impl Parser {
             };
             self.pos += 1;
             let rhs = self.additive()?;
+            self.enter()?; // each fold deepens the tree by one level
             lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
+        self.unwind(start);
         Ok(lhs)
     }
 
     fn additive(&mut self) -> Result<Expr, String> {
+        let start = self.depth;
         let mut lhs = self.term()?;
         loop {
             let op = match self.peek() {
@@ -519,12 +552,15 @@ impl Parser {
             };
             self.pos += 1;
             let rhs = self.term()?;
+            self.enter()?; // each fold deepens the tree by one level
             lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
+        self.unwind(start);
         Ok(lhs)
     }
 
     fn term(&mut self) -> Result<Expr, String> {
+        let start = self.depth;
         let mut lhs = self.unary()?;
         loop {
             let op = match self.peek() {
@@ -535,8 +571,10 @@ impl Parser {
             };
             self.pos += 1;
             let rhs = self.unary()?;
+            self.enter()?; // each fold deepens the tree by one level
             lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
+        self.unwind(start);
         Ok(lhs)
     }
 

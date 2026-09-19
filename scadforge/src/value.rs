@@ -85,6 +85,27 @@ impl Value {
         }
     }
 
+    /// Three numeric components, padding a short vector with `fill`.
+    ///
+    /// translate() pads with 0 and scale() pads with 1 — the reference is
+    /// explicit that scale([2,3]) "leaves Z unscaled". Sharing translate's
+    /// zero-padding gave scale() a diag(2,3,0) matrix that FLATTENED every
+    /// 3D child onto z=0, with a zero determinant, so neither the
+    /// non-finite guard nor the winding flip noticed and the collapsed mesh
+    /// went out to STL as a zero-volume soup.
+    pub fn as_vec3_fill(&self, fill: f64) -> Option<[f64; 3]> {
+        match self {
+            Value::Vector(items) if items.len() <= 3 => {
+                let mut out = [fill; 3];
+                for (i, item) in items.iter().enumerate() {
+                    out[i] = item.as_num()?;
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     /// Exactly three numeric components — no zero padding.
     ///
     /// `as_vec3` pads a short vector, which is right for translate() (the
