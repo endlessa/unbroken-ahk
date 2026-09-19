@@ -33,6 +33,19 @@ fn regions_bbox(regions: &[Poly2]) -> ([f64; 2], [f64; 2]) {
     }
 }
 
+/// Resolve every region to its true filled area and merge them into one
+/// even-odd region.
+///
+/// Every 2D writer here emits closed loops that its consumer fills by PARITY,
+/// and a `text()` region is filled by the font's WINDING — the bundled face
+/// draws a letter as deliberately overlapping closed strokes that only the
+/// non-zero rule unions. Handed over raw, each overlap reads as a hole, so
+/// the crossbar junctions of an "A" come out punched through. Two overlapping
+/// top-level squares have the same problem for the same reason.
+fn as_even_odd(regions: &[Poly2]) -> Poly2 {
+    crate::csg2::union2(&regions.iter().map(crate::poly2::sanitize).collect::<Vec<_>>())
+}
+
 /// Write a 2D region set as one SVG document: every contour becomes a closed
 /// `<path>` subpath and the whole set is one filled path with
 /// `fill-rule="evenodd"` (so holes read correctly). The Y axis is flipped so
@@ -46,9 +59,7 @@ pub fn write_svg(regions: &[Poly2]) -> String {
     // strokes came out with holes punched where they crossed, and two
     // separate top-level squares that overlapped exported with their
     // overlap cut away.
-    let merged = crate::csg2::union2(
-        &regions.iter().map(crate::poly2::sanitize).collect::<Vec<_>>(),
-    );
+    let merged = as_even_odd(regions);
     let regions: &[Poly2] = std::slice::from_ref(&merged);
     let (lo, hi) = regions_bbox(regions);
     let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
@@ -100,6 +111,11 @@ pub fn write_pdf(regions: &[Poly2]) -> String {
     let w = (hi[0] - lo[0]) * K + 2.0 * MARGIN;
     let h = (hi[1] - lo[1]) * K + 2.0 * MARGIN;
     // Build the content stream: path ops in page points (origin bottom-left).
+    // `B*` below is PDF's EVEN-ODD fill-and-stroke, so the region has to be
+    // resolved first, exactly as write_svg does — text() came out with its
+    // stroke crossings punched into holes AND outlined across the letter.
+    let merged = as_even_odd(regions);
+    let regions: &[Poly2] = std::slice::from_ref(&merged);
     let mut cs = String::from("0.8 0.8 0.8 rg 0 0 0 RG 0.5 w\n");
     for r in regions {
         for c in &r.contours {
@@ -151,6 +167,13 @@ pub fn write_pdf(regions: &[Poly2]) -> String {
 /// Write a 2D region set as a minimal DXF: one closed LWPOLYLINE entity per
 /// contour (the entity CAM tools read most reliably). Millimetre units.
 pub fn write_dxf_2d(regions: &[Poly2]) -> String {
+    // Closed loops that every consumer — including this crate's own
+    // `read_dxf`, which hard-codes Fill::EvenOdd — fills by parity, so the
+    // region is resolved first. Writing a text() region's raw overlapping
+    // strokes lost the ink at every crossing, and the round trip through our
+    // own reader did not preserve area.
+    let merged = as_even_odd(regions);
+    let regions: &[Poly2] = std::slice::from_ref(&merged);
     let mut s = String::from("0\nSECTION\n2\nENTITIES\n");
     for r in regions {
         for c in &r.contours {
@@ -1227,6 +1250,63 @@ mod tests {
         // A triangle referencing an out-of-range vertex is dropped.
         let onlyvtx = write_3mf(&Mesh { positions: vec![[0.0; 3]], tris: vec![] });
         assert_eq!(tri_count(&read_3mf(&onlyvtx).unwrap()), 0);
+    }
+
+    #[test]
+    fn every_2d_writer_resolves_a_font_region_before_emitting_it() {
+        // A text() region is Fill::Font — NON-ZERO — because the face draws a
+        // letter as deliberately OVERLAPPING closed strokes of the same
+        // winding. Each of these writers emits closed loops that its consumer
+        // fills by PARITY: SVG's fill-rule="evenodd", PDF's B* operator, and
+        // for DXF this crate's own read_dxf, which hard-codes Fill::EvenOdd.
+        // Handed the raw contours, the overlap came back as a HOLE.
+        //
+        // Two overlapping same-wound squares are that situation exactly.
+        let sq = |x: f64, y: f64, w: f64| {
+            vec![[x, y], [x + w, y], [x + w, y + w], [x, y + w]]
+        };
+        let strokes = Poly2::new_font(vec![sq(0.0, 0.0, 10.0), sq(6.0, 6.0, 10.0)]);
+        assert_eq!(strokes.contours.len(), 2);
+        // Non-zero area: two 100 squares less their 4x4 overlap counted twice.
+        let want = 100.0 + 100.0 - 16.0;
+        assert!((region_area(&crate::poly2::sanitize(&strokes)) - want).abs() < 1e-6);
+
+        let svg = write_svg(std::slice::from_ref(&strokes));
+        let pdf = write_pdf(std::slice::from_ref(&strokes));
+        let dxf = write_dxf_2d(std::slice::from_ref(&strokes));
+        // One resolved outline, not two crossing loops.
+        assert_eq!(svg.matches('Z').count(), 1, "SVG subpaths:\n{svg}");
+        assert_eq!(pdf.matches("\nh\n").count(), 1, "PDF subpaths");
+        assert_eq!(dxf.matches("LWPOLYLINE").count(), 1, "DXF loops");
+
+        // ...and the DXF round trip through our own reader preserves the area
+        // instead of cutting the overlap out of it.
+        let (back, warns) = read_dxf(&dxf, 0.0, 12.0, 2.0);
+        assert!(warns.is_empty(), "{warns:?}");
+        let got = region_area(&back);
+        assert!((got - want).abs() / want < 1e-6, "DXF round trip lost ink: {want} -> {got}");
+
+        // A plain even-odd region with a real hole still keeps it.
+        let ring = Poly2::new(vec![
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            vec![[3.0, 3.0], [3.0, 7.0], [7.0, 7.0], [7.0, 3.0]],
+        ]);
+        assert_eq!(write_dxf_2d(std::slice::from_ref(&ring)).matches("LWPOLYLINE").count(), 2);
+        assert!((region_area(&read_dxf(&write_dxf_2d(std::slice::from_ref(&ring)), 0.0, 12.0, 2.0).0)
+            - 84.0)
+            .abs()
+            < 1e-6);
+    }
+
+    /// Total filled area of an even-odd region, by triangulating it.
+    fn region_area(p: &Poly2) -> f64 {
+        let (pts, tris) = crate::poly2::triangulate(p);
+        tris.iter()
+            .map(|t| {
+                let (a, b, c) = (pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]);
+                ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0
+            })
+            .sum()
     }
 
     #[test]

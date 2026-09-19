@@ -632,10 +632,15 @@ pub fn circle(r: f64, n: u32) -> Poly2 {
     if !(r > 0.0) || n < 3 {
         return Poly2::new(Vec::new());
     }
+    // The reference: "Vertex i at (r*cos(360*i/N), r*sin(360*i/N)) ... so
+    // vertex 0 is exactly (r, 0)". In DEGREES, through the shared exact trig,
+    // so circle(r, $fn=4) lands on the axes exactly and circle(r, $fn=6)
+    // gives cos(60) == 0.5 — and so the 2D primitive agrees with the 3D ones,
+    // which matters the moment a profile is extruded.
     let contour = (0..n)
         .map(|i| {
-            let a = std::f64::consts::TAU * i as f64 / n as f64;
-            [r * a.cos(), r * a.sin()]
+            let (sa, ca) = crate::trig::sin_cos_deg(360.0 * i as f64 / n as f64);
+            [r * ca, r * sa]
         })
         .collect();
     Poly2::new(vec![contour])

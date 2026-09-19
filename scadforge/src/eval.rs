@@ -3258,7 +3258,13 @@ fn positional_names(module: &str) -> &'static [&'static str] {
         }
         "surface" => &["file", "center", "convexity"],
         "render" => &["convexity"],
-        "text" => &["text", "size", "font", "halign", "valign", "spacing", "direction"],
+        // Nine, per the reference signature — `language` and `script` were
+        // missing, so the two rightmost positional arguments of the
+        // documented form drew a spurious "too many positional arguments"
+        // warning and never reached `bound`.
+        "text" => {
+            &["text", "size", "font", "halign", "valign", "spacing", "direction", "language", "script"]
+        }
         "dxf_linear_extrude" => &["file", "layer", "height", "origin", "scale"],
         "dxf_rotate_extrude" => &["file", "layer", "origin"],
         "color" => &["c", "alpha"],
@@ -3370,6 +3376,18 @@ fn resolve_fragments(r: f64, ctx: &mut Ctx) -> u32 {
             "$fn of {} exceeds the {} fragment cap; clamping (a sphere is \
              quadratic in $fn, and the allocation would abort the process)",
             fn_, geom::MAX_FRAGMENTS
+        ));
+    }
+    // The same promise for the $fa/$fs branch, which the check above never
+    // reached: with $fn = 0 the cap bit in silence and the model came out
+    // coarser than the script asked for with nothing in the console.
+    let want = geom::uncapped_fragments(r, fn_, fa, fs);
+    if want > geom::MAX_FRAGMENTS as f64 && !ctx.clamp_warned.iter().any(|w| w == "$fa/$fs") {
+        ctx.clamp_warned.push("$fa/$fs".into());
+        ctx.warn(format!(
+            "$fa/$fs ask for {} fragments, past the {} cap; clamping",
+            fmt_num(want),
+            geom::MAX_FRAGMENTS
         ));
     }
     geom::fragments(r, fn_, fa, fs)

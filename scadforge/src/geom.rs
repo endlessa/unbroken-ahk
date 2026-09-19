@@ -73,6 +73,22 @@ pub fn fragments(r: f64, fn_: f64, fa: f64, fs: f64) -> u32 {
     if !n.is_finite() { 3 } else { n.clamp(3.0, MAX_FRAGMENTS as f64) as u32 }
 }
 
+/// What the $fa/$fs branch WOULD produce before the cap, so the evaluator can
+/// tell whether the cap bit and say so. `MAX_FRAGMENTS`' own doc comment
+/// promises "the clamp is never silent", but the warning only ever tested the
+/// $fn branch: with $fn = 0 and small $fa/$fs, a `cylinder(h=1, r=100)` asked
+/// for 3600 fragments, silently got 1024, and nothing in the console said the
+/// model was rendered coarser than the script asked for.
+pub fn uncapped_fragments(r: f64, fn_: f64, fa: f64, fs: f64) -> f64 {
+    if fn_ > 0.0 || !r.is_finite() || r <= 0.0 {
+        return 0.0; // the $fn branch, or a degenerate radius: not this path
+    }
+    let by_angle = 360.0 / fa.max(0.01);
+    let by_arc = 2.0 * std::f64::consts::PI * r / fs.max(0.01);
+    let n = by_angle.min(by_arc).max(5.0).ceil();
+    if n.is_finite() { n } else { 0.0 }
+}
+
 // -- Matrices ---------------------------------------------------------------
 
 pub fn identity() -> Mat4 {
@@ -354,12 +370,18 @@ pub fn sphere(r: f64, n: u32) -> Mesh {
     let n = n.max(3) as usize;
     let rings = (n as f64 / 2.0).ceil() as usize;
     let mut positions = Vec::with_capacity(rings * n);
+    // DEGREES, through the shared exact trig, exactly as the reference states
+    // the layout: "Ring i lies at polar angle phi = 180*(i+0.5)/R degrees" and
+    // "Each ring has N vertices at azimuth 360*j/N degrees". Radian trig put
+    // 6.1e-17 dust on the axis vertices and, worse, ASYMMETRIC dust — the +Y
+    // and -Y vertices of a 4-sided ring differed in magnitude, so the mesh was
+    // not symmetric about a plane the shape obviously is.
     for i in 0..rings {
-        let phi = std::f64::consts::PI * (i as f64 + 0.5) / rings as f64;
-        let (rz, z) = (r * phi.sin(), r * phi.cos());
+        let (sp, cp) = crate::trig::sin_cos_deg(180.0 * (i as f64 + 0.5) / rings as f64);
+        let (rz, z) = (r * sp, r * cp);
         for j in 0..n {
-            let theta = 2.0 * std::f64::consts::PI * j as f64 / n as f64;
-            positions.push([rz * theta.cos(), rz * theta.sin(), z]);
+            let (st, ct) = crate::trig::sin_cos_deg(360.0 * j as f64 / n as f64);
+            positions.push([rz * ct, rz * st, z]);
         }
     }
     let mut tris = Vec::new();
@@ -407,9 +429,10 @@ pub fn cylinder(h: f64, r1: f64, r2: f64, center: bool, n: u32) -> Mesh {
             vec![(positions.len() - 1) as u32]
         } else {
             let base = positions.len() as u32;
+            // "Both rings have N vertices at azimuth 360*i/N" — degrees.
             for j in 0..n {
-                let theta = 2.0 * std::f64::consts::PI * j as f64 / n as f64;
-                positions.push([r * theta.cos(), r * theta.sin(), z]);
+                let (st, ct) = crate::trig::sin_cos_deg(360.0 * j as f64 / n as f64);
+                positions.push([r * ct, r * st, z]);
             }
             (base..base + n as u32).collect()
         }
@@ -538,5 +561,57 @@ mod tests {
         let before = mesh.tris.clone();
         apply(&scaling([-1.0, 1.0, 1.0]), &mut mesh);
         assert_ne!(mesh.tris, before, "negative determinant must flip winding");
+    }
+}
+
+#[cfg(test)]
+mod exactness_tests {
+    use super::*;
+
+    #[test]
+    fn primitive_rings_land_on_exact_degrees() {
+        // The reference gives every ring in DEGREES — circle "Vertex i at
+        // (r*cos(360*i/N), r*sin(360*i/N)) ... vertex 0 is exactly (r, 0)",
+        // sphere "polar angle 180*(i+0.5)/R degrees" and "azimuth 360*j/N
+        // degrees", cylinder "azimuth 360*i/N" — and the whole point of
+        // trig.rs is that those are exact. Radian trig put 6.1e-17 dust on
+        // the axis vertices, and ASYMMETRIC dust at that: the +Y and -Y
+        // vertices of a 4-sided ring differed in magnitude, so the mesh was
+        // not symmetric about a plane the shape plainly is.
+        let c = cylinder(1.0, 1.0, 1.0, false, 4);
+        assert_eq!(&c.positions[0..4], &[
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ]);
+        // Three rings at 30/90/150 degrees: sin(30) is exactly 0.5.
+        let s = sphere(1.0, 6);
+        assert_eq!(s.positions[0][0], 0.5);
+        assert_eq!(s.positions[0][1], 0.0);
+        // A hexagon's second vertex is (cos 60, sin 60) = (0.5, sqrt(3)/2).
+        let h = crate::poly2::circle(1.0, 6);
+        assert_eq!(h.contours[0][0], [1.0, 0.0]);
+        assert_eq!(h.contours[0][1][0], 0.5);
+        // ...and a square's vertices are exactly on the axes.
+        assert_eq!(crate::poly2::circle(2.0, 4).contours[0], vec![
+            [2.0, 0.0],
+            [0.0, 2.0],
+            [-2.0, 0.0],
+            [0.0, -2.0],
+        ]);
+    }
+
+    #[test]
+    fn the_fa_fs_branch_reports_what_it_wanted() {
+        // MAX_FRAGMENTS' doc comment promises "the clamp is never silent",
+        // but the warning only ever tested the $fn branch.
+        assert_eq!(fragments(100.0, 0.0, 0.1, 0.1), MAX_FRAGMENTS);
+        assert_eq!(uncapped_fragments(100.0, 0.0, 0.1, 0.1), 3600.0);
+        // The $fn branch and a degenerate radius are not this path.
+        assert_eq!(uncapped_fragments(100.0, 64.0, 0.1, 0.1), 0.0);
+        assert_eq!(uncapped_fragments(0.0, 0.0, 0.1, 0.1), 0.0);
+        // An ordinary radius does not trip the cap.
+        assert!(uncapped_fragments(10.0, 0.0, 12.0, 2.0) <= MAX_FRAGMENTS as f64);
     }
 }

@@ -51,7 +51,14 @@ pub fn cos_deg(x: f64) -> f64 {
     if !x.is_finite() || x.abs() >= TRIG_MAX {
         return f64::NAN;
     }
-    exact_sin_deg(x + 90.0).unwrap_or_else(|| x.to_radians().cos())
+    // REDUCE FIRST, then shift. `x % 360.0` is exact for every f64, but
+    // `x + 90.0` is not: once |x| >= 2^54 the ulp of x is 4 or more, so the
+    // shifted angle rounded to x + 88 or x + 92, missed the table, and fell
+    // through to the radian path — whose argument already carries an absolute
+    // error of many radians at that magnitude. cos(1000000000056026880), an
+    // exact multiple of 360, came back 0.272451 while sin of the same angle
+    // reduced exactly to 0.
+    exact_sin_deg(x % 360.0 + 90.0).unwrap_or_else(|| x.to_radians().cos())
 }
 
 pub fn tan_deg(x: f64) -> f64 {
@@ -147,5 +154,33 @@ mod tests {
         assert_ne!(asin_deg(off), 30.0, "a value near sin(30) is not 30 degrees");
         assert!((asin_deg(off) - 30.0).abs() < 1e-6);
         assert_ne!(asin_deg(0.3), asin_deg(0.3).round());
+    }
+}
+
+#[cfg(test)]
+mod huge_angle_tests {
+    use super::*;
+
+    #[test]
+    fn cos_reduces_before_it_shifts() {
+        // cos_deg derived its exact value from exact_sin_deg(x + 90.0). Once
+        // |x| >= 2^54 the ulp of x is 4 or more, so x + 90.0 rounded to
+        // x + 88 or x + 92, missed the table, and fell through to the radian
+        // path — whose argument already carries an error of many radians at
+        // that magnitude. sin was unaffected because it reduces with fmod,
+        // which is exact, so the two disagreed about the same angle.
+        for x in [36000.0f64, 18_014_398_509_482_280.0, 1_000_000_000_056_026_880.0] {
+            assert_eq!(x % 360.0, 0.0, "{x} must be an exact multiple of 360");
+            assert_eq!(sin_deg(x), 0.0, "sin({x})");
+            assert_eq!(cos_deg(x), 1.0, "cos({x})");
+        }
+        // The guard above TRIG_MAX still fires.
+        assert!(cos_deg(TRIG_MAX).is_nan());
+        assert!(sin_deg(TRIG_MAX).is_nan());
+        // ...and the ordinary exact angles are untouched.
+        assert_eq!(cos_deg(60.0), 0.5);
+        assert_eq!(cos_deg(90.0), 0.0);
+        assert_eq!(cos_deg(-90.0), 0.0);
+        assert_eq!(cos_deg(180.0), -1.0);
     }
 }
