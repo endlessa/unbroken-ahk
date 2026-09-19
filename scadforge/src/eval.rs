@@ -3229,7 +3229,14 @@ fn named_params(module: &str) -> Option<&'static [&'static str]> {
         ],
         "color" => &["c", "alpha"],
         "children" | "child" => &["index"],
-        "union" | "difference" | "intersection" | "hull" | "minkowski" | "group" => &[],
+        // minkowski is the only one of these with a parameter — the
+        // reference signature is `minkowski(convexity = 1)`. Grouping it with
+        // the parameterless booleans meant the evaluator warned "unknown
+        // parameter 'convexity'" at a value its OWN .csg export writes into
+        // every minkowski node, so the export re-imported with a diagnostic
+        // the original run never produced.
+        "minkowski" => &["convexity"],
+        "union" | "difference" | "intersection" | "hull" | "group" => &[],
         _ => return None,
     })
 }
@@ -5353,6 +5360,50 @@ mod tests {
         assert!(tree.contains("%sphere("), "background kept:\n{}", tree);
         assert!(!tree.contains("r = 3"), "disabled subtree must not appear:\n{}", tree);
         assert!(csg_of("!cube(2); sphere(1);").contains("!cube("), "root kept");
+    }
+
+    #[test]
+    fn the_csg_export_always_re_parses() {
+        // The export is this project's own correctness oracle, so anything it
+        // can emit that the PARSER rejects poisons every test that leans on
+        // it — and takes the whole file down, not just the offending node.
+        //
+        // A function value was spelled as the bare token `function`, which is
+        // a reserved word: one of them in one rejected argument and the
+        // re-import died at parse time with the cube that rendered fine
+        // alongside it.
+        let src = "f = function (x) x;\ncube(10);\npolygon(points = f);\n";
+        let tree = csg_of(src);
+        assert!(!tree.contains("= function"), "reserved word in the export:\n{tree}");
+        let back = run(&tree);
+        assert!(back.error.is_none(), "export did not re-parse: {:?}\n{tree}", back.error);
+        assert!(
+            (total_volume(&back) - total_volume(&run(src))).abs() < 1e-9,
+            "re-import drew something else"
+        );
+
+        // minkowski's head writes `convexity = N`, and the evaluator listed
+        // minkowski's named parameters as EMPTY, so the export re-imported
+        // with a warning the original run never produced. The reference
+        // signature is `minkowski(convexity = 1)`.
+        let src = "minkowski() { cube([4, 4, 1]); cylinder(r = 1, h = 1, $fn = 8); }";
+        let tree = csg_of(src);
+        assert!(tree.contains("minkowski(convexity ="), "{tree}");
+        let before = run(src);
+        let after = run(&tree);
+        assert_eq!(after.warnings, before.warnings, "the re-import invented a diagnostic");
+        assert!(after.warnings.is_empty(), "{:?}", after.warnings);
+        // ...and a hand-written one is accepted too.
+        assert!(run("minkowski(convexity = 2) { cube(2); sphere(1); }").warnings.is_empty());
+        // The parameterless booleans stay parameterless.
+        for m in ["union", "difference", "intersection", "hull"] {
+            let out = run(&format!("{m}(convexity = 2) {{ cube(2); sphere(1); }}"));
+            assert!(
+                out.warnings.iter().any(|w| w.contains("unknown parameter")),
+                "{m} must still reject convexity: {:?}",
+                out.warnings
+            );
+        }
     }
 
     #[test]

@@ -169,7 +169,17 @@ pub fn value(v: &Value) -> String {
         Value::Range { start, step, end, .. } => {
             format!("[{} : {} : {}]", num(*start), num(*step), num(*end))
         }
-        Value::Function(_) => "function".into(),
+        // A function value has no literal spelling that survives a
+        // re-import: the bare token `function` is a RESERVED WORD, and the
+        // parser rejects it unless a `(` follows. Emitting it made the whole
+        // export unparseable — one function value in one rejected argument
+        // and every shape in the file was lost, not just that one.
+        //
+        // `undef` instead. Every argument that can carry a raw Value here
+        // (polyhedron points/faces/triangles, polygon points/paths, import
+        // layer) rejects a function and an undef identically, so the
+        // re-import draws exactly what the render drew.
+        Value::Function(_) => "undef".into(),
         Value::Undef => "undef".into(),
     }
 }
