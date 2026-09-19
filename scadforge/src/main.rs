@@ -7,7 +7,17 @@ use std::process::exit;
 /// The headless mode is the reference CLI's `-o` export with `-D` Customizer
 /// overrides, sharing eval::render_export with the web `/export` route.
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    // args_os, not args: std::env::args PANICS mid-iteration on an argument
+    // that is not valid Unicode, and a Linux filename is an arbitrary byte
+    // string — a Latin-1 .scad name aborted the process with a backtrace
+    // before any of the diagnostics below could run.
+    let args: Vec<String> = match std::env::args_os().map(|a| a.into_string()).collect() {
+        Ok(v) => v,
+        Err(bad) => {
+            eprintln!("argument is not valid UTF-8: {}", bad.to_string_lossy());
+            exit(2);
+        }
+    };
     let mut port: u16 = 4571;
     let mut output: Option<String> = None;
     let mut input: Option<String> = None;
@@ -62,17 +72,22 @@ fn main() {
                 }
                 i += 2;
             }
-            "--camera" => {
-                // --camera=tx,ty,tz,rx,ry,rz,dist populates $vpt/$vpr/$vpd,
-                // per the reference. Accepted as one argument or as
-                // `--camera=...`; the eye/center form is not supported and
-                // says so rather than guessing.
-                let spec = match args.get(i + 1) {
-                    Some(v) => v.clone(),
-                    None => {
-                        eprintln!("--camera requires tx,ty,tz,rx,ry,rz,dist");
-                        exit(2);
-                    }
+            // --camera=tx,ty,tz,rx,ry,rz,dist populates $vpt/$vpr/$vpd, per
+            // the reference — which spells it with the `=`. Matching only the
+            // bare "--camera" sent the documented form to the
+            // unknown-argument arm, so the comment below promised something
+            // the code refused. Both spellings now work; the eye/center form
+            // is not supported and says so rather than guessing.
+            a if a == "--camera" || a.starts_with("--camera=") => {
+                let (spec, step) = match a.strip_prefix("--camera=") {
+                    Some(v) => (v.to_string(), 1),
+                    None => match args.get(i + 1) {
+                        Some(v) => (v.clone(), 2),
+                        None => {
+                            eprintln!("--camera requires tx,ty,tz,rx,ry,rz,dist");
+                            exit(2);
+                        }
+                    },
                 };
                 match parse_camera(&spec) {
                     Some(c) => camera = c,
@@ -85,7 +100,7 @@ fn main() {
                         exit(2);
                     }
                 }
-                i += 2;
+                i += step;
             }
             "-P" => {
                 // `-P NAME`: the preset set to select from the `-p` file.
@@ -110,7 +125,7 @@ fn main() {
                 eprintln!(
                     "unknown argument '{}'; usage: scadforge [--port N] | \
                      scadforge -o OUT [-D name=value ...] \
-                     [--camera tx,ty,tz,rx,ry,rz,dist] INPUT.scad",
+                     [--camera=tx,ty,tz,rx,ry,rz,dist] INPUT.scad",
                     other
                 );
                 exit(2);

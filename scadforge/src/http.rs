@@ -16,6 +16,11 @@ const PAGE: &str = include_str!("../web/index.html");
 /// Cap request bodies (a render request is a script, not a dataset).
 const MAX_BODY: usize = 1_000_000;
 
+/// How long a connection may go without sending anything before it is
+/// dropped. Generous for a local viewer typing a request, short enough that
+/// a stalled socket cannot hold a thread indefinitely.
+const READ_TIMEOUT_SECS: u64 = 30;
+
 pub struct Response {
     pub status: &'static str,
     pub content_type: &'static str,
@@ -371,6 +376,14 @@ pub fn serve(port: u16) -> std::io::Result<()> {
             Err(_) => continue,
         };
         std::thread::spawn(move || {
+            // A client that connects and then stalls — a crashed viewer, a
+            // half-open socket after a network drop, a probe that never
+            // sends a byte — must not park this thread forever. Neither
+            // read loop in serve_one has any escape other than EOF, so five
+            // such connections permanently cost five OS threads.
+            let t = Some(std::time::Duration::from_secs(READ_TIMEOUT_SECS));
+            let _ = stream.set_read_timeout(t);
+            let _ = stream.set_write_timeout(t);
             let _ = serve_one(stream);
         });
     }
@@ -395,16 +408,39 @@ fn serve_one(mut stream: std::net::TcpStream) -> std::io::Result<()> {
         }
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
+    let request_line = head.split("\r\n").next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
-    let content_length: usize = lines
-        .filter_map(|l| l.split_once(':'))
-        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse().ok())
-        .unwrap_or(0);
+    let header = |name: &str| {
+        head.split("\r\n")
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim())
+    };
+    // A body framed a way we do not implement, or not framed at all, used to
+    // be truncated to NOTHING: the script vanished and the response was a
+    // successful empty render, indistinguishable from a real empty design.
+    // Refuse it instead of lying about it.
+    if header("transfer-encoding").is_some() {
+        return respond(
+            &mut stream,
+            "501 Not Implemented",
+            "text/plain",
+            "transfer encodings are not supported; send a Content-Length",
+        );
+    }
+    let declared = header("content-length").and_then(|v| v.parse::<usize>().ok());
+    if method.eq_ignore_ascii_case("POST") && declared.is_none() {
+        return respond(
+            &mut stream,
+            "411 Length Required",
+            "text/plain",
+            "POST requires a Content-Length header",
+        );
+    }
+    let content_length: usize = declared.unwrap_or(0);
     if content_length > MAX_BODY {
         return respond(&mut stream, "413 Payload Too Large", "text/plain", "body too large");
     }
@@ -447,6 +483,127 @@ fn respond(
 mod tests {
     use super::*;
     use unbroken_test_platform::json::parse_json;
+
+    /// Drive a real socket through `serve` on an ephemeral port and return the
+    /// raw response. The framing and timeout rules live in `serve_one`, below
+    /// `handle`, so `handle` alone cannot reach them.
+    fn raw_request(port: u16, raw: &[u8], read_all: bool) -> String {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        s.write_all(raw).unwrap();
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = s.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+            if !read_all && out.len() > 2048 {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn spawn_server() -> u16 {
+        // Bind first to learn a free port, drop it, then let `serve` take it.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let _ = serve(port);
+        });
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("server never came up on port {port}");
+    }
+
+    #[test]
+    fn the_viewer_is_wired_to_the_camera_channel() {
+        // The server reported Camera::DEFAULT in every response and parsed
+        // vpr0..vpf out of every query, but the viewer sent neither and read
+        // back neither: the whole $vp* feature was dead in the UI. These
+        // pin the two ends together — the viewer's startup view has to BE
+        // Camera::DEFAULT, or echo($vpr) lies before the user touches
+        // anything.
+        let page = handle("GET", "/", "").body;
+        let d = eval::Camera::DEFAULT;
+        let start = format!("let yaw = (-90 - {}) * D2R, pitch = (90 - {}) * D2R;", d.rot[2], d.rot[0]);
+        assert!(page.contains(&start), "viewer startup view drifted from Camera::DEFAULT; want `{start}`");
+        let fov = format!("let fov = {} * D2R;", d.fov);
+        assert!(page.contains(&fov), "viewer field of view drifted from the $vpf default; want `{fov}`");
+        assert!(page.contains("function cameraVp"), "viewer has no camera-to-$vp* mapping");
+        for k in ["vpr0", "vpr1", "vpr2", "vpt0", "vpt1", "vpt2", "vpd", "vpf"] {
+            assert!(page.contains(k), "viewer never sends {k}, so a script reading it sees the default");
+        }
+        assert!(page.contains("applyVp(got, sentVp)"), "viewer ignores the camera the server returns");
+    }
+
+    #[test]
+    fn an_unframed_or_chunked_body_is_refused_not_silently_dropped() {
+        // Both used to be truncated to nothing and answered "200 OK" with an
+        // empty render — a posted script vanishing without a word.
+        let port = spawn_server();
+        let chunked = raw_request(
+            port,
+            b"POST /render HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ncube(10);\r\n0\r\n\r\n",
+            false,
+        );
+        assert!(chunked.starts_with("HTTP/1.1 501"), "chunked: {}", &chunked[..40.min(chunked.len())]);
+        let unframed = raw_request(port, b"POST /render HTTP/1.1\r\nHost: x\r\n\r\ncube(10);", false);
+        assert!(unframed.starts_with("HTTP/1.1 411"), "unframed: {}", &unframed[..40.min(unframed.len())]);
+
+        // A properly framed POST still renders, an explicitly empty one is
+        // still a legitimate empty render, and a GET needs no Content-Length.
+        let body = "cube(10);";
+        let ok = raw_request(
+            port,
+            format!("POST /render HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{}", body.len(), body)
+                .as_bytes(),
+            true,
+        );
+        assert!(ok.starts_with("HTTP/1.1 200"), "framed POST: {}", &ok[..40.min(ok.len())]);
+        assert!(ok.contains("\"positions\""), "framed POST must render geometry");
+        let empty = raw_request(port, b"POST /render HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", true);
+        assert!(empty.starts_with("HTTP/1.1 200"), "empty POST: {}", &empty[..40.min(empty.len())]);
+        let get = raw_request(port, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", false);
+        assert!(get.starts_with("HTTP/1.1 200"), "GET: {}", &get[..40.min(get.len())]);
+    }
+
+    #[test]
+    fn the_viewport_camera_survives_the_query_round_trip() {
+        // The viewer sends the live camera as vpr0..vpf so a script READING
+        // $vpr sees where the user orbited to, and the response carries where
+        // the camera should end up so a top-level assignment can move it.
+        let c = camera_from_query("vpr0=70&vpr1=0&vpr2=15&vpt0=1&vpt1=2&vpt2=3&vpd=250&vpf=45");
+        assert_eq!(c.rot, [70.0, 0.0, 15.0]);
+        assert_eq!(c.trans, [1.0, 2.0, 3.0]);
+        assert_eq!((c.dist, c.fov), (250.0, 45.0));
+        // A missing or unparseable key falls back to that component's default,
+        // never to NaN.
+        let d = camera_from_query("vpr0=nope&vpd=");
+        assert_eq!(d.rot, eval::Camera::DEFAULT.rot);
+        assert_eq!(d.dist, eval::Camera::DEFAULT.dist);
+
+        let read = render_json_with_camera("echo($vpr); echo($vpf);", &[], c);
+        assert!(read.contains("[70, 0, 15]"), "a read must see the live camera: {read}");
+        assert!(read.contains("ECHO: 45"), "$vpf too: {read}");
+        // A top-level assignment comes back in `camera` so the viewer can move.
+        let moved = render_json_with_camera("$vpr = [12, 0, 34]; cube(1);", &[], c);
+        let v = parse_json(&moved).unwrap();
+        let cam = v.get("camera").unwrap().as_array().unwrap();
+        assert_eq!(cam[0].as_f64().unwrap(), 12.0);
+        assert_eq!(cam[2].as_f64().unwrap(), 34.0);
+        // ...and with no assignment it is exactly what the viewer sent, which
+        // is what keeps the viewer from fighting the user's own orbiting.
+        let still = parse_json(&render_json_with_camera("cube(1);", &[], c)).unwrap();
+        let cam = still.get("camera").unwrap().as_array().unwrap();
+        let got: Vec<f64> = cam.iter().map(|n| n.as_f64().unwrap()).collect();
+        assert_eq!(got, vec![70.0, 0.0, 15.0, 1.0, 2.0, 3.0, 250.0, 45.0]);
+    }
 
     #[test]
     fn index_serves_the_app_and_unknown_paths_404() {

@@ -173,7 +173,42 @@ function replaceCanvas() {
 // ---- scene state ----------------------------------------------------------
 let soup = [];        // per-mesh: {verts: Float32Array (x,y,z,nx,ny,nz)*, color:[r,g,b,a]}
 let center = [0,0,0], radius = 10;
-let yaw = -0.7, pitch = 0.42, dist = 3.2;   // dist is a multiple of radius
+// The camera IS the $vp* quartet, in the spherical form the draw code wants.
+// $vpr is an Euler rotation of the VIEWPORT: rx tilts it off the top-down
+// view (rx = 90 is the front view) and rz spins it about Z, so
+//     elevation = 90 - rx        azimuth = -90 - rz
+// The startup view is the reference's documented [55, 0, 25], which is why
+// pitch and yaw start at 35 and -115 degrees rather than round numbers; the
+// server reports that same default in every /render response, and the two
+// have to agree or echo($vpr) lies on a fresh page.
+const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+let yaw = (-90 - 25) * D2R, pitch = (90 - 55) * D2R;
+let dist = 3.2;                   // dist is a multiple of radius; $vpd is dist*radius
+let fov = 22.5 * D2R;             // $vpf — the reference's default field of view
+
+// The live camera as the $vp* quartet. The viewer has no roll, so ry is
+// always 0 on read and ignored on write.
+function cameraVp() {
+  return [90 - pitch * R2D, 0, -90 - yaw * R2D,
+          center[0], center[1], center[2],
+          dist * radius, fov * R2D];
+}
+
+// Adopt a camera the script asked for with a top-level $vp* assignment.
+// Only the components that actually CHANGED are applied: the response
+// carries the whole quartet, so writing all of it back would restore the
+// pre-auto-fit look-at point and undo the re-framing for a script that
+// assigned nothing but $vpr. Scripted values are not clamped the way the
+// mouse handlers clamp, so a camera path can go anywhere; only the
+// degenerate cases are guarded.
+function applyVp(got, sent) {
+  const moved = i => Math.abs(got[i] - sent[i]) > 1e-9 && isFinite(got[i]);
+  if (moved(0)) pitch = (90 - got[0]) * D2R;
+  if (moved(2)) yaw = (-90 - got[2]) * D2R;
+  for (let i = 3; i <= 5; i++) if (moved(i)) center[i - 3] = got[i];
+  if (moved(6) && radius > 0) dist = got[6] / radius;
+  if (moved(7) && got[7] > 0 && got[7] < 180) fov = got[7] * D2R;
+}
 
 function setMessages(items) {
   messages.innerHTML = items.map(m =>
@@ -182,9 +217,10 @@ function setMessages(items) {
 }
 
 async function render() {
-  let data;
+  let data, sentVp = null;
   try {
-    const res = await fetch('/render' + overrideQuery(), { method: 'POST', body: editor.value });
+    sentVp = cameraVp();
+    const res = await fetch('/render' + overrideQuery(sentVp), { method: 'POST', body: editor.value });
     data = await res.json();
   } catch (e) {
     setMessages([{cls:'err', text: 'render request failed: ' + e}]);
@@ -240,6 +276,12 @@ async function render() {
   } else if (!data.error) {
     msgs.push({cls:'warn', text: 'no geometry produced'});
   }
+  // AFTER the auto-fit, so a scripted camera wins over the re-framing. The
+  // server echoes back exactly what we sent unless a top-level $vp*
+  // assignment moved it, so comparing is what makes this a no-op for the
+  // ordinary case and keeps the user's orbit from being overwritten.
+  const got = data.camera;
+  if (sentVp && Array.isArray(got) && got.length === 8) applyVp(got, sentVp);
   setMessages(msgs);
   uploadAndDraw();
 }
@@ -247,9 +289,15 @@ async function render() {
 // ---- Customizer panel -----------------------------------------------------
 // Encode the current overrides as `?p=<enc(name=literal)>&...`; the server
 // injects them as trailing assignments before eval (customizer::apply_overrides).
-function overrideQuery() {
+// ...and the live camera as vpr0..vpf, so a script that READS $vpr sees
+// where the user actually orbited to rather than the startup default.
+function overrideQuery(vp) {
   const parts = Object.keys(overrides).map(
     n => 'p=' + encodeURIComponent(n + '=' + overrides[n]));
+  if (vp) {
+    const keys = ['vpr0','vpr1','vpr2','vpt0','vpt1','vpt2','vpd','vpf'];
+    keys.forEach((k, i) => parts.push(k + '=' + encodeURIComponent(vp[i])));
+  }
   return parts.length ? '?' + parts.join('&') : '';
 }
 
@@ -449,8 +497,8 @@ function viewProj(w, h) {
   s = [f[1]*1 - f[2]*0, f[2]*0 - f[0]*1, f[0]*0 - f[1]*0];
   const slen = Math.hypot(...s) || 1; s[0]/=slen; s[1]/=slen; s[2]/=slen;
   const u = [s[1]*f[2]-s[2]*f[1], s[2]*f[0]-s[0]*f[2], s[0]*f[1]-s[1]*f[0]];
-  const near = eyeDist/100, far = eyeDist*10, fov = Math.PI/5, aspect = w/h;
-  const t = 1/Math.tan(fov/2);
+  const near = eyeDist/100, far = eyeDist*10, aspect = w/h;
+  const t = 1/Math.tan(fov/2);   // fov is $vpf
   return { eye,
     tx: p => {   // world → clip; returns [x,y,z,w]
       const x = p[0]-eye[0], y = p[1]-eye[1], z = p[2]-eye[2];
@@ -500,7 +548,7 @@ function mvpMatrix(w, h) {
   let s = [f[1], -f[0], 0];
   const sl = Math.hypot(...s) || 1; s = s.map(v=>v/sl);
   const u = [s[1]*f[2]-s[2]*f[1], s[2]*f[0]-s[0]*f[2], s[0]*f[1]-s[1]*f[0]];
-  const near = eyeDist/100, far = eyeDist*10, t = 1/Math.tan(Math.PI/10), aspect = w/h;
+  const near = eyeDist/100, far = eyeDist*10, t = 1/Math.tan(fov/2), aspect = w/h;
   const a = t/aspect, b = t, c = (far+near)/(near-far), d = (2*far*near)/(near-far);
   const ex = -(s[0]*eye[0]+s[1]*eye[1]+s[2]*eye[2]);
   const ey = -(u[0]*eye[0]+u[1]*eye[1]+u[2]*eye[2]);
