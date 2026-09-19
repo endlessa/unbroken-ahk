@@ -206,7 +206,12 @@ function applyVp(got, sent) {
   if (moved(0)) pitch = (90 - got[0]) * D2R;
   if (moved(2)) yaw = (-90 - got[2]) * D2R;
   for (let i = 3; i <= 5; i++) if (moved(i)) center[i - 3] = got[i];
-  if (moved(6) && radius > 0) dist = got[6] / radius;
+  // Guard the incoming distance, not `radius`: radius is clamped to >= 1e-6
+  // at the auto-fit and so is always positive, which made that test dead
+  // code. A top-level `$vpd = 0;` then set dist = 0, the eye landed exactly
+  // on the look-at point, the view direction normalised to NaN and the
+  // whole viewport went blank.
+  if (moved(6) && got[6] > 0 && radius > 0) dist = got[6] / radius;
   if (moved(7) && got[7] > 0 && got[7] < 180) fov = got[7] * D2R;
 }
 
@@ -229,9 +234,20 @@ async function render() {
   }
   buildCustomizer(data.parameters || []);
   const msgs = [];
-  if (data.error) msgs.push({cls:'err', text: data.error.startsWith('ERROR') ? data.error : 'error: ' + data.error});
-  for (const e of data.echoes || []) msgs.push({cls:'ok', text: e});
-  for (const w of data.warnings || []) msgs.push({cls:'warn', text: w});
+  // `console` is the single interleaved stream the evaluator actually
+  // emitted. Concatenating the `echoes` and `warnings` arrays instead put
+  // every warning after every echo and the error before both, so the panel
+  // disagreed with the .echo export of the very same source.
+  const stream = Array.isArray(data.console) ? data.console : null;
+  if (stream) {
+    for (const [chan, text] of stream) {
+      msgs.push({cls: chan === 'echo' ? 'ok' : chan === 'warn' ? 'warn' : 'err', text});
+    }
+  } else {
+    if (data.error) msgs.push({cls:'err', text: data.error.startsWith('ERROR') ? data.error : 'error: ' + data.error});
+    for (const e of data.echoes || []) msgs.push({cls:'ok', text: e});
+    for (const w of data.warnings || []) msgs.push({cls:'warn', text: w});
+  }
   soup = [];
   let tris = 0;
   const lo = [Infinity,Infinity,Infinity], hi = [-Infinity,-Infinity,-Infinity];
@@ -258,17 +274,27 @@ async function render() {
     // ghost (its color, forced low-alpha); `#` highlight draws as a
     // translucent debug pink. Both land in the transparency pass via alpha<1.
     let color = mesh.color;
-    if (mesh.highlight) {
+    const highlight = !!mesh.highlight;
+    if (highlight) {
       color = [1.0, 0.28, 0.34, 0.55]; // # debug pink (checked first: # ghosts also carry background)
     } else if (mesh.background) {
       color = [color[0], color[1], color[2], 0.22]; // % translucent ghost
     }
-    soup.push({ verts, color });
+    soup.push({ verts, color, highlight });
   }
-  // Opaque meshes first so both render paths can draw transparency in a
-  // second pass (depth-tested, no depth write). Stable sort keeps source
-  // order within each group.
-  soup.sort((a, b) => (b.color[3] >= 1) - (a.color[3] >= 1));
+  // Three passes, in this order:
+  //   0 opaque      — depth tested and written
+  //   1 % ghosts    — depth tested, not written
+  //   2 # ghosts    — NOT depth tested (see below), not written
+  // A `#` ghost is a bit-identical copy of its own opaque geometry, so every
+  // one of its fragments had exactly the depth already in the buffer and the
+  // strictly-less test threw all of them away: `#cube(10);` rendered pixel
+  // for pixel the same as `cube(10);`. The reference is explicit that the
+  // highlight is drawn "superimposed on wherever the geometry logically is —
+  // including geometry that is being SUBTRACTED", which is the whole point of
+  // #-marking a subtrahend, so the ghost must not be depth-hidden at all.
+  const pass = m => (m.color[3] >= 1 ? 0 : m.highlight ? 2 : 1);
+  soup.sort((a, b) => pass(a) - pass(b));
   if (tris > 0) {
     center = [(lo[0]+hi[0])/2, (lo[1]+hi[1])/2, (lo[2]+hi[2])/2];
     radius = Math.max(1e-6, Math.hypot(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]) / 2);
@@ -303,7 +329,13 @@ function overrideQuery(vp) {
 
 // Turn a widget's raw value into an OpenSCAD literal of the parameter's kind.
 function toLiteral(kind, raw) {
-  if (kind === 'bool') return raw ? 'true' : 'false';
+  // The checkbox handler passes a real boolean, but a preset stores values
+  // as STRINGS, so loading one handed this the string "false" — non-empty,
+  // therefore truthy, therefore 'true'. Every saved false came back true.
+  if (kind === 'bool') {
+    if (typeof raw === 'string') return raw.trim() === 'true' ? 'true' : 'false';
+    return raw ? 'true' : 'false';
+  }
   if (kind === 'string') {
     if (typeof raw === 'string' && raw.startsWith('"') && raw.endsWith('"')) return raw;
     return JSON.stringify(String(raw)); // quote + escape
@@ -569,7 +601,7 @@ function uploadAndDraw() {
       const buf = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, buf);
       gl.bufferData(gl.ARRAY_BUFFER, m.verts, gl.STATIC_DRAW);
-      return { buf, count: m.verts.length / 6, color: m.color };
+      return { buf, count: m.verts.length / 6, color: m.color, highlight: m.highlight };
     });
   }
   draw();
@@ -596,9 +628,10 @@ function draw() {
       gl.uniform4fv(loc.uColor, m.color);
       gl.drawArrays(gl.TRIANGLES, 0, m.count);
     };
-    // glBuffers mirrors soup's opaque-first order: draw opaque with the
-    // depth buffer, then transparency blended without depth writes.
-    let blending = false;
+    // glBuffers mirrors soup's pass order: opaque with the depth buffer,
+    // then the ghosts blended without depth writes, and the # highlights
+    // last with the depth test off so they superimpose.
+    let blending = false, unDepthed = false;
     for (const m of glBuffers) {
       if (!blending && m.color[3] < 1) {
         blending = true;
@@ -606,8 +639,13 @@ function draw() {
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
         gl.depthMask(false);
       }
+      if (!unDepthed && m.highlight) {
+        unDepthed = true;
+        gl.disable(gl.DEPTH_TEST);
+      }
       drawMesh(m);
     }
+    if (unDepthed) gl.enable(gl.DEPTH_TEST);
     if (blending) { gl.depthMask(true); gl.disable(gl.BLEND); }
     return;
   }
@@ -647,14 +685,14 @@ function softwareDraw(w, h) {
     const v = m.verts;
     const [cr, cg, cb, ca] = m.color;
     const opaque = ca >= 1;
+    // No backface culling, matching the GL path, which never enables
+    // CULL_FACE. Culling opaque faces away from the eye assumed every
+    // opaque mesh is a CLOSED solid whose back faces are redundant, but a
+    // 2D shape arrives as a one-sided z = 0 sheet whose normals are all
+    // (0, 0, +1): orbiting below the plane culled every triangle and the
+    // design vanished, on the fallback only. The z-buffer already resolves
+    // the closed-solid case, so the cull only ever changed behaviour.
     for (let i = 0; i < v.length; i += 18) {
-      // Backface cull opaque meshes (winding-convention-free: the face
-      // normal comes from the vertex data, so test it against the eye
-      // ray). Transparent meshes keep interior faces, like the GL path.
-      if (opaque) {
-        const facing = v[i+3]*(eye[0]-v[i]) + v[i+4]*(eye[1]-v[i+1]) + v[i+5]*(eye[2]-v[i+2]);
-        if (facing <= 0) continue;
-      }
       const sx = [], sy = [], sz = [];
       let behind = false;
       for (let k = 0; k < 3; k++) {
@@ -696,7 +734,9 @@ function softwareDraw(w, h) {
         let at = y * w + x0;
         for (let x = x0; x <= x1; x++, at++, w0 += dw0x, w1 += dw1x, z += dzx) {
           if (w0 < 0 || w1 < 0 || w0 + w1 > 1) continue;
-          if (z >= zbuf[at]) continue;
+          // A # highlight is not depth tested, so its ghost superimposes on
+          // the bit-identical opaque copy it shadows (see the pass comment).
+          if (!m.highlight && z >= zbuf[at]) continue;
           const o = at * 4;
           if (opaque) {
             zbuf[at] = z;

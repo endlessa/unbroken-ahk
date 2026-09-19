@@ -2963,6 +2963,38 @@ pub fn export_bytes(out: &EvalOutput, format: &str) -> Result<Vec<u8>, String> {
 /// one halted the run. Unlike the geometry exports it is produced even when
 /// evaluation errored, so a `.echo` of an asserting script still captures the
 /// assert message (matching the reference's console-stream semantics).
+/// The console stream as (channel, line) pairs, in the order the evaluation
+/// emitted them. `echo_stream` renders these to text for the `.echo` export;
+/// the web viewer needs the same interleaving with the channels kept apart so
+/// it can colour each line, and two independent arrays cannot express it.
+pub fn console_stream(out: &EvalOutput) -> Vec<(&'static str, String)> {
+    let mut lines: Vec<(&'static str, String)> = Vec::new();
+    let (mut ei, mut wi) = (0usize, 0usize);
+    for chan in &out.order {
+        match chan {
+            Chan::Echo => {
+                if let Some(l) = out.echoes.get(ei) {
+                    lines.push(("echo", l.clone()));
+                    ei += 1;
+                }
+            }
+            Chan::Diag => {
+                if let Some(l) = out.warnings.get(wi) {
+                    lines.push(("warn", l.clone()));
+                    wi += 1;
+                }
+            }
+        }
+    }
+    // Anything the order does not account for is appended rather than dropped.
+    lines.extend(out.echoes.iter().skip(ei).map(|l| ("echo", l.clone())));
+    lines.extend(out.warnings.iter().skip(wi).map(|l| ("warn", l.clone())));
+    if let Some(e) = &out.error {
+        lines.push(("err", e.clone()));
+    }
+    lines
+}
+
 pub fn echo_stream(out: &EvalOutput) -> String {
     // Walk the recorded emission order, pulling from each buffer in turn, so
     // a warning raised between two echoes lands between them. Anything the

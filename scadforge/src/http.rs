@@ -297,6 +297,24 @@ pub fn render_json_with_camera(
                 "echoes",
                 JsonValue::Array(out.echoes.iter().map(|e| str_val(e)).collect()),
             ));
+            // The console as ONE ordered stream. `warnings` and `echoes` are
+            // two independent arrays, and the viewer concatenated them — so a
+            // warning raised BETWEEN two echoes was printed after both, and an
+            // error was printed first rather than last. eval.rs keeps a Chan
+            // per emission precisely because two arrays cannot express the
+            // interleaving; this hands the viewer the same walk the .echo
+            // export uses. The two arrays stay for compatibility.
+            pairs.push((
+                "console",
+                JsonValue::Array(
+                    eval::console_stream(&out)
+                        .into_iter()
+                        .map(|(chan, line)| {
+                            JsonValue::Array(vec![str_val(chan), str_val(&line)])
+                        })
+                        .collect(),
+                ),
+            ));
             if let Some(err) = &out.error {
                 pairs.push(("error", str_val(err)));
             }
@@ -519,6 +537,80 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         panic!("server never came up on port {port}");
+    }
+
+    #[test]
+    fn the_console_is_one_ordered_stream() {
+        // `warnings` and `echoes` are two independent arrays; the viewer
+        // concatenated them, so a warning raised BETWEEN two echoes printed
+        // after both and an error printed first rather than last — the panel
+        // disagreed with the .echo export of the very same source.
+        let json = render_json("echo(\"one\");\nfrob();\necho(\"two\");\ncube(1);", &[]);
+        let v = parse_json(&json).unwrap();
+        let stream: Vec<(String, String)> = v
+            .get("console")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let p = e.as_array().unwrap();
+                (p[0].as_str().unwrap().to_string(), p[1].as_str().unwrap().to_string())
+            })
+            .collect();
+        let chans: Vec<&str> = stream.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(chans, vec!["echo", "warn", "echo"], "stream: {stream:?}");
+        assert!(stream[0].1.contains("one") && stream[2].1.contains("two"));
+        assert!(stream[1].1.contains("frob"));
+
+        // It must agree line for line with what the .echo export writes.
+        let src = "echo(1); frob(); echo(2); assert(false);";
+        let v = parse_json(&render_json(src, &[])).unwrap();
+        let web: Vec<String> = v
+            .get("console")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_array().unwrap()[1].as_str().unwrap().to_string())
+            .collect();
+        let exported = eval::render_export(src, std::path::Path::new("."), &[], "echo").unwrap();
+        let file: Vec<&str> = exported.lines().collect();
+        assert_eq!(web, file, "panel and .echo export disagree");
+        // The error is LAST, not first.
+        assert!(web.last().unwrap().starts_with("ERROR"), "{web:?}");
+
+        // The two flat arrays stay for compatibility.
+        assert!(v.get("warnings").is_some() && v.get("echoes").is_some());
+    }
+
+    #[test]
+    fn the_viewer_draws_the_highlight_ghost_and_guards_a_degenerate_camera() {
+        // A `#` ghost is a bit-identical copy of its own opaque geometry, so
+        // every fragment had exactly the depth already in the buffer and the
+        // strictly-less test discarded all of them: `#cube(10);` rendered
+        // pixel for pixel the same as `cube(10);` in BOTH paths.
+        let page = handle("GET", "/", "").body;
+        assert!(page.contains("gl.disable(gl.DEPTH_TEST)"), "GL path still depth-tests the ghost");
+        assert!(
+            page.contains("if (!m.highlight && z >= zbuf[at]) continue;"),
+            "software path still depth-tests the ghost"
+        );
+        assert!(page.contains("soup.sort((a, b) => pass(a) - pass(b));"), "no three-pass ordering");
+        // The degenerate-distance guard has to test the VALUE: `radius` is
+        // clamped to >= 1e-6 at the auto-fit, so guarding on it was dead code
+        // and `$vpd = 0;` blanked the viewport.
+        assert!(page.contains("moved(6) && got[6] > 0"), "$vpd = 0 is not guarded");
+        // A preset stores booleans as STRINGS, and "false" is truthy.
+        assert!(
+            page.contains("return raw.trim() === 'true' ? 'true' : 'false';"),
+            "a preset's false still comes back true"
+        );
+        // The software path must not cull: a 2D shape is a one-sided z = 0
+        // sheet, and the GL path never enables CULL_FACE.
+        assert!(!page.contains("if (facing <= 0) continue;"), "software path still backface-culls");
+        // ...and it reads the ordered stream.
+        assert!(page.contains("Array.isArray(data.console)"), "viewer ignores the ordered console");
     }
 
     #[test]
