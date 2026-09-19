@@ -345,6 +345,10 @@ fn parameters_json(source: &str) -> JsonValue {
                     ("description", str_val(&p.description)),
                     ("value", str_val(&p.value)),
                     ("kind", str_val(kind)),
+                    // How many widgets to render: 1 for a scalar, the
+                    // component count for a vector, which the reference gives
+                    // "one spinner/slider per component".
+                    ("components", JsonValue::Number(p.components as f64)),
                     ("widget", widget_json(&p.widget)),
                 ])
             })

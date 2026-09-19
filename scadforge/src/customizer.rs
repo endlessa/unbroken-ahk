@@ -38,77 +38,252 @@ pub struct Parameter {
     pub value: String, // default RHS as an OpenSCAD literal string
     pub kind: Kind,
     pub widget: Widget,
+    /// How many widgets this parameter needs: 1 for a scalar, and for a
+    /// vector its component count. The reference: "vector (<=4 numeric
+    /// elements) -> one spinner/slider per component, with a single range
+    /// comment applying to every component". A single scalar widget for a
+    /// vector was worse than none — it displayed the wrong value and every
+    /// edit it produced was rejected as a kind mismatch.
+    pub components: usize,
+}
+
+/// One line after comment removal: the code, the text of a `//` comment that
+/// ran to end of line, the contents of every `/* ... */` block that CLOSED on
+/// this line, and the net brace delta of the code (strings excluded).
+struct LineScan {
+    code: String,
+    line_comment: Option<String>,
+    blocks: Vec<String>,
+    braces: i32,
+}
+
+/// Split one line into code and comments, carrying block-comment state across
+/// lines in `in_block`/`block_acc`. String literals are respected, so a `//`
+/// or `{` inside one is not a comment or a brace.
+///
+/// Bytes are moved, never re-encoded, so UTF-8 in a description or a label
+/// survives: every branch pushes whole bytes in order, and the only bytes ever
+/// matched are ASCII, which can never occur inside a multi-byte sequence.
+fn scan_line(line: &str, in_block: &mut bool, block_acc: &mut Vec<u8>) -> LineScan {
+    let b = line.as_bytes();
+    let mut code: Vec<u8> = Vec::with_capacity(b.len());
+    let mut line_comment = None;
+    let mut blocks = Vec::new();
+    let mut braces = 0i32;
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        if *in_block {
+            if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                *in_block = false;
+                blocks.push(String::from_utf8(std::mem::take(block_acc)).unwrap_or_default());
+                i += 2;
+            } else {
+                block_acc.push(b[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if in_str {
+            code.push(b[i]);
+            if b[i] == b'\\' {
+                if let Some(&n) = b.get(i + 1) {
+                    code.push(n);
+                }
+                i += 2;
+            } else {
+                if b[i] == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        match b[i] {
+            b'"' => {
+                in_str = true;
+                code.push(b'"');
+                i += 1;
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                line_comment = Some(line[i + 2..].to_string());
+                break;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                *in_block = true;
+                block_acc.clear();
+                i += 2;
+            }
+            c => {
+                if c == b'{' {
+                    braces += 1;
+                } else if c == b'}' {
+                    braces -= 1;
+                }
+                code.push(c);
+                i += 1;
+            }
+        }
+    }
+    LineScan {
+        code: String::from_utf8(code).unwrap_or_default(),
+        line_comment,
+        blocks,
+        braces,
+    }
 }
 
 /// Parse the customizable parameters from the source (in first-appearance
 /// order). Stops at the first top-level module/function definition.
+///
+/// Only TOP-LEVEL assignments count. The scan used to be a bare line split
+/// with no lexical state at all, so an assignment commented out inside a
+/// `/* ... */` block became a phantom parameter (and an override was written
+/// INTO the comment), and one nested in an `if`/`for` block was offered as
+/// though it were customizable although the reference states flatly that
+/// "Parameters inside 'if' blocks or modules are never customizable".
 pub fn parse(source: &str) -> Vec<Parameter> {
-    let mut params = Vec::new();
+    // Every top-level assignment in order: the name, the Parameter if its RHS
+    // was a literal, and whether the line carried a widget comment.
+    let mut found: Vec<(String, Option<Parameter>, bool)> = Vec::new();
     let mut group = String::new();
     let mut pending_desc = String::new();
+    let mut in_block = false;
+    let mut block_acc: Vec<u8> = Vec::new();
+    let mut depth = 0i32;
     for raw in source.lines() {
-        let line = raw.trim();
-        // A standalone /* [Group] */ block comment opens a section.
-        if let Some(g) = section_name(line) {
-            group = g;
-            pending_desc.clear();
-            continue;
+        let scan = scan_line(raw, &mut in_block, &mut block_acc);
+        // A block comment whose whole content is `[Name]` opens a section.
+        for blk in &scan.blocks {
+            let t = blk.trim();
+            if let Some(name) = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+                group = name.trim().to_string();
+                pending_desc.clear();
+            }
         }
-        // A `// text` line (not a widget) becomes the next parameter's label.
-        if let Some(rest) = line.strip_prefix("//") {
-            let t = rest.trim();
-            if !t.starts_with('[') {
-                pending_desc = t.to_string();
+        let code = scan.code.trim();
+        if code.is_empty() {
+            // A `// text` line (not a widget) labels the next parameter.
+            if let Some(c) = &scan.line_comment {
+                let t = c.trim();
+                if !t.starts_with('[') {
+                    pending_desc = t.to_string();
+                }
             }
             continue;
         }
-        if line.is_empty() {
-            continue;
-        }
         // Stop scanning at the first top-level definition.
-        if line.starts_with("module ") || line.starts_with("function ") {
+        if depth == 0 && (code.starts_with("module ") || code.starts_with("function ")) {
             break;
         }
-        if let Some(p) = parse_assignment(line, &group, &pending_desc) {
-            params.push(p);
+        let here = depth;
+        depth = (depth + scan.braces).max(0);
+        if here == 0 {
+            if let Some(hit) = parse_assignment(
+                code,
+                scan.line_comment.as_deref().unwrap_or(""),
+                &group,
+                &pending_desc,
+            ) {
+                found.push(hit);
+            }
         }
         pending_desc.clear();
     }
-    params
+    one_per_name(found)
 }
 
-/// `/* [Name] */` (the whole block comment is just the bracketed name).
-fn section_name(line: &str) -> Option<String> {
-    let inner = line.strip_prefix("/*")?.strip_suffix("*/")?.trim();
-    let name = inner.strip_prefix('[')?.strip_suffix(']')?.trim();
-    Some(name.to_string())
+/// Collapse repeated assignments to ONE parameter per name.
+///
+/// The value comes from the LAST top-level assignment, because that is the
+/// write whose value every read sees; the annotations come from the first
+/// occurrence that supplied them, because that is where people write them.
+/// A name whose last assignment is NOT a literal drops out entirely: a
+/// computed value overwrites whatever the panel would set, so the variable is
+/// not customizable. Emitting one row per ASSIGNMENT put the same name in the
+/// panel twice, sharing a single override slot, and the override was written
+/// into the dead first slot while the later assignment still won.
+fn one_per_name(found: Vec<(String, Option<Parameter>, bool)>) -> Vec<Parameter> {
+    let mut out: Vec<(String, Option<Parameter>)> = Vec::new();
+    for (name, param, had_comment) in found {
+        match out.iter_mut().find(|(n, _)| *n == name) {
+            Some(slot) => {
+                let first = slot.0.clone();
+                let earlier = slot.1.take();
+                slot.1 = param.map(|mut p| {
+                    if let Some(a) = earlier {
+                        if p.description.is_empty() {
+                            p.description = a.description;
+                        }
+                        if p.group.is_empty() {
+                            p.group = a.group;
+                        }
+                        // Inherit the earlier widget only when this line had
+                        // no comment of its own AND the kind still matches.
+                        if !had_comment && a.kind == p.kind {
+                            p.widget = a.widget;
+                        }
+                    }
+                    p.name = first;
+                    p
+                });
+            }
+            None => out.push((name, param)),
+        }
+    }
+    out.into_iter().filter_map(|(_, p)| p).collect()
 }
 
-/// Parse `name = <literal> ; // [widget]` into a Parameter, or None if the RHS
-/// is not a literal (a computed expression gets no widget).
-fn parse_assignment(line: &str, group: &str, desc: &str) -> Option<Parameter> {
-    let eq = line.find('=')?;
-    let name = line[..eq].trim();
+/// Parse `name = <literal>;` plus its trailing `// [widget]` comment. Returns
+/// the name even when the RHS is not a literal, so `parse` can tell that the
+/// name was reassigned to something computed.
+fn parse_assignment(
+    code: &str,
+    widget_src: &str,
+    group: &str,
+    desc: &str,
+) -> Option<(String, Option<Parameter>, bool)> {
+    let eq = code.find('=')?;
+    // `==`, `<=`, `>=` and `!=` are comparisons, not assignments.
+    if code.as_bytes().get(eq + 1) == Some(&b'=')
+        || matches!(code.as_bytes().get(eq.wrapping_sub(1)), Some(b'<') | Some(b'>') | Some(b'!') | Some(b'='))
+    {
+        return None;
+    }
+    let name = code[..eq].trim();
     if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
         return None;
     }
-    let after = &line[eq + 1..];
+    let after = &code[eq + 1..];
     let semi = after.find(';')?;
     let rhs = after[..semi].trim();
-    // Split any trailing comment off the tail after ';'.
-    let tail = after[semi + 1..].trim();
-    let widget_src = tail.strip_prefix("//").map(str::trim).unwrap_or("");
+    let widget_src = widget_src.trim();
+    let had_comment = widget_src.starts_with('[');
 
-    let (kind, value) = classify_literal(rhs)?;
+    let Some((kind, value)) = classify_literal(rhs) else {
+        return Some((name.to_string(), None, had_comment));
+    };
+    let components = if kind == Kind::Vector { vector_len(&value) } else { 1 };
     let widget = widget_for(&kind, widget_src);
-    Some(Parameter {
-        name: name.to_string(),
-        group: group.to_string(),
-        description: desc.to_string(),
-        value,
-        kind,
-        widget,
-    })
+    Some((
+        name.to_string(),
+        Some(Parameter {
+            name: name.to_string(),
+            group: group.to_string(),
+            description: desc.to_string(),
+            value,
+            kind,
+            widget,
+            components,
+        }),
+        had_comment,
+    ))
+}
+
+/// How many components a vector literal has (it is already known to be a
+/// bracketed list of number literals).
+fn vector_len(lit: &str) -> usize {
+    lit.trim_start_matches('[').trim_end_matches(']').split(',').count()
 }
 
 /// Recognize a literal RHS and its kind. Anything with an operator, call, or
@@ -141,10 +316,46 @@ fn classify_literal(rhs: &str) -> Option<(Kind, String)> {
     None
 }
 
-/// A plain decimal number literal (optionally signed, with a fraction or
-/// exponent) — but NOT an expression like `1+2` or `w`.
+/// A decimal number literal as the LEXER defines one — digits with an optional
+/// fraction and exponent — plus an optional leading `-`, since the reference
+/// counts `a = -5;` as a literal that gets a widget.
+///
+/// Emphatically NOT `s.parse::<f64>().is_ok()`: Rust's float parser also
+/// accepts "inf", "-inf", "infinity" and "nan", case-insensitively, and this
+/// language has no literal for either ("they arise only from arithmetic").
+/// The lexer lexes them as ordinary identifiers, so an override of `nan` was
+/// written into the source as a bare name and evaluated to undef with an
+/// unknown-variable warning, and a source line `x = inf;` was shown in the
+/// panel as a number parameter.
 fn is_number_literal(s: &str) -> bool {
-    !s.is_empty() && s.parse::<f64>().is_ok()
+    let b = s.as_bytes();
+    let mut i = if b.first() == Some(&b'-') { 1 } else { 0 };
+    let mant_start = i;
+    while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+        i += 1;
+    }
+    let mant = &s[mant_start..i];
+    // At least one digit, and at most one '.': "1.2.3" lexes as a single token
+    // but is not a number.
+    if !mant.bytes().any(|c| c.is_ascii_digit()) || mant.bytes().filter(|&c| c == b'.').count() > 1
+    {
+        return false;
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        let digits = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digits {
+            return false; // "1e", "1e+"
+        }
+    }
+    // Nothing left over, and the value has to be usable as a number.
+    i == b.len() && s.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
 /// Is `s` exactly ONE double-quoted string literal — outer quotes only, with
@@ -179,6 +390,8 @@ fn widget_for(kind: &Kind, comment: &str) -> Widget {
             Some(items) => Widget::Dropdown(items),
             None => Widget::Textbox,
         },
+        // A vector shares one widget spec across its components; `components`
+        // on the Parameter says how many to render.
         Kind::Number | Kind::Vector => {
             let inner = match bracket_inner(comment) {
                 Some(i) => i,
@@ -216,13 +429,22 @@ fn widget_for(kind: &Kind, comment: &str) -> Widget {
 /// "variable reassigned" diagnostic. It works because the panel edits the same
 /// slot the file declares. This is the GUI / preset / CLI `-D` mechanism.
 ///
-/// Overrides are validated against the parsed parameter model: an override is
-/// honored only when its `name` is a real customizer parameter AND its `value`
-/// is a literal of that parameter's kind. So a malformed or hostile value can
-/// never smuggle arbitrary statements into the source — the replacement is
-/// always a bare literal token in the RHS position. Unknown names and type
-/// mismatches are dropped. `overrides` is `(name, literal)` where the literal is
-/// written as OpenSCAD source (`20`, `true`, `"round"`, `[1, 2, 3]`).
+/// Every override's VALUE must be a bare literal, and a value for a name that
+/// is a known parameter must also match that parameter's kind. That is what
+/// keeps a malformed or hostile value from smuggling statements into the
+/// source: the replacement is always a single literal token in RHS position.
+///
+/// The NAME, though, may be anything. The reference lists `-D '$fn=64'`,
+/// `-D '$t=0.5'` and `-D '$preview=false'` as standard automation, and says an
+/// override of a name the file never defines simply "creates a new top-level
+/// variable". Requiring the name to be in the parameter model silently dropped
+/// all of those — a $-special is never a customizer parameter — so `-D $fn=6`
+/// left $fn at 0 with no diagnostic anywhere. A name with no declaration line
+/// to rewrite is appended instead, which is the reference's own model ("as if
+/// assigned at the end of the top-level scope").
+///
+/// `overrides` is `(name, literal)` where the literal is written as OpenSCAD
+/// source (`20`, `true`, `"round"`, `[1, 2, 3]`).
 pub fn apply_overrides(source: &str, overrides: &[(String, String)]) -> String {
     if overrides.is_empty() {
         return source.to_string();
@@ -232,53 +454,83 @@ pub fn apply_overrides(source: &str, overrides: &[(String, String)]) -> String {
     // later override for the same name wins (matches last-write-wins).
     let mut repl: Vec<(String, String)> = Vec::new();
     for (name, raw) in overrides {
-        let Some(p) = params.iter().find(|p| &p.name == name) else { continue };
+        let name = name.trim();
+        if name.is_empty()
+            || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            || name.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            continue; // not an identifier: never paste it into the source
+        }
         let Some((kind, lit)) = classify_literal(raw.trim()) else { continue };
-        if kind != p.kind {
-            continue;
+        // A declared parameter keeps its kind, so the panel round-trip cannot
+        // put a string where a slider was. An undeclared name (a $-special,
+        // or one the file never assigns) has no kind to match.
+        if let Some(p) = params.iter().find(|p| p.name == name) {
+            if kind != p.kind {
+                continue;
+            }
         }
         // A literal is rewritten onto a single line; a raw newline (or CR) would
         // split it and corrupt the source, so reject one outright.
         if lit.contains('\n') || lit.contains('\r') {
             continue;
         }
-        match repl.iter_mut().find(|(n, _)| n == &p.name) {
+        match repl.iter_mut().find(|(n, _)| n == name) {
             Some(slot) => slot.1 = lit,
-            None => repl.push((p.name.clone(), lit)),
+            None => repl.push((name.to_string(), lit)),
         }
     }
     if repl.is_empty() {
         return source.to_string();
     }
-    // Walk the lines up to the first module/function (the same window `parse`
-    // scans) and rewrite each matched declaration line's RHS once.
-    let mut applied = vec![false; repl.len()];
-    let mut out_lines: Vec<String> = Vec::with_capacity(source.lines().count() + 1);
-    let mut stop = false;
-    for raw in source.lines() {
-        if !stop {
-            let t = raw.trim_start();
-            if t.starts_with("module ") || t.starts_with("function ") {
-                stop = true;
-            } else if let Some(idx) =
-                repl.iter().position(|(n, _)| !applied_at(&applied, &repl, n) && line_assigns(t, n))
-            {
-                out_lines.push(rewrite_rhs(raw, &repl[idx].1));
-                applied[idx] = true;
+    // Find each name's LAST top-level declaration line, using the same
+    // lexical scan `parse` uses so a line inside a block comment or nested in
+    // an if/for block is never a candidate.
+    //
+    // The LAST, not the first: `size = 10; size = 20;` binds at the first slot
+    // but takes the later write's value, so rewriting the first one left the
+    // second still winning and the panel did nothing at all.
+    let mut target = vec![usize::MAX; repl.len()];
+    {
+        let mut in_block = false;
+        let mut block_acc: Vec<u8> = Vec::new();
+        let mut depth = 0i32;
+        for (ln, raw) in source.lines().enumerate() {
+            let scan = scan_line(raw, &mut in_block, &mut block_acc);
+            let code = scan.code.trim();
+            if code.is_empty() {
                 continue;
             }
+            if depth == 0 && (code.starts_with("module ") || code.starts_with("function ")) {
+                break;
+            }
+            let here = depth;
+            depth = (depth + scan.braces).max(0);
+            if here != 0 {
+                continue;
+            }
+            if let Some(idx) = repl.iter().position(|(n, _)| line_assigns(code, n)) {
+                target[idx] = ln;
+            }
         }
-        out_lines.push(raw.to_string());
+    }
+    let mut out_lines: Vec<String> = Vec::with_capacity(source.lines().count() + 1);
+    for (ln, raw) in source.lines().enumerate() {
+        match target.iter().position(|&t| t == ln) {
+            Some(idx) => out_lines.push(rewrite_rhs(raw, &repl[idx].1)),
+            None => out_lines.push(raw.to_string()),
+        }
     }
     let mut out = out_lines.join("\n");
     if source.ends_with('\n') {
         out.push('\n');
     }
-    // Fallback: any validated override whose line wasn't found (it always
-    // should be, since it came from `parse`) is appended so it still applies.
+    // A name with no declaration line to rewrite — a $-special, or one the
+    // file never assigns — is appended instead, which is the reference's own
+    // model: "as if assigned at the end of the top-level scope".
     let mut tail = String::new();
     for (i, (n, lit)) in repl.iter().enumerate() {
-        if !applied[i] {
+        if target[i] == usize::MAX {
             tail.push_str(&format!("{} = {};\n", n, lit));
         }
     }
@@ -392,14 +644,11 @@ fn value_string_to_literal(kind: &Kind, valstr: &str) -> String {
     }
 }
 
-/// Has the override for `name` already been applied on an earlier line?
-fn applied_at(applied: &[bool], repl: &[(String, String)], name: &str) -> bool {
-    repl.iter().position(|(n, _)| n == name).map(|i| applied[i]).unwrap_or(true)
-}
-
-/// Does this (already left-trimmed) line assign to exactly `name`?
-fn line_assigns(trimmed: &str, name: &str) -> bool {
-    parse_assignment(trimmed, "", "").map(|p| p.name == name).unwrap_or(false)
+/// Does this (comment-stripped, trimmed) line assign to exactly `name`? True
+/// for a computed RHS too: the line still holds that name's value, and it is
+/// the one to rewrite.
+fn line_assigns(code: &str, name: &str) -> bool {
+    parse_assignment(code, "", "", "").is_some_and(|(n, _, _)| n == name)
 }
 
 /// Replace the RHS of `raw` (`indent name = <rhs> ; tail`) with `new_lit`,
@@ -450,6 +699,125 @@ fn parse_bracket(comment: &str) -> Option<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_top_level_assignments_are_parameters() {
+        // The scan had no lexical state at all, so an assignment commented out
+        // in a /* */ block became a phantom parameter — and an override was
+        // written INTO the comment — and one nested in an if/for block was
+        // offered although the reference states flatly that "Parameters inside
+        // 'if' blocks or modules are never customizable".
+        let names = |src: &str| parse(src).into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert!(names("/*\nold = 10;\n*/\ncube(5);\n").is_empty(), "block comment");
+        assert!(names("/* a\n * b\n */\nx = 1;\n") == vec!["x"], "multi-line block then code");
+        assert_eq!(
+            names("show = true;\nif (show) {\n  // Lid\n  lid_t = 2; // [1:5]\n}\n"),
+            vec!["show"],
+            "an if body is not top level"
+        );
+        assert_eq!(
+            names("a = 1;\nfor (i = [0:2]) {\n  b = i;\n}\nc = 3;\n"),
+            vec!["a", "c"],
+            "a for body is not top level, and the scan resumes after it"
+        );
+        // A brace inside a STRING must not open a block.
+        assert_eq!(names("label = \"{\";\ngap = 3; // [1:9]\n"), vec!["label", "gap"]);
+        // A `//` inside a string is not a comment either.
+        assert_eq!(names("u = \"http://x\";\nv = 2;\n"), vec!["u", "v"]);
+        // Sections and Unicode descriptions still work through the new scan.
+        let p = parse("/* [Größe] */\n// Höhe über NN\nh = 3; // [0:9]\n");
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].group, "Größe");
+        assert_eq!(p[0].description, "Höhe über NN");
+        assert_eq!(p[0].widget, Widget::Slider { min: 0.0, step: None, max: 9.0 });
+    }
+
+    #[test]
+    fn a_name_assigned_twice_gets_one_row_bound_to_the_winning_slot() {
+        // Two rows shared one override key, and the override was written into
+        // the dead FIRST slot while the later assignment still won: the user
+        // moved the slider and nothing changed, with no diagnostic.
+        let src = "size = 10; // [1:50]\nsize = 20;\necho(size);\n";
+        let p = parse(src);
+        assert_eq!(p.len(), 1, "one row per NAME: {p:?}");
+        assert_eq!(p[0].value, "20", "the winning write supplies the value");
+        assert_eq!(
+            p[0].widget,
+            Widget::Slider { min: 1.0, step: None, max: 50.0 },
+            "the annotation is inherited from where it was written"
+        );
+        // The override must land on the slot that wins.
+        let out = apply_overrides(src, &[("size".into(), "42".into())]);
+        assert!(out.contains("size = 42;"), "{out:?}");
+        assert!(out.contains("size = 10; // [1:50]"), "the annotated line is untouched: {out:?}");
+
+        // A name whose LAST assignment is computed is not customizable: that
+        // value overwrites anything the panel could set.
+        assert!(parse("w = 5; // [1:9]\nw = h * 2;\n").is_empty());
+    }
+
+    #[test]
+    fn a_vector_parameter_gets_one_widget_per_component() {
+        // widget_for treated Vector exactly like Number, so a vector got a
+        // single scalar slider: it displayed NaN's midpoint and every value it
+        // produced was rejected downstream as a kind mismatch.
+        let p = parse("size = [20, 30]; // [10:100]\n");
+        assert_eq!(p[0].kind, Kind::Vector);
+        assert_eq!(p[0].components, 2);
+        assert_eq!(p[0].widget, Widget::Slider { min: 10.0, step: None, max: 100.0 });
+        assert_eq!(parse("d = [1,2,3,4]; // [0:9]\n")[0].components, 4);
+        assert_eq!(parse("x = 5;\n")[0].components, 1);
+        // A vector value round-trips; a scalar for a vector is still refused.
+        let src = "size = [20, 30]; // [10:100]\n";
+        assert!(apply_overrides(src, &[("size".into(), "[44, 55]".into())]).contains("[44, 55]"));
+        assert_eq!(apply_overrides(src, &[("size".into(), "55".into())]), src);
+    }
+
+    #[test]
+    fn an_override_may_name_a_special_or_an_undeclared_variable() {
+        // Overrides were validated against the parameter MODEL, so a name that
+        // is not a customizer parameter was dropped — and a $-special never is
+        // one. `-D '$fn=64'`, which the reference lists as standard automation,
+        // did nothing at all and said nothing about it.
+        let out = apply_overrides("echo($fn);\ncylinder(h = 10, r = 5);\n", &[("$fn".into(), "6".into())]);
+        assert!(out.ends_with("$fn = 6;\n"), "appended as a trailing assignment: {out:?}");
+        // A name the file never assigns becomes a new top-level variable.
+        assert!(apply_overrides("cube(1);\n", &[("nw".into(), "3".into())]).contains("nw = 3;"));
+        // A file that DOES assign the special has that line rewritten instead.
+        let out = apply_overrides("$fn = 12;\nsphere(4);\n", &[("$fn".into(), "6".into())]);
+        assert!(out.starts_with("$fn = 6;"), "{out:?}");
+        assert_eq!(out.matches("$fn =").count(), 1, "no duplicate assignment: {out:?}");
+        // The VALUE is still strictly a literal, so nothing can be smuggled in.
+        for hostile in ["1; cube(9); //", "\"a\"; cube(9); //", "a+b", "f(1)", "[1,2]; x=1; //"] {
+            assert_eq!(
+                apply_overrides("cube(1);\n", &[("z".into(), hostile.into())]),
+                "cube(1);\n",
+                "hostile value accepted: {hostile:?}"
+            );
+        }
+        // ...and so is the NAME.
+        for bad in ["a; cube(9)", "1abc", "", "a b"] {
+            assert_eq!(apply_overrides("cube(1);\n", &[(bad.into(), "3".into())]), "cube(1);\n");
+        }
+    }
+
+    #[test]
+    fn inf_and_nan_are_not_number_literals() {
+        // is_number_literal was `s.parse::<f64>().is_ok()`, and Rust's parser
+        // accepts inf/nan. This language has no literal for either, so the
+        // lexer reads them as identifiers: an override of `nan` was written in
+        // as a bare name and evaluated to undef.
+        for bad in ["inf", "-inf", "Infinity", "infinity", "nan", "NaN", "1e", "1e+", "1.2.3", "", "-", "."] {
+            assert!(!is_number_literal(bad), "{bad:?} must not be a number literal");
+            assert_eq!(classify_literal(bad), None, "{bad:?}");
+        }
+        for good in ["0", "5", "-5", "1.5", ".5", "-.5", "1e-3", "2.5E+6", "123."] {
+            assert!(is_number_literal(good), "{good:?} must be a number literal");
+        }
+        // `x = inf;` gets no widget, and an inf/nan override is dropped.
+        assert!(parse("x = inf;\n").is_empty());
+        assert_eq!(apply_overrides("x = 1;\n", &[("x".into(), "nan".into())]), "x = 1;\n");
+    }
 
     #[test]
     fn scans_typed_parameters_with_widgets_and_groups() {
@@ -511,7 +879,7 @@ after = 99;\n"; // after the first module → not scanned
             ("vec".to_string(), "[3, 4, 5]".to_string()),    // ok: vector → vector
             ("size".to_string(), "cube(9); size".to_string()), // rejected: not a literal
             ("name".to_string(), "5".to_string()),            // rejected: kind mismatch
-            ("ghost".to_string(), "1".to_string()),           // rejected: unknown name
+            ("ghost".to_string(), "1".to_string()),           // APPENDED: a new variable
         ];
         let out = apply_overrides(src, &ov);
         // Each declaration line is rewritten IN PLACE — RHS replaced, widget
@@ -527,7 +895,10 @@ after = 99;\n"; // after the first module → not scanned
         // Nothing hostile or mismatched leaks through.
         assert!(!out.contains("cube(9)"));
         assert!(!out.contains("name = 5;"));
-        assert!(!out.contains("ghost"));
+        // A name the file never assigns is a NEW top-level variable, appended,
+        // which is the reference's model for -D. Dropping it silently was the
+        // same rule that made `-D '$fn=64'` a no-op.
+        assert!(out.contains("ghost = 1;"), "{out}");
         // Exactly one assignment per name (no appended duplicate).
         assert_eq!(out.matches("size =").count(), 1);
         // No overrides → source returned unchanged.

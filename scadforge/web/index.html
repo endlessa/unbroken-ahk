@@ -57,6 +57,10 @@
      border-radius:5px; padding:3px 6px; font:12px "DejaVu Sans Mono", monospace; }
   .param input[type=range] { flex:1; min-width:0; accent-color:var(--accent); }
   .param .val { color:var(--dim); font:11px "DejaVu Sans Mono", monospace; min-width:44px; text-align:right; }
+  /* One cell per component of a vector parameter. */
+  .param .vec { display:inline-flex; align-items:center; gap:4px; min-width:0; flex:1; }
+  .param .vec input[type=number] { width:100%; min-width:44px; }
+  .param .vec .val { min-width:30px; }
   .param.changed label::after { content:" •"; color:var(--accent); }
   #right { flex:1; position:relative; }
   #view { position:absolute; inset:0; width:100%; height:100%; display:block; }
@@ -343,6 +347,16 @@ function toLiteral(kind, raw) {
   return String(raw); // number / vector: source form as typed
 }
 
+// Split a vector literal "[20, 30]" into its component strings, padded or
+// trimmed to exactly `n` so the row always renders the widgets the model
+// promised even if the default is malformed.
+function splitVector(lit, n) {
+  const inner = String(lit).trim().replace(/^\[/, '').replace(/\]$/, '');
+  const parts = inner.split(',').map(s => s.trim());
+  while (parts.length < n) parts.push('0');
+  return parts.slice(0, n);
+}
+
 // Strip surrounding quotes from a string literal for display in a textbox.
 function unquote(lit) {
   if (lit.length >= 2 && lit.startsWith('"') && lit.endsWith('"')) {
@@ -400,6 +414,45 @@ function paramRow(p) {
   const markChanged = () => row.classList.toggle('changed', p.name in overrides);
   const set = (lit) => { overrides[p.name] = lit; markChanged(); scheduleRender(); };
   const w = p.widget;
+
+  // A vector gets ONE WIDGET PER COMPONENT, with the range comment bounding
+  // every one of them. A single scalar control for a vector parameter showed
+  // parseFloat("[20, 30]") — NaN, which a range input silently replaces with
+  // its midpoint — and the scalar it produced was rejected downstream as a
+  // kind mismatch, so the widget displayed the wrong value AND could never
+  // change anything.
+  if (p.kind === 'vector' && (p.components || 1) > 1) {
+    const parts = splitVector(current, p.components);
+    const push = () => set('[' + parts.join(', ') + ']');
+    for (let i = 0; i < p.components; i++) {
+      const cell = document.createElement('span');
+      cell.className = 'vec';
+      if (w.type === 'slider') {
+        const rng = document.createElement('input');
+        rng.type = 'range';
+        rng.min = w.min; rng.max = w.max;
+        rng.step = (w.step == null) ? 'any' : w.step;
+        rng.value = parts[i];
+        const out = document.createElement('span');
+        out.className = 'val';
+        out.textContent = parts[i];
+        rng.addEventListener('input', () => {
+          out.textContent = rng.value; parts[i] = rng.value; push();
+        });
+        cell.appendChild(rng); cell.appendChild(out);
+      } else {
+        const nb = document.createElement('input');
+        nb.type = 'number';
+        if (w.type === 'slider') { nb.min = w.min; nb.max = w.max; }
+        nb.value = parts[i];
+        nb.addEventListener('change', () => { parts[i] = nb.value; push(); });
+        cell.appendChild(nb);
+      }
+      ctl.appendChild(cell);
+    }
+    markChanged();
+    return row;
+  }
 
   if (w.type === 'checkbox') {
     const cb = document.createElement('input');
