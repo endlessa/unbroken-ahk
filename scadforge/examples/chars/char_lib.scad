@@ -1,4 +1,4 @@
-include <ship_lib.scad>
+include <char_kit.scad>
 // ===================================================================
 //  char_lib.scad -- parameterised humanoid, shared by every species
 //

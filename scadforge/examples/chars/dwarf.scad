@@ -1,15 +1,15 @@
-include <ship_lib.scad>
+include <char_kit.scad>
 // ===================================================================
 //  DWARF -- player character                                     v4
 //
 //  Faces +x, up +z, the character's LEFT is +y.  Scene units metres,
 //  feet on z = 0, so the figure drops straight into a scene at scale.
 //
-//  NOTE ON THE INCLUDE: this kernel resolves include paths against the
-//  SERVER's working directory, not the file's.  So either start
-//  scadforge from a directory holding both files, or build a flat copy:
-//      cat ../ships/ship_lib.scad            >  /tmp/dwarf.scad
-//      grep -v '^include' dwarf.scad         >> /tmp/dwarf.scad
+//  The include above resolves against THIS file's directory, so the kit
+//  it names sits beside it.  (An older note here said includes resolved
+//  against the server's working directory and told you to build a flat
+//  copy by hand; that stopped being true, and the recipe no longer
+//  applies.)
 //
 //  WHY A FIGURE IS HARDER THAN A SHIP HERE
 //  A hull is one sweep along one spine.  A body is a dozen sweeps that
