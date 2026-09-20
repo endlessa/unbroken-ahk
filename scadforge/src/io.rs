@@ -502,8 +502,14 @@ fn triangle_normal(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> [f64; 3] {
 
 /// ASCII STL. Header/trailer name is fixed boilerplate; facet normals are
 /// recomputed from winding.
+/// ASCII STL. The solid name is the reference's fixed boilerplate, not a
+/// signature: the format has no provenance field, the name is a free-form
+/// label every reader ignores, and the reference pins it ("header 'solid
+/// OpenSCAD_Model' / trailer 'endsolid OpenSCAD_Model'") the same way it pins
+/// the export error texts — so a diff against a reference export does not
+/// fail on line 1.
 pub fn write_stl_ascii(mesh: &Mesh) -> String {
-    let mut s = String::from("solid scadforge_model\n");
+    let mut s = String::from("solid OpenSCAD_Model\n");
     for t in &mesh.tris {
         let a = mesh.positions[t[0] as usize];
         let b = mesh.positions[t[1] as usize];
@@ -525,7 +531,7 @@ pub fn write_stl_ascii(mesh: &Mesh) -> String {
         }
         s.push_str("    endloop\n  endfacet\n");
     }
-    s.push_str("endsolid scadforge_model\n");
+    s.push_str("endsolid OpenSCAD_Model\n");
     s
 }
 
@@ -1229,8 +1235,8 @@ mod tests {
     fn stl_ascii_round_trips_a_cube() {
         let cube = geom::cube([3.0, 4.0, 5.0], false); // volume 60
         let text = write_stl_ascii(&cube);
-        assert!(text.starts_with("solid scadforge_model"));
-        assert!(text.trim_end().ends_with("endsolid scadforge_model"));
+        assert!(text.starts_with("solid OpenSCAD_Model"));
+        assert!(text.trim_end().ends_with("endsolid OpenSCAD_Model"));
         let back = read_stl(text.as_bytes()).unwrap();
         // 12 triangles either way; welding gives 8 unique corners.
         assert_eq!(tri_count(&back), 12);

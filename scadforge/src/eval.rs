@@ -3190,6 +3190,15 @@ pub fn render_export(
 pub fn export_bytes(out: &EvalOutput, format: &str) -> Result<Vec<u8>, String> {
     match format {
         "3mf" => Ok(crate::io::write_3mf(&export_mesh(out)?)),
+        // `.stl` is BINARY. The reference says so three times over — the
+        // summary ("binary STL (default for .stl)"), the signature's
+        // `--export-format asciistl|binstl`, and the note that the flag is
+        // "needed for ASCII STL since .stl defaults to binary" — and none of
+        // them is VERIFY-marked. Writing ASCII under the .stl extension made
+        // every exported file roughly five times the size of the reference's
+        // and textually unlike it.
+        "stl" | "binstl" => Ok(crate::io::write_stl_binary(&export_mesh(out)?)),
+        "asciistl" => Ok(crate::io::write_stl_ascii(&export_mesh(out)?).into_bytes()),
         other => export_string(out, other).map(String::into_bytes),
     }
 }
@@ -3327,11 +3336,14 @@ pub fn render_export_bytes_reporting(
 
 /// Export the design to a text format's serialized string, dispatching by a
 /// lowercase format tag (`stl`|`off`|`amf` for the solid mesh, `svg`|`dxf`|`pdf`
-/// for the 2D outlines). The shared core behind both the HTTP `/export` route
-/// and the CLI headless render, so the two never drift. `stl` is ASCII (binary STL
-/// is available programmatically via `io::write_stl_binary`). An unknown tag,
-/// or geometry of the wrong dimensionality, is an `Err` with the reference's
-/// message.
+/// for the 2D outlines). The TEXT half of the export surface; `export_bytes`
+/// is the complete one and is what both the HTTP `/export` route and the CLI
+/// call, so the two never drift.
+///
+/// The STL tag here is `asciistl`. Plain `stl` means the extension's default,
+/// which is BINARY, so it is rejected rather than quietly answered with text.
+/// An unknown tag, or geometry of the wrong dimensionality, is an `Err` with
+/// the reference's message.
 pub fn export_string(out: &EvalOutput, format: &str) -> Result<String, String> {
     match format {
         "echo" => Ok(echo_stream(out)),
@@ -3349,7 +3361,14 @@ pub fn export_string(out: &EvalOutput, format: &str) -> Result<String, String> {
         "pdf" => Ok(crate::io::write_pdf(&export_2d(out)?)),
         "off" => Ok(crate::io::write_off(&export_mesh(out)?)),
         "amf" => Ok(crate::io::write_amf(&export_mesh(out)?)),
-        "stl" => Ok(crate::io::write_stl_ascii(&export_mesh(out)?)),
+        "asciistl" => Ok(crate::io::write_stl_ascii(&export_mesh(out)?)),
+        // Named explicitly rather than falling into the catch-all, so the
+        // message says which tag to use instead of "unsupported format".
+        "stl" | "binstl" | "3mf" => Err(format!(
+            "ERROR: '{}' is a binary format; use eval::export_bytes (or the \
+             'asciistl' tag for text STL)",
+            format
+        )),
         other => Err(format!("ERROR: unsupported export format '{}'", other)),
     }
 }
@@ -5585,9 +5604,9 @@ mod tests {
     fn assert_csg_round_trips(src: &str) {
         let base = std::path::Path::new(".");
         let tree = csg_of(src);
-        let before = render_export(src, base, &[], "stl")
+        let before = render_export(src, base, &[], "asciistl")
             .unwrap_or_else(|e| panic!("source did not export: {e}\n{src}"));
-        let after = render_export(&tree, base, &[], "stl")
+        let after = render_export(&tree, base, &[], "asciistl")
             .unwrap_or_else(|e| panic!("exported .csg did not re-import: {e}\n{tree}"));
         assert_eq!(before, after, "re-importing the .csg changed the geometry\n{tree}");
     }
@@ -5597,8 +5616,8 @@ mod tests {
     fn assert_csg_round_trips_or_both_empty(src: &str) {
         let base = std::path::Path::new(".");
         let tree = csg_of(src);
-        let before = render_export(src, base, &[], "stl");
-        let after = render_export(&tree, base, &[], "stl");
+        let before = render_export(src, base, &[], "asciistl");
+        let after = render_export(&tree, base, &[], "asciistl");
         match (before, after) {
             (Ok(a), Ok(b)) => assert_eq!(a, b, "geometry changed on re-import\n{tree}"),
             (Err(_), Err(_)) => {}
@@ -5683,7 +5702,7 @@ mod tests {
         let base = std::path::Path::new(".");
         let src = "echo(\"hello\");\na = 1;\na = 2;\nfrobnicate();\ncube(1);\n";
         let (bytes, console) =
-            render_export_bytes_reporting(src, base, &[], "stl", Camera::DEFAULT);
+            render_export_bytes_reporting(src, base, &[], "asciistl", Camera::DEFAULT);
         assert!(bytes.is_ok());
         assert!(console.contains("ECHO: \"hello\""), "{console}");
         assert!(console.contains("was reassigned"), "{console}");
@@ -6268,7 +6287,7 @@ mod tests {
         let render = evaluate_source_for(src, base, false, Mode::Render);
         assert_eq!(render.echoes, vec!["ECHO: false, 64"], "an export is a render");
         // And the exported mesh really is the fine one.
-        let coarse = render_export(src, base, &[], "stl").unwrap();
+        let coarse = render_export(src, base, &[], "asciistl").unwrap();
         assert!(
             coarse.matches("facet normal").count() > 3000,
             "export used preview tessellation: {} facets",
@@ -6377,20 +6396,20 @@ mod tests {
         let src = "e = 2; // [1:10]\ncube(e);";
         let base = std::path::Path::new(".");
         // No overrides → edge-2 cube; ASCII STL mentions a 2.0 vertex.
-        let stl = render_export(src, base, &[], "stl").unwrap();
+        let stl = render_export(src, base, &[], "asciistl").unwrap();
         assert!(stl.contains("facet"), "STL body: {}", &stl[..stl.len().min(80)]);
         // -D e=5 grows the cube; the STL must now carry a 5 coordinate and no 2.
-        let stl5 = render_export(src, base, &[("e".into(), "5".into())], "stl").unwrap();
+        let stl5 = render_export(src, base, &[("e".into(), "5".into())], "asciistl").unwrap();
         assert!(stl5.contains("5.0") || stl5.contains(" 5 "), "override took effect");
         // A rejected override (wrong kind) leaves the default in force.
-        let stl_bad = render_export(src, base, &[("e".into(), "\"x\"".into())], "stl").unwrap();
+        let stl_bad = render_export(src, base, &[("e".into(), "\"x\"".into())], "asciistl").unwrap();
         assert_eq!(stl, stl_bad);
         // An unknown format is an error, not a panic.
         assert!(render_export(src, base, &[], "obj").is_err());
         // A 2D design exports SVG; asking for STL is the reference's error.
         let sq = "s = 4; // [1:9]\nsquare(s);";
         assert!(render_export(sq, base, &[], "svg").unwrap().contains("<svg"));
-        assert!(render_export(sq, base, &[], "stl").unwrap_err().contains("not a 3D"));
+        assert!(render_export(sq, base, &[], "asciistl").unwrap_err().contains("not a 3D"));
     }
 
     /// Evaluate one expression against a fresh root scope; returns
@@ -6830,15 +6849,26 @@ mod tests {
             "an only-% scene exports empty"
         );
 
-        // The HTTP export route serializes ASCII STL / OFF and reports errors.
+        // The HTTP export route serves the SAME bytes the CLI writes, so a
+        // download and a `-o` of the same design are the same file. `stl` is
+        // BINARY: 80-byte header, u32 triangle count, 50 bytes per triangle.
         let stl = crate::http::handle("POST", "/export?format=stl", "cube(2, center=true);");
         assert_eq!(stl.status, "200 OK");
-        assert!(stl.body.starts_with("solid scadforge_model"));
+        assert_eq!(stl.body.len(), 84 + 12 * 50, "binary STL of a cube");
+        assert_eq!(u32::from_le_bytes(stl.body[80..84].try_into().unwrap()), 12);
+        // ...and `asciistl` is the text form, which is what the tag is for.
+        let text = crate::http::handle("POST", "/export?format=asciistl", "cube(2, center=true);");
+        assert!(text.text_body().starts_with("solid OpenSCAD_Model"));
+        // 3MF is a ZIP, and used to be refused over HTTP because the response
+        // could only carry a String.
+        let z = crate::http::handle("POST", "/export?format=3mf", "cube(2, center=true);");
+        assert_eq!(z.status, "200 OK");
+        assert_eq!(&z.body[..2], b"PK", "3MF downloads as a real ZIP");
         let off = crate::http::handle("POST", "/export?format=off", "cube(2, center=true);");
-        assert!(off.body.starts_with("OFF\n"));
+        assert!(off.text_body().starts_with("OFF\n"));
         let bad = crate::http::handle("POST", "/export?format=stl", "square(5);");
         assert_eq!(bad.status, "422 Unprocessable Entity");
-        assert!(bad.body.contains("not a 3D object"));
+        assert!(bad.text_body().contains("not a 3D object"));
     }
 
     #[test]
@@ -6951,19 +6981,19 @@ mod tests {
         // SVG export of a 2D design.
         let svg = crate::http::handle("POST", "/export?format=svg", "square([10, 6]);");
         assert_eq!(svg.status, "200 OK");
-        assert!(svg.body.contains("<svg") && svg.body.contains("fill-rule"));
+        assert!(svg.text_body().contains("<svg") && svg.text_body().contains("fill-rule"));
         // DXF export of a 2D design.
         let dxf = crate::http::handle("POST", "/export?format=dxf", "circle(5, $fn = 32);");
-        assert!(dxf.body.contains("LWPOLYLINE"));
+        assert!(dxf.text_body().contains("LWPOLYLINE"));
         // PDF export of a 2D design: a well-formed one-page vector document.
         let pdf = crate::http::handle("POST", "/export?format=pdf", "square([10, 6]);");
         assert_eq!(pdf.status, "200 OK");
         assert_eq!(pdf.content_type, "application/pdf");
-        assert!(pdf.body.starts_with("%PDF-1.4") && pdf.body.trim_end().ends_with("%%EOF"));
+        assert!(pdf.text_body().starts_with("%PDF-1.4") && pdf.text_body().trim_end().ends_with("%%EOF"));
         // Exporting a 3D result to a 2D format is the reference error.
         let bad = crate::http::handle("POST", "/export?format=svg", "cube(3);");
         assert_eq!(bad.status, "422 Unprocessable Entity");
-        assert!(bad.body.contains("not a 2D object"));
+        assert!(bad.text_body().contains("not a 2D object"));
         // PDF of a 3D result is likewise the reference error.
         let bad_pdf = crate::http::handle("POST", "/export?format=pdf", "cube(3);");
         assert_eq!(bad_pdf.status, "422 Unprocessable Entity");

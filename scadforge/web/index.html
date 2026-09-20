@@ -74,9 +74,11 @@
   <div class="sub">from-scratch OpenSCAD-compatible modeler &middot; localhost &middot; zero dependencies</div>
   <button id="renderBtn">Render&nbsp;(Ctrl+Enter)</button>
   <select id="exportFmt" title="Export format">
-    <option value="stl">STL</option>
+    <option value="stl">STL (binary)</option>
+    <option value="asciistl">STL (ASCII)</option>
     <option value="off">OFF</option>
     <option value="amf">AMF</option>
+    <option value="3mf">3MF</option>
     <option value="svg">SVG</option>
     <option value="dxf">DXF</option>
     <option value="pdf">PDF</option>
@@ -842,20 +844,31 @@ document.getElementById('custReset').addEventListener('click', () => {
 });
 document.getElementById('custSave').addEventListener('click', savePreset);
 document.getElementById('custPreset').addEventListener('change', e => loadPreset(e.target.value));
-const EXPORT_MIME = { stl: 'model/stl', off: 'text/plain', amf: 'application/x-amf',
+const EXPORT_MIME = { stl: 'model/stl', asciistl: 'model/stl', off: 'text/plain',
+                      amf: 'application/x-amf', '3mf': 'model/3mf',
                       svg: 'image/svg+xml', dxf: 'application/dxf', pdf: 'application/pdf' };
+// The download's file extension. Both STL flavours are `.stl`; the rest are
+// their own tag.
+const EXPORT_EXT = { stl: 'stl', asciistl: 'stl' };
 document.getElementById('exportBtn').addEventListener('click', async () => {
   const fmt = document.getElementById('exportFmt').value;
   try {
     const q = overrideQuery();
     const res = await fetch(`/export?format=${fmt}` + (q ? '&' + q.slice(1) : ''),
                             { method: 'POST', body: editor.value });
-    const text = await res.text();
-    if (!res.ok) { setMessages([{cls:'err', text: 'export: ' + text}]); return; }
-    const blob = new Blob([text], { type: EXPORT_MIME[fmt] || 'application/octet-stream' });
+    // Read BYTES, not text: binary STL is little-endian floats and 3MF is a
+    // ZIP, and decoding either as UTF-8 replaces every invalid sequence with
+    // U+FFFD -- which downloaded a corrupt file that still looked like a
+    // successful export.
+    const buf = await res.arrayBuffer();
+    if (!res.ok) {
+      setMessages([{cls:'err', text: 'export: ' + new TextDecoder().decode(buf)}]);
+      return;
+    }
+    const blob = new Blob([buf], { type: EXPORT_MIME[fmt] || 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = `scadforge_model.${fmt}`;
+    a.href = url; a.download = `scadforge_model.${EXPORT_EXT[fmt] || fmt}`;
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
   } catch (e) {

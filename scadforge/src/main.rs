@@ -25,6 +25,10 @@ fn main() {
     let mut preset_file: Option<String> = None;
     let mut preset_name: Option<String> = None;
     let mut camera = scadforge::eval::Camera::DEFAULT;
+    // `--export-format TAG` overrides what the output extension implies. The
+    // reference spells it with either an `=` or a following word, and it is
+    // the only way to ask for ASCII STL, since `.stl` means binary.
+    let mut export_format: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -102,6 +106,29 @@ fn main() {
                 }
                 i += step;
             }
+            a if a == "--export-format" || a.starts_with("--export-format=") => {
+                let (tag, step) = match a.strip_prefix("--export-format=") {
+                    Some(v) => (v.to_string(), 1),
+                    None => match args.get(i + 1) {
+                        Some(v) => (v.clone(), 2),
+                        None => {
+                            eprintln!("--export-format requires a format name");
+                            exit(2);
+                        }
+                    },
+                };
+                let tag = tag.to_ascii_lowercase();
+                if !EXPORT_FORMATS.contains(&tag.as_str()) {
+                    eprintln!(
+                        "unknown --export-format '{}' (expected one of: {})",
+                        tag,
+                        EXPORT_FORMATS.join(", ")
+                    );
+                    exit(2);
+                }
+                export_format = Some(tag);
+                i += step;
+            }
             "-P" => {
                 // `-P NAME`: the preset set to select from the `-p` file.
                 match args.get(i + 1) {
@@ -124,7 +151,8 @@ fn main() {
             other => {
                 eprintln!(
                     "unknown argument '{}'; usage: scadforge [--port N] | \
-                     scadforge -o OUT [-D name=value ...] \
+                     scadforge -o OUT [--export-format TAG] \
+                     [-D name=value ...] \
                      [--camera=tx,ty,tz,rx,ry,rz,dist] INPUT.scad",
                     other
                 );
@@ -135,7 +163,15 @@ fn main() {
 
     // Headless render when an input file (or -o) is present; otherwise serve.
     if input.is_some() || output.is_some() {
-        exit(render_headless(input, output, &defines, preset_file, preset_name, camera));
+        exit(render_headless(
+            input,
+            output,
+            export_format,
+            &defines,
+            preset_file,
+            preset_name,
+            camera,
+        ));
     }
 
     if let Err(e) = scadforge::http::serve(port) {
@@ -162,9 +198,17 @@ fn parse_camera(spec: &str) -> Option<scadforge::eval::Camera> {
     })
 }
 
+/// Every tag `eval::export_bytes` understands, as `--export-format` accepts
+/// them. `stl` is an alias of `binstl` (the extension default); `asciistl` is
+/// the only way to ask for text STL.
+const EXPORT_FORMATS: &[&str] = &[
+    "stl", "binstl", "asciistl", "off", "amf", "3mf", "svg", "dxf", "pdf", "echo", "csg",
+];
+
 fn render_headless(
     input: Option<String>,
     output: Option<String>,
+    export_format: Option<String>,
     defines: &[(String, String)],
     preset_file: Option<String>,
     preset_name: Option<String>,
@@ -178,40 +222,50 @@ fn render_headless(
         }
     };
     // The export format is the output file's extension (the tags
-    // eval::export_string understands).
+    // eval::export_bytes understands) unless --export-format overrode it, in
+    // which case the extension is not consulted at all: that is what makes
+    // `-o part.stl --export-format asciistl` — and any other
+    // extension/format pairing the caller wants — possible.
     let ext = output.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    let format = match ext.as_str() {
-        "stl" | "off" | "amf" | "svg" | "dxf" | "pdf" | "3mf" | "echo" | "csg" => ext,
-        // Known 2021.01 debug formats we deliberately do not produce. The
-        // reference recommends refusing the CGAL dumps outright rather than
-        // emulating kernel internals; `.ast`/`.term` are re-serializations
-        // of stages this pipeline does not keep. Name them, so a user does
-        // not read "unknown extension" and assume a typo.
-        "nef3" | "nefdbg" => {
-            eprintln!(
-                "'{}' is a CGAL Nef polyhedron dump — kernel internals this \
+    let format = match export_format {
+        Some(tag) => tag,
+        None => match ext.as_str() {
+            // `.stl` is BINARY STL, per the reference: "--export-format
+            // asciistl|binstl ... needed for ASCII STL since .stl defaults to
+            // binary". `--export-format asciistl` is how a caller asks for text.
+            "stl" | "off" | "amf" | "svg" | "dxf" | "pdf" | "3mf" | "echo" | "csg" => ext,
+            // Known 2021.01 debug formats we deliberately do not produce. The
+            // reference recommends refusing the CGAL dumps outright rather than
+            // emulating kernel internals; `.ast`/`.term` are re-serializations
+            // of stages this pipeline does not keep. Name them, so a user does
+            // not read "unknown extension" and assume a typo.
+            "nef3" | "nefdbg" => {
+                eprintln!(
+                    "'{}' is a CGAL Nef polyhedron dump — kernel internals this \
                  implementation has no equivalent for, and does not emulate. \
                  Use .csg for the evaluated tree.",
-                ext
-            );
-            return 2;
-        }
-        "ast" | "term" => {
-            eprintln!(
-                "'{}' export is not implemented. Use .csg for the fully \
+                    ext
+                );
+                return 2;
+            }
+            "ast" | "term" => {
+                eprintln!(
+                    "'{}' export is not implemented. Use .csg for the fully \
                  evaluated instantiation tree.",
-                ext
-            );
-            return 2;
-        }
-        _ => {
-            eprintln!(
-                "cannot infer export format from '{}' \
-                 (use .stl/.off/.amf/.svg/.dxf/.pdf/.3mf/.echo/.csg)",
-                output
-            );
-            return 2;
-        }
+                    ext
+                );
+                return 2;
+            }
+            _ => {
+                eprintln!(
+                    "cannot infer export format from '{}' \
+                     (use .stl/.off/.amf/.svg/.dxf/.pdf/.3mf/.echo/.csg, \
+                     or pass --export-format)",
+                    output
+                );
+                return 2;
+            }
+        },
     };
     let source = match std::fs::read_to_string(&input) {
         Ok(s) => s,
@@ -279,5 +333,51 @@ fn render_headless(
             eprintln!("{}", e);
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--export-format` is only useful if every tag it accepts is a tag the
+    /// exporter actually serves. The list used to be implicit in a match arm,
+    /// so `.stl` could drift from what the flag allowed without anything
+    /// noticing.
+    #[test]
+    fn every_advertised_export_format_produces_a_file() {
+        let base = std::path::Path::new(".");
+        for tag in EXPORT_FORMATS {
+            // 2D formats need a 2D design; `.echo` needs something on the
+            // console (an echo-free design writing an empty .echo is correct,
+            // not a failure); the rest take a solid.
+            let src = match *tag {
+                "svg" | "dxf" | "pdf" => "square([2, 3]);",
+                "echo" => "echo(\"hi\"); cube(1);",
+                _ => "cube([2, 3, 4]);",
+            };
+            let bytes = scadforge::eval::render_export_bytes(src, base, &[], tag)
+                .unwrap_or_else(|e| panic!("--export-format {tag}: {e}"));
+            assert!(!bytes.is_empty(), "--export-format {tag} wrote nothing");
+        }
+    }
+
+    /// `.stl` is BINARY, and `asciistl` is the only way to ask for text —
+    /// the whole reason the flag exists.
+    #[test]
+    fn the_stl_extension_means_binary() {
+        let base = std::path::Path::new(".");
+        let src = "cube([2, 3, 4]);";
+        let bin = scadforge::eval::render_export_bytes(src, base, &[], "stl").unwrap();
+        // 80-byte header, u32 count, 50 bytes per triangle.
+        assert_eq!(bin.len(), 84 + 12 * 50);
+        assert_eq!(u32::from_le_bytes(bin[80..84].try_into().unwrap()), 12);
+        assert_eq!(
+            bin,
+            scadforge::eval::render_export_bytes(src, base, &[], "binstl").unwrap(),
+            "`stl` and `binstl` are the same format"
+        );
+        let text = scadforge::eval::render_export_bytes(src, base, &[], "asciistl").unwrap();
+        assert!(String::from_utf8(text).unwrap().starts_with("solid OpenSCAD_Model"));
     }
 }

@@ -24,7 +24,26 @@ const READ_TIMEOUT_SECS: u64 = 30;
 pub struct Response {
     pub status: &'static str,
     pub content_type: &'static str,
-    pub body: String,
+    /// BYTES, not text: 3MF is a ZIP and binary STL is little-endian floats,
+    /// and a String body could carry neither — so the download button offered
+    /// a different, larger file than the CLI wrote, and 3MF not at all.
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    fn text(status: &'static str, content_type: &'static str, body: impl Into<String>) -> Response {
+        Response { status, content_type, body: body.into().into_bytes() }
+    }
+
+    /// The body as text, for callers (and tests) that know the route is textual.
+    pub fn text_body(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.body)
+    }
+}
+
+/// The plain-text 422 every export failure returns.
+fn export_error(msg: impl Into<String>) -> Response {
+    Response::text("422 Unprocessable Entity", "text/plain; charset=utf-8", msg)
 }
 
 /// Route one parsed request. Pure: no I/O.
@@ -34,22 +53,19 @@ pub fn handle(method: &str, path: &str, body: &str) -> Response {
         ("GET", "/") => Response {
             status: "200 OK",
             content_type: "text/html; charset=utf-8",
-            body: PAGE.to_string(),
+            body: PAGE.as_bytes().to_vec(),
         },
         ("POST", "/render") => Response {
             status: "200 OK",
             content_type: "application/json",
-            body: render_json_with_camera(body, &overrides_from_query(query), camera_from_query(query)),
+            body: render_json_with_camera(body, &overrides_from_query(query), camera_from_query(query))
+                .into_bytes(),
         },
         // Export the current source's solid geometry as a downloadable mesh
         // (ASCII STL or OFF). Text formats only over HTTP; binary STL is
         // available programmatically via io::write_stl_binary.
         ("POST", "/export") => export_response(query, body),
-        _ => Response {
-            status: "404 Not Found",
-            content_type: "text/plain; charset=utf-8",
-            body: "not found".into(),
-        },
+        _ => Response::text("404 Not Found", "text/plain; charset=utf-8", "not found"),
     }
 }
 
@@ -136,35 +152,20 @@ fn export_response(query: &str, source: &str) -> Response {
     // even when a fatal error halted evaluation — so it is handled before the
     // error check that the geometry exports use.
     if format == "echo" {
-        return Response {
-            status: "200 OK",
-            content_type: "text/plain; charset=utf-8",
-            body: eval::echo_stream(&out),
-        };
+        return Response::text("200 OK", "text/plain; charset=utf-8", eval::echo_stream(&out));
     }
     if let Some(err) = &out.error {
-        return Response {
-            status: "422 Unprocessable Entity",
-            content_type: "text/plain; charset=utf-8",
-            body: err.clone(),
-        };
+        return export_error(err.clone());
     }
-    // 3MF is binary (ZIP); the String-bodied HTTP response can't carry it, so
-    // it is a CLI-only export. Say so rather than silently returning STL.
-    if format == "3mf" {
-        return Response {
-            status: "415 Unsupported Media Type",
-            content_type: "text/plain; charset=utf-8",
-            body: "3MF is a binary format; export it with the CLI: \
-                   scadforge -o model.3mf input.scad"
-                .into(),
-        };
-    }
-    // Normalize the tag (default STL) so it matches eval::export_string, then
+    // Normalize the tag (default STL) so it matches eval::export_bytes, then
     // pair each format with its MIME type. 2D vector formats export the 2D
-    // outlines; mesh formats export the solid geometry.
+    // outlines; mesh formats export the solid geometry. `stl` is BINARY,
+    // exactly as the CLI writes it for a `.stl` output; `asciistl` is the
+    // text form.
     let tag = match format {
-        "svg" | "dxf" | "pdf" | "off" | "amf" | "stl" | "csg" => format,
+        "svg" | "dxf" | "pdf" | "off" | "amf" | "stl" | "binstl" | "asciistl" | "3mf" | "csg" => {
+            format
+        }
         _ => "stl",
     };
     let content_type = match tag {
@@ -173,16 +174,13 @@ fn export_response(query: &str, source: &str) -> Response {
         "pdf" => "application/pdf",
         "off" => "text/plain; charset=utf-8",
         "amf" => "application/x-amf",
+        "3mf" => "model/3mf",
         "csg" => "text/plain; charset=utf-8",
         _ => "model/stl",
     };
-    match eval::export_string(&out, tag) {
+    match eval::export_bytes(&out, tag) {
         Ok(body) => Response { status: "200 OK", content_type, body },
-        Err(e) => Response {
-            status: "422 Unprocessable Entity",
-            content_type: "text/plain; charset=utf-8",
-            body: e,
-        },
+        Err(e) => export_error(e),
     }
 }
 
@@ -426,7 +424,7 @@ fn serve_one(mut stream: std::net::TcpStream) -> std::io::Result<()> {
             break pos;
         }
         if buf.len() > 64 * 1024 {
-            return respond(&mut stream, "431 Request Header Fields Too Large", "text/plain", "");
+            return respond(&mut stream, "431 Request Header Fields Too Large", "text/plain", b"");
         }
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
@@ -450,7 +448,7 @@ fn serve_one(mut stream: std::net::TcpStream) -> std::io::Result<()> {
             &mut stream,
             "501 Not Implemented",
             "text/plain",
-            "transfer encodings are not supported; send a Content-Length",
+            b"transfer encodings are not supported; send a Content-Length",
         );
     }
     let declared = header("content-length").and_then(|v| v.parse::<usize>().ok());
@@ -459,12 +457,12 @@ fn serve_one(mut stream: std::net::TcpStream) -> std::io::Result<()> {
             &mut stream,
             "411 Length Required",
             "text/plain",
-            "POST requires a Content-Length header",
+            b"POST requires a Content-Length header",
         );
     }
     let content_length: usize = declared.unwrap_or(0);
     if content_length > MAX_BODY {
-        return respond(&mut stream, "413 Payload Too Large", "text/plain", "body too large");
+        return respond(&mut stream, "413 Payload Too Large", "text/plain", b"body too large");
     }
     let mut body = buf[header_end + 4..].to_vec();
     while body.len() < content_length {
@@ -489,7 +487,7 @@ fn respond(
     stream: &mut std::net::TcpStream,
     status: &str,
     content_type: &str,
-    body: &str,
+    body: &[u8],
 ) -> std::io::Result<()> {
     let head = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -498,7 +496,7 @@ fn respond(
         body.len()
     );
     stream.write_all(head.as_bytes())?;
-    stream.write_all(body.as_bytes())
+    stream.write_all(body)
 }
 
 #[cfg(test)]
@@ -594,7 +592,7 @@ mod tests {
         // every fragment had exactly the depth already in the buffer and the
         // strictly-less test discarded all of them: `#cube(10);` rendered
         // pixel for pixel the same as `cube(10);` in BOTH paths.
-        let page = handle("GET", "/", "").body;
+        let page = handle("GET", "/", "").text_body().into_owned();
         assert!(page.contains("gl.disable(gl.DEPTH_TEST)"), "GL path still depth-tests the ghost");
         assert!(
             page.contains("if (!m.highlight && z >= zbuf[at]) continue;"),
@@ -625,7 +623,7 @@ mod tests {
         // pin the two ends together — the viewer's startup view has to BE
         // Camera::DEFAULT, or echo($vpr) lies before the user touches
         // anything.
-        let page = handle("GET", "/", "").body;
+        let page = handle("GET", "/", "").text_body().into_owned();
         let d = eval::Camera::DEFAULT;
         let start = format!("let yaw = (-90 - {}) * D2R, pitch = (90 - {}) * D2R;", d.rot[2], d.rot[0]);
         assert!(page.contains(&start), "viewer startup view drifted from Camera::DEFAULT; want `{start}`");
@@ -705,7 +703,7 @@ mod tests {
     fn index_serves_the_app_and_unknown_paths_404() {
         let r = handle("GET", "/", "");
         assert_eq!(r.status, "200 OK");
-        assert!(r.body.contains("<canvas"), "page must embed the viewport");
+        assert!(r.text_body().contains("<canvas"), "page must embed the viewport");
         assert_eq!(handle("GET", "/nope", "").status, "404 Not Found");
         assert_eq!(handle("DELETE", "/render", "").status, "404 Not Found");
     }
@@ -768,7 +766,7 @@ mod tests {
         let src = "n = 1; // [0:10]\nm = \"a\";\ncube([n, 1, 1]);";
         let query = "p=n%3D7&p=m%3D%22b%22";
         let r = handle("POST", &format!("/render?{}", query), src);
-        let v = parse_json(&r.body).unwrap();
+        let v = parse_json(&r.text_body()).unwrap();
         let m = v.get("meshes").unwrap().as_array().unwrap()[0].get("positions").unwrap().as_array().unwrap();
         let maxc = m.iter().map(|c| c.as_f64().unwrap()).fold(0.0_f64, f64::max);
         assert_eq!(maxc, 7.0);
