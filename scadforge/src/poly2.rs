@@ -419,11 +419,158 @@ fn sweep_component(contours: &[Vec<Vec2>], fill: Fill) -> (Vec<Vec2>, Vec<[u32; 
     (positions, tris)
 }
 
+// ---------------------------------------------------------------------------
+// The working frame
+//
+// Booleans and offsets commute with translation and uniform scaling, and so
+// does the fill sweep, so any of them may be solved with the shape moved to
+// the origin and scaled to unit extent and the answer moved back. That is
+// what makes the absolute tolerances below mean the same thing for a
+// millimetre feature as for a kilometre one.
+//
+// This lives in poly2, not csg2, because `triangulate` needs it too: a
+// tessellated offset result 1e11 times further from the origin than it is
+// wide swept to NOTHING, in a band of distances rather than past a clean
+// threshold, which is the signature of an absolute epsilon meeting a
+// coordinate whose ulp has grown past it.
+
+#[derive(Clone, Copy)]
+pub(crate) struct Frame {
+    pub(crate) c: Vec2,
+    pub(crate) s: f64,
+}
+
+impl Frame {
+    pub(crate) const ID: Frame = Frame { c: [0.0, 0.0], s: 1.0 };
+
+    pub(crate) fn of(regions: &[Poly2]) -> Frame {
+        Frame::of_len(regions, 0.0)
+    }
+
+    /// As `of`, but `extra` is a length the caller also needs resolvable —
+    /// an offset distance far larger than the shape still has to land on the
+    /// tolerances' scale, not the shape's.
+    pub(crate) fn of_len(regions: &[Poly2], extra: f64) -> Frame {
+        // REACH (how far the scene sits from the origin) decides the shift;
+        // DETAIL (the smallest extent any ONE operand has) decides the
+        // scale, since that is the finest structure the tolerances must
+        // still resolve. Scaling by the joint span instead lets a distant
+        // operand shrink a near one into the tolerance and annihilate it.
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        let mut detail = f64::INFINITY;
+        for r in regions {
+            let mut rlo = [f64::INFINITY; 2];
+            let mut rhi = [f64::NEG_INFINITY; 2];
+            for c in &r.contours {
+                for p in c {
+                    if !p[0].is_finite() || !p[1].is_finite() {
+                        continue;
+                    }
+                    for k in 0..2 {
+                        rlo[k] = rlo[k].min(p[k]);
+                        rhi[k] = rhi[k].max(p[k]);
+                        lo[k] = lo[k].min(p[k]);
+                        hi[k] = hi[k].max(p[k]);
+                    }
+                }
+            }
+            let rspan = (rhi[0] - rlo[0]).max(rhi[1] - rlo[1]);
+            if rspan.is_finite() && rspan > 0.0 {
+                detail = detail.min(rspan);
+            }
+        }
+        let reach = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(extra.abs());
+        if !reach.is_finite() || reach <= 0.0 {
+            return Frame::ID;
+        }
+        // An offset distance is part of the problem's detail as well as its
+        // reach: an offset far smaller than the shape still has to resolve.
+        if extra != 0.0 && extra.abs().is_finite() {
+            detail = detail.min(extra.abs());
+        }
+        if !detail.is_finite() || detail <= 0.0 {
+            detail = reach;
+        }
+        let shift = |l: f64, h: f64| {
+            if l.abs().max(h.abs()) > reach * 4.0 {
+                (l + h) * 0.5
+            } else {
+                0.0
+            }
+        };
+        let e = detail.log2().round();
+        let s = if e.is_finite() && e != 0.0 && e.abs() < 900.0 {
+            2f64.powi(-(e as i32))
+        } else {
+            1.0
+        };
+        Frame { c: [shift(lo[0], hi[0]), shift(lo[1], hi[1])], s }
+    }
+
+    pub(crate) fn is_identity(&self) -> bool {
+        self.c[0] == 0.0 && self.c[1] == 0.0 && self.s == 1.0
+    }
+
+    pub(crate) fn fwd(&self, p: &Poly2) -> Poly2 {
+        let mut q = p.clone(); // clone, so the region's fill rule rides along
+        for c in &mut q.contours {
+            for v in c {
+                v[0] = (v[0] - self.c[0]) * self.s;
+                v[1] = (v[1] - self.c[1]) * self.s;
+            }
+        }
+        q
+    }
+
+    pub(crate) fn inv(&self, p: &Poly2) -> Poly2 {
+        let mut q = p.clone();
+        for c in &mut q.contours {
+            for v in c {
+                v[0] = v[0] / self.s + self.c[0];
+                v[1] = v[1] / self.s + self.c[1];
+            }
+        }
+        q
+    }
+}
+
+/// Solve `op` in the operands' own working frame.
+pub(crate) fn framed<F: FnOnce(&[Poly2]) -> Poly2>(regions: &[Poly2], op: F) -> Poly2 {
+    let f = Frame::of(regions);
+    if f.is_identity() {
+        return op(regions);
+    }
+    let scaled: Vec<Poly2> = regions.iter().map(|r| f.fwd(r)).collect();
+    f.inv(&op(&scaled))
+}
+
+
 /// Triangulate a region into (vertices, triangles). An even-odd region
 /// bridges each solid contour to its holes into one weakly-simple polygon
 /// and ear-clips it; a font region goes to the non-zero sweep instead,
 /// which is what its self-crossing outlines need.
 pub fn triangulate(poly: &Poly2) -> (Vec<Vec2>, Vec<[u32; 3]>) {
+    // In the shape's own working frame, for the same reason the booleans are:
+    // the sweep's tolerances are absolute, and a shape far from the origin
+    // has coordinates whose ULP has grown past them. A tessellated offset
+    // result 1e11 times further out than it was wide swept to NOTHING — and
+    // in a BAND of distances rather than past a clean threshold, which is
+    // what an absolute epsilon meeting a growing ULP looks like.
+    //
+    // The scale is a power of two and the shift is only taken when the shape
+    // really is far out, so for anything near the origin the round trip is
+    // exact and this changes no coordinate at all.
+    let f = Frame::of(std::slice::from_ref(poly));
+    if !f.is_identity() {
+        let (pts, tris) = triangulate_in_frame(&f.fwd(poly));
+        let back = pts.iter().map(|v| [v[0] / f.s + f.c[0], v[1] / f.s + f.c[1]]).collect();
+        return (back, tris);
+    }
+    triangulate_in_frame(poly)
+}
+
+fn triangulate_in_frame(poly: &Poly2) -> (Vec<Vec2>, Vec<[u32; 3]>) {
     let clean = clean_contours(poly);
     if clean.is_empty() {
         return (Vec::new(), Vec::new());
@@ -1299,6 +1446,56 @@ pub fn extrude_rotate(poly: &Poly2, angle_deg: f64, frags: usize) -> Result<Mesh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shape far from the origin relative to its own size must triangulate
+    /// to the same thing it does at the origin.
+    ///
+    /// Found by differential testing, not by reading: the sweep's tolerances
+    /// are absolute, and past a dynamic range of about 1e11 the ULP of the
+    /// coordinates grows through them. A tessellated offset result swept to
+    /// NOTHING — 31 of 400 distances between 1e7 and 1e11, a BAND rather than
+    /// a clean threshold, which is what an absolute epsilon meeting a growing
+    /// ULP looks like. The raw shape was fine at every distance; it took the
+    /// ~90 closely-spaced points of a tessellated offset to trip it.
+    #[test]
+    fn triangulation_survives_distance_from_the_origin() {
+        let ring = |s: f64, t: f64| {
+            let pts = |r: f64, n: usize, phase: f64| -> Vec<Vec2> {
+                (0..n)
+                    .map(|i| {
+                        let (sa, ca) =
+                            crate::trig::sin_cos_deg(360.0 * i as f64 / n as f64 + phase);
+                        [t + s * r * ca, t + s * r * sa]
+                    })
+                    .collect()
+            };
+            Poly2::new(vec![pts(1.0, 37, 0.0), pts(0.42, 29, 5.0)])
+        };
+        let area = |p: &Poly2| -> f64 {
+            let (pts, tris) = triangulate(p);
+            tris.iter()
+                .map(|t| {
+                    let (a, b, c) = (pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]);
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0
+                })
+                .sum()
+        };
+        for &s in &[1.0f64, 1e-2, 1e-4] {
+            let want = area(&ring(s, 0.0)) ;
+            assert!(want > 0.0, "the reference ring must have area");
+            // Every decade out to 1e11 times the shape's own size.
+            for k in 0..12 {
+                let t = s * 10f64.powi(k);
+                let got = area(&ring(s, t));
+                assert!(got > 0.0, "s={s:e} t={t:e}: triangulated to nothing");
+                assert!(
+                    (got - want).abs() / want < 1e-3,
+                    "s={s:e} t={t:e}: area {got:e} against {want:e} at the origin"
+                );
+            }
+        }
+    }
+
 
     fn area(tris: &[[u32; 3]], v: &[Vec2]) -> f64 {
         tris.iter()

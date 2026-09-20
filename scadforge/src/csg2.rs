@@ -19,7 +19,7 @@
 //! with tolerance snapping.
 
 use crate::geom::Mesh;
-use crate::poly2::{self, Poly2};
+use crate::poly2::{self, framed, Frame, Poly2};
 use std::collections::HashMap;
 
 /// Line-classification tolerance. 2D coordinates live in the unit-to-
@@ -648,117 +648,6 @@ fn cw_angle(from: V2, to: V2) -> f64 {
 /// the centre, which makes that subtraction exact too. A region already
 /// near unit scale at the origin gets the identity and comes back
 /// bit-identical to before.
-#[derive(Clone, Copy)]
-struct Frame {
-    c: V2,
-    s: f64,
-}
-
-impl Frame {
-    const ID: Frame = Frame { c: [0.0, 0.0], s: 1.0 };
-
-    fn of(regions: &[Poly2]) -> Frame {
-        Frame::of_len(regions, 0.0)
-    }
-
-    /// As `of`, but `extra` is a length the caller also needs resolvable —
-    /// an offset distance far larger than the shape still has to land on the
-    /// tolerances' scale, not the shape's.
-    fn of_len(regions: &[Poly2], extra: f64) -> Frame {
-        // REACH (how far the scene sits from the origin) decides the shift;
-        // DETAIL (the smallest extent any ONE operand has) decides the
-        // scale, since that is the finest structure the tolerances must
-        // still resolve. Scaling by the joint span instead lets a distant
-        // operand shrink a near one into the tolerance and annihilate it.
-        let mut lo = [f64::INFINITY; 2];
-        let mut hi = [f64::NEG_INFINITY; 2];
-        let mut detail = f64::INFINITY;
-        for r in regions {
-            let mut rlo = [f64::INFINITY; 2];
-            let mut rhi = [f64::NEG_INFINITY; 2];
-            for c in &r.contours {
-                for p in c {
-                    if !p[0].is_finite() || !p[1].is_finite() {
-                        continue;
-                    }
-                    for k in 0..2 {
-                        rlo[k] = rlo[k].min(p[k]);
-                        rhi[k] = rhi[k].max(p[k]);
-                        lo[k] = lo[k].min(p[k]);
-                        hi[k] = hi[k].max(p[k]);
-                    }
-                }
-            }
-            let rspan = (rhi[0] - rlo[0]).max(rhi[1] - rlo[1]);
-            if rspan.is_finite() && rspan > 0.0 {
-                detail = detail.min(rspan);
-            }
-        }
-        let reach = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(extra.abs());
-        if !reach.is_finite() || reach <= 0.0 {
-            return Frame::ID;
-        }
-        // An offset distance is part of the problem's detail as well as its
-        // reach: an offset far smaller than the shape still has to resolve.
-        if extra != 0.0 && extra.abs().is_finite() {
-            detail = detail.min(extra.abs());
-        }
-        if !detail.is_finite() || detail <= 0.0 {
-            detail = reach;
-        }
-        let shift = |l: f64, h: f64| {
-            if l.abs().max(h.abs()) > reach * 4.0 {
-                (l + h) * 0.5
-            } else {
-                0.0
-            }
-        };
-        let e = detail.log2().round();
-        let s = if e.is_finite() && e != 0.0 && e.abs() < 900.0 {
-            2f64.powi(-(e as i32))
-        } else {
-            1.0
-        };
-        Frame { c: [shift(lo[0], hi[0]), shift(lo[1], hi[1])], s }
-    }
-
-    fn is_identity(&self) -> bool {
-        self.c[0] == 0.0 && self.c[1] == 0.0 && self.s == 1.0
-    }
-
-    fn fwd(&self, p: &Poly2) -> Poly2 {
-        let mut q = p.clone(); // clone, so the region's fill rule rides along
-        for c in &mut q.contours {
-            for v in c {
-                v[0] = (v[0] - self.c[0]) * self.s;
-                v[1] = (v[1] - self.c[1]) * self.s;
-            }
-        }
-        q
-    }
-
-    fn inv(&self, p: &Poly2) -> Poly2 {
-        let mut q = p.clone();
-        for c in &mut q.contours {
-            for v in c {
-                v[0] = v[0] / self.s + self.c[0];
-                v[1] = v[1] / self.s + self.c[1];
-            }
-        }
-        q
-    }
-}
-
-/// Solve `op` in the operands' own working frame.
-fn framed<F: FnOnce(&[Poly2]) -> Poly2>(regions: &[Poly2], op: F) -> Poly2 {
-    let f = Frame::of(regions);
-    if f.is_identity() {
-        return op(regions);
-    }
-    let scaled: Vec<Poly2> = regions.iter().map(|r| f.fwd(r)).collect();
-    f.inv(&op(&scaled))
-}
-
 /// n-ary union of 2D regions (the boundary of the combined filled area).
 /// A single region passes through unchanged; empty regions are skipped.
 pub fn union2(regions: &[Poly2]) -> Poly2 {

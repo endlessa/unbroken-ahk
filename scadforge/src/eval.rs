@@ -236,7 +236,7 @@ fn evaluate_source_inner(
         stamp_error(&mut out);
         return out;
     }
-    let mut out = evaluate_maybe_recording(&resolved.program, record_csg, mode, camera);
+    let mut out = evaluate_maybe_recording(&resolved.program, record_csg, mode, camera, base_dir);
     if !resolved.warnings.is_empty() {
         // These are raised before evaluation begins, so they lead the stream —
         // and `order` has to be shifted with them or every index after the
@@ -253,14 +253,14 @@ fn evaluate_source_inner(
 }
 
 pub fn evaluate(program: &[Stmt]) -> EvalOutput {
-    evaluate_maybe_recording(program, false, Mode::Preview, Camera::DEFAULT)
+    evaluate_maybe_recording(program, false, Mode::Preview, Camera::DEFAULT, &cwd())
 }
 
 /// Evaluate while recording the instantiation tree for `.csg` export. The
 /// geometry kernel still runs (so one code path serves both modes and the
 /// tree can never disagree with the render); only the tree is extra.
 pub fn evaluate_recording(program: &[Stmt]) -> EvalOutput {
-    evaluate_maybe_recording(program, true, Mode::Render, Camera::DEFAULT)
+    evaluate_maybe_recording(program, true, Mode::Render, Camera::DEFAULT, &cwd())
 }
 
 fn evaluate_maybe_recording(
@@ -268,11 +268,12 @@ fn evaluate_maybe_recording(
     record: bool,
     mode: Mode,
     camera: Camera,
+    base: &std::path::Path,
 ) -> EvalOutput {
     std::thread::scope(|s| {
         let handle = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
-            .spawn_scoped(s, || evaluate_inner(program, record, mode, camera))
+            .spawn_scoped(s, || evaluate_inner(program, record, mode, camera, base))
             .expect("failed to spawn the evaluator thread");
         handle.join().unwrap_or_else(|_| EvalOutput {
             error: Some("ERROR: the evaluator crashed (please report this script)".into()),
@@ -286,6 +287,7 @@ fn evaluate_inner(
     record: bool,
     mode: Mode,
     camera: Camera,
+    base: &std::path::Path,
 ) -> EvalOutput {
     let mut ctx = Ctx {
         out: EvalOutput::default(),
@@ -298,6 +300,7 @@ fn evaluate_inner(
         clamp_warned: Vec::new(),
         scope_depth: 0,
         camera_base: camera,
+        base: base.to_path_buf(),
     };
     {
         let mut dv = ctx.dynv.vars.borrow_mut();
@@ -573,6 +576,12 @@ struct Ctx {
     /// The camera evaluation started from; the baseline a `$vp*` the script
     /// never touched falls back to.
     camera_base: Camera,
+    /// The directory `import()`/`surface()` data paths resolve against — the
+    /// SCRIPT's own, the same base `include`/`use` already use. It used to be
+    /// the process working directory, so the same source with the same files
+    /// beside it rendered differently depending on which directory the shell
+    /// happened to be in.
+    base: std::path::PathBuf,
 }
 
 impl Ctx {
@@ -1956,7 +1965,7 @@ fn call_builtin_module(
                     return Vec::new();
                 }
             };
-            let text = match sandboxed_path(&path).and_then(|p| std::fs::read_to_string(p).ok()) {
+            let text = match sandboxed_path(&ctx.base, &path).and_then(|p| std::fs::read_to_string(p).ok()) {
                 Some(t) => t,
                 None => {
                     ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
@@ -2764,20 +2773,40 @@ fn text_region(
 /// and require it to stay under it — refusing absolute paths, `..` traversal,
 /// and symlink escapes (canonicalized). None => refused. A missing file
 /// returns its lexical path so the caller's read fails and warns.
-fn sandboxed_path(path: &str) -> Option<std::path::PathBuf> {
+/// The process working directory, for the entry points that evaluate a
+/// program with no file behind it.
+fn cwd() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// Resolve a data-file path for `import()`/`surface()` against `base` — the
+/// SCRIPT's directory — and require the result to stay under it.
+///
+/// `base` used to be `std::env::current_dir()`, while `include`/`use` already
+/// resolved against the script. So within one file `include <lib.scad>` found
+/// the library beside the script and `surface(file = "h.dat")` looked in
+/// whatever directory the shell happened to be in: the same source with the
+/// same files next to it rendered differently, and differently again in the
+/// console, decided by nothing but the caller's cwd. The reference puts both
+/// on the script ("resolved relative to the invoking script's directory") and
+/// its determinism posture requires the render to be a pure function of the
+/// script and its file inputs.
+///
+/// The containment rule is unchanged — no absolute paths, no `..`, no symlink
+/// escape — it just anchors somewhere that does not move.
+fn sandboxed_path(base: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(path);
     if p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         return None;
     }
-    let cwd = std::env::current_dir().ok()?;
-    let joined = cwd.join(p);
+    let joined = base.join(p);
     match joined.canonicalize() {
         Ok(canon) => {
-            let root = cwd.canonicalize().unwrap_or(cwd);
+            let root = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
             if canon.starts_with(&root) {
                 Some(canon)
             } else {
-                None // symlink escaping the working directory
+                None // symlink escaping the script's directory
             }
         }
         Err(_) => Some(joined), // missing file: let the read fail and warn
@@ -2789,7 +2818,7 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
     // DXF and SVG are 2D vector formats — they import as a 2D shape, not a mesh.
     // Their curve tessellation follows the $fn/$fa/$fs in scope at the call.
     if ext == "dxf" || ext == "svg" {
-        let resolved = match sandboxed_path(path) {
+        let resolved = match sandboxed_path(&ctx.base, path) {
             Some(p) => p,
             None => {
                 ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
@@ -2815,7 +2844,7 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
     }
     // 3MF is a ZIP+XML mesh container (binary), read from bytes like STL.
     if ext == "3mf" {
-        let resolved = match sandboxed_path(path) {
+        let resolved = match sandboxed_path(&ctx.base, path) {
             Some(p) => p,
             None => {
                 ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
@@ -2841,7 +2870,7 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
             return Vec::new();
         }
     };
-    let resolved = match sandboxed_path(path) {
+    let resolved = match sandboxed_path(&ctx.base, path) {
         Some(p) => p,
         None => {
             ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
@@ -5740,14 +5769,56 @@ mod tests {
             "/tmp/loot.stl",
         ] {
             assert!(
-                sandboxed_path(escape).is_none(),
+                sandboxed_path(&cwd(), escape).is_none(),
                 "{escape} escaped the sandbox"
             );
         }
         // Ordinary relative paths are still allowed.
         for ok in ["model.stl", "assets/model.stl", "./model.stl"] {
-            assert!(sandboxed_path(ok).is_some(), "{ok} was wrongly blocked");
+            assert!(sandboxed_path(&cwd(), ok).is_some(), "{ok} was wrongly blocked");
         }
+        // ...and the containment holds against whatever base it is given, so
+        // anchoring it to the script rather than the process cwd costs nothing.
+        let base = std::path::Path::new("/some/script/dir");
+        assert!(sandboxed_path(base, "../x.stl").is_none());
+        assert!(sandboxed_path(base, "/etc/passwd").is_none());
+        assert_eq!(
+            sandboxed_path(base, "a/model.stl"),
+            Some(std::path::PathBuf::from("/some/script/dir/a/model.stl"))
+        );
+    }
+
+    #[test]
+    fn data_files_resolve_against_the_script_not_the_shell() {
+        // `include`/`use` resolved against the script's directory while
+        // import()/surface() resolved against std::env::current_dir(), so the
+        // SAME source with the SAME files beside it rendered differently — and
+        // said different things in the console — depending only on which
+        // directory the shell was in. The reference puts both on the script
+        // ("resolved relative to the invoking script's directory") and its
+        // determinism posture requires the render to be a pure function of the
+        // script and its file inputs.
+        let dir = std::env::temp_dir().join(format!("sfbase{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("h.dat"), "0 0 0\n0 5 0\n0 0 0\n").unwrap();
+        let src = "surface(file = \"h.dat\");";
+
+        // Evaluated with the script's directory as the base, the heightmap is
+        // found regardless of where the process happens to be standing.
+        let out = evaluate_source(src, &dir);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(total_volume(&out) > 0.0, "the heightmap must render");
+
+        // With an unrelated base it is simply absent — no panic, no escape,
+        // just the missing-file warning.
+        let elsewhere = std::env::temp_dir().join(format!("sfbase{}x", std::process::id()));
+        let _ = std::fs::create_dir_all(&elsewhere);
+        let out = evaluate_source(src, &elsewhere);
+        assert!(out.warnings.iter().any(|w| w.contains("Can't open import file")), "{:?}", out.warnings);
+        assert_eq!(total_volume(&out), 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     #[test]
@@ -5971,6 +6042,7 @@ mod tests {
             clamp_warned: Vec::new(),
             scope_depth: 0,
             camera_base: Camera::DEFAULT,
+            base: std::path::PathBuf::from("."),
         };
         let root = Scope::root();
         let v = eval_expr(&value, &root, &mut ctx);
@@ -7660,6 +7732,7 @@ mod tests {
             clamp_warned: Vec::new(),
             scope_depth: 0,
             camera_base: Camera::DEFAULT,
+            base: std::path::PathBuf::from("."),
         };
         let root = Scope::root();
         let weak = Rc::downgrade(&root);
