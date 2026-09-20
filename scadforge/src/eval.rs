@@ -371,6 +371,19 @@ fn evaluate_inner(
 /// arrive from `preproc` as bare text — so `^ERROR:` matched every assert
 /// failure and no syntax error at all, which is exactly backwards for anything
 /// grepping the stream.
+/// Give a message the class prefix, if it has not got one. Anything grepping
+/// the stream keys on `^ERROR:`, so a fatal that reaches the user without it
+/// is invisible to them — the export failures did exactly that, printing
+/// "Current top level object is not a 3D object" bare while an assert
+/// alongside it printed "ERROR: Assertion ... failed".
+fn as_error(msg: String) -> String {
+    if msg.starts_with("ERROR:") || msg.starts_with("WARNING:") {
+        msg
+    } else {
+        format!("ERROR: {msg}")
+    }
+}
+
 fn stamp_error(out: &mut EvalOutput) {
     if let Some(e) = &mut out.error {
         if !(e.starts_with("ERROR:") || e.starts_with("WARNING:")) {
@@ -1615,9 +1628,25 @@ fn call_builtin_module(
             Shape::flat(poly2::square(size, center)).into_iter().collect()
         }
         "circle" => {
+            // The only primitive in the r/d family that said nothing about
+            // either condition its siblings warn on: a supplied-but-
+            // unconvertible radius was indistinguishable from an omitted one
+            // and drew a full default r = 1 circle, and r together with d
+            // drew the d silently while sphere and cylinder both reported it.
+            if matches!(bound.get("d"), Some(Value::Num(_)))
+                && matches!(bound.get("r"), Some(Value::Num(_)))
+            {
+                ctx.warn("WARNING: Ignoring radius variable 'r' as diameter 'd' is defined too");
+            }
+            let given = |k: &str| !matches!(bound.get(k), None | Some(Value::Undef));
             let r = match (bound.get("d"), bound.get("r")) {
                 (Some(Value::Num(d)), _) => d / 2.0,
                 (_, Some(Value::Num(r))) => *r,
+                _ if given("d") || given("r") => {
+                    ctx.warn("circle: radius must be a number");
+                    ctx.csg_unhead();
+                    return Vec::new();
+                }
                 _ => 1.0,
             };
             let n = resolve_fragments(r, ctx);
@@ -1788,7 +1817,23 @@ fn call_builtin_module(
                 .map(|p| p[0].abs())
                 .fold(0.0, f64::max);
             let base = resolve_fragments(max_r, ctx) as f64;
-            let frags = ((base * angle.abs() / 360.0).trunc() as usize).max(1);
+            let mut frags = ((base * angle.abs() / 360.0).trunc() as usize).max(1);
+            // The same quad budget linear_extrude has, for the same reason:
+            // the sweep emits frags x profile-points quads, and while $fn is
+            // capped the PROFILE is not, so the product is unbounded. A
+            // 400,000-point polygon at $fn = 1024 asks for 1.6e9 vertices —
+            // about 39 GB — and in Rust an allocation failure is an abort,
+            // which takes the diagnostic explaining it down with the process.
+            let pts: usize = poly.contours.iter().map(|c| c.len()).sum::<usize>().max(1);
+            let cap = (MAX_EXTRUDE_QUADS / pts).max(1);
+            if frags > cap {
+                ctx.warn(format!(
+                    "rotate_extrude: {} fragments truncated at {}",
+                    fmt_num(frags as f64),
+                    cap
+                ));
+                frags = cap;
+            }
             match poly2::extrude_rotate(&poly, angle, frags) {
                 Ok((positions, tris)) => leaf(Mesh { positions, tris }),
                 Err(e) => {
@@ -1984,7 +2029,14 @@ fn call_builtin_module(
                     bound.get("convexity").and_then(Value::as_num).unwrap_or(1.0),
                 ));
             }
-            let grid = io::parse_surface_text(&text);
+            let (grid, truncated) = io::parse_surface_grid(&text);
+            if truncated {
+                ctx.warn(format!(
+                    "surface(): heightmap '{}' is larger than the {} cell limit; truncated",
+                    path,
+                    fmt_num(io::MAX_SURFACE_CELLS as f64)
+                ));
+            }
             leaf(io::heightmap_solid(&grid, center))
         }
         "text" => {
@@ -2307,7 +2359,7 @@ fn call_builtin_module(
         other => {
             // Per the reference, the statement — children included — is
             // skipped entirely.
-            ctx.warn(format!("unknown module '{}' ignored", other));
+            ctx.warn(format!("Ignoring unknown module '{}'", other));
             Vec::new()
         }
     }
@@ -3094,17 +3146,44 @@ pub fn render_export_bytes_with_camera(
     format: &str,
     camera: Camera,
 ) -> Result<Vec<u8>, String> {
+    render_export_bytes_reporting(source, base_dir, overrides, format, camera).0
+}
+
+/// As `render_export_bytes_with_camera`, but also hands back the console
+/// stream the evaluation produced.
+///
+/// The bytes-only form DROPPED it: for every format but `echo` the
+/// `EvalOutput` went out of scope with all its warnings and echoes inside,
+/// so `scadforge -o part.stl model.scad` printed "wrote part.stl" and
+/// nothing else — no ECHO, no reassignment warning, no unknown-module
+/// warning. The information existed and was thrown away at the last step.
+pub fn render_export_bytes_reporting(
+    source: &str,
+    base_dir: &std::path::Path,
+    overrides: &[(String, String)],
+    format: &str,
+    camera: Camera,
+) -> (Result<Vec<u8>, String>, String) {
     let effective = crate::customizer::apply_overrides(source, overrides);
     let out =
         evaluate_source_with_camera(&effective, base_dir, format == "csg", Mode::Render, camera);
-    // `.echo` captures the console stream regardless of a fatal error.
+    let console = echo_stream(&out);
+    // `.echo` captures the console stream regardless of a fatal error. It IS
+    // the console, so it is not also reported.
     if format == "echo" {
-        return Ok(echo_stream(&out).into_bytes());
+        return (Ok(console.into_bytes()), String::new());
     }
-    if let Some(e) = out.error {
-        return Err(e);
+    if let Some(e) = &out.error {
+        // The error is the last line of the stream; the caller prints it, so
+        // hand back everything before it.
+        let head: String = console
+            .lines()
+            .filter(|l| *l != e)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        return (Err(as_error(e.clone())), head);
     }
-    export_bytes(&out, format)
+    (export_bytes(&out, format).map_err(as_error), console)
 }
 
 /// Export the design to a text format's serialized string, dispatching by a
@@ -3132,7 +3211,7 @@ pub fn export_string(out: &EvalOutput, format: &str) -> Result<String, String> {
         "off" => Ok(crate::io::write_off(&export_mesh(out)?)),
         "amf" => Ok(crate::io::write_amf(&export_mesh(out)?)),
         "stl" => Ok(crate::io::write_stl_ascii(&export_mesh(out)?)),
-        other => Err(format!("unsupported export format '{}'", other)),
+        other => Err(format!("ERROR: unsupported export format '{}'", other)),
     }
 }
 
@@ -3357,6 +3436,10 @@ fn bind_builtin_args(module: &str, ev: &[EvArg], ctx: &mut Ctx) -> HashMap<Strin
     let names = positional_names(module);
     let mut bound = HashMap::new();
     let mut pos = 0;
+    // One line per CALL, not one per surplus argument — `bind_params`, which
+    // does the same job for user modules, has had this latch all along, and
+    // the reference treats the emitted warning SET as a compatibility gate.
+    let mut too_many = false;
     for a in ev {
         match &a.name {
             Some(n) if n.starts_with('$') => {} // dynamic, already bound
@@ -3392,6 +3475,10 @@ fn bind_builtin_args(module: &str, ev: &[EvArg], ctx: &mut Ctx) -> HashMap<Strin
                         // compatibility gate, so extra lines are a defect in
                         // their own right.
                         if !matches!(module, "echo" | "assert") && is_builtin_module(module) {
+                            if too_many {
+                                continue;
+                            }
+                            too_many = true;
                             ctx.warn(format!(
                                 "{}: too many positional arguments (expected at most {})",
                                 module,
@@ -3437,7 +3524,8 @@ fn resolve_fragments(r: f64, ctx: &mut Ctx) -> u32 {
         ctx.warn(format!(
             "$fn of {} exceeds the {} fragment cap; clamping (a sphere is \
              quadratic in $fn, and the allocation would abort the process)",
-            fn_, geom::MAX_FRAGMENTS
+            fmt_num(fn_),
+            geom::MAX_FRAGMENTS
         ));
     }
     // The same promise for the $fa/$fs branch, which the check above never
@@ -3722,7 +3810,7 @@ fn eval_expr(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Value {
             match scope.lookup(name) {
                 Some(v) => v,
                 None => {
-                    ctx.warn(format!("unknown variable '{}' (undef)", name));
+                    ctx.warn(format!("Ignoring unknown variable '{}'", name));
                     Value::Undef
                 }
             }
@@ -4348,18 +4436,30 @@ fn num_vector(v: Vec<f64>) -> Value {
 /// vector*vector = DOT PRODUCT, matrix*vector, vector*matrix,
 /// matrix*matrix.
 fn multiply(l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
-    fn scale(n: f64, v: &Value, ctx: &mut Ctx) -> Value {
+    // As with `/`: one line per source-level `*`, not one per element.
+    fn scale_elems(n: f64, v: &Value, fault: &mut Option<String>) -> Value {
         match v {
             Value::Num(m) => Value::Num(n * m),
             Value::Vector(items) => {
-                Value::Vector(items.iter().map(|item| scale(n, item, ctx)).collect())
+                Value::Vector(items.iter().map(|item| scale_elems(n, item, fault)).collect())
             }
             other => {
-                ctx.warn(format!("undefined operation (number * {})", other.type_name()));
+                if fault.is_none() {
+                    *fault =
+                        Some(format!("undefined operation (number * {})", other.type_name()));
+                }
                 Value::Undef
             }
         }
     }
+    let scale = |n: f64, v: &Value, ctx: &mut Ctx| {
+        let mut fault = None;
+        let out = scale_elems(n, v, &mut fault);
+        if let Some(msg) = fault {
+            ctx.warn(msg);
+        }
+        out
+    };
     match (l, r) {
         (Value::Num(a), Value::Num(b)) => Value::Num(a * b),
         (Value::Num(n), v @ Value::Vector(_)) | (v @ Value::Vector(_), Value::Num(n)) => {
@@ -4414,26 +4514,43 @@ fn multiply(l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
 
 /// /: num/num; vector/num and num/vector elementwise (recursive);
 /// vector/vector is undef.
+/// One diagnostic per source-level `/`, however many elements it touches.
+///
+/// The recursion warned at each leaf, so `[1, 2, 3] / 0` printed "division by
+/// zero" three times and a 4x4 matrix printed it sixteen. The fault is
+/// collected through the recursion and reported once at the top, which is
+/// where the operator the user actually wrote lives.
 fn divide(l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
+    let mut fault = None;
+    let v = divide_elems(l, r, &mut fault);
+    if let Some(msg) = fault {
+        ctx.warn(msg);
+    }
+    v
+}
+
+fn divide_elems(l: &Value, r: &Value, fault: &mut Option<String>) -> Value {
     match (l, r) {
         (Value::Num(a), Value::Num(b)) => {
-            if *b == 0.0 {
-                ctx.warn("division by zero");
+            if *b == 0.0 && fault.is_none() {
+                *fault = Some("division by zero".to_string());
             }
             Value::Num(a / b)
         }
-        (Value::Vector(items), Value::Num(_)) => Value::Vector(
-            items.iter().map(|item| divide(item, r, ctx)).collect(),
-        ),
-        (Value::Num(_), Value::Vector(items)) => Value::Vector(
-            items.iter().map(|item| divide(l, item, ctx)).collect(),
-        ),
+        (Value::Vector(items), Value::Num(_)) => {
+            Value::Vector(items.iter().map(|item| divide_elems(item, r, fault)).collect())
+        }
+        (Value::Num(_), Value::Vector(items)) => {
+            Value::Vector(items.iter().map(|item| divide_elems(l, item, fault)).collect())
+        }
         _ => {
-            ctx.warn(format!(
-                "undefined operation ({} / {})",
-                l.type_name(),
-                r.type_name()
-            ));
+            if fault.is_none() {
+                *fault = Some(format!(
+                    "undefined operation ({} / {})",
+                    l.type_name(),
+                    r.type_name()
+                ));
+            }
             Value::Undef
         }
     }
@@ -5026,7 +5143,7 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
         // No object values exist in this implementation.
         "is_object" => Value::Bool(false),
         other => {
-            ctx.warn(format!("unknown function '{}'", other));
+            ctx.warn(format!("Ignoring unknown function '{}'", other));
             Value::Undef
         }
     }
@@ -5415,6 +5532,120 @@ mod tests {
         assert!(tree.contains("%sphere("), "background kept:\n{}", tree);
         assert!(!tree.contains("r = 3"), "disabled subtree must not appear:\n{}", tree);
         assert!(csg_of("!cube(2); sphere(1);").contains("!cube("), "root kept");
+    }
+
+    #[test]
+    fn a_headless_render_reports_its_console() {
+        // `render_export_bytes_with_camera` built the whole console stream and
+        // then dropped it on the floor for every format but `echo`, so
+        // `scadforge -o part.stl model.scad` printed "wrote part.stl" and
+        // nothing about the reassignment, the unknown module or the echo in
+        // it. The information existed and was thrown away at the last step.
+        let base = std::path::Path::new(".");
+        let src = "echo(\"hello\");\na = 1;\na = 2;\nfrobnicate();\ncube(1);\n";
+        let (bytes, console) =
+            render_export_bytes_reporting(src, base, &[], "stl", Camera::DEFAULT);
+        assert!(bytes.is_ok());
+        assert!(console.contains("ECHO: \"hello\""), "{console}");
+        assert!(console.contains("was reassigned"), "{console}");
+        assert!(console.contains("Ignoring unknown module 'frobnicate'"), "{console}");
+        // It is the SAME stream the .echo export writes.
+        let (echo, reported) =
+            render_export_bytes_reporting(src, base, &[], "echo", Camera::DEFAULT);
+        assert_eq!(String::from_utf8(echo.unwrap()).unwrap(), console);
+        assert!(reported.is_empty(), ".echo IS the console; it must not be reported twice");
+
+        // A fatal export error keeps the class prefix every other fatal has —
+        // these bypassed stamp_error and reached the CLI bare, so anything
+        // grepping for ^ERROR: could not see them.
+        let (err, head) =
+            render_export_bytes_reporting("square(10);", base, &[], "stl", Camera::DEFAULT);
+        let e = err.unwrap_err();
+        assert!(e.starts_with("ERROR: "), "{e}");
+        assert!(e.contains("not a 3D object"), "{e}");
+        // ...and the diagnostics from before the failure survive it.
+        let (err, head2) = render_export_bytes_reporting(
+            "echo(\"before\"); assert(false);",
+            base,
+            &[],
+            "stl",
+            Camera::DEFAULT,
+        );
+        assert!(err.unwrap_err().starts_with("ERROR: "));
+        assert!(head2.contains("ECHO: \"before\""), "{head2}");
+        let _ = head;
+    }
+
+    #[test]
+    fn one_diagnostic_per_cause_not_per_element() {
+        // Two once-guards the sibling code paths already had. `bind_params`,
+        // which does the same job for user modules, latches its "too many
+        // positional arguments"; `bind_builtin_args` did not, so it printed
+        // one line per SURPLUS ARGUMENT. And `/` and `*` recurse elementwise,
+        // warning at every leaf, so one source-level operator produced as
+        // many identical lines as the vector had elements.
+        let lines = |src: &str| run(src).warnings;
+        assert_eq!(lines("cube(1, true, 3, 4);").len(), 1, "one line per call");
+        assert_eq!(lines("cube(1, true, 3, 4, 5, 6);").len(), 1);
+        assert_eq!(lines("echo([1, 2, 3] / 0);").len(), 1, "one line per operator");
+        assert_eq!(lines("echo([[1,2],[3,4]] / 0);").len(), 1, "nested too");
+        assert_eq!(lines("echo(2 * [\"a\", \"b\", \"c\"]);").len(), 1);
+        // ...but genuinely separate causes still each report.
+        assert_eq!(lines("echo([1,2] / 0); echo([3,4] / 0);").len(), 2);
+        // ...and the values are unaffected.
+        assert!(echo_stream(&run("echo([1, 2, 3] / 0);")).contains("[inf, inf, inf]"));
+        assert!(echo_stream(&run("echo(2 * [\"a\"]);")).contains("[undef]"));
+    }
+
+    #[test]
+    fn circle_reports_what_its_siblings_report() {
+        // circle was the only primitive in the r/d family with no argument
+        // diagnostics at all: r together with d was silent where sphere and
+        // cylinder both warn, and a supplied-but-unconvertible radius was
+        // indistinguishable from an omitted one — it drew a full default
+        // r = 1 circle and said nothing, where square and sphere warn and
+        // produce nothing.
+        let out = run("circle(r = 5, d = 10);");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("Ignoring radius variable 'r'")),
+            "{:?}",
+            out.warnings
+        );
+        let out = run("circle(\"a\");");
+        assert!(out.warnings.iter().any(|w| w.contains("circle")), "{:?}", out.warnings);
+        assert!(out.shapes.iter().all(|s| s.outline.is_none()), "circle(\"a\") drew something");
+        // An omitted radius is still the documented default, silently.
+        let out = run("circle();");
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_eq!(out.shapes.len(), 1);
+        // ...and the ordinary forms stay silent.
+        for src in ["circle(5);", "circle(r = 5);", "circle(d = 8);"] {
+            assert!(run(src).warnings.is_empty(), "{src}");
+        }
+    }
+
+    #[test]
+    fn rotate_extrude_has_a_quad_budget() {
+        // linear_extrude caps its sweep on emitted quads; rotate_extrude had
+        // no analogue, and while $fn is capped the PROFILE is not, so the
+        // product was unbounded. A 40,000-point profile at $fn = 1024 asks
+        // for 164 million vertices — and in Rust an allocation failure is an
+        // abort, which takes the diagnostic explaining it with the process.
+        let pts: Vec<String> = (0..600)
+            .map(|i| format!("[1,{i}]"))
+            .chain((0..600).map(|i| format!("[2,{}]", 600 - i)))
+            .collect();
+        let src = format!("rotate_extrude($fn = 1024) polygon([{}]);", pts.join(","));
+        let out = run(&src);
+        assert!(
+            out.warnings.iter().any(|w| w.contains("rotate_extrude") && w.contains("truncated")),
+            "{:?}",
+            out.warnings
+        );
+        assert!(!out.shapes.is_empty(), "it still renders, just bounded");
+        // An ordinary profile is untouched.
+        let out = run("rotate_extrude($fn = 64) translate([10, 0]) circle(3, $fn = 32);");
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
 
     #[test]
@@ -6392,7 +6623,21 @@ mod tests {
             "every diagnostic carries a class prefix: {:?}",
             out.warnings
         );
-        assert!(out.warnings.iter().any(|w| w.starts_with("WARNING: unknown module")));
+        // The reference's wording, pinned in six separate entries — two of
+        // which ("fill", "roof") say to clone it exactly for a 2021.01
+        // baseline: "WARNING: Ignoring unknown module 'x'".
+        assert!(
+            out.warnings.iter().any(|w| w == "WARNING: Ignoring unknown module 'frob'"),
+            "{:?}",
+            out.warnings
+        );
+        for (src, want) in [
+            ("echo(nosuchfn(1));", "WARNING: Ignoring unknown function 'nosuchfn'"),
+            ("echo(nosuchvar);", "WARNING: Ignoring unknown variable 'nosuchvar'"),
+        ] {
+            let o = run(src);
+            assert!(o.warnings.iter().any(|w| w == want), "{src}: {:?}", o.warnings);
+        }
         let out = run("assign(x = 1) cube(x);");
         assert!(out.warnings.iter().any(|w| w.starts_with("DEPRECATED:")));
         assert!(!out.warnings.iter().any(|w| w.starts_with("WARNING: DEPRECATED")));

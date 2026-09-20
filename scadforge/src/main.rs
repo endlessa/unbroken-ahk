@@ -255,7 +255,16 @@ fn render_headless(
     }
     overrides.extend_from_slice(defines);
 
-    match scadforge::eval::render_export_bytes_with_camera(&source, &base, &overrides, &format, camera) {
+    // The console stream comes back alongside the bytes and goes to stderr:
+    // every ECHO, WARNING and DEPRECATED the evaluation produced used to be
+    // dropped on the floor for any format but `.echo`, so a headless render
+    // reported "wrote part.stl" and nothing about what went wrong in it.
+    let (result, console) =
+        scadforge::eval::render_export_bytes_reporting(&source, &base, &overrides, &format, camera);
+    if !console.is_empty() {
+        eprint!("{}", console);
+    }
+    match result {
         Ok(body) => match std::fs::write(&output, &body) {
             Ok(()) => {
                 eprintln!("wrote {}", output);

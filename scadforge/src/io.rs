@@ -342,10 +342,19 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
                     }
                 }
                 if r > 0.0 {
+                    // An arc sweeps at most once around, so a file claiming
+                    // more is clamped rather than believed. `fragments()` is
+                    // capped, but it was then MULTIPLIED by a sweep the file
+                    // chose: `51\n1e18` made the segment count saturate u32 at
+                    // 4,294,967,295 and the loop below ask for ~137 GB — an
+                    // allocation abort, which in Rust cannot be caught and
+                    // takes the diagnostic with it.
                     let sweep = if a1 >= a0 { a1 - a0 } else { a1 + 360.0 - a0 };
+                    let sweep = if sweep.is_finite() { sweep.clamp(0.0, 360.0) } else { 0.0 };
                     let n = (crate::geom::fragments(r, fn_, fa, fs) as f64 * sweep / 360.0)
                         .ceil()
-                        .max(1.0) as u32;
+                        .max(1.0)
+                        .min(crate::geom::MAX_FRAGMENTS as f64) as u32;
                     let mut prev: Option<[f64; 2]> = None;
                     for k in 0..=n {
                         let (sa, ca) = crate::trig::sin_cos_deg(a0 + sweep * k as f64 / n as f64);
@@ -991,10 +1000,25 @@ fn push_triangle(w: &mut Welder, tris: &mut Vec<[u32; 3]>, a: [f64; 3], b: [f64;
 
 // -- surface() heightmap -----------------------------------------------------
 
+/// The most grid cells a `surface()` heightmap may occupy. The file is already
+/// bounded by what is on disk, but the PADDING is not: rows x cols grows as
+/// the product of two numbers the file picks independently, so a 1 MB file can
+/// name a 500 GB grid. A million cells is a 1000x1000 heightmap, which is
+/// already a two-million-vertex mesh once `heightmap_solid` gives every
+/// sample a top and a base — well past what a preview wants.
+pub const MAX_SURFACE_CELLS: usize = 1_000_000;
+
 /// Parse a `surface()` text grid: whitespace-separated numeric heights, one
 /// row per non-comment line (`#`-led lines and blank lines skipped). Rows are
 /// padded to the widest with zeros so the grid is rectangular.
 pub fn parse_surface_text(text: &str) -> Vec<Vec<f64>> {
+    parse_surface_grid(text).0
+}
+
+/// As `parse_surface_text`, and also whether the grid was truncated to fit
+/// `MAX_SURFACE_CELLS`, so the caller can say so rather than quietly handing
+/// back part of a model.
+pub fn parse_surface_grid(text: &str) -> (Vec<Vec<f64>>, bool) {
     let mut grid: Vec<Vec<f64>> = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim_start();
@@ -1006,11 +1030,22 @@ pub fn parse_surface_text(text: &str) -> Vec<Vec<f64>> {
             grid.push(row);
         }
     }
+    // Every row is padded to the widest, so the grid costs rows x cols while
+    // the FILE only costs about max(rows, cols): one very wide line sets
+    // `cols` for every one-number line after it. A 1 MB file of 250,000
+    // one-number rows behind a single 250,000-number row asks for 500 GB.
+    // Bound the grid, not the file.
     let cols = grid.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut truncated = false;
+    if cols > 0 && grid.len().saturating_mul(cols) > MAX_SURFACE_CELLS {
+        let rows = (MAX_SURFACE_CELLS / cols).max(1);
+        grid.truncate(rows);
+        truncated = true;
+    }
     for r in &mut grid {
         r.resize(cols, 0.0);
     }
-    grid
+    (grid, truncated)
 }
 
 /// Build a closed 3D solid from a height grid: the top surface follows the
@@ -1250,6 +1285,55 @@ mod tests {
         // A triangle referencing an out-of-range vertex is dropped.
         let onlyvtx = write_3mf(&Mesh { positions: vec![[0.0; 3]], tris: vec![] });
         assert_eq!(tri_count(&read_3mf(&onlyvtx).unwrap()), 0);
+    }
+
+    #[test]
+    fn a_file_cannot_name_an_allocation_it_does_not_contain() {
+        // Two places where a value the FILE chooses multiplied or padded an
+        // otherwise-capped quantity with no check. In Rust an allocation
+        // failure is an abort, not a catchable panic, so each of these took
+        // the process down and the diagnostic with it.
+
+        // A DXF arc's fragment count is fragments() — capped — times a sweep
+        // the file supplies. `51\n1e18` saturated the u32 at 4,294,967,295
+        // and asked for about 137 GB of segments.
+        let arc = |sweep: &str| {
+            format!("0\nSECTION\n2\nENTITIES\n0\nARC\n8\n0\n10\n0\n20\n0\n40\n10\n50\n0\n51\n{sweep}\n0\nENDSEC\n0\nEOF\n")
+        };
+        for sweep in ["1e18", "1000000", "360", "90", "1e308", "-1e18"] {
+            let (poly, warns) = read_dxf(&arc(sweep), 0.0, 12.0, 2.0);
+            let pts: usize = poly.contours.iter().map(|c| c.len()).sum();
+            assert!(
+                pts <= crate::geom::MAX_FRAGMENTS as usize + 8,
+                "sweep {sweep} produced {pts} points"
+            );
+            assert!(warns.is_empty(), "sweep {sweep}: {warns:?}");
+        }
+
+        // A heightmap pads every row out to the widest, so the grid costs
+        // rows x cols while the FILE costs about max(rows, cols): one wide
+        // line sets `cols` for every one-number line after it. This text is
+        // ~12 KB and used to name a 25-million-cell grid.
+        let wide = 2000;
+        let mut text = "1 ".repeat(wide);
+        text.push('\n');
+        for _ in 0..wide {
+            text.push_str("1\n");
+        }
+        let (grid, truncated) = parse_surface_grid(&text);
+        assert!(truncated, "the grid must be reported as truncated");
+        let cells = grid.len() * grid.first().map_or(0, |r| r.len());
+        assert!(cells <= MAX_SURFACE_CELLS, "{cells} cells past the cap");
+
+        // An ordinary heightmap is untouched and NOT reported.
+        let (grid, truncated) = parse_surface_grid("0 0 0\n0 5 0\n0 0 0\n");
+        assert!(!truncated);
+        assert_eq!(grid.len(), 3);
+        assert_eq!(grid[1], vec![0.0, 5.0, 0.0]);
+        // ...including a ragged one, which still pads.
+        let (grid, truncated) = parse_surface_grid("1 2 3\n4 5\n");
+        assert!(!truncated);
+        assert_eq!(grid[1], vec![4.0, 5.0, 0.0]);
     }
 
     #[test]
