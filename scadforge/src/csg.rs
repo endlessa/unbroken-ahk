@@ -737,7 +737,7 @@ fn framed<F: FnOnce(&[Mesh]) -> Mesh>(meshes: &[Mesh], op: F) -> Mesh {
 
 /// n-ary union of a list of meshes (empty meshes are skipped).
 pub fn union_all(meshes: &[Mesh]) -> Mesh {
-    framed(meshes, union_all_raw)
+    framed(meshes, union_all_raw).welded()
 }
 
 fn union_all_raw(meshes: &[Mesh]) -> Mesh {
@@ -754,7 +754,7 @@ pub fn difference(first: &Mesh, rest: &[Mesh]) -> Mesh {
     let mut all = Vec::with_capacity(1 + rest.len());
     all.push(first.clone());
     all.extend_from_slice(rest);
-    framed(&all, |m| difference_raw(&m[0], &m[1..]))
+    framed(&all, |m| difference_raw(&m[0], &m[1..])).welded()
 }
 
 fn difference_raw(first: &Mesh, rest: &[Mesh]) -> Mesh {
@@ -771,7 +771,7 @@ fn difference_raw(first: &Mesh, rest: &[Mesh]) -> Mesh {
 /// n-ary intersection: the region common to every mesh. An empty operand
 /// annihilates the result (A ∩ ∅ = ∅), so intersection is commutative.
 pub fn intersection_all(meshes: &[Mesh]) -> Mesh {
-    framed(meshes, intersection_all_raw)
+    framed(meshes, intersection_all_raw).welded()
 }
 
 fn intersection_all_raw(meshes: &[Mesh]) -> Mesh {
@@ -1124,6 +1124,60 @@ mod tests {
             v += dot(a, cross(b, c)) / 6.0;
         }
         v
+    }
+
+    #[test]
+    fn boolean_results_share_their_vertices() {
+        // The BSP carries every polygon's corners independently, so a boolean
+        // handed back a mesh in which NO two triangles shared a vertex: a
+        // union of two DISJOINT cubes — nothing cut at all — came back with
+        // 72 vertices for 24 triangles, every one of its 72 half-edges
+        // unmatched. STL does not care, being a soup format, but OFF, AMF and
+        // 3MF write explicit indices, so a `difference()` exported 3065 vertex
+        // records for 982 distinct positions.
+        //
+        // Found by differential testing. The geometry was never wrong — 640k
+        // ray-parity checks against an independent point-in-mesh oracle agree
+        // everywhere, including on the hard case below — it was the topology
+        // that was thrown away.
+        let a = geom::cube([1.0, 1.0, 1.0], false);
+        let mut b = geom::cube([1.0, 1.0, 1.0], false);
+        for p in &mut b.positions {
+            p[0] += 5.0;
+        }
+        // Disjoint: the answer IS the two inputs, so it must be exactly as
+        // welded as they are — a closed 2-manifold.
+        let u = union_all(&[a.clone(), b.clone()]);
+        assert_eq!(u.positions.len(), 16, "disjoint union must not explode its vertices");
+        assert_eq!(u.tris.len(), 24);
+        assert!(is_closed_manifold(&u), "a union that cuts nothing must stay manifold");
+        assert!((signed_volume(&u) - 2.0).abs() < 1e-9);
+
+        // Where it really does cut, welding cannot make the result manifold —
+        // the splitter leaves T-junctions, which is a separate matter — but no
+        // position may appear twice.
+        for m in [
+            union_all(&[a.clone(), {
+                let mut c = a.clone();
+                for p in &mut c.positions {
+                    p[0] += 0.5;
+                }
+                c
+            }]),
+            difference(&geom::cube([10.0, 10.0, 10.0], true), &[geom::sphere(6.0, 24)]),
+            intersection_all(&[geom::cube([2.0, 2.0, 2.0], true), geom::sphere(1.3, 12)]),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for p in &m.positions {
+                let k = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
+                assert!(seen.insert(k), "position {p:?} appears twice in a boolean result");
+            }
+            // ...and every triangle still has three distinct corners.
+            for t in &m.tris {
+                assert!(t[0] != t[1] && t[1] != t[2] && t[0] != t[2], "degenerate triangle {t:?}");
+            }
+            assert!(!m.tris.is_empty());
+        }
     }
 
     #[test]

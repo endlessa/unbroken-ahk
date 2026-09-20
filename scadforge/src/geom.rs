@@ -16,6 +16,47 @@ impl Mesh {
     pub fn empty() -> Mesh {
         Mesh { positions: Vec::new(), tris: Vec::new() }
     }
+
+    /// Merge vertices that sit at EXACTLY the same position, and drop any
+    /// triangle left with a repeated corner.
+    ///
+    /// The BSP carries every polygon's corners independently, so a boolean
+    /// hands back a mesh in which no two triangles share a vertex at all:
+    /// `difference() { cube(10, center = true); sphere(6, $fn = 24); }`
+    /// exported 3065 vertex records for 982 distinct positions. STL does not
+    /// care — it is a soup format — but OFF, AMF and 3MF all write explicit
+    /// indices, so the topology those formats exist to express was thrown
+    /// away and the files came out three times larger than the geometry
+    /// needs.
+    ///
+    /// Only bit-identical positions merge, so this cannot move a vertex or
+    /// change what the mesh encloses; it is bookkeeping, not repair. The
+    /// T-junctions the splitter leaves behind are a separate matter and
+    /// survive this.
+    pub fn welded(&self) -> Mesh {
+        use std::collections::HashMap;
+        let mut map: HashMap<[u64; 3], u32> = HashMap::new();
+        let mut positions: Vec<Vec3> = Vec::with_capacity(self.positions.len());
+        let mut at: Vec<u32> = Vec::with_capacity(self.positions.len());
+        for p in &self.positions {
+            // -0.0 and 0.0 are one position, as they are for the STL welder.
+            let bits = |v: f64| if v == 0.0 { 0f64.to_bits() } else { v.to_bits() };
+            let key = [bits(p[0]), bits(p[1]), bits(p[2])];
+            let next = positions.len() as u32;
+            let idx = *map.entry(key).or_insert(next);
+            if idx == next {
+                positions.push(*p);
+            }
+            at.push(idx);
+        }
+        let tris = self
+            .tris
+            .iter()
+            .map(|t| [at[t[0] as usize], at[t[1] as usize], at[t[2] as usize]])
+            .filter(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
+            .collect();
+        Mesh { positions, tris }
+    }
 }
 
 /// The most fragments any primitive will tessellate a full circle into.
