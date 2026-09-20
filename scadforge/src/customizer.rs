@@ -491,6 +491,8 @@ pub fn apply_overrides(source: &str, overrides: &[(String, String)]) -> String {
     // but takes the later write's value, so rewriting the first one left the
     // second still winning and the panel did nothing at all.
     let mut target = vec![usize::MAX; repl.len()];
+    let slot: std::collections::HashMap<&str, usize> =
+        repl.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
     {
         let mut in_block = false;
         let mut block_acc: Vec<u8> = Vec::new();
@@ -509,16 +511,29 @@ pub fn apply_overrides(source: &str, overrides: &[(String, String)]) -> String {
             if here != 0 {
                 continue;
             }
-            if let Some(idx) = repl.iter().position(|(n, _)| line_assigns(code, n)) {
-                target[idx] = ln;
+            // ONE parse per line, then a lookup. It used to call
+            // `line_assigns(code, n)` once per override, and each of those
+            // re-parsed the whole line and built a `Parameter` it threw
+            // away — so a 3,000-line design driven by a 200-control panel
+            // did 600,000 line-parses to place 200 values, and the panel
+            // visibly stalled on every slider drag.
+            if let Some(name) = assigned_name(code) {
+                if let Some(&idx) = slot.get(name) {
+                    target[idx] = ln;
+                }
             }
         }
     }
+    // Invert target once (line -> replacement) rather than scanning it per
+    // line, for the same reason.
+    let mut by_line: Vec<(usize, usize)> =
+        target.iter().enumerate().filter(|(_, &t)| t != usize::MAX).map(|(i, &t)| (t, i)).collect();
+    by_line.sort_unstable();
     let mut out_lines: Vec<String> = Vec::with_capacity(source.lines().count() + 1);
     for (ln, raw) in source.lines().enumerate() {
-        match target.iter().position(|&t| t == ln) {
-            Some(idx) => out_lines.push(rewrite_rhs(raw, &repl[idx].1)),
-            None => out_lines.push(raw.to_string()),
+        match by_line.binary_search_by_key(&ln, |&(l, _)| l) {
+            Ok(k) => out_lines.push(rewrite_rhs(raw, &repl[by_line[k].1].1)),
+            Err(_) => out_lines.push(raw.to_string()),
         }
     }
     let mut out = out_lines.join("\n");
@@ -644,11 +659,34 @@ fn value_string_to_literal(kind: &Kind, valstr: &str) -> String {
     }
 }
 
-/// Does this (comment-stripped, trimmed) line assign to exactly `name`? True
-/// for a computed RHS too: the line still holds that name's value, and it is
-/// the one to rewrite.
-fn line_assigns(code: &str, name: &str) -> bool {
-    parse_assignment(code, "", "", "").is_some_and(|(n, _, _)| n == name)
+/// The name a top-level assignment line binds, or None if the line is not an
+/// assignment. Borrows from `code`, and does no widget/parameter work — the
+/// override placer calls this once per line and only wants the name.
+fn assigned_name(code: &str) -> Option<&str> {
+    let eq = code.find('=')?;
+    // `==`, `<=`, `>=` and `!=` are comparisons, not assignments.
+    if code.as_bytes().get(eq + 1) == Some(&b'=')
+        || matches!(
+            code.as_bytes().get(eq.wrapping_sub(1)),
+            Some(b'<') | Some(b'>') | Some(b'!') | Some(b'=')
+        )
+    {
+        return None;
+    }
+    let name = code[..eq].trim();
+    if name.is_empty()
+        || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        || name.chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    // The statement must END on this line. Without this, the first line of a
+    // multi-line literal (`sizes = [1, 2,`) looked like the slot to rewrite,
+    // and `rewrite_rhs` — which needs the `;` to know where the value stops —
+    // returned the line untouched, so the override vanished instead of
+    // falling back to a trailing re-assignment.
+    code[eq + 1..].find(';')?;
+    Some(name)
 }
 
 /// Replace the RHS of `raw` (`indent name = <rhs> ; tail`) with `new_lit`,
@@ -903,6 +941,43 @@ after = 99;\n"; // after the first module → not scanned
         assert_eq!(out.matches("size =").count(), 1);
         // No overrides → source returned unchanged.
         assert_eq!(apply_overrides(src, &[]), src);
+    }
+
+    /// Placing overrides is ONE parse per line plus a lookup, not one full
+    /// line-parse per (line, override) pair. Every slider drag re-applies the
+    /// whole panel, so the old quadratic form stalled the preview on a large
+    /// design: 3,000 lines against 200 controls did 600,000 line-parses,
+    /// each of which also built and threw away a Parameter.
+    #[test]
+    fn overrides_are_placed_in_one_pass() {
+        let mut src = String::new();
+        for i in 0..400 {
+            src.push_str(&format!("p{} = {};\n", i, i));
+        }
+        let ov: Vec<(String, String)> =
+            (0..50).map(|i| (format!("p{}", i * 7), format!("{}", 1000 + i))).collect();
+        let out = apply_overrides(&src, &ov);
+        // Every override landed on its own declaration line, in place.
+        assert_eq!(out.lines().count(), 400, "rewritten in place, nothing appended");
+        for (i, (n, v)) in ov.iter().enumerate() {
+            assert!(out.contains(&format!("{} = {};", n, v)), "override {} placed", i);
+        }
+        // The lines no override names are untouched.
+        assert!(out.contains("p1 = 1;") && out.contains("p399 = 399;"));
+
+        // A statement that does not END on its line is not the slot: the
+        // rewriter needs the `;` to know where the value stops, and without
+        // this guard the override vanished instead of falling back to a
+        // trailing re-assignment.
+        let ml = "a = 1;\nsizes = [1, 2,\n         3, 4];\nb = 2;\n";
+        let got = apply_overrides(ml, &[("sizes".into(), "[9, 9]".into())]);
+        assert!(got.contains("sizes = [1, 2,"), "the multi-line literal is left alone: {got}");
+        assert!(got.trim_end().ends_with("sizes = [9, 9];"), "appended instead: {got}");
+
+        // The LAST top-level assignment is still the one rewritten.
+        let twice = "size = 10;\nsize = 20;\n";
+        let got = apply_overrides(twice, &[("size".into(), "42".into())]);
+        assert_eq!(got, "size = 10;\nsize = 42;\n", "last write wins: {got}");
     }
 
     #[test]

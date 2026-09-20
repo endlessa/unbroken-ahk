@@ -2093,12 +2093,71 @@ fn call_builtin_module(
                     return Vec::new();
                 }
             };
-            let size = bound.get("size").and_then(Value::as_num).filter(|v| *v > 0.0).unwrap_or(10.0);
+            // An OMITTED size is the documented default of 10. A size that is
+            // present but unusable (<= 0, non-finite, not a number) yields no
+            // geometry: it used to fall back to the default too, so
+            // `text("A", size = 0)` drew size-10 letters where the script
+            // asked for none at all.
+            // `size` OMITTED is the documented default of 10. A size that was
+            // SUPPLIED but is unusable — `<= 0`, non-finite, or not a number
+            // (undef included: passing it explicitly overrides the default) —
+            // yields no geometry, per the reference's "size <= 0 or
+            // non-numeric ... empty geometry". It used to fall back to the
+            // default in every one of those cases, so `text("A", size = 0)`
+            // drew size-10 letters where the script asked for none at all.
+            let size = match bound.get("size") {
+                None => 10.0,
+                Some(v) => match v.as_num().filter(|n| *n > 0.0 && n.is_finite()) {
+                    Some(n) => n,
+                    None => return Vec::new(),
+                },
+            };
             let spacing = bound.get("spacing").and_then(Value::as_num).unwrap_or(1.0);
             let as_string = |v: Option<&Value>| match v {
                 Some(Value::Str(s)) => Some(s.clone()),
                 _ => None,
             };
+            // The shaping arguments this kernel does not implement. Accepting
+            // them in silence was the worst of the three options: a script
+            // that asked for a serif face got sans, one that asked for `rtl`
+            // got its string reversed on screen relative to what it wrote,
+            // and nothing said so. The reference requires the font
+            // substitution be reported ("fontconfig substitutes a default
+            // face; OpenSCAD emits a WARNING ...; geometry is still produced
+            // with the substitute") and its impl notes say to keep
+            // language/script parsed and PIN the simplification — which a
+            // diagnostic does and silence does not.
+            if let Some(req) = as_string(bound.get("font")) {
+                if !crate::font::selector_matches_bundled(&req) {
+                    ctx.warn(format!(
+                        "WARNING: text(): Can't get font \"{}\"; using the bundled face.",
+                        req
+                    ));
+                }
+            }
+            if let Some(d) = as_string(bound.get("direction")) {
+                match d.as_str() {
+                    "ltr" => {}
+                    "rtl" | "ttb" | "btt" => ctx.warn(format!(
+                        "WARNING: text(): direction \"{}\" is not supported; laid out \"ltr\".",
+                        d
+                    )),
+                    _ => ctx.warn(format!(
+                        "WARNING: text(): unknown direction '{}'; using \"ltr\".",
+                        d
+                    )),
+                }
+            }
+            for (arg, default) in [("language", "en"), ("script", "latin")] {
+                if let Some(v) = as_string(bound.get(arg)) {
+                    if v != default {
+                        ctx.warn(format!(
+                            "WARNING: text(): {} \"{}\" is not supported; shaping as \"{}\".",
+                            arg, v, default
+                        ));
+                    }
+                }
+            }
             let halign = as_string(bound.get("halign"));
             let valign = as_string(bound.get("valign"));
             if let Some(h) = &halign {
@@ -7629,10 +7688,63 @@ mod tests {
         let w = run("cylinder(h=10, radius=5);").warnings;
         assert!(w.iter().any(|m| m.contains("radius")), "{w:?}");
         // $-specials and every real parameter stay silent.
+        // `font = ""` is the DEFAULT face, so it draws no substitution
+        // warning of its own and still exercises `font` as a real parameter.
         let quiet = "cylinder(h=1, r=2, $fn=8); cube(size=1, center=true); \
-                     text(\"x\", size=4, font=\"f\"); color(c=\"red\", alpha=0.5) cube(1); \
+                     text(\"x\", size=4, font=\"\"); color(c=\"red\", alpha=0.5) cube(1); \
                      linear_extrude(height=1, twist=90, slices=4) square(1);";
         assert!(run(quiet).warnings.is_empty(), "{:?}", run(quiet).warnings);
+    }
+
+    /// text() accepts four shaping arguments this kernel does not implement.
+    /// Accepting them in SILENCE was the worst of the options: a script that
+    /// asked for a serif face got sans and never learned it. The reference
+    /// requires the font substitution be reported, and its implementation
+    /// notes say to keep language/script parsed and pin the simplification.
+    #[test]
+    fn text_reports_the_shaping_it_cannot_do() {
+        let said = |src: &str, needle: &str| {
+            let w = run(src).warnings;
+            assert!(w.iter().any(|m| m.contains(needle)), "{src} -> {w:?}");
+        };
+        let quiet = |src: &str| {
+            let w = run(src).warnings;
+            assert!(w.is_empty(), "{src} -> {w:?}");
+        };
+        // An unresolvable family substitutes the bundled face AND says so.
+        said("text(\"Hi\", font = \"Liberation Serif\");", "Can't get font");
+        // The bundled family resolves — matching is fontconfig-fuzzy, so
+        // case and spacing do not matter, and a style qualifier on a family
+        // that DOES resolve is silently best-matched per the reference.
+        quiet("text(\"Hi\", font = \"Instrument Sans\");");
+        quiet("text(\"Hi\", font = \"instrumentsans\");");
+        quiet("text(\"Hi\", font = \"Instrument Sans:style=Bold\");");
+        quiet("text(\"Hi\", font = \"\");"); // the default face, explicitly
+        // Directions the reference defines but this kernel lays out as ltr,
+        // and a direction it defines at all.
+        said("text(\"Hi\", direction = \"rtl\");", "direction \"rtl\" is not supported");
+        said("text(\"Hi\", direction = \"ttb\");", "direction \"ttb\" is not supported");
+        said("text(\"Hi\", direction = \"sideways\");", "unknown direction 'sideways'");
+        quiet("text(\"Hi\", direction = \"ltr\");");
+        // Shaping hints.
+        said("text(\"Hi\", script = \"arabic\");", "script \"arabic\" is not supported");
+        said("text(\"Hi\", language = \"ar\");", "language \"ar\" is not supported");
+        quiet("text(\"Hi\", language = \"en\", script = \"latin\");");
+        // Geometry is still produced in every one of those cases.
+        assert!(!run("text(\"Hi\", font = \"Nope\", direction = \"rtl\");").shapes.is_empty());
+
+        // A SUPPLIED but unusable size yields no geometry rather than falling
+        // back to the default and drawing size-10 letters.
+        for src in [
+            "text(\"Hi\", size = 0);",
+            "text(\"Hi\", size = -3);",
+            "text(\"Hi\", size = \"big\");",
+            "text(\"Hi\", size = 1/0);",
+        ] {
+            assert!(run(src).shapes.is_empty(), "{src} drew something");
+        }
+        // Omitted, it is the documented default of 10.
+        assert!(!run("text(\"Hi\");").shapes.is_empty());
     }
 
     /// Texts the reference pins verbatim, and the shared 6-digit formatter

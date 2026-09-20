@@ -20,6 +20,12 @@ pub struct Font {
     pub ascent: f64,
     pub descent: f64,
     num_glyphs: u16,
+    /// nameID 1 and 2 from the `name` table: the family ("Instrument Sans")
+    /// and the subfamily ("Regular"). These are what a fontconfig-style
+    /// `font = "Family:style=Style"` selector matches against, so the face
+    /// names itself rather than the caller hard-coding what is bundled.
+    pub family: String,
+    pub subfamily: String,
     loca: Vec<u32>,
     glyf: usize,
     /// glyph id → advance width in font units.
@@ -99,6 +105,13 @@ impl Font {
         }
 
         let cmap = parse_cmap(&data, cmap_off).unwrap_or_default();
+        let (family, subfamily) = match get(b"name") {
+            Some((off, len)) => (
+                parse_name(&data, off, len, 1).unwrap_or_default(),
+                parse_name(&data, off, len, 2).unwrap_or_default(),
+            ),
+            None => (String::new(), String::new()),
+        };
 
         Some(Font {
             data,
@@ -106,6 +119,8 @@ impl Font {
             ascent,
             descent,
             num_glyphs,
+            family,
+            subfamily,
             loca,
             glyf,
             advances,
@@ -463,10 +478,74 @@ fn parse_cmap12(d: &[u8], sub: usize) -> Option<HashMap<u32, u16>> {
     Some(map)
 }
 
+/// One string from the `name` table, by name ID (1 = family, 2 = subfamily).
+///
+/// Records are searched for a Windows/Unicode UTF-16BE entry first (platform
+/// 3 or 0), then any Macintosh Roman entry, which between them cover every
+/// face in practice. Every read is bounds-checked: this is the one table an
+/// eventual `use <font.ttf>` would expose to untrusted bytes, and a name
+/// record is a length and an offset the file chooses.
+fn parse_name(d: &[u8], off: usize, len: usize, want: u16) -> Option<String> {
+    if off + 6 > d.len() || len < 6 {
+        return None;
+    }
+    let end = (off + len).min(d.len());
+    let count = be16(d, off + 2) as usize;
+    let str_base = off + be16(d, off + 4) as usize;
+    let mut mac: Option<String> = None;
+    for i in 0..count {
+        let rec = off + 6 + i * 12;
+        if rec + 12 > end {
+            break;
+        }
+        if be16(d, rec + 6) != want {
+            continue;
+        }
+        let plat = be16(d, rec);
+        let nlen = be16(d, rec + 8) as usize;
+        let noff = str_base + be16(d, rec + 10) as usize;
+        if noff + nlen > d.len() {
+            continue;
+        }
+        let bytes = &d[noff..noff + nlen];
+        if plat == 3 || plat == 0 {
+            // UTF-16BE. Surrogate pairs are not expected in a family name;
+            // an unpaired unit becomes U+FFFD rather than failing the parse.
+            let units: Vec<u16> =
+                bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+            return Some(String::from_utf16_lossy(&units));
+        }
+        if plat == 1 && mac.is_none() {
+            // Mac Roman: ASCII-compatible for the characters a family name uses.
+            mac = Some(bytes.iter().map(|&b| b as char).collect());
+        }
+    }
+    mac
+}
+
 /// The bundled default face, parsed once.
 pub fn default_font() -> Option<&'static Font> {
     static FONT: OnceLock<Option<Font>> = OnceLock::new();
     FONT.get_or_init(|| Font::parse(DEFAULT_TTF.to_vec())).as_ref()
+}
+
+/// Does a fontconfig-style `font =` selector resolve to the bundled face?
+///
+/// The selector is `"Family"` or `"Family:style=Style Name"`; matching is
+/// fontconfig BEST-match, not exact-or-error, so only the FAMILY decides.
+/// The reference is explicit that an unknown style on a known family is
+/// silently best-matched, while an unknown family substitutes a default face
+/// AND warns — and with one face bundled, every other family is a
+/// substitution. Comparison is case-insensitive and ignores spaces, which is
+/// as much of fontconfig's fuzziness as one face can express.
+pub fn selector_matches_bundled(selector: &str) -> bool {
+    let Some(font) = default_font() else { return false };
+    let family = selector.split(':').next().unwrap_or("");
+    let norm = |s: &str| -> String {
+        s.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect()
+    };
+    let f = norm(family);
+    f.is_empty() || f == norm(&font.family)
 }
 
 #[cfg(test)]
