@@ -1010,7 +1010,16 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
                 ctx.dynv = saved_dyn;
             }, ctx);
             ctx.csg_close();
-            if operands.is_empty() {
+            // `!`/`%` children bypass the intersection exactly as they do in
+            // `intersection()` — and this arm was the one combining form that
+            // never got the rule. A `%` ghost inside the loop body was fed to
+            // the boolean and then VANISHED from the preview (the kernel
+            // returns a mesh, not the shapes, so the flag went with it), a `#`
+            // overlay likewise, and a `!` root was consumed instead of rooting
+            // the design: `intersection_for (i = [0:1]) !cube(3);` showed ONE
+            // cube where the same loop written with `for` showed two.
+            let pass = extract_passthrough(&mut operands);
+            let mut out = if operands.is_empty() {
                 Vec::new()
             } else if all_2d(&operands) {
                 // The reference gives intersection_for the iteration semantics
@@ -1042,7 +1051,9 @@ fn exec_stmt(stmt: &Stmt, scope: &Rc<Scope>, ctx: &mut Ctx) -> Vec<Shape> {
             } else {
                 let meshes: Vec<Mesh> = operands.iter().map(|g| combine_group(g).0).collect();
                 leaf_colored(csg::intersection_all(&meshes), color)
-            }
+            };
+            out.extend(pass);
+            out
         }
         Stmt::Call { name, args, children } => exec_call(name, args, children, scope, ctx),
     }
@@ -7351,6 +7362,63 @@ mod tests {
             out.warnings
         );
         assert!(!out.shapes.is_empty(), "and the children are still shown");
+    }
+
+    /// intersection_for() is a boolean, so `!`/`%` children bypass it the way
+    /// they bypass intersection(). It was the one combining form that never
+    /// got the rule: the kernel returns a MESH, not the shapes, so a ghost
+    /// fed into it came back as anonymous material and its flag was gone.
+    /// Found by fuzzing the .csg round trip — the export recorded the `!`
+    /// faithfully, so re-importing produced what the render should have.
+    #[test]
+    fn intersection_for_lets_preview_only_children_past() {
+        let ghosts = |out: &EvalOutput| out.shapes.iter().filter(|s| s.background).count();
+        let solid = |out: &EvalOutput| {
+            let mut v = 0.0;
+            for s in out.shapes.iter().filter(|s| !s.background) {
+                for t in &s.mesh.tris {
+                    let (a, b, c) = (
+                        s.mesh.positions[t[0] as usize],
+                        s.mesh.positions[t[1] as usize],
+                        s.mesh.positions[t[2] as usize],
+                    );
+                    v += (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                        / 6.0;
+                }
+            }
+            v.abs()
+        };
+
+        // A `%` child cannot clip the result, and is still drawn — once per
+        // iteration, exactly as the same body under `for` would draw it.
+        let out = run("intersection_for (i = [0:1]) { cube(10, center = true); \
+                       %cube(2, center = true); }");
+        assert!((solid(&out) - 1000.0).abs() < 1e-6, "ghost did not clip: {}", solid(&out));
+        assert_eq!(ghosts(&out), 2, "one ghost per iteration");
+        // `#` is a geometric no-op plus an overlay: the material is unchanged.
+        let out = run("intersection_for (i = [0:1]) { cube(10, center = true); \
+                       #cube(2, center = true); }");
+        assert!((solid(&out) - 1000.0).abs() < 1e-6, "# changed the material: {}", solid(&out));
+        assert_eq!(out.shapes.iter().filter(|s| s.highlight).count(), 2);
+
+        // A `!` root inside the loop roots the design, and must resolve the
+        // same way the identical loop written with `for` resolves it.
+        let bang_if = run("intersection_for (i = [0:1]) !cube(3);");
+        let bang_for = run("for (i = [0:1]) !cube(3);");
+        assert_eq!(
+            bang_if.shapes.len(),
+            bang_for.shapes.len(),
+            "intersection_for ate a `!` that for() kept"
+        );
+        assert!(bang_if.shapes.iter().all(|s| s.rooted));
+        assert!((solid(&bang_if) - 54.0).abs() < 1e-9, "two rooted cubes: {}", solid(&bang_if));
+
+        // The ordinary case is untouched: three bars at 60 degrees intersect
+        // to a regular hexagonal prism, 2 x 8/sqrt(3) x ... = 4 sqrt(3).
+        let out = run("intersection_for (a = [0:60:179]) rotate([0, 0, a]) \
+                       cube([8, 2, 2], center = true);");
+        assert!((solid(&out) - 4.0 * 3.0_f64.sqrt()).abs() < 1e-6, "{}", solid(&out));
     }
 
     #[test]
