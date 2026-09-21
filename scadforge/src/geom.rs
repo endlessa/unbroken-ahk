@@ -57,6 +57,67 @@ impl Mesh {
             .collect();
         Mesh { positions, tris }
     }
+
+    /// Drop triangles that no export format can represent as a surface.
+    ///
+    /// The 2D fill sweep resolves crossings numerically, so two scanline
+    /// crossings can land an ULP apart and the trapezoid between them comes
+    /// out a sliver: real at f64 (area 5e-17 on a 143-unit glyph), and
+    /// exactly collinear once written. Across the example corpus that was
+    /// 222 facets in 2.5 million, every one of them exported as
+    /// `facet normal 0 0 0` -- a facet whose normal the STL format requires
+    /// and which no reader can recover, because the three vertices listed
+    /// beside it are collinear.
+    ///
+    /// The test is the writers' own resolution, not a magic number. The text
+    /// formats print coordinates with `{:.6}`, so they land on a 1e-6 grid;
+    /// binary STL stores f32, whose spacing near a coordinate is about
+    /// `|x| * f32::EPSILON`. On a grid of spacing `res` the thinnest triangle
+    /// that is still a triangle has `|cross| == res * res`, so anything below
+    /// that is collinear as written however it is written. Dropping it
+    /// removes no surface -- volume and area over the whole corpus are
+    /// unchanged to twelve significant digits -- and it happens ONCE, at the
+    /// export funnel, so every format agrees on the triangle list.
+    pub fn without_unrepresentable(&self) -> Mesh {
+        /// |cross| -- twice the area -- of a triangle whose vertices have
+        /// been moved onto the grid a writer will put them on.
+        fn cross_on_grid(pts: [Vec3; 3], snap: impl Fn(f64) -> f64) -> f64 {
+            let g = |p: Vec3| [snap(p[0]), snap(p[1]), snap(p[2])];
+            let (a, b, c) = (g(pts[0]), g(pts[1]), g(pts[2]));
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt()
+        }
+        let keep = |t: &[u32; 3]| {
+            let pts = [
+                self.positions[t[0] as usize],
+                self.positions[t[1] as usize],
+                self.positions[t[2] as usize],
+            ];
+            let mag = pts.iter().flatten().fold(0.0f64, |m, c| m.max(c.abs()));
+            // The text writers print `{:.6}`, landing on a 1e-6 grid; binary
+            // STL stores f32. The vertices are SNAPPED before the test, not
+            // just compared against the grid: rounding moves each corner by
+            // up to half a step, which is itself enough to flatten a triangle
+            // that was thin but real beforehand.
+            let text = cross_on_grid(pts, |x| (x * 1e6).round() / 1e6);
+            let f32_res = (mag * f32::EPSILON as f64).max(f32::MIN_POSITIVE as f64);
+            let binary = cross_on_grid(pts, |x| x as f32 as f64);
+            text.is_finite()
+                && binary.is_finite()
+                && text >= 1e-12
+                && binary >= f32_res * f32_res
+        };
+        Mesh {
+            positions: self.positions.clone(),
+            tris: self.tris.iter().copied().filter(|t| keep(t)).collect(),
+        }
+    }
 }
 
 /// The most fragments any primitive will tessellate a full circle into.
@@ -520,6 +581,63 @@ pub fn cylinder(h: f64, r1: f64, r2: f64, center: bool, n: u32) -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 2D fill sweep resolves crossings numerically, so two scanline
+    /// crossings can land an ULP apart and the trapezoid between them is a
+    /// sliver: real at f64, exactly collinear once written to six
+    /// significant digits. Every one of those exported as
+    /// `facet normal 0 0 0` -- a facet whose normal the STL format requires
+    /// and which no reader can recover from three collinear vertices.
+    #[test]
+    fn unrepresentable_slivers_leave_the_export() {
+        // A unit cube plus one sliver whose two far corners are an ULP apart
+        // -- the shape the 2D sweep actually produces.
+        let mut m = cube([1.0, 1.0, 1.0], false);
+        let n = m.positions.len() as u32;
+        let x = 0.5_f64;
+        m.positions.push([0.25, 0.25, 0.0]);
+        m.positions.push([x, 0.25, 0.0]);
+        m.positions.push([f64::from_bits(x.to_bits() + 1), 0.25, 0.0]);
+        m.tris.push([n, n + 1, n + 2]);
+        assert_eq!(m.tris.len(), 13);
+
+        let clean = m.without_unrepresentable();
+        assert_eq!(clean.tris.len(), 12, "the sliver is gone and the cube is not");
+        // Positions are untouched -- this drops faces, it does not move or
+        // renumber anything.
+        assert_eq!(clean.positions, m.positions);
+
+        // Thin but REAL at f64, and still flattened by the writers' rounding:
+        // a 1e-9 rise over a 0.5 run has |cross| = 5e-10, comfortably above
+        // any bound on the unrounded numbers, yet both corners print the same
+        // y at `{:.6}`. Testing the unrounded triangle kept these, and they
+        // reappeared as collinear facets in the file.
+        let mut thin = cube([1.0, 1.0, 1.0], false);
+        let n = thin.positions.len() as u32;
+        thin.positions.push([0.25, 0.25, 0.0]);
+        thin.positions.push([0.75, 0.25, 0.0]);
+        thin.positions.push([0.5, 0.25 + 1e-9, 0.0]);
+        thin.tris.push([n, n + 1, n + 2]);
+        assert_eq!(thin.without_unrepresentable().tris.len(), 12, "flattened by rounding");
+
+        // A triangle that is small but REPRESENTABLE survives: the writers
+        // resolve 1e-6, and 1e-3 is a thousand times that.
+        let mut ok = cube([1.0, 1.0, 1.0], false);
+        let n = ok.positions.len() as u32;
+        ok.positions.push([0.25, 0.25, 0.0]);
+        ok.positions.push([0.25 + 1e-3, 0.25, 0.0]);
+        ok.positions.push([0.25, 0.25 + 1e-3, 0.0]);
+        ok.tris.push([n, n + 1, n + 2]);
+        assert_eq!(ok.without_unrepresentable().tris.len(), 13, "a real small face is kept");
+
+        // A triangle with a repeated vertex has no area at all.
+        let mut dup = cube([1.0, 1.0, 1.0], false);
+        dup.tris.push([0, 1, 1]);
+        assert_eq!(dup.without_unrepresentable().tris.len(), 12);
+
+        // An empty mesh has no bounds; it must come back empty, not panic.
+        assert!(Mesh::empty().without_unrepresentable().tris.is_empty());
+    }
 
     #[test]
     fn fragment_formula_matches_the_reference_cases() {

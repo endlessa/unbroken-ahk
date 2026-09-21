@@ -3161,6 +3161,10 @@ pub fn export_mesh(out: &EvalOutput) -> Result<Mesh, String> {
             combined.tris.push([t[0] + base, t[1] + base, t[2] + base]);
         }
     }
+    // Weld once here rather than per-format, and drop the slivers the 2D
+    // fill sweep leaves behind: they are below the resolution the files can
+    // carry, and every one of them wrote `facet normal 0 0 0`.
+    let combined = combined.without_unrepresentable();
     if combined.tris.is_empty() {
         return Err(if saw_2d {
             "Current top level object is not a 3D object".into()
