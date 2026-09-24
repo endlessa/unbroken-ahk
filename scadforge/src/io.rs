@@ -464,12 +464,9 @@ fn stitch_loops(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
 
 // -- Export -----------------------------------------------------------------
 
-/// Format a coordinate the way the reference's ASCII exporters do: up to 6
-/// significant digits, no trailing zeros, no exponent for ordinary ranges.
+/// Format a coordinate for the text exporters: six DECIMAL places (not six
+/// significant digits -- `{:.6}`), trailing zeros stripped, no exponent.
 fn fmt_coord(x: f64) -> String {
-    if x == 0.0 {
-        return "0".to_string(); // avoid "-0"
-    }
     let mut s = format!("{:.6}", x);
     if s.contains('.') {
         while s.ends_with('0') {
@@ -478,6 +475,16 @@ fn fmt_coord(x: f64) -> String {
         if s.ends_with('.') {
             s.pop();
         }
+    }
+    // A value that ROUNDS to zero has no sign. The guard used to test the
+    // INPUT (`x == 0.0`), which catches -0.0 but not -1e-9: that formats as
+    // "-0.000000" and strips to "-0", so the writers emitted a signed zero
+    // for any coordinate small enough to vanish at six decimals. It is not
+    // just ugly -- it breaks the fixed point, because re-importing "-0"
+    // yields exactly -0.0, which the old guard then wrote as "0", so a file
+    // written twice was not the same file.
+    if s == "-0" {
+        s.remove(0);
     }
     s
 }
@@ -1157,6 +1164,30 @@ pub fn format_from_ext(path: &str) -> Option<MeshFormat> {
 
 #[cfg(test)]
 mod tests {
+
+    use super::*;
+
+    /// A coordinate that ROUNDS to zero has no sign. The guard tested the
+    /// INPUT (`x == 0.0`), which catches -0.0 but not -1e-9: that formats as
+    /// "-0.000000" and strips to "-0", so every text export carried signed
+    /// zeros -- 16,403 of them across the 24 example models. It also broke
+    /// the fixed point, because re-importing "-0" gives exactly -0.0, which
+    /// the old guard then wrote as "0": a file written twice was not the
+    /// same file, which a 2D round-trip fuzz caught on 7 of 60 designs.
+    #[test]
+    fn a_coordinate_that_rounds_to_zero_is_unsigned() {
+        for x in [0.0, -0.0, -1e-9, 1e-9, -4.9e-7, -0.0000004] {
+            assert_eq!(fmt_coord(x), "0", "fmt_coord({x:e})");
+        }
+        // Everything that does NOT round away keeps its sign and its digits.
+        assert_eq!(fmt_coord(-1e-6), "-0.000001");
+        assert_eq!(fmt_coord(-0.5), "-0.5");
+        assert_eq!(fmt_coord(-1.0), "-1");
+        assert_eq!(fmt_coord(2.5), "2.5");
+        assert_eq!(fmt_coord(1.0 / 3.0), "0.333333");
+        // ...and the rounding is to six DECIMALS, not six significant digits.
+        assert_eq!(fmt_coord(1234.5678915), "1234.567892");
+    }
 
     /// Hostile input must never abort, hang, or allocate on a number the FILE
     /// chose. A 6,152-case mutation sweep (truncation at every length, byte
