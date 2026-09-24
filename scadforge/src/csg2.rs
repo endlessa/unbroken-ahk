@@ -978,9 +978,18 @@ fn dilate(region: &Poly2, dist: f64, join: Join, frags_full: u32) -> Poly2 {
 
 // -- Projection (projection()) ----------------------------------------------
 
-/// Above this projected-triangle count the silhouette union is skipped (the
-/// per-facet 2D union is the slow path — a public preview must not hang).
-pub const PROJECT_MAX_TRIS: usize = 4_000;
+/// Above this facet count the SILHOUETTE union is skipped. Only `cut = false`
+/// pays it — that mode unions one polygon per facet — and the cost measured
+/// on spheres grows about n^1.4: 4k facets in 0.12s, 37k in 2.7s, 102k in
+/// 12s, so this bound is tens of seconds, which a preview can wear.
+///
+/// It used to be 4_000, which is below an ordinary model: a `$fn = 64`
+/// sphere is 4,092 facets, so `projection() sphere(r = 10, $fn = 64);` and
+/// every `projection() import("part.stl")` came back EMPTY. The reference is
+/// explicit that this is the wrong failure: "cut=false on high-triangle-count
+/// children is extremely slow upstream (per-facet union); being faster is
+/// fine, erroring is not."
+pub const PROJECT_MAX_TRIS: usize = 250_000;
 
 /// Project a 3D mesh to 2D at z=0. `cut = false`: the full silhouette
 /// (shadow) — the union of every non-vertical facet's XY projection,

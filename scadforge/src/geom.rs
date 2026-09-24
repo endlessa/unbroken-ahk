@@ -266,7 +266,29 @@ pub fn rotation_xyz(deg: Vec3) -> Mat4 {
 /// rotate(a, v) — angle-axis about the (normalized) vector v through the
 /// origin, right-hand rule. A zero-length v falls back to plain Z rotation
 /// per the reference's believed behavior.
+/// Scale a direction vector so its largest component is 1, leaving the
+/// direction exactly as it was.
+///
+/// `|v|` and `|v|^2` overflow and underflow long before `v` itself does:
+/// `[1e-200, 0, 0]` squares to 0 and `[1e200, 0, 0]` squares to inf, so a
+/// perfectly ordinary axis was read as "no axis". The reference is explicit
+/// that "magnitude of v is irrelevant", and dividing by the largest
+/// component first makes that true across the whole exponent range -- it is
+/// an exact operation when the divisor is a power of two and at worst one
+/// rounding otherwise, and every component stays in [-1, 1].
+fn unit_scaled(v: Vec3) -> Option<Vec3> {
+    let m = v.iter().fold(0.0f64, |a, c| a.max(c.abs()));
+    if !(m > 0.0) || !m.is_finite() {
+        return None;
+    }
+    Some([v[0] / m, v[1] / m, v[2] / m])
+}
+
 pub fn rotation_axis(deg: f64, v: Vec3) -> Mat4 {
+    // Bring the vector into range BEFORE squaring it (see `unit_scaled`):
+    // `rotate(90, [1e-200, 0, 0])` used to rotate about Z, and
+    // `rotate(90, [1e200, 0, 0])` collapsed every vertex onto the origin.
+    let Some(v) = unit_scaled(v) else { return rot_z(deg) };
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if len == 0.0 {
         return rot_z(deg);
@@ -287,6 +309,9 @@ pub fn rotation_axis(deg: f64, v: Vec3) -> Mat4 {
 /// normalized and yields identity (the caller warns), so children pass
 /// through unreflected. Determinant is -1, so apply() rewinds faces.
 pub fn mirror(v: Vec3) -> Mat4 {
+    // Same reason as `rotation_axis`: `mirror([1e-200, 0, 0])` squared to
+    // zero and passed its children through unreflected, in silence.
+    let Some(v) = unit_scaled(v) else { return identity() };
     let n2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
     if !(n2 > 0.0) || !n2.is_finite() {
         return identity();

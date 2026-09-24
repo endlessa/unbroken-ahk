@@ -1476,6 +1476,17 @@ fn call_builtin_module(
             // form (r1 or r), then the default. The radius form used to be
             // tried before the shared diameter, so cylinder(d=8, r1=2) came
             // out a FRUSTUM — bottom 2, top 4 — instead of a plain cylinder.
+            // A SUPPLIED argument that will not convert is not the same as an
+            // omitted one. `unwrap_or` conflated them, so `cylinder(h = "x",
+            // r = 5)` drew a height-1 cylinder and said nothing at all, while
+            // `sphere(r = "x")` and `circle(r = "x")` both warn and yield
+            // nothing. Name the first offender and produce no geometry.
+            let bad = |k: &str| bound.get(k).is_some_and(|v| v.as_num().is_none());
+            if let Some(k) = ["h", "r", "d", "r1", "r2", "d1", "d2"].iter().find(|k| bad(k)) {
+                ctx.warn(format!("cylinder: {} must be a number", k));
+                no_children(name, children, ctx);
+                return Vec::new();
+            }
             let end = |dia: &str, rad: &str| -> f64 {
                 num(dia)
                     .or_else(|| num("d"))
@@ -1616,9 +1627,15 @@ fn call_builtin_module(
             // and it flows into the same face pipeline. It was being
             // rejected outright — while the .csg export happily recorded
             // the faces it had refused to build.
-            let faces = match bound.get("faces").and_then(index_lists) {
+            let mut index_notes = Vec::new();
+            let mut take = |v: Option<&Value>| -> Option<Vec<Vec<usize>>> {
+                let (f, notes) = v.and_then(index_lists_reporting)?;
+                index_notes.extend(notes);
+                Some(f)
+            };
+            let faces = match take(bound.get("faces")) {
                 Some(f) => Some(f),
-                None => match bound.get("triangles").and_then(index_lists) {
+                None => match take(bound.get("triangles")) {
                     Some(f) => {
                         ctx.warn(
                             "DEPRECATED: polyhedron(triangles=[]) will be removed in future \
@@ -1632,7 +1649,13 @@ fn call_builtin_module(
             match (points, faces) {
                 (Some(points), Some(faces)) => {
                     let (mesh, warnings) = geom::polyhedron(&points, &faces);
-                    ctx.warn_all(warnings);
+                    // The unusable-index lines come first, and geom's own
+                    // sentinel line for the same face is dropped: one face,
+                    // one diagnostic, naming the index as it was written.
+                    let sentinel =
+                        format!("polyhedron: point index {} out of bounds; face dropped", usize::MAX);
+                    ctx.warn_all(index_notes);
+                    ctx.warn_all(warnings.into_iter().filter(|w| *w != sentinel));
                     no_children(name, children, ctx);
                     leaf(mesh)
                 }
@@ -1988,10 +2011,12 @@ fn call_builtin_module(
             if combined.tris.is_empty() {
                 return Vec::new();
             }
-            // Both modes fold per-facet geometry through the 2D kernel, so both
-            // are capped (cut is cheaper, but a huge straddling mesh still
-            // stitches an unbounded number of segments).
-            if combined.tris.len() > csg2::PROJECT_MAX_TRIS {
+            // Only the SILHOUETTE pays the per-facet union. `cut = true` is a
+            // planar section — one segment per crossing facet, then a stitch —
+            // and measures at hundredths of a second on meshes where the
+            // silhouette takes ten, so capping it was capping the cheap mode
+            // at the expensive mode's budget.
+            if !cut && combined.tris.len() > csg2::PROJECT_MAX_TRIS {
                 ctx.warn(format!(
                     "projection(): {} facets exceed the preview cap ({}); reduce $fn on the \
                      children",
@@ -2063,8 +2088,26 @@ fn call_builtin_module(
                     return Vec::new();
                 }
             };
-            let text = match sandboxed_path(&ctx.base, &path).and_then(|p| std::fs::read_to_string(p).ok()) {
-                Some(t) => t,
+            // A file that opens but is not a text grid is a DIFFERENT failure
+            // from one that will not open, and saying "Can't open" about a
+            // readable PNG sent people hunting for a path problem that was
+            // not there. This build reads the text-grid mode only; the
+            // reference's PNG mode (2015.03+, luminance mapped into a fixed
+            // 0..100 band) needs a decoder this tree does not have, so say
+            // which of the two it is.
+            let text = match sandboxed_path(&ctx.base, &path).and_then(|p| std::fs::read(p).ok()) {
+                Some(bytes) => match String::from_utf8(bytes) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        let png = path.rsplit('.').next().is_some_and(|e| e.eq_ignore_ascii_case("png"));
+                        ctx.warn(format!(
+                            "WARNING: surface(): '{}' is not a text heightmap{}",
+                            path,
+                            if png { " (PNG heightmaps are not supported)" } else { "" }
+                        ));
+                        return Vec::new();
+                    }
+                },
                 None => {
                     ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
                     return Vec::new();
@@ -2703,24 +2746,43 @@ fn vec2_list(v: &Value) -> Option<Vec<poly2::Vec2>> {
 /// non-finite, non-numeric) become usize::MAX so polyhedron's bounds
 /// check drops just that face; a non-vector face becomes empty (dropped).
 fn index_lists(v: &Value) -> Option<Vec<Vec<usize>>> {
-    match v {
-        Value::Vector(faces) => Some(
-            faces
+    index_lists_reporting(v).map(|(f, _)| f)
+}
+
+/// The same, plus a diagnostic for every index that is not a usable one.
+///
+/// An index that is negative, non-finite or not a number has no `usize` to
+/// become, and mapping it to `usize::MAX` made the out-of-bounds message
+/// print `18446744073709551615` where the script had written `-1`. The value
+/// is reported HERE, where it is still a number, and the face is dropped by
+/// the sentinel as before — so the caller emits one line naming what was
+/// actually written.
+fn index_lists_reporting(v: &Value) -> Option<(Vec<Vec<usize>>, Vec<String>)> {
+    let Value::Vector(faces) = v else { return None };
+    let mut notes = Vec::new();
+    let out = faces
+        .iter()
+        .map(|f| match f {
+            Value::Vector(idxs) => idxs
                 .iter()
-                .map(|f| match f {
-                    Value::Vector(idxs) => idxs
-                        .iter()
-                        .map(|i| match i.as_num() {
-                            Some(n) if n.is_finite() && n >= 0.0 => n.trunc() as usize,
-                            _ => usize::MAX,
-                        })
-                        .collect(),
-                    _ => Vec::new(),
+                .map(|i| match i.as_num() {
+                    Some(n) if n.is_finite() && n >= 0.0 => n.trunc() as usize,
+                    other => {
+                        notes.push(format!(
+                            "polyhedron: point index {} out of bounds; face dropped",
+                            match other {
+                                Some(n) => fmt_num(n),
+                                None => "undef".to_string(),
+                            }
+                        ));
+                        usize::MAX
+                    }
                 })
                 .collect(),
-        ),
-        _ => None,
-    }
+            _ => Vec::new(),
+        })
+        .collect();
+    Some((out, notes))
 }
 
 /// resize's per-axis `auto` flags: a bool applies to all three axes, a
@@ -3682,13 +3744,21 @@ fn resolve_fragments(r: f64, ctx: &mut Ctx) -> u32 {
     // instantiation, buries the console under thousands of identical lines.
     // (The reference marks the exact text and the fire-once-vs-per-use
     // question VERIFY; this is the least-noisy reading.)
-    for (name, v) in [("$fa", fa), ("$fs", fs)] {
-        if v < 0.01 && !ctx.clamp_warned.iter().any(|w| w == name) {
-            ctx.clamp_warned.push(name.to_string());
-            ctx.warn(format!("{} too small - clamping to 0.01", name));
+    let fn_ = get("$fn", 0.0);
+    // `$fn > 0` shadows both, and the reference is explicit that a shadowed
+    // value draws no complaint: "$fa ... Ignored entirely whenever $fn > 0 in
+    // scope — no warning about the shadowed value". The loop used to run
+    // before `$fn` was even read, so `sphere(5, $fn = 64, $fa = 0.001);`
+    // warned about a variable it never consulted — and under --hardwarnings
+    // that is a failed build.
+    if !(fn_.is_finite() && fn_ > 0.0) {
+        for (name, v) in [("$fa", fa), ("$fs", fs)] {
+            if v < 0.01 && !ctx.clamp_warned.iter().any(|w| w == name) {
+                ctx.clamp_warned.push(name.to_string());
+                ctx.warn(format!("{} too small - clamping to 0.01", name));
+            }
         }
     }
-    let fn_ = get("$fn", 0.0);
     // The clamp exists so a large $fn cannot abort the process on an
     // allocation it can never satisfy; say so rather than quietly rendering
     // something coarser than asked for.
@@ -7366,6 +7436,100 @@ mod tests {
             out.warnings
         );
         assert!(!out.shapes.is_empty(), "and the children are still shown");
+    }
+
+    /// The primitives and transforms this round's audit found wrong, each
+    /// verified against the reference clause it violates.
+    #[test]
+    fn primitive_arguments_and_axes_are_taken_as_written() {
+        fn solid(out: &EvalOutput) -> f64 {
+            let mut v = 0.0;
+            for s in out.shapes.iter().filter(|s| !s.background) {
+                for t in &s.mesh.tris {
+                    let (a, b, c) = (
+                        s.mesh.positions[t[0] as usize],
+                        s.mesh.positions[t[1] as usize],
+                        s.mesh.positions[t[2] as usize],
+                    );
+                    v += (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                        / 6.0;
+                }
+            }
+            v.abs()
+        }
+        let said = |src: &str, needle: &str| {
+            let w = run(src).warnings;
+            assert!(w.iter().any(|m| m.contains(needle)), "{src} -> {w:?}");
+        };
+        let quiet = |src: &str| {
+            let w = run(src).warnings;
+            assert!(w.is_empty(), "{src} -> {w:?}");
+        };
+
+        // A SUPPLIED argument that will not convert is not an omitted one.
+        // cylinder used to fall back to the default and say nothing, while
+        // sphere and circle both warned and produced nothing.
+        for (src, arg) in [
+            ("cylinder(h = \"x\", r = 5);", "h"),
+            ("cylinder(h = 10, r = [5]);", "r"),
+            ("cylinder(h = 10, r1 = true);", "r1"),
+        ] {
+            said(src, &format!("cylinder: {arg} must be a number"));
+            assert!(run(src).shapes.is_empty(), "{src} still built geometry");
+        }
+        quiet("cylinder(h = 10, r1 = 4, r2 = 2);");
+        quiet("cylinder();"); // every argument omitted: the documented defaults
+
+        // "$fa ... Ignored entirely whenever $fn > 0 in scope -- no warning
+        // about the shadowed value."
+        quiet("sphere(5, $fn = 64, $fa = 0.001);");
+        quiet("sphere(5, $fn = 64, $fs = 0.001);");
+        said("sphere(5, $fa = 0.001);", "$fa too small");
+
+        // An index is reported as the script wrote it. Mapping a negative to
+        // usize::MAX printed 18446744073709551615.
+        said("polyhedron(points=[[0,0,0],[1,0,0],[0,1,0]], faces=[[0,1,-1]]);", "point index -1");
+        said("polyhedron(points=[[0,0,0],[1,0,0],[0,1,0]], faces=[[0,1,9]]);", "point index 9");
+        said("polyhedron(points=[[0,0,0],[1,0,0],[0,1,0]], faces=[[0,1,undef]]);", "point index undef");
+        // ...and exactly one line per bad face, not one plus a sentinel.
+        assert_eq!(
+            run("polyhedron(points=[[0,0,0],[1,0,0],[0,1,0]], faces=[[0,1,-1]]);").warnings.len(),
+            1
+        );
+
+        // "Magnitude of v is irrelevant" -- across the whole exponent range.
+        // |v|^2 underflows to 0 and overflows to inf long before v does, so
+        // these used to mirror nothing and rotate about the wrong axis.
+        let bbox = |src: &str| {
+            let out = run(src);
+            let mut lo = [f64::MAX; 3];
+            let mut hi = [f64::MIN; 3];
+            for s in &out.shapes {
+                for p in &s.mesh.positions {
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(p[k]);
+                        hi[k] = hi[k].max(p[k]);
+                    }
+                }
+            }
+            (lo, hi)
+        };
+        for tiny in ["1e-200", "1e200"] {
+            assert_eq!(
+                bbox(&format!("mirror([{tiny},0,0]) translate([1,0,0]) cube(1);")),
+                bbox("mirror([1,0,0]) translate([1,0,0]) cube(1);"),
+                "mirror with a {tiny} normal"
+            );
+            assert_eq!(
+                bbox(&format!("rotate(90,[{tiny},0,0]) cube([2,1,1]);")),
+                bbox("rotate(90,[1,0,0]) cube([2,1,1]);"),
+                "rotate about a {tiny} axis"
+            );
+        }
+        // An exactly zero normal is still the documented no-op, with a warning.
+        said("mirror([0,0,0]) cube(1);", "mirror");
+        assert!((solid(&run("mirror([0,0,0]) cube(2);")) - 8.0).abs() < 1e-9);
     }
 
     /// intersection_for() is a boolean, so `!`/`%` children bypass it the way

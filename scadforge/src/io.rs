@@ -1165,8 +1165,6 @@ pub fn format_from_ext(path: &str) -> Option<MeshFormat> {
 #[cfg(test)]
 mod tests {
 
-    use super::*;
-
     /// A coordinate that ROUNDS to zero has no sign. The guard tested the
     /// INPUT (`x == 0.0`), which catches -0.0 but not -1e-9: that formats as
     /// "-0.000000" and strips to "-0", so every text export carried signed
