@@ -311,6 +311,11 @@ fn evaluate_inner(
             dv.insert(k.to_string(), v);
         }
     }
+    // Everything above is the LANGUAGE's default environment. The program
+    // runs one layer up, so a top-level `$fn = 64;` is distinguishable from
+    // the default 0 -- which is what lets a module's own `$fn = 32` formal
+    // default apply when nothing has set it.
+    ctx.dynv = DynScope::layer(&ctx.dynv);
     let root = Scope::root();
     let mut shapes = exec_scope(program, &root, &mut ctx);
     // Root modifier (`!`): if any shape is root-marked, the design shows ONLY
@@ -539,6 +544,28 @@ impl DynScope {
         }
         None
     }
+
+    /// Like `lookup`, but only finds a value somebody actually SET.
+    ///
+    /// The root layer holds the language's own defaults ($fn = 0, $fa = 12,
+    /// ...), and a lookup that cannot tell those from a caller's choice makes
+    /// a declared `$`-formal's default dead code: `module m($fn = 32)` always
+    /// saw the root's 0 and tessellated at the $fa/$fs rate instead of 32.
+    /// Everything the script or the host sets lands in a layer ABOVE the
+    /// root, so stopping there answers "did anyone set this?".
+    fn lookup_set(self: &Rc<DynScope>, name: &str) -> Option<Value> {
+        let mut cur = Some(self.clone());
+        while let Some(s) = cur {
+            if s.parent.is_none() {
+                return None; // the root: language defaults only
+            }
+            if let Some(v) = s.vars.borrow().get(name) {
+                return Some(v.clone());
+            }
+            cur = s.parent.clone();
+        }
+        None
+    }
 }
 
 /// The children a module call was given: instantiated lazily by each
@@ -735,6 +762,15 @@ fn geometry_stmts(stmts: &[Stmt]) -> Vec<&Stmt> {
         .iter()
         .filter(|s| {
             !matches!(s, Stmt::Assign { .. } | Stmt::ModuleDef { .. } | Stmt::FunctionDef { .. })
+                // A `*`-disabled statement is not instantiated at ALL, so it
+                // takes no child slot either. `eval_children_grouped` already
+                // gives it no operand -- the reference's rule that "its
+                // position among siblings matters" -- but this list feeds
+                // `$children` and the `children(i)` index, so the two
+                // disagreed: `m() { *cube(20); sphere(3); }` reported
+                // $children == 2 and `children(0)` instantiated the DISABLED
+                // cube, rendering nothing.
+                && !is_disabled(s)
         })
         .collect()
 }
@@ -1296,10 +1332,11 @@ fn bind_params(
         let v = match bound.remove(p.name.as_str()) {
             Some(v) => v,
             None => {
-                // A declared $-formal inherits a dynamic value before
-                // falling back to its default.
+                // A declared $-formal inherits a value somebody SET before
+                // falling back to its default; the language's own defaults do
+                // not count, or the declaration could never take effect.
                 let inherited = if p.name.starts_with('$') {
-                    ctx.dynv.lookup(&p.name)
+                    ctx.dynv.lookup_set(&p.name)
                 } else {
                     None
                 };
@@ -6954,6 +6991,99 @@ mod tests {
         let bad = crate::http::handle("POST", "/export?format=stl", "square(5);");
         assert_eq!(bad.status, "422 Unprocessable Entity");
         assert!(bad.text_body().contains("not a 3D object"));
+    }
+
+    /// A declared `$`-formal's DEFAULT has to be reachable, and a
+    /// `*`-disabled child has to take no child slot.
+    #[test]
+    fn declared_dollar_defaults_apply_and_disabled_children_do_not_count() {
+        let echoes = |src: &str| run(src).echoes.join(" | ");
+
+        // "unbound parameters take their default expressions" — the lookup
+        // could not tell the LANGUAGE's own $fn = 0 from a caller's choice, so
+        // the declared default was dead code and the module tessellated at the
+        // $fa/$fs rate instead of the 32 it asked for.
+        assert_eq!(echoes("module m($fn = 32) { echo($fn); } m();"), "ECHO: 32");
+        // An explicit argument still wins...
+        assert_eq!(echoes("module m($fn = 32) { echo($fn); } m($fn = 8);"), "ECHO: 8");
+        // ...and so does a value the script actually set, which keeps dynamic
+        // scoping intact (the reference marks this interplay VERIFY; this is
+        // the conservative reading).
+        assert_eq!(echoes("module m($fn = 32) { echo($fn); } $fn = 64; m();"), "ECHO: 64");
+        // A module that declares no formal inherits as before, and sees the
+        // language default when nothing set it.
+        assert_eq!(echoes("module m() { echo($fn); } $fn = 64; m();"), "ECHO: 64");
+        assert_eq!(echoes("module m() { echo($fn); } m();"), "ECHO: 0");
+        // The declared default reaches the geometry, not just the echo:
+        // $fn = 32 is 1020 triangles, the $fa/$fs default is 252.
+        let tris = |src: &str| run(src).shapes.iter().map(|s| s.mesh.tris.len()).sum::<usize>();
+        assert_eq!(tris("module m($fn = 32) { sphere(5); } m();"), 1020);
+
+        // "Because the node disappears from the tree, its position among
+        // siblings matters" — $children counted it anyway, so children(0) was
+        // the DISABLED statement and the module drew nothing.
+        assert_eq!(echoes("module m() { echo($children); } m() { *cube(20); sphere(3); }"), "ECHO: 1");
+        assert_eq!(echoes("module m() { echo($children); } m() { cube(1); sphere(1); }"), "ECHO: 2");
+        let out = run("module m() { children(0); } m() { *cube(20); sphere(3); }");
+        assert_eq!(out.shapes.len(), 1, "children(0) picked the disabled child");
+        assert!(out.shapes[0].mesh.tris.len() > 12, "that is a cube, not the sphere");
+    }
+
+    /// Library resolution defects this round's audit found, each reproduced
+    /// before it was fixed. Files are written into a private temp dir so the
+    /// test cannot collide with a parallel one.
+    #[test]
+    fn libraries_resolve_transitively_and_the_main_file_wins() {
+        let dir = std::env::temp_dir().join("scadforge_lib_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = |name: &str, body: &str| std::fs::write(dir.join(name), body).unwrap();
+        let run_in = |src: &str| evaluate_source_for(src, &dir, false, Mode::Preview);
+        let echoes = |out: &EvalOutput| out.echoes.join(" | ");
+
+        // `use` is TRANSITIVE INTO the used file: "modules that the used file
+        // itself use's are available inside the used file". Those inner
+        // directives were collected and then dropped, so a library that used
+        // another library lost everything it depended on.
+        w("libB.scad", "module b() { cube(1); }\n");
+        w("libA.scad", "use <libB.scad>\nmodule a() { b(); }\n");
+        let out = run_in("use <libA.scad>\na();\n");
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_eq!(out.shapes.len(), 1, "libA could not reach libB");
+        // ...and a `use` CYCLE terminates instead of looping.
+        w("cyc1.scad", "use <cyc2.scad>\nmodule c1() { cube(1); }\n");
+        w("cyc2.scad", "use <cyc1.scad>\nmodule c2() { c1(); }\n");
+        assert_eq!(run_in("use <cyc1.scad>\nc2();\n").shapes.len(), 1);
+
+        // "Since 2019.05, assignments in the MAIN file override same-name
+        // assignments from included files REGARDLESS of textual order" — the
+        // before-the-include case came out exactly backwards.
+        w("lib.scad", "r = 10;\nmodule ball() { echo(r); }\n");
+        assert_eq!(echoes(&run_in("r = 3;\ninclude <lib.scad>\nball();\n")), "ECHO: 3");
+        assert_eq!(echoes(&run_in("include <lib.scad>\nr = 3;\nball();\n")), "ECHO: 3");
+        // ...and the library's own value still stands when main says nothing.
+        assert_eq!(echoes(&run_in("include <lib.scad>\nball();\n")), "ECHO: 10");
+        // Overriding is not a reassignment: the console used to blame the user.
+        assert!(
+            !run_in("r = 3;\ninclude <lib.scad>\nball();\n")
+                .warnings
+                .iter()
+                .any(|m| m.contains("reassigned")),
+            "overriding an included value is not a reassignment"
+        );
+        // Nested includes resolve the same way.
+        w("mid.scad", "include <lib.scad>\nq = 1;\n");
+        assert_eq!(echoes(&run_in("r = 42;\ninclude <mid.scad>\nball();\n")), "ECHO: 42");
+
+        // A used file's `$`-reads resolve from the CALLER ("a used module
+        // honors the caller's $fn"); privatizing them froze the library at its
+        // own file-level value. And its top-level `$` assignment must not
+        // reconfigure the whole design.
+        w("dyn.scad", "$fn = 64;\nfunction f() = $fn;\n");
+        assert_eq!(echoes(&run_in("use <dyn.scad>\necho(f($fn = 8));\n")), "ECHO: 8");
+        assert_eq!(echoes(&run_in("use <dyn.scad>\necho($fn);\n")), "ECHO: 0");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

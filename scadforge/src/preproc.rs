@@ -47,6 +47,94 @@ struct Budget {
     capped: bool,
 }
 
+/// Fences written around every spliced `include` body. They parse as calls to
+/// modules nobody defines, which is exactly why they are unmistakable, and
+/// they are removed from the AST before evaluation.
+const INC_OPEN: &str = "\n__scadforge_inc_open__();\n";
+const INC_CLOSE: &str = "\n__scadforge_inc_close__();\n";
+const OPEN_NAME: &str = "__scadforge_inc_open__";
+const CLOSE_NAME: &str = "__scadforge_inc_close__";
+
+/// Apply the 2019.05 include override rule and remove the fences.
+///
+/// "Since 2019.05, assignments in the MAIN file override same-name
+/// assignments from included files REGARDLESS of textual order" -- so
+/// `width = 5;` BEFORE the include wins too. Plain textual pasting gives
+/// last-write-wins instead, which got the after-the-include case right and
+/// the before-the-include case exactly backwards: the library's value won and
+/// the console blamed the user for a reassignment.
+///
+/// With the fences the origin is known, so an included top-level assignment
+/// to a name the main file also assigns at top level is simply dropped. The
+/// main file's assignment is then the only one, which is the rule, and the
+/// spurious "was reassigned" line goes with it.
+fn apply_include_overrides(stmts: Vec<Stmt>) -> Vec<Stmt> {
+    let is_marker = |s: &Stmt, want: &str| {
+        matches!(s, Stmt::Call { name, .. } if name == want)
+    };
+    let mut depth = 0usize;
+    let mut main_names: HashSet<String> = HashSet::new();
+    for s in &stmts {
+        if is_marker(s, OPEN_NAME) {
+            depth += 1;
+        } else if is_marker(s, CLOSE_NAME) {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 {
+            if let Stmt::Assign { name, .. } = s {
+                main_names.insert(name.clone());
+            }
+        }
+    }
+    let mut depth = 0usize;
+    let mut out = Vec::with_capacity(stmts.len());
+    for s in stmts {
+        if is_marker(&s, OPEN_NAME) {
+            depth += 1;
+            continue;
+        }
+        if is_marker(&s, CLOSE_NAME) {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth > 0 {
+            if let Stmt::Assign { name, .. } = &s {
+                if main_names.contains(name) {
+                    continue; // the main file's assignment wins
+                }
+            }
+        }
+        out.push(s);
+    }
+    strip_markers(&mut out);
+    out
+}
+
+/// Every child statement list a statement owns, for a recursive walk.
+fn stmt_bodies(s: &mut Stmt) -> Vec<&mut Vec<Stmt>> {
+    match s {
+        Stmt::Modified { stmt, .. } => stmt_bodies(stmt),
+        Stmt::Call { children, .. } => vec![children],
+        Stmt::For { body, .. } | Stmt::IntersectionFor { body, .. } => vec![body],
+        Stmt::If { then, els, .. } => vec![then, els],
+        Stmt::Let { body, .. } => vec![body],
+        Stmt::ModuleDef { body, .. } => vec![body],
+        Stmt::Block(body) => vec![body],
+        Stmt::Assign { .. } | Stmt::FunctionDef { .. } => Vec::new(),
+    }
+}
+
+/// Remove any fence that ended up nested inside a block -- an `include`
+/// inside a module body or a child list -- so it can never be mistaken for a
+/// child or an unknown module.
+fn strip_markers(stmts: &mut Vec<Stmt>) {
+    stmts.retain(|s| !matches!(s, Stmt::Call { name, .. } if name == OPEN_NAME || name == CLOSE_NAME));
+    for s in stmts.iter_mut() {
+        for body in stmt_bodies(s) {
+            strip_markers(body);
+        }
+    }
+}
+
 /// Resolve every include/use in `source` (whose directory is `base`) and parse
 /// the result into one program, with the definitions of every `use`d file
 /// prepended (so local definitions shadow them via last-write-wins).
@@ -63,7 +151,7 @@ pub fn resolve(source: &str, base: &Path) -> Resolved {
         inline_includes(source, base, &root, &mut seen, &mut warnings, &mut uses, &mut budget, 0);
 
     let main = match parser::parse(&inlined) {
-        Ok(p) => p,
+        Ok(p) => apply_include_overrides(p),
         Err(e) => {
             return Resolved { program: Vec::new(), warnings, error: Some(e) };
         }
@@ -75,7 +163,25 @@ pub fn resolve(source: &str, base: &Path) -> Resolved {
     let mut used_defs: Vec<Stmt> = Vec::new();
     let mut used_seen: HashSet<PathBuf> = HashSet::new();
     let mut used_tag = 0usize;
-    for (path, dir, spelled) in uses {
+    // A WORKLIST, not a fixed list: a used file's own `use` directives were
+    // collected into `inner_uses` below and then dropped on the floor, so a
+    // library that used another library lost every definition it depended on
+    // -- `use <libA.scad>` where libA says `use <libB.scad>` reported
+    // "Ignoring unknown module 'b'" and drew nothing. The reference is
+    // explicit that those are "available inside the used file".
+    //
+    // They are added to the same flat definition table the direct uses go
+    // into, so a transitively-used module is also reachable from the MAIN
+    // file, where the reference says it should not be ("use is not
+    // transitive ... NOT re-exported"). A script relying on that is not
+    // portable, but nothing it writes breaks; the alternative -- a private
+    // namespace per used file, with call sites rewritten -- is a much larger
+    // change, and losing the library outright was the worse of the two.
+    let mut queue = uses;
+    let mut qi = 0usize;
+    while qi < queue.len() {
+        let (path, dir, spelled) = queue[qi].clone();
+        qi += 1;
         if !used_seen.insert(path.clone()) {
             continue; // using the same file twice is idempotent
         }
@@ -93,14 +199,29 @@ pub fn resolve(source: &str, base: &Path) -> Resolved {
         let inner = inline_includes(
             &text, &dir, &root, &mut inner_seen, &mut warnings, &mut inner_uses, &mut budget, 0,
         );
+        // Whatever this file `use`s is resolved next. `used_seen` keeps a
+        // cycle from looping and a diamond from being read twice.
+        queue.extend(inner_uses);
         match parser::parse(&inner) {
-            Ok(mut stmts) => {
+            Ok(stmts) => {
+                let mut stmts = apply_include_overrides(stmts);
                 // The used file's own top-level constants come across too,
                 // renamed into a private namespace so its definitions can
                 // see them while the user cannot.
                 privatize(&mut stmts, used_tag);
                 used_tag += 1;
                 for s in stmts {
+                    // A `$`-assignment at the top of a USED file is not run:
+                    // the reference says a used file's top-level variables do
+                    // not execute, and a dynamic one would otherwise
+                    // reconfigure the WHOLE design -- `use <lib>` where lib
+                    // opens with `$fn = 64;` would silently re-tessellate the
+                    // caller's own geometry. The library's reads of it
+                    // resolve from the caller instead, which is the dynamic
+                    // scoping the reference asks for.
+                    if matches!(&s, Stmt::Assign { name, .. } if name.starts_with('$')) {
+                        continue;
+                    }
                     if matches!(
                         s,
                         Stmt::ModuleDef { .. } | Stmt::FunctionDef { .. } | Stmt::Assign { .. }
@@ -303,7 +424,14 @@ fn process_directive(
                     let dir = resolved.parent().unwrap_or(base).to_path_buf();
                     let inner =
                         inline_includes(&text, &dir, root, seen, warnings, uses, budget, depth + 1);
+                    // Fence the spliced text so the parsed program still knows
+                    // which statements came from a file and which the user
+                    // wrote. Both markers are stripped from the AST before
+                    // evaluation, at every depth, so nothing downstream --
+                    // $children included -- ever sees them.
+                    out.extend_from_slice(INC_OPEN.as_bytes());
                     out.extend_from_slice(inner.as_bytes());
+                    out.extend_from_slice(INC_CLOSE.as_bytes());
                     seen.remove(&resolved);
                 }
                 Err(_) => {
@@ -521,7 +649,14 @@ fn privatize(stmts: &mut [Stmt], tag: usize) {
     let owned: HashSet<String> = stmts
         .iter()
         .filter_map(|s| match s {
-            Stmt::Assign { name, .. } => Some(name.clone()),
+            // `$`-names are NEVER privatized. They are dynamically scoped, so
+            // a read inside the library must resolve from the CALLER's
+            // environment at call time -- the reference: "a used module
+            // honors the caller's $fn". Renaming the reads to a lexical
+            // `__useN__$fn` froze them at the library's own file-level value,
+            // so `use <lib>` where lib says `$fn = 64;` made every function
+            // in it ignore the $fn its caller passed.
+            Stmt::Assign { name, .. } if !name.starts_with('$') => Some(name.clone()),
             _ => None,
         })
         .collect();
@@ -532,7 +667,9 @@ fn privatize(stmts: &mut [Stmt], tag: usize) {
     let mut shadow: Vec<HashSet<String>> = Vec::new();
     for s in stmts.iter_mut() {
         if let Stmt::Assign { name, .. } = s {
-            *name = format!("{}{}", pre, name);
+            if !name.starts_with('$') {
+                *name = format!("{}{}", pre, name);
+            }
         }
         rn_stmt(s, &owned, &mut shadow, &pre);
     }
