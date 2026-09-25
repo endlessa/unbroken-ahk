@@ -26,6 +26,8 @@ python3 algebra2d.py 100 160
 python3 expr.py    1000 1600
 python3 mods.py     100  200
 python3 children.py 100  300
+python3 convex.py   100  300
+python3 convex2d.py 100  200
 ```
 
 `SCADFORGE=/path/to/scadforge` overrides the binary; the default is
@@ -75,6 +77,24 @@ nesting — rather than the BSP. Area comes from the DXF export summed with the
 shoelace formula: an outline winds positive and a hole winds negative, so the
 total is the net filled area. Shapes with holes and `offset()` results are in
 the generator, so nesting is in play on both sides of every boolean.
+
+### `convex.py` / `convex2d.py` — hull and minkowski, by their definitions
+
+`hull()`'s defining property is checkable straight off the exported mesh: the
+result must be convex, so every face plane must have every vertex behind it
+(in 2D, every edge's supporting line must have every vertex on one side). That
+is a far stronger statement than any volume comparison — it catches a hull
+that has merely *grown* rather than *closed*. Alongside it: the hull contains
+its input, it is idempotent, and the hull of a cube or a sphere is that cube
+or sphere. `minkowski()` is checked to commute and to grow.
+
+`convex2d.py` adds `offset()`, pinned by containment rather than by area. A
+rounded corner's area depends on how finely `$fn` cuts the arc, but "A is
+inside its own outset" does not depend on anything — so the outset must
+contain `A`, the inset must be contained by it, and a smaller outset must sit
+inside a larger one. Each containment is written as a `difference()` that has
+to come out empty, which makes every one of them an exercise of the boolean
+kernel as well.
 
 ### `expr.py` — a value must not depend on its route
 
