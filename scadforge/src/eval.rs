@@ -2826,10 +2826,6 @@ fn vec2_list(v: &Value) -> Option<Vec<poly2::Vec2>> {
 /// A list of index lists (polyhedron faces). Invalid indices (negative,
 /// non-finite, non-numeric) become usize::MAX so polyhedron's bounds
 /// check drops just that face; a non-vector face becomes empty (dropped).
-fn index_lists(v: &Value) -> Option<Vec<Vec<usize>>> {
-    index_lists_reporting(v).map(|(f, _)| f)
-}
-
 /// The same, plus a diagnostic for every index that is not a usable one.
 ///
 /// An index that is negative, non-finite or not a number has no `usize` to

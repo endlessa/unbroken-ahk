@@ -390,9 +390,106 @@ pub fn polyhedron(points: &[Vec3], faces: &[Vec<usize>]) -> (Mesh, Vec<String>) 
                 *i = remap[*i as usize];
             }
         }
-        return (Mesh { positions: kept, tris }, warnings);
+        let mesh = Mesh { positions: kept, tris };
+        warnings.extend(closedness_note(&mesh));
+        return (mesh, warnings);
     }
-    (Mesh { positions: points.to_vec(), tris }, warnings)
+    let mesh = Mesh { positions: points.to_vec(), tris };
+    warnings.extend(closedness_note(&mesh));
+    (mesh, warnings)
+}
+
+/// Report a polyhedron that is not a closed surface.
+///
+/// The reference: "A polyhedron that is non-manifold only fails when it
+/// participates in CSG or F6", where "the classic render error is
+/// approximately 'ERROR: The given mesh is not closed! Unable to convert to
+/// CGAL_Nef_Polyhedron.'" Nothing said anything: a shell with a face missing
+/// went through a `difference()` and came back as arbitrary triangle soup,
+/// silently. This says it where the mesh is BUILT, which is earlier than the
+/// reference does and is the only place that can tell an author-supplied
+/// shell from a boolean result (whose T-junctions are a separate matter and
+/// would make the same test fire constantly).
+///
+/// Edges are matched by POSITION, not index: the reference accepts duplicate
+/// points silently, and two vertices at the same place close a seam just as
+/// well as one does.
+fn closedness_note(mesh: &Mesh) -> Option<String> {
+    use std::collections::HashMap;
+    // Weld by position, but KEEP the degenerate triangles. `Mesh::welded`
+    // drops them, and dropping one orphans its edges: a quad that closes on
+    // itself at a pole, `[a, b, b, c]`, fans into `[a, b, b]` and `[a, b, c]`,
+    // and discarding the first leaves `a-b` used once. Every capped sweep in
+    // the example corpus tripped that. Kept, the flap seals its own edge --
+    // which is the right topological reading, since it has no area to leak
+    // through.
+    let mut map: HashMap<[u64; 3], u32> = HashMap::new();
+    let mut at: Vec<u32> = Vec::with_capacity(mesh.positions.len());
+    let mut next = 0u32;
+    for p in &mesh.positions {
+        let bits = |v: f64| if v == 0.0 { 0f64.to_bits() } else { v.to_bits() };
+        let key = [bits(p[0]), bits(p[1]), bits(p[2])];
+        let idx = *map.entry(key).or_insert_with(|| {
+            let i = next;
+            next += 1;
+            i
+        });
+        at.push(idx);
+    }
+    let welded = Mesh {
+        positions: Vec::new(),
+        tris: mesh
+            .tris
+            .iter()
+            .map(|t| [at[t[0] as usize], at[t[1] as usize], at[t[2] as usize]])
+            .collect(),
+    };
+    if welded.tris.is_empty() {
+        return None;
+    }
+    // Every directed edge of a closed, consistently wound surface is paired
+    // with exactly one opposite. Count both directions per undirected edge.
+    let mut edges: HashMap<(u32, u32), (i32, i32)> = HashMap::new();
+    for t in &welded.tris {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            if a == b {
+                continue; // a zero-length edge bounds nothing
+            }
+            let key = if a < b { (a, b) } else { (b, a) };
+            let slot = edges.entry(key).or_insert((0, 0));
+            if a < b {
+                slot.0 += 1;
+            } else {
+                slot.1 += 1;
+            }
+        }
+    }
+    // An edge used ONCE is a boundary: the surface has a hole there, and that
+    // is exactly what "not closed" means. Nothing else is reported.
+    //
+    // Two tempting stronger tests were tried and rejected on evidence. An
+    // edge used more than twice looked like non-manifoldness, but quads are
+    // fanned into triangles here and a quad that collapses at a pole leaves a
+    // zero-area flap whose edges double up legitimately. An edge whose two
+    // faces are wound the SAME way looked like an inversion, but welding by
+    // position merges vertices that a sweep placed separately -- a hull whose
+    // bow section closes to a point, say -- and faces that were distinct
+    // before the weld can end up sharing an edge in agreement. Eight of the
+    // twenty-four example models tripped that, all of them meshes whose
+    // volumes and silhouettes have been checked against independent oracles.
+    // Welding can close a seam; it can never open one, so the boundary count
+    // is the signal that survives it.
+    let holes = edges.values().filter(|(f, r)| f + r == 1).count();
+    if holes == 0 {
+        return None;
+    }
+    Some(format!(
+        "polyhedron: the given mesh is not closed ({} boundary edge{}); \
+         booleans and exports on it are undefined",
+        holes,
+        if holes == 1 { "" } else { "s" }
+    ))
 }
 
 /// Axis-aligned bounding box of a mesh's vertices (None if empty).
@@ -606,6 +703,50 @@ pub fn cylinder(h: f64, r1: f64, r2: f64, center: bool, n: u32) -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "A polyhedron that is non-manifold only fails when it participates in
+    /// CSG or F6" — and nothing said anything, so a shell with a face missing
+    /// went through a difference() and came back as arbitrary triangle soup.
+    #[test]
+    fn an_open_polyhedron_is_reported() {
+        let tet = |faces: &[&[usize]]| {
+            let pts = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+            let f: Vec<Vec<usize>> = faces.iter().map(|x| x.to_vec()).collect();
+            polyhedron(&pts, &f).1
+        };
+        let closed: &[&[usize]] = &[&[0, 2, 1], &[0, 1, 3], &[1, 2, 3], &[0, 3, 2]];
+        assert!(tet(closed).is_empty(), "a closed tetrahedron says nothing");
+
+        // A face missing leaves three edges with nothing on the other side.
+        let w = tet(&[&[0, 2, 1], &[0, 1, 3], &[0, 3, 2]]);
+        assert!(w.iter().any(|m| m.contains("not closed") && m.contains("3 boundary")), "{w:?}");
+        // A face wound the WRONG way is NOT reported: it leaves no boundary,
+        // and the stronger winding test that would catch it fires on ordinary
+        // swept meshes once vertices are welded by position (see the note in
+        // `closedness_note`). A missed inversion beats warning about eight of
+        // the example models.
+        assert!(tet(&[&[0, 2, 1], &[0, 1, 3], &[1, 2, 3], &[0, 2, 3]]).is_empty());
+
+        // Duplicate points close a seam as well as one point does: the
+        // reference accepts them silently, so edges match by POSITION.
+        let pts = [
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0],
+        ];
+        let faces = vec![vec![0, 2, 1], vec![0, 1, 3], vec![1, 2, 3], vec![4, 3, 2]];
+        assert!(polyhedron(&pts, &faces).1.is_empty(), "a duplicated corner still closes");
+
+        // A quad that closes on itself at a pole fans into a degenerate
+        // triangle plus a real one. Dropping the degenerate orphans its edges,
+        // which flagged every capped sweep in the example corpus; kept, the
+        // flap seals its own edge.
+        let ring = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let with_pole = vec![vec![0, 2, 1], vec![0, 1, 3], vec![1, 2, 3], vec![0, 3, 3, 2]];
+        assert!(
+            polyhedron(&ring, &with_pole).1.is_empty(),
+            "a quad that collapses at a pole fans into a zero-area flap whose edges \
+             double up legitimately"
+        );
+    }
 
     /// The 2D fill sweep resolves crossings numerically, so two scanline
     /// crossings can land an ULP apart and the trapezoid between them is a

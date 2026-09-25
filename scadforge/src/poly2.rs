@@ -1402,7 +1402,7 @@ pub fn extrude_linear(
     // with a fan of zero-area triangles at that apex, where the reference
     // says "both produce valid, closed meshes ... (degenerate triangles
     // culled)".
-    let mut cap = |tris: &mut Vec<[u32; 3]>, positions: &mut Vec<[f64; 3]>, t: f64, flip: bool| {
+    let cap = |tris: &mut Vec<[u32; 3]>, positions: &mut Vec<[f64; 3]>, t: f64, flip: bool| {
         let base = positions.len() as u32;
         positions.extend(cap2.iter().map(|v| ring(*v, t)));
         for tr in &cap_tris {
