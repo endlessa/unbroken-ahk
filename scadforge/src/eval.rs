@@ -236,7 +236,14 @@ fn evaluate_source_inner(
         stamp_error(&mut out);
         return out;
     }
-    let mut out = evaluate_maybe_recording(&resolved.program, record_csg, mode, camera, base_dir);
+    let mut out = evaluate_with_library(
+        &resolved.program,
+        &resolved.used,
+        record_csg,
+        mode,
+        camera,
+        base_dir,
+    );
     if !resolved.warnings.is_empty() {
         // These are raised before evaluation begins, so they lead the stream —
         // and `order` has to be shifted with them or every index after the
@@ -263,6 +270,28 @@ pub fn evaluate_recording(program: &[Stmt]) -> EvalOutput {
     evaluate_maybe_recording(program, true, Mode::Render, Camera::DEFAULT, &cwd())
 }
 
+/// Evaluate `program` with `used` -- the definitions `use`d files export --
+/// hoisted into an ENCLOSING scope rather than the same one.
+///
+/// They used to be concatenated into a single statement list, so a used
+/// library's modules captured the main file's top-level frame and could read
+/// its variables: `module m() { echo(x); }` in the library printed 42 when
+/// the main file happened to define `x = 42`. The reference asks for the
+/// opposite -- "a separate top-level scope ... exporting only its definition
+/// table". One frame out, the library reaches its own helpers and its own
+/// privatized constants, sees none of the user's names, and is still found by
+/// a call from the main file, which shadows it on a name collision.
+fn evaluate_with_library(
+    program: &[Stmt],
+    used: &[Stmt],
+    record: bool,
+    mode: Mode,
+    camera: Camera,
+    base: &std::path::Path,
+) -> EvalOutput {
+    evaluate_layered(program, used, record, mode, camera, base)
+}
+
 fn evaluate_maybe_recording(
     program: &[Stmt],
     record: bool,
@@ -270,10 +299,22 @@ fn evaluate_maybe_recording(
     camera: Camera,
     base: &std::path::Path,
 ) -> EvalOutput {
+    evaluate_layered(program, &[], record, mode, camera, base)
+}
+
+fn evaluate_layered(
+    program: &[Stmt],
+    library: &[Stmt],
+    record: bool,
+    mode: Mode,
+    camera: Camera,
+    base: &std::path::Path,
+) -> EvalOutput {
+    let library = (!library.is_empty()).then_some(library);
     std::thread::scope(|s| {
         let handle = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
-            .spawn_scoped(s, || evaluate_inner(program, record, mode, camera, base))
+            .spawn_scoped(s, || evaluate_inner(program, library, record, mode, camera, base))
             .expect("failed to spawn the evaluator thread");
         handle.join().unwrap_or_else(|_| EvalOutput {
             error: Some("ERROR: the evaluator crashed (please report this script)".into()),
@@ -284,6 +325,7 @@ fn evaluate_maybe_recording(
 
 fn evaluate_inner(
     program: &[Stmt],
+    library: Option<&[Stmt]>,
     record: bool,
     mode: Mode,
     camera: Camera,
@@ -316,7 +358,19 @@ fn evaluate_inner(
     // the default 0 -- which is what lets a module's own `$fn = 32` formal
     // default apply when nothing has set it.
     ctx.dynv = DynScope::layer(&ctx.dynv);
-    let root = Scope::root();
+    let root = match library {
+        // The library frame: definitions and the used files' own (privatized)
+        // constants, so a library reaches its own helpers while nothing in it
+        // can see the main file's names. Its geometry never runs -- `use`
+        // discards that -- so the slots are evaluated and the statements are
+        // not executed.
+        Some(defs) => {
+            let scope = build_scope(defs, &Scope::root(), &mut ctx);
+            eval_slots(defs, &scope, &mut ctx);
+            scope
+        }
+        None => Scope::root(),
+    };
     let mut shapes = exec_scope(program, &root, &mut ctx);
     // Root modifier (`!`): if any shape is root-marked, the design shows ONLY
     // root-marked shapes — everything else is pruned (their side effects have
@@ -7317,6 +7371,27 @@ mod tests {
         // Nested includes resolve the same way.
         w("mid.scad", "include <lib.scad>\nq = 1;\n");
         assert_eq!(echoes(&run_in("r = 42;\ninclude <mid.scad>\nball();\n")), "ECHO: 42");
+
+        // A used library gets its OWN top-level scope: "a separate top-level
+        // scope ... exporting only its definition table". Concatenating the
+        // two statement lists made its modules capture the main file's frame,
+        // so a helper could read a name the user happened to define.
+        w("priv.scad", "k = 7;\nmodule m() { echo(x); echo(k); }\n");
+        let out = run_in("use <priv.scad>\nx = 42;\nk = 99;\nm();\necho(k);\n");
+        assert_eq!(
+            echoes(&out),
+            "ECHO: undef | ECHO: 7 | ECHO: 99",
+            "library saw the user's names, or lost its own"
+        );
+        assert!(
+            out.warnings.iter().any(|m| m.contains("unknown variable 'x'")),
+            "{:?}",
+            out.warnings
+        );
+        // A same-name definition in the using file still shadows the library's.
+        w("shadow.scad", "module s() { cube(1); }\n");
+        let out = run_in("use <shadow.scad>\nmodule s() { sphere(3); }\ns();\n");
+        assert!(out.shapes[0].mesh.tris.len() > 12, "the library's cube won");
 
         // A used file's `$`-reads resolve from the CALLER ("a used module
         // honors the caller's $fn"); privatizing them froze the library at its

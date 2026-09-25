@@ -23,6 +23,12 @@ use std::path::{Path, PathBuf};
 
 pub struct Resolved {
     pub program: Vec<Stmt>,
+    /// The statements contributed by `use`d files: their definitions and
+    /// their own (privatized) top-level constants. They are kept SEPARATE
+    /// from `program` so the evaluator can put them in an enclosing scope --
+    /// a used library must be able to reach its own helpers without seeing
+    /// the using file's variables.
+    pub used: Vec<Stmt>,
     pub warnings: Vec<String>,
     /// A parse error in the main (post-include) source; included/used files
     /// that fail to parse warn instead of aborting the whole design.
@@ -153,7 +159,7 @@ pub fn resolve(source: &str, base: &Path) -> Resolved {
     let main = match parser::parse(&inlined) {
         Ok(p) => apply_include_overrides(p),
         Err(e) => {
-            return Resolved { program: Vec::new(), warnings, error: Some(e) };
+            return Resolved { program: Vec::new(), used: Vec::new(), warnings, error: Some(e) };
         }
     };
 
@@ -236,9 +242,7 @@ pub fn resolve(source: &str, base: &Path) -> Resolved {
         }
     }
 
-    let mut program = used_defs;
-    program.extend(main);
-    Resolved { program, warnings, error: None }
+    Resolved { program: main, used: used_defs, warnings, error: None }
 }
 
 /// Return `source` with each `include` directive replaced by the (recursively
