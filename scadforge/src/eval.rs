@@ -4433,18 +4433,51 @@ fn call_function(
     result
 }
 
-/// The base a tail call's next frame should layer over: the captured env,
-/// but with transparent (empty) layers skipped so a plain tail loop does
-/// not build one dynamic-chain link per iteration.
+/// The base a tail call's next frame should layer over: the captured `$`
+/// environment, FLATTENED to a single layer above the root.
+///
+/// Skipping empty layers keeps a plain tail loop at O(1) chain depth, but a
+/// loop whose tail path binds a `$`-name -- `let($q = ...) f(n - 1)`, or a
+/// `$`-named argument -- leaves a non-empty layer behind on every iteration,
+/// so the chain grew one link per call and every `$`-lookup walked it. That
+/// is quadratic, and it does not stay theoretical:
+/// `function f(n) = n <= 0 ? 0 : let($q = $fn) f(n - 1);` did not finish
+/// 100,000 iterations in three minutes, while the same loop binding a
+/// constant does 2,000,000 in under four seconds.
+///
+/// Flattening preserves the mapping exactly -- inner layers override outer
+/// ones, which is what a chain walk computes -- and costs one small map copy
+/// per call instead of an ever-longer walk. The root layer is kept separate
+/// so `lookup_set` can still tell the language's defaults from a value
+/// somebody chose.
 fn base_for_next(dyn_at_call: &Rc<DynScope>) -> Rc<DynScope> {
     let mut cur = dyn_at_call.clone();
     loop {
         let empty = cur.vars.borrow().is_empty();
         match (empty, cur.parent.clone()) {
             (true, Some(parent)) => cur = parent,
-            _ => return cur,
+            _ => break,
         }
     }
+    if cur.parent.is_none() {
+        return cur; // the root itself: nothing above it to flatten
+    }
+    let mut chain: Vec<Rc<DynScope>> = Vec::new();
+    let mut root = cur;
+    while let Some(parent) = root.parent.clone() {
+        chain.push(root);
+        root = parent;
+    }
+    if chain.len() == 1 {
+        return chain.pop().unwrap(); // already one layer over the root
+    }
+    let mut vars: HashMap<String, Value> = HashMap::new();
+    for layer in chain.iter().rev() {
+        for (k, v) in layer.vars.borrow().iter() {
+            vars.insert(k.clone(), v.clone());
+        }
+    }
+    Rc::new(DynScope { vars: RefCell::new(vars), parent: Some(root) })
 }
 
 fn eval_tail(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Tail {
@@ -7109,6 +7142,44 @@ mod tests {
         let bad = crate::http::handle("POST", "/export?format=stl", "square(5);");
         assert_eq!(bad.status, "422 Unprocessable Entity");
         assert!(bad.text_body().contains("not a 3D object"));
+    }
+
+    /// A tail loop that binds a `$`-name must not grow the dynamic chain.
+    ///
+    /// Empty frame layers were collapsed, which keeps a plain accumulator at
+    /// O(1) depth -- but `let($q = ...) f(n - 1)` leaves a NON-empty layer on
+    /// every iteration, so the chain grew one link per call and every
+    /// `$`-lookup walked it. 100,000 iterations of a loop that reads `$fn`
+    /// did not finish in three minutes; the same loop binding a constant did
+    /// 2,000,000 in under four seconds. This depth takes a fraction of a
+    /// second now and would take minutes quadratically, so it discriminates
+    /// without asserting a wall-clock number.
+    #[test]
+    fn a_tail_loop_that_binds_a_dollar_name_stays_linear() {
+        let out = run("function f(n) = n <= 0 ? 0 : let($q = $fn) f(n - 1);\necho(f(200000));");
+        assert_eq!(out.echoes, vec!["ECHO: 0"], "{:?}", out.warnings);
+
+        // Flattening must not change what anything SEES. An eliminated
+        // frame's binding stays visible to the next one, a `$`-named argument
+        // carries through a tail call, an outer `$` is still reachable under
+        // a binding loop, and an inner binding still shadows it.
+        let echoes = |src: &str| run(src).echoes.join(" | ");
+        assert_eq!(
+            echoes("function f(n) = n <= 0 ? $q : let($q = n) f(n - 1); echo(f(3));"),
+            "ECHO: 1"
+        );
+        assert_eq!(
+            echoes("function f(n) = n <= 0 ? $w : f(n - 1, $w = n); echo(f(3));"),
+            "ECHO: 1"
+        );
+        assert_eq!(
+            echoes("$z = 9; function f(n) = n <= 0 ? $z : let($q = n) f(n - 1); echo(f(5));"),
+            "ECHO: 9"
+        );
+        assert_eq!(
+            echoes("$z = 9; function f(n) = n <= 0 ? $z : let($z = 1) f(n - 1); echo(f(3));"),
+            "ECHO: 1"
+        );
     }
 
     /// Value and operator defects from this round's audit.
