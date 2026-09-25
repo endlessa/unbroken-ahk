@@ -1,0 +1,9 @@
+# every fuzzer writes its probe programs and exports beside itself
+*.scad
+*.stl
+*.dxf
+*.svg
+*.csg
+*.off
+*.log
+__pycache__/
