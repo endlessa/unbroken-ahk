@@ -22,8 +22,10 @@ cd scadforge/fuzz
 python3 run.py     1000 1200            # 3D designs
 python3 run.py     1000 1200 2d         # 2D designs
 python3 algebra.py  100  160
+python3 algebra2d.py 100 160
 python3 expr.py    1000 1600
 python3 mods.py     100  200
+python3 children.py 100  300
 ```
 
 `SCADFORGE=/path/to/scadforge` overrides the binary; the default is
@@ -65,6 +67,15 @@ pairs:
 - the three-piece decomposition `A − B`, `B − A`, `A ∩ B` partitions `A ∪ B`
 - idempotence: `A ∪ A == A`, `A ∩ A == A`, and `A − A` is empty
 
+### `algebra2d.py` — the same identities, in 2D
+
+The same list again, measured as signed area instead of volume, so it
+exercises the 2D kernel — polygon clipping, contour orientation and hole
+nesting — rather than the BSP. Area comes from the DXF export summed with the
+shoelace formula: an outline winds positive and a hole winds negative, so the
+total is the net filled area. Shapes with holes and `offset()` results are in
+the generator, so nesting is in play on both sides of every boolean.
+
 ### `expr.py` — a value must not depend on its route
 
 Each random expression is echoed eight ways — written out directly, returned
@@ -73,6 +84,17 @@ back out, passed as a function parameter, assigned at top level, passed as a
 module parameter, and bound by a `for` loop. All eight `ECHO` lines must be
 character-identical. A difference is a scoping, copying or evaluation-order
 bug.
+
+### `children.py` — every spelling of "my children" is the same geometry
+
+A module whose whole body is `children();` is the identity on geometry, so
+every other way of writing "all of my children, in order" must export
+byte-identically to it: `children([0 : $children - 1])`, a `for` loop over the
+indices, an explicitly built index list, the same list walked backwards,
+forwarding through a second module, and a few no-op wrappers (`{ }`,
+`union()`, `translate([0,0,0])`, a double `mirror`). Byte equality rather than
+volume, because order is part of the answer. `$children` is separately checked
+to be the count the caller actually passed.
 
 ### `mods.py` — the modifier characters have exact equivalents
 
