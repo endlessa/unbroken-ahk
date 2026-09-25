@@ -1150,6 +1150,9 @@ fn iterate(v: &Value, ctx: &mut Ctx) -> Vec<Value> {
         Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
         Value::Range { start, step, end, implicit_step } => {
             let mut items = Vec::new();
+            if step.is_nan() && start.is_nan() && end.is_nan() {
+                return items; // the degenerate range: already reported
+            }
             if *step == 0.0 || !step.is_finite() {
                 ctx.warn("for: range step must be a nonzero finite number");
                 return items;
@@ -2640,8 +2643,25 @@ fn wrapped_in_parens(s: &str) -> bool {
         return false;
     }
     let mut depth = 0i32;
+    // A paren inside a STRING LITERAL is a character, not nesting. Counting
+    // it unbalanced the scan, so `assert(s == ")")` -- whose serialization is
+    // already parenthesized -- read as unwrapped and got a second pair:
+    // `Assertion '((s == ")"))' failed`.
+    let mut in_str = false;
+    let mut esc = false;
     for (i, c) in b.iter().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if *c == b'\\' {
+                esc = true;
+            } else if *c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
         match c {
+            b'"' => in_str = true,
             b'(' => depth += 1,
             b')' => depth -= 1,
             _ => {}
@@ -2650,7 +2670,7 @@ fn wrapped_in_parens(s: &str) -> bool {
             return false;
         }
     }
-    depth == 0
+    depth == 0 && !in_str
 }
 
 /// The reference pins the failure line as `Assertion '<condition>' failed`,
@@ -4140,8 +4160,21 @@ fn eval_expr(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Value {
                     Value::Range { start: s, step: st, end: e, implicit_step }
                 }
                 _ => {
+                    // A DEGENERATE RANGE, not undef. The reference: non-numeric
+                    // components are "believed WARNING and a degenerate range
+                    // producing nothing". Returning undef made it produce
+                    // something instead: `iterate` treats any non-iterable
+                    // value as a bare scalar that iterates ONCE, so
+                    // `for (i = ["a":1:5]) cube(1);` warned and then drew a
+                    // cube. It is still a range, so `r[0]` and `len(r)` read
+                    // as a range's do rather than as undef's.
                     ctx.warn("range bounds must be numbers");
-                    Value::Undef
+                    Value::Range {
+                        start: f64::NAN,
+                        step: f64::NAN,
+                        end: f64::NAN,
+                        implicit_step,
+                    }
                 }
             }
         }
@@ -4648,8 +4681,18 @@ fn value_cmp(a: &Value, b: &Value) -> Result<Option<std::cmp::Ordering>, String>
                 match value_cmp(ea, eb) {
                     Ok(Some(Ordering::Equal)) => continue,
                     Ok(Some(order)) => return Ok(Some(order)),
-                    // An incomparable element pair propagates undef.
-                    Ok(None) => return Err(format!("in vector comparison at index {}", i)),
+                    // An incomparable element pair propagates undef. The
+                    // message needs its own subject: the tag alone printed
+                    // `WARNING: in vector comparison at index 0`, a sentence
+                    // fragment with nothing to say what was undefined.
+                    Ok(None) => {
+                        return Err(format!(
+                            "undefined operation ({} < {}) in vector comparison at index {}",
+                            ea.type_name(),
+                            eb.type_name(),
+                            i
+                        ))
+                    }
                     Err(e) => return Err(format!("{} (in vector comparison at index {})", e, i)),
                 }
             }
@@ -4660,7 +4703,14 @@ fn value_cmp(a: &Value, b: &Value) -> Result<Option<std::cmp::Ordering>, String>
             Value::Range { start: s1, step: t1, end: e1, .. },
             Value::Range { start: s2, step: t2, end: e2, .. },
         ) => {
-            // Ranges order by begin, then step, then element count.
+            // Ranges order by begin, then step, then element count, all read
+            // from the fields as written. A legacy reversed `[4:1]` ITERATES
+            // four elements (the deprecated bound swap) while scoring as
+            // empty here, which is a real incoherence -- but so is ordering
+            // by a swapped count beside an unswapped begin, and `value_eq`
+            // compares the raw fields too, so swapping only here would let
+            // `<` and `==` disagree. The reference leaves the question open;
+            // one consistent reading is better than a partial fix.
             let keys1 = [*s1, *t1, range_count(*s1, *t1, *e1)];
             let keys2 = [*s2, *t2, range_count(*s2, *t2, *e2)];
             for (k1, k2) in keys1.iter().zip(&keys2) {
@@ -4676,35 +4726,66 @@ fn value_cmp(a: &Value, b: &Value) -> Result<Option<std::cmp::Ordering>, String>
     }
 }
 
+/// Unary `-`, with ONE diagnostic per operator however deep the failure.
+///
+/// The reference's rule for the whole operator surface: "Emit exactly one
+/// warning per failing operation evaluation (per loop iteration if in a
+/// loop)." `*` and `/` already latched their first fault; `-` and `+` warned
+/// at every leaf, so `-["a","b"]` printed the same line twice and a matrix of
+/// strings printed it once per cell. Under --hardwarnings the count is part
+/// of the compatibility surface.
 fn negate(v: Value, ctx: &mut Ctx) -> Value {
+    let mut fault = None;
+    let out = negate_elems(v, &mut fault);
+    if let Some(msg) = fault {
+        ctx.warn(msg);
+    }
+    out
+}
+
+fn negate_elems(v: Value, fault: &mut Option<String>) -> Value {
     match v {
         Value::Num(n) => Value::Num(-n),
         // Recursive so -matrix works.
         Value::Vector(items) => {
-            Value::Vector(items.into_iter().map(|item| negate(item, ctx)).collect())
+            Value::Vector(items.into_iter().map(|item| negate_elems(item, fault)).collect())
         }
         other => {
-            ctx.warn(format!("undefined operation (- {})", other.type_name()));
+            if fault.is_none() {
+                *fault = Some(format!("undefined operation (- {})", other.type_name()));
+            }
             Value::Undef
         }
     }
 }
 
 /// + and -: numbers, or equal-length vectors elementwise (recursive, so
-/// matrix+matrix works). NO broadcasting: scalar+vector is undef.
+/// matrix+matrix works). NO broadcasting: scalar+vector is undef. One
+/// diagnostic per operator, as for `negate`.
 fn add_sub(sub: bool, l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
+    let mut fault = None;
+    let out = add_sub_elems(sub, l, r, &mut fault);
+    if let Some(msg) = fault {
+        ctx.warn(msg);
+    }
+    out
+}
+
+fn add_sub_elems(sub: bool, l: &Value, r: &Value, fault: &mut Option<String>) -> Value {
     match (l, r) {
         (Value::Num(a), Value::Num(b)) => Value::Num(if sub { a - b } else { a + b }),
         (Value::Vector(x), Value::Vector(y)) if x.len() == y.len() => Value::Vector(
-            x.iter().zip(y).map(|(a, b)| add_sub(sub, a, b, ctx)).collect(),
+            x.iter().zip(y).map(|(a, b)| add_sub_elems(sub, a, b, fault)).collect(),
         ),
         _ => {
-            ctx.warn(format!(
-                "undefined operation ({} {} {})",
-                l.type_name(),
-                if sub { "-" } else { "+" },
-                r.type_name()
-            ));
+            if fault.is_none() {
+                *fault = Some(format!(
+                    "undefined operation ({} {} {})",
+                    l.type_name(),
+                    if sub { "-" } else { "+" },
+                    r.type_name()
+                ));
+            }
             Value::Undef
         }
     }
@@ -5217,6 +5298,19 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
     // one/two-number math fns) just take positionals in order.
     let names = builtin_param_names(name);
     let vals: Vec<Value> = if names.is_empty() {
+        // A builtin with no name table takes positionals in order -- but a
+        // PLAIN named argument is still an unknown parameter, and the
+        // reference makes that a uniform rule: "unknown named arguments warn
+        // and are ignored", with the follow-up that "unknown PLAIN named args
+        // on builtins also warn-and-ignore". They were dropped in silence, so
+        // `len(value = [1, 2])` returned undef with nothing at all to say.
+        for a in ev {
+            if let Some(n) = &a.name {
+                if !n.starts_with('$') {
+                    ctx.warn(format!("{}: unknown parameter '{}' ignored", name, n));
+                }
+            }
+        }
         ev.iter().filter(|a| a.name.is_none()).map(|a| a.value.clone()).collect()
     } else {
         let mut slots: Vec<Option<Value>> = vec![None; names.len()];
@@ -7015,6 +7109,64 @@ mod tests {
         let bad = crate::http::handle("POST", "/export?format=stl", "square(5);");
         assert_eq!(bad.status, "422 Unprocessable Entity");
         assert!(bad.text_body().contains("not a 3D object"));
+    }
+
+    /// Value and operator defects from this round's audit.
+    #[test]
+    fn operators_report_once_and_a_broken_range_yields_nothing() {
+        let said = |src: &str| run(src).warnings.join(" | ");
+        let echoes = |src: &str| run(src).echoes.join(" | ");
+        let warn_count = |src: &str| run(src).warnings.len();
+
+        // "non-numeric components ... believed WARNING and a degenerate range
+        // producing nothing." It produced `undef`, and `iterate` treats any
+        // non-iterable value as a scalar that runs ONCE, so a broken range
+        // drew a cube.
+        for src in ["for (i = [0:undef:5]) cube(1);", "for (i = [\"a\":1:5]) cube(1);"] {
+            let out = run(src);
+            assert!(out.shapes.is_empty(), "{src} still built geometry");
+            assert!(out.warnings.iter().any(|w| w.contains("range bounds")), "{src}");
+        }
+        assert_eq!(echoes("echo([for (i = [\"a\":1:5]) i]);"), "ECHO: []");
+        // A usable range is untouched.
+        assert_eq!(echoes("echo([for (i = [0:2]) i]);"), "ECHO: [0, 1, 2]");
+
+        // "Emit exactly one warning per failing operation evaluation." `*` and
+        // `/` already latched their first fault; `+`, `-` and unary `-` warned
+        // at every leaf, so one operator could print the same line four times.
+        assert_eq!(warn_count("echo([\"a\",\"b\"] - [\"c\",\"d\"]);"), 1);
+        assert_eq!(warn_count("echo(-[\"a\",\"b\"]);"), 1);
+        assert_eq!(warn_count("echo(-[[\"a\",\"b\"],[\"c\",\"d\"]]);"), 1);
+        assert_eq!(warn_count("echo([\"a\",\"b\"] + [\"c\",\"d\"]);"), 1);
+        assert!(said("echo(-[\"a\",\"b\"]);").contains("undefined operation (- string)"));
+        // The VALUES are unchanged: still elementwise undef.
+        assert_eq!(echoes("echo(-[\"a\",\"b\"]);"), "ECHO: [undef, undef]");
+
+        // "unknown named arguments warn and are ignored" — builtins with no
+        // parameter table dropped them in silence, so `len(value = [1,2])`
+        // returned undef with nothing to say.
+        assert!(said("echo(len(value = [1,2]));").contains("len: unknown parameter 'value' ignored"));
+        assert!(said("echo(abs(x = -3));").contains("abs: unknown parameter 'x' ignored"));
+        // $-named arguments are the documented exception.
+        assert_eq!(warn_count("echo(abs(-3, $q = 1));"), 0);
+        // A builtin that HAS a table still resolves its names.
+        assert_eq!(echoes("echo(pow(base = 2, exponent = 10));"), "ECHO: 1024");
+
+        // The assert condition is re-serialized and wrapped once. Counting
+        // parens without skipping string literals unbalanced the scan, so a
+        // `)` inside a string bought a second pair.
+        let err = |src: &str| run(src).error.unwrap_or_default();
+        assert_eq!(err("s = \"x\"; assert(s == \")\");"), "ERROR: Assertion '(s == \")\")' failed");
+        assert_eq!(err("assert(1 + 1 == 3);"), "ERROR: Assertion '((1 + 1) == 3)' failed");
+        assert_eq!(err("assert(false);"), "ERROR: Assertion '(false)' failed");
+
+        // An incomparable element inside a vector comparison named the index
+        // but not the operation: `WARNING: in vector comparison at index 0`
+        // is a sentence with no subject.
+        for src in ["echo([\"a\"] < [1]);", "echo([undef] < [undef]);"] {
+            let w = said(src);
+            assert!(w.contains("undefined operation") && w.contains("index 0"), "{src} -> {w}");
+        }
     }
 
     /// A declared `$`-formal's DEFAULT has to be reachable, and a
