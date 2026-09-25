@@ -609,6 +609,65 @@ pub fn write_amf(mesh: &Mesh) -> String {
     s
 }
 
+/// A monotonic scan for several tags at once.
+///
+/// Both XML readers below walk their document by repeatedly asking "which of
+/// these tags comes next?". Asking with `find` every time is what made those
+/// imports quadratic: a file whose single `<mesh` sits in the first line still
+/// paid a scan to the end of the document for each of its vertices, and while
+/// reading the vertex list every step scanned past all the remaining vertices
+/// to re-find the first triangle. An 18,000-triangle model took eight seconds
+/// through 3MF and fourteen through AMF; OFF, carrying the same mesh, took
+/// thirty milliseconds.
+///
+/// So each tag's next occurrence is remembered as an absolute offset and
+/// looked for again only once the cursor has passed it. `usize::MAX` marks a
+/// tag with no occurrence left, and since the cursor only moves forward that
+/// verdict never needs revisiting -- which is what keeps an absent tag from
+/// being searched for once per element.
+struct Tags<'a> {
+    text: &'a str,
+    names: [&'static str; 3],
+    at: [usize; 3],
+}
+
+impl<'a> Tags<'a> {
+    fn new(text: &'a str, names: [&'static str; 3]) -> Tags<'a> {
+        let mut at = [usize::MAX; 3];
+        for (slot, name) in at.iter_mut().zip(names) {
+            *slot = text.find(name).unwrap_or(usize::MAX);
+        }
+        Tags { text, names, at }
+    }
+
+    /// The earliest of the tags at or after `from`, as (which one, where).
+    fn next(&mut self, from: usize) -> Option<(usize, usize)> {
+        for (slot, name) in self.at.iter_mut().zip(self.names) {
+            if *slot >= from {
+                continue; // still ahead of the cursor, or already exhausted
+            }
+            *slot = match self.text.get(from..).and_then(|s| s.find(name)) {
+                Some(d) => d + from,
+                None => usize::MAX,
+            };
+        }
+        let (k, &p) = self.at.iter().enumerate().min_by_key(|(_, &p)| p)?;
+        if p == usize::MAX {
+            None
+        } else {
+            Some((k, p))
+        }
+    }
+}
+
+/// The text of the element body starting at `from`, up to `close` (or to the
+/// end of the document if the file never closes it). The search is bounded by
+/// the element itself, so it stays linear over the document as a whole.
+fn upto<'a>(text: &'a str, from: usize, close: &str) -> (&'a str, usize) {
+    let end = text[from..].find(close).map_or(text.len(), |d| d + from);
+    (&text[from..end], end)
+}
+
 /// Read an AMF mesh with a minimal tag scanner (no XML dependency): every
 /// `<vertex>` contributes a point, every `<triangle>` a face; all objects and
 /// volumes union into one mesh. Out-of-range triangle indices are dropped.
@@ -626,40 +685,37 @@ pub fn read_amf(text: &str) -> Mesh {
     let mut positions: Vec<[f64; 3]> = Vec::new();
     let mut tris = Vec::new();
     let mut base = 0usize;
-    let mut scan = text;
-    loop {
-        let at_mesh = scan.find("<mesh");
-        let at_vert = scan.find("<vertex>");
-        let at_tri = scan.find("<triangle>");
-        let Some(p) = [at_mesh, at_vert, at_tri].into_iter().flatten().min() else { break };
-        if at_mesh == Some(p) {
-            base = positions.len(); // a new mesh restarts vertex numbering
-            scan = &scan[p + 5..];
-        } else if at_vert == Some(p) {
-            let rest = &scan[p + 8..];
-            let end = rest.find("</vertex>").unwrap_or(rest.len());
-            let chunk = &rest[..end];
-            match (between(chunk, "<x>", "</x>"), between(chunk, "<y>", "</y>"), between(chunk, "<z>", "</z>")) {
-                (Some(x), Some(y), Some(z)) if x.is_finite() && y.is_finite() && z.is_finite() => {
-                    positions.push([x, y, z]);
-                }
-                _ => {}
+    let mut tags = Tags::new(text, ["<mesh", "<vertex>", "<triangle>"]);
+    let mut at = 0usize;
+    while let Some((which, p)) = tags.next(at) {
+        match which {
+            0 => {
+                base = positions.len(); // a new mesh restarts vertex numbering
+                at = p + 5;
             }
-            scan = &rest[end..];
-        } else {
-            let rest = &scan[p + 10..];
-            let end = rest.find("</triangle>").unwrap_or(rest.len());
-            let chunk = &rest[..end];
-            let idx = |tag_o: &str, tag_c: &str| between(chunk, tag_o, tag_c).map(|v| v as usize);
-            if let (Some(a), Some(b), Some(c)) = (idx("<v1>", "</v1>"), idx("<v2>", "</v2>"), idx("<v3>", "</v3>")) {
-                // Compare against the LOCAL count, which also keeps a wild
-                // index (f64 -> usize saturates) from overflowing `base + a`.
-                let local = positions.len() - base;
-                if a < local && b < local && c < local && a != b && b != c && a != c {
-                    tris.push([(base + a) as u32, (base + b) as u32, (base + c) as u32]);
+            1 => {
+                let (chunk, end) = upto(text, p + 8, "</vertex>");
+                match (between(chunk, "<x>", "</x>"), between(chunk, "<y>", "</y>"), between(chunk, "<z>", "</z>")) {
+                    (Some(x), Some(y), Some(z)) if x.is_finite() && y.is_finite() && z.is_finite() => {
+                        positions.push([x, y, z]);
+                    }
+                    _ => {}
                 }
+                at = end;
             }
-            scan = &rest[end..];
+            _ => {
+                let (chunk, end) = upto(text, p + 10, "</triangle>");
+                let idx = |tag_o: &str, tag_c: &str| between(chunk, tag_o, tag_c).map(|v| v as usize);
+                if let (Some(a), Some(b), Some(c)) = (idx("<v1>", "</v1>"), idx("<v2>", "</v2>"), idx("<v3>", "</v3>")) {
+                    // Compare against the LOCAL count, which also keeps a wild
+                    // index (f64 -> usize saturates) from overflowing `base + a`.
+                    let local = positions.len() - base;
+                    if a < local && b < local && c < local && a != b && b != c && a != c {
+                        tris.push([(base + a) as u32, (base + b) as u32, (base + c) as u32]);
+                    }
+                }
+                at = end;
+            }
         }
     }
     Mesh { positions, tris }
@@ -741,39 +797,36 @@ fn parse_3mf_model(xml: &str) -> Mesh {
     // As in AMF, a triangle indexes its own `<mesh>`'s vertices, so walk the
     // document in order and rebase at each mesh.
     let mut base = 0usize;
-    let mut scan = xml;
-    loop {
-        let at_mesh = scan.find("<mesh");
-        let at_vert = scan.find("<vertex");
-        let at_tri = scan.find("<triangle");
-        let Some(p) = [at_mesh, at_vert, at_tri].into_iter().flatten().min() else { break };
-        if at_mesh == Some(p) {
-            base = positions.len();
-            scan = &scan[p + 5..];
-        } else if at_vert == Some(p) {
-            let rest = &scan[p + 7..];
-            let end = rest.find('>').unwrap_or(rest.len());
-            let chunk = &rest[..end];
-            if let (Some(x), Some(y), Some(z)) = (num(chunk, "x"), num(chunk, "y"), num(chunk, "z")) {
-                if x.is_finite() && y.is_finite() && z.is_finite() {
-                    positions.push([x, y, z]);
-                }
+    let mut tags = Tags::new(xml, ["<mesh", "<vertex", "<triangle"]);
+    let mut at = 0usize;
+    while let Some((which, p)) = tags.next(at) {
+        match which {
+            0 => {
+                base = positions.len();
+                at = p + 5;
             }
-            scan = &rest[end..];
-        } else {
-            // `<triangles>` also matches the `<triangle` prefix; its chunk
-            // carries no v1/v2/v3, so it falls through harmlessly.
-            let rest = &scan[p + 9..];
-            let end = rest.find('>').unwrap_or(rest.len());
-            let chunk = &rest[..end];
-            let idx = |k: &str| attr(chunk, k).and_then(|v| v.trim().parse::<usize>().ok());
-            if let (Some(a), Some(b), Some(c)) = (idx("v1"), idx("v2"), idx("v3")) {
-                let local = positions.len() - base;
-                if a < local && b < local && c < local && a != b && b != c && a != c {
-                    tris.push([(base + a) as u32, (base + b) as u32, (base + c) as u32]);
+            1 => {
+                let (chunk, end) = upto(xml, p + 7, ">");
+                if let (Some(x), Some(y), Some(z)) = (num(chunk, "x"), num(chunk, "y"), num(chunk, "z")) {
+                    if x.is_finite() && y.is_finite() && z.is_finite() {
+                        positions.push([x, y, z]);
+                    }
                 }
+                at = end;
             }
-            scan = &rest[end..];
+            _ => {
+                // `<triangles>` also matches the `<triangle` prefix; its chunk
+                // carries no v1/v2/v3, so it falls through harmlessly.
+                let (chunk, end) = upto(xml, p + 9, ">");
+                let idx = |k: &str| attr(chunk, k).and_then(|v| v.trim().parse::<usize>().ok());
+                if let (Some(a), Some(b), Some(c)) = (idx("v1"), idx("v2"), idx("v3")) {
+                    let local = positions.len() - base;
+                    if a < local && b < local && c < local && a != b && b != c && a != c {
+                        tris.push([(base + a) as u32, (base + b) as u32, (base + c) as u32]);
+                    }
+                }
+                at = end;
+            }
         }
     }
     Mesh { positions, tris }
@@ -1777,4 +1830,57 @@ mod tests {
         let s1 = pdf.find("endstream").unwrap();
         assert_eq!(declared, s1 - s0, "declared /Length matches the stream bytes");
     }
+
+    #[test]
+    fn a_large_xml_mesh_imports_in_linear_time() {
+        // Both XML readers used to ask `find` for every tag at every step,
+        // which made the work quadratic in the element count: the single
+        // `<mesh` at the top of the file was searched for again -- all the way
+        // to the end of the document -- once per vertex, and while reading the
+        // vertex list every step scanned past all the remaining vertices to
+        // re-find the first triangle. A 99,000-triangle 3MF took over five
+        // minutes to import; it now takes under a second.
+        //
+        // The bound below is two orders of magnitude looser than the measured
+        // time, so what it catches is the return of the quadratic term, not a
+        // slow machine. At this size the old code needed roughly half a minute.
+        const N: usize = 40_000;
+        let mut three = String::from("<model><resources><object><mesh><vertices>");
+        let mut amf = String::from("<amf><object><mesh><vertices>");
+        for i in 0..N {
+            let (x, y, z) = (i as f64 * 0.5, i as f64 * 0.25, i as f64 * 0.125);
+            three.push_str(&format!("<vertex x=\"{}\" y=\"{}\" z=\"{}\"/>", x, y, z));
+            amf.push_str(&format!(
+                "<vertex><coordinates><x>{}</x><y>{}</y><z>{}</z></coordinates></vertex>", x, y, z));
+        }
+        three.push_str("</vertices><triangles>");
+        amf.push_str("</vertices><volume>");
+        for i in 0..N - 2 {
+            three.push_str(&format!("<triangle v1=\"{}\" v2=\"{}\" v3=\"{}\"/>", i, i + 1, i + 2));
+            amf.push_str(&format!(
+                "<triangle><v1>{}</v1><v2>{}</v2><v3>{}</v3></triangle>", i, i + 1, i + 2));
+        }
+        three.push_str("</triangles></mesh></object></resources></model>");
+        amf.push_str("</volume></mesh></object></amf>");
+
+        let t0 = std::time::Instant::now();
+        let a = parse_3mf_model(&three);
+        let b = read_amf(&amf);
+        let took = t0.elapsed();
+
+        assert_eq!(a.positions.len(), N, "every 3MF vertex read");
+        assert_eq!(a.tris.len(), N - 2, "every 3MF triangle read");
+        assert_eq!(b.positions.len(), N, "every AMF vertex read");
+        assert_eq!(b.tris.len(), N - 2, "every AMF triangle read");
+        assert_eq!(a.positions[N - 1], [(N - 1) as f64 * 0.5, (N - 1) as f64 * 0.25,
+                                        (N - 1) as f64 * 0.125]);
+        assert_eq!(a.positions[N - 1], b.positions[N - 1], "and read the same way");
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "reading {} elements took {:?}; the tag search has gone quadratic again",
+            2 * N,
+            took
+        );
+    }
+
 }
