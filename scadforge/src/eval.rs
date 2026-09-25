@@ -1723,7 +1723,7 @@ fn call_builtin_module(
             // the faces it had refused to build.
             let mut index_notes = Vec::new();
             let mut take = |v: Option<&Value>| -> Option<Vec<Vec<usize>>> {
-                let (f, notes) = v.and_then(index_lists_reporting)?;
+                let (f, notes) = v.and_then(|v| index_lists_reporting(v, &FACE_WORDS))?;
                 index_notes.extend(notes);
                 Some(f)
             };
@@ -1816,12 +1816,9 @@ fn call_builtin_module(
                 // non-finite or not a number is reported HERE, while it is
                 // still a number, instead of as the usize::MAX sentinel it
                 // becomes (`point index 18446744073709551615`).
-                Some(v) => match index_lists_reporting(v) {
+                Some(v) => match index_lists_reporting(v, &PATH_WORDS) {
                     Some((p, notes)) => {
-                        path_notes = notes
-                            .into_iter()
-                            .map(|n| n.replace("polyhedron: ", "polygon: ").replace("out of bounds; face dropped", "out of range; path dropped"))
-                            .collect();
+                        path_notes = notes;
                         Some(p)
                     }
                     None => {
@@ -2888,29 +2885,64 @@ fn vec2_list(v: &Value) -> Option<Vec<poly2::Vec2>> {
 /// is reported HERE, where it is still a number, and the face is dropped by
 /// the sentinel as before — so the caller emits one line naming what was
 /// actually written.
-fn index_lists_reporting(v: &Value) -> Option<(Vec<Vec<usize>>, Vec<String>)> {
+/// What a caller calls the members of its index list, and how it phrases an
+/// index it cannot use: `polyhedron` drops a `face` whose index is `out of
+/// bounds`, `polygon` drops a `path` whose index is `out of range`. Both
+/// phrasings are load-bearing -- geom.rs and poly2.rs emit the matching line
+/// for the same member, and the caller filters that duplicate by exact text.
+struct IndexWords {
+    owner: &'static str,
+    bad: &'static str,
+    noun: &'static str,
+}
+
+const FACE_WORDS: IndexWords =
+    IndexWords { owner: "polyhedron", bad: "out of bounds", noun: "face" };
+const PATH_WORDS: IndexWords =
+    IndexWords { owner: "polygon", bad: "out of range", noun: "path" };
+
+fn index_lists_reporting(v: &Value, w: &IndexWords) -> Option<(Vec<Vec<usize>>, Vec<String>)> {
     let Value::Vector(faces) = v else { return None };
     let mut notes = Vec::new();
     let out = faces
         .iter()
-        .map(|f| match f {
-            Value::Vector(idxs) => idxs
-                .iter()
-                .map(|i| match i.as_num() {
-                    Some(n) if n.is_finite() && n >= 0.0 => n.trunc() as usize,
-                    other => {
-                        notes.push(format!(
-                            "polyhedron: point index {} out of bounds; face dropped",
-                            match other {
-                                Some(n) => fmt_num(n),
-                                None => "undef".to_string(),
-                            }
-                        ));
-                        usize::MAX
-                    }
-                })
-                .collect(),
-            _ => Vec::new(),
+        .filter_map(|f| match f {
+            Value::Vector(idxs) => Some(
+                idxs.iter()
+                    .map(|i| match i.as_num() {
+                        Some(n) if n.is_finite() && n >= 0.0 => n.trunc() as usize,
+                        other => {
+                            notes.push(format!(
+                                "{}: point index {} {}; {} dropped",
+                                w.owner,
+                                match other {
+                                    Some(n) => fmt_num(n),
+                                    None => "undef".to_string(),
+                                },
+                                w.bad,
+                                w.noun
+                            ));
+                            usize::MAX
+                        }
+                    })
+                    .collect(),
+            ),
+            // A member that is not a list at all. Writing `paths = [0, 1, 2]`
+            // for `paths = [[0, 1, 2]]` is the usual way in, and it used to
+            // become an empty member here: polygon then drew nothing and said
+            // nothing, so the only line printed was the top-level "object is
+            // empty", and polyhedron blamed "a face with fewer than 3
+            // vertices" -- which was not what the author had written. Dropping
+            // it here instead of passing an empty member down keeps the count
+            // at one line per mistake. An explicitly empty member is left
+            // alone: `paths = [[]]` is documented as contributing nothing.
+            _ => {
+                notes.push(format!(
+                    "{}: {} is not a list of point indices; {} dropped",
+                    w.owner, w.noun, w.noun
+                ));
+                None
+            }
         })
         .collect();
     Some((out, notes))
@@ -8222,6 +8254,49 @@ mod tests {
         // Out-of-bounds face index drops that face with a warning.
         let bad = run("polyhedron(points=[[0,0,0],[1,0,0],[0,1,0]], faces=[[0,1,2],[0,1,9]]);");
         assert!(bad.warnings.iter().any(|w| w.contains("out of bounds")));
+    }
+
+    #[test]
+    fn a_member_of_an_index_list_that_is_not_a_list_is_named() {
+        // `paths = [0,1,2,3]` for `paths = [[0,1,2,3]]` is the usual slip.
+        // Each member became an empty path and the square silently vanished:
+        // the only line was the top level's "object is empty", which does not
+        // point at the argument that caused it.
+        let flat = run("polygon(points=[[0,0],[9,0],[9,9],[0,9]], paths=[0,1,2,3]);");
+        assert_eq!(
+            flat.warnings.iter().filter(|w| w.contains("not a list of point indices")).count(),
+            4,
+            "one line per bad member: {:?}",
+            flat.warnings
+        );
+        assert!(flat.warnings.iter().all(|w| !w.contains("polyhedron")), "{:?}", flat.warnings);
+
+        // The same slip on polyhedron used to be blamed on "a face with fewer
+        // than 3 vertices", describing a face the author never wrote.
+        let faces = run(
+            "polyhedron(points=[[0,0,0],[1,0,0],[0,1,0],[0,0,1]], \
+             faces=[[0,1,2],[0,3,1],[0,2,3],7]);",
+        );
+        assert_eq!(
+            faces.warnings.iter().filter(|w| w.contains("not a list of point indices")).count(),
+            1,
+            "{:?}",
+            faces.warnings
+        );
+        assert!(
+            faces.warnings.iter().all(|w| !w.contains("fewer than 3 vertices")),
+            "the dropped member must not be re-reported as a short face: {:?}",
+            faces.warnings
+        );
+
+        // An explicitly empty member is documented as contributing nothing,
+        // so it keeps its existing (silent) treatment here.
+        let empty = run("polygon(points=[[0,0],[9,0],[9,9]], paths=[[]]);");
+        assert!(
+            empty.warnings.iter().all(|w| !w.contains("not a list of point indices")),
+            "{:?}",
+            empty.warnings
+        );
     }
 
     #[test]
