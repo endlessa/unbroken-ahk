@@ -601,7 +601,16 @@ fn reduce_pairwise(mut items: Vec<Mesh>, op: fn() -> Op) -> Mesh {
         let mut next = Vec::with_capacity(items.len().div_ceil(2));
         let mut i = 0;
         while i + 1 < items.len() {
-            next.push(boolean(&items[i], &items[i + 1], op()));
+            // Disjoint operands of a UNION need no boolean at all (see
+            // `boxes_overlap`). Difference and intersection have their own
+            // empty-operand identities and are left alone.
+            next.push(
+                if matches!(op(), Op::Union) && !boxes_overlap(&items[i], &items[i + 1]) {
+                    concat(&items[i], &items[i + 1])
+                } else {
+                    boolean(&items[i], &items[i + 1], op())
+                },
+            );
             i += 2;
         }
         if i < items.len() {
@@ -737,13 +746,46 @@ fn framed<F: FnOnce(&[Mesh]) -> Mesh>(meshes: &[Mesh], op: F) -> Mesh {
 
 /// n-ary union of a list of meshes (empty meshes are skipped).
 pub fn union_all(meshes: &[Mesh]) -> Mesh {
-    framed(meshes, union_all_raw).welded()
+    // One operand is its own union. Going through the working frame anyway
+    // scales the coordinates out and back, and a scale that is not a power of
+    // two is not an exact round trip -- a lone `cube(4)` came back with a
+    // volume of 63.99999999999999. Nothing to solve, so nothing to move.
+    let mut solid = meshes.iter().filter(|m| !m.positions.is_empty());
+    let (Some(first), None) = (solid.next(), solid.next()) else {
+        return framed(meshes, union_all_raw).welded();
+    };
+    first.welded()
 }
 
 fn union_all_raw(meshes: &[Mesh]) -> Mesh {
     let items: Vec<Mesh> =
         meshes.iter().filter(|m| !m.positions.is_empty()).cloned().collect();
     reduce_pairwise(items, || Op::Union)
+}
+
+/// Do two meshes' bounding boxes overlap at all?
+///
+/// Two solids that do not are already each other's union: nothing to clip,
+/// nothing to split. Taking the BSP anyway is not just slow, it is
+/// destructive -- every polygon that straddles any plane of the other's tree
+/// gets cut, so a union of twenty disjoint spheres came back with seven times
+/// the triangles it went in with. The test is exact, so this is a shortcut,
+/// not an approximation.
+fn boxes_overlap(a: &Mesh, b: &Mesh) -> bool {
+    let (Some((alo, ahi)), Some((blo, bhi))) = (crate::geom::bounds(a), crate::geom::bounds(b))
+    else {
+        return false;
+    };
+    (0..3).all(|k| alo[k] <= bhi[k] && blo[k] <= ahi[k])
+}
+
+/// Concatenate two meshes, rebasing the second's indices.
+fn concat(a: &Mesh, b: &Mesh) -> Mesh {
+    let mut out = a.clone();
+    let base = out.positions.len() as u32;
+    out.positions.extend_from_slice(&b.positions);
+    out.tris.extend(b.tris.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));
+    out
 }
 
 /// difference: the first mesh minus the union of the rest.

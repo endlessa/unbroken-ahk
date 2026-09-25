@@ -64,9 +64,21 @@ Remaining partial here: assert lacks file/line + the TRACE stack.
 `difference`, `intersection`, `intersection_for` compute real mesh
 geometry via a from-scratch BSP-tree-merging kernel (`scadforge/src/
 csg.rs`; Thibault & Naylor 1987 — clean-room, no CGAL), with a balancing
-split-plane chooser (reviewed + hardened). `union`/`group` stay preview
-concatenation (faithful to the reference's F5 preview), with the exact
-union used internally to combine multi-shape operands. `hull` is a
+split-plane chooser (reviewed + hardened). `union`/`group` are preview
+concatenation during evaluation — which is the F5 behaviour, and what
+keeps per-shape colour and modifier flags alive for the viewer — and the
+EXPORT merges them for real, because the reference is explicit that
+"export always operates on fully rendered (F6-equivalent) geometry" and
+concatenated overlapping shells make a self-intersecting file. Disjoint
+parts cost nothing (a pair whose bounding boxes miss is concatenated),
+so only genuinely overlapping solids pay. Above
+`eval::MAX_UNION_EXPORT_TRIS` the merge is skipped with a console line:
+a BSP plane is infinite, so every polygon straddling one is cut whether
+the boolean touches it or not, and the cost turns vertical with how
+deeply the parts interpenetrate — measured on this corpus, 16k triangles
+merge in seconds while 34k of a densely crossing hull took 299s and came
+out 33x larger. Reducing that inflation is the work that would raise the
+budget. `hull` is a
 from-scratch incremental 3D convex hull. `minkowski` is exact for convex
 operands (hull of pairwise vertex sums, the dominant rounding use),
 over-approximates concave ones with a warning, and caps the pairwise

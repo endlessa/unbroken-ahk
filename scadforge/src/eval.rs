@@ -3337,8 +3337,53 @@ pub fn export_2d(out: &EvalOutput) -> Result<Vec<Poly2>, String> {
 /// for export. A purely-2D top level is an error, as is empty geometry (both
 /// matching the reference's export messages). Preview-grade: top-level bodies
 /// are concatenated, not boolean-unioned (a valid multi-body mesh).
+/// Above this many triangles the export-time union is skipped (see
+/// `export_mesh`).
+///
+/// Chosen from measurement, not taste. Across the example corpus everything
+/// at or below about 16,000 triangles merges in under ten seconds. Above
+/// that the cost is not a function of size alone but of how deeply the parts
+/// interpenetrate, and it turns vertical fast: 34,288 triangles of a hull
+/// with many crossing parts took 299 seconds and came out at 1,122,789, a
+/// 33x explosion, while 69,656 triangles of a gear took 206. This is the
+/// last count that was reliably affordable.
+pub const MAX_UNION_EXPORT_TRIS: usize = 25_000;
+
+/// Whether the export-time union was skipped for the last export on this
+/// thread, and how many triangles it was asked to merge. Set by
+/// `export_mesh`, read once by the reporting wrapper -- the same one-shot
+/// channel `csg::take_degraded` uses, for the same reason: the mesh assembly
+/// has no `Ctx` to warn into.
+fn union_skipped(set: Option<usize>) -> Option<usize> {
+    thread_local! {
+        static SKIPPED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    SKIPPED.with(|c| if set.is_some() { c.replace(set) } else { c.replace(None) })
+}
+
+/// Do any two parts' bounding boxes overlap? If none do, the union is a
+/// concatenation anyway and there is nothing to skip.
+fn overlapping(parts: &[Mesh]) -> bool {
+    let boxes: Vec<_> = parts.iter().filter_map(geom::bounds).collect();
+    boxes.iter().enumerate().any(|(i, (alo, ahi))| {
+        boxes[i + 1..]
+            .iter()
+            .any(|(blo, bhi)| (0..3).all(|k| alo[k] <= bhi[k] && blo[k] <= ahi[k]))
+    })
+}
+
+fn concat_all(parts: &[Mesh]) -> Mesh {
+    let mut out = Mesh::empty();
+    for m in parts {
+        let base = out.positions.len() as u32;
+        out.positions.extend_from_slice(&m.positions);
+        out.tris.extend(m.tris.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));
+    }
+    out
+}
+
 pub fn export_mesh(out: &EvalOutput) -> Result<Mesh, String> {
-    let mut combined = Mesh::empty();
+    let mut parts: Vec<Mesh> = Vec::new();
     let mut saw_2d = false;
     for s in &out.shapes {
         if s.background {
@@ -3348,11 +3393,36 @@ pub fn export_mesh(out: &EvalOutput) -> Result<Mesh, String> {
             saw_2d = true;
             continue;
         }
-        let base = combined.positions.len() as u32;
-        combined.positions.extend_from_slice(&s.mesh.positions);
-        for t in &s.mesh.tris {
-            combined.tris.push([t[0] + base, t[1] + base, t[2] + base]);
-        }
+        parts.push(s.mesh.clone());
+    }
+    // A real UNION, not a concatenation. The design's shapes stay separate
+    // through evaluation so colours and modifier flags survive to the viewer,
+    // and the preview draws them that way -- which is the F5 behaviour. An
+    // EXPORT is F6: "Export always operates on fully rendered (F6-equivalent)
+    // geometry". Concatenating overlapping shells wrote a self-intersecting
+    // file: correct to any reader that fills by parity, and wrong to every
+    // validator and to anything that integrates a volume.
+    //
+    // Disjoint parts cost nothing (`csg::union_all` concatenates a pair whose
+    // bounding boxes miss), so the price is paid only where solids actually
+    // overlap -- which is where the merge is the whole point.
+    //
+    // It is not free there. A BSP plane is infinite, so every polygon that
+    // straddles one is cut whether or not the boolean touches it, and the
+    // merged mesh comes out ten to thirteen times the triangle count it went
+    // in with. Measured on the example corpus: models up to about 16,000
+    // triangles merge in three to seven seconds, and two models of a million
+    // and more do not finish in four minutes. Above the budget the merge is
+    // SKIPPED and said so, because an export that never returns is worse than
+    // one a validator complains about.
+    let total: usize = parts.iter().map(|m| m.tris.len()).sum();
+    let (combined, note) = if total > MAX_UNION_EXPORT_TRIS && overlapping(&parts) {
+        (concat_all(&parts), Some(total))
+    } else {
+        (csg::union_all(&parts), None)
+    };
+    if let Some(n) = note {
+        union_skipped(Some(n));
     }
     // Weld once here rather than per-format, and drop the slivers the 2D
     // fill sweep leaves behind: they are below the resolution the files can
@@ -3539,7 +3609,20 @@ pub fn render_export_bytes_reporting(
             .collect();
         return (Err(as_error(e.clone())), head);
     }
-    (export_bytes(&out, format).map_err(as_error), console)
+    let bytes = export_bytes(&out, format).map_err(as_error);
+    // The mesh assembly has no Ctx; pick its one note up here so it lands in
+    // the console stream with everything else.
+    let console = match union_skipped(None) {
+        Some(n) => format!(
+            "{}WARNING: {} triangles is past the {} the export-time union will \
+             merge; overlapping shells were left separate.\n",
+            console,
+            fmt_num(n as f64),
+            fmt_num(MAX_UNION_EXPORT_TRIS as f64)
+        ),
+        None => console,
+    };
+    (bytes, console)
 }
 
 /// Export the design to a text format's serialized string, dispatching by a
@@ -7192,6 +7275,64 @@ mod tests {
         let bad = crate::http::handle("POST", "/export?format=stl", "square(5);");
         assert_eq!(bad.status, "422 Unprocessable Entity");
         assert!(bad.text_body().contains("not a 3D object"));
+    }
+
+    /// An export is F6: "Export always operates on fully rendered
+    /// (F6-equivalent) geometry". The design's shapes stay separate through
+    /// evaluation so colours and modifier flags reach the viewer, and the
+    /// preview draws them that way -- but concatenating overlapping shells
+    /// into a file wrote a self-intersecting mesh, correct only to a reader
+    /// that fills by parity.
+    #[test]
+    fn the_export_merges_overlapping_shells() {
+        let vol = |src: &str| {
+            let out = run(src);
+            let m = export_mesh(&out).expect("exported");
+            let v: f64 = m
+                .tris
+                .iter()
+                .map(|t| {
+                    let (a, b, c) =
+                        (m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]);
+                    (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                        / 6.0
+                })
+                .sum();
+            (v.abs(), m.tris.len())
+        };
+
+        // Two 4-cubes overlapping by 2: the union is a 6x4x4 bar, 96, not 128.
+        assert!((vol("union(){ cube(4); translate([2,0,0]) cube(4); }").0 - 96.0).abs() < 1e-6);
+        // The IMPLICIT top-level union counts too.
+        assert!((vol("cube(4); translate([2,0,0]) cube(4);").0 - 96.0).abs() < 1e-6);
+        // Identical operands collapse to one solid, at the minimum count.
+        let same = vol("union(){ cube(4); cube(4); }");
+        assert!((same.0 - 64.0).abs() < 1e-9 && same.1 == 12, "{same:?}");
+        // Disjoint parts are their own union and keep every triangle.
+        let apart_vol = vol("union(){ cube(4); translate([10,0,0]) cube(4); }");
+        assert!((apart_vol.0 - 128.0).abs() < 1e-9 && apart_vol.1 == 24, "{apart_vol:?}");
+        // A single shape keeps its triangles (nothing to merge).
+        let one = vol("cube(4);");
+        assert!((one.0 - 64.0).abs() < 1e-9 && one.1 == 12, "{one:?}");
+
+        // The merge is skipped above a budget rather than never returning: a
+        // BSP plane is infinite, so every polygon straddling one is cut
+        // whether the boolean touches it or not, and the cost turns vertical
+        // with how deeply the parts interpenetrate.
+        assert!(MAX_UNION_EXPORT_TRIS >= 16_000, "everything measured under 16k merged in seconds");
+        // `overlapping` is what decides whether skipping would change
+        // anything: parts that never meet are already their own union.
+        let apart = [geom::cube([1.0, 1.0, 1.0], false), {
+            let mut m = geom::cube([1.0, 1.0, 1.0], false);
+            for p in &mut m.positions {
+                p[0] += 10.0;
+            }
+            m
+        }];
+        assert!(!overlapping(&apart));
+        let together = [geom::cube([1.0, 1.0, 1.0], false), geom::cube([1.0, 1.0, 1.0], false)];
+        assert!(overlapping(&together));
     }
 
     /// A tail loop that binds a `$`-name must not grow the dynamic chain.
