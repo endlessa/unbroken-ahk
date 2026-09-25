@@ -1752,20 +1752,36 @@ fn call_builtin_module(
         }
         "polygon" => {
             let points = bound.get("points").and_then(vec2_list);
+            let mut path_notes = Vec::new();
             let paths = match bound.get("paths") {
                 Some(Value::Undef) | None => None,
-                Some(v) => match index_lists(v) {
-                    Some(p) => Some(p),
+                // Same as polyhedron's faces: an index that is negative,
+                // non-finite or not a number is reported HERE, while it is
+                // still a number, instead of as the usize::MAX sentinel it
+                // becomes (`point index 18446744073709551615`).
+                Some(v) => match index_lists_reporting(v) {
+                    Some((p, notes)) => {
+                        path_notes = notes
+                            .into_iter()
+                            .map(|n| n.replace("polyhedron: ", "polygon: ").replace("out of bounds; face dropped", "out of range; path dropped"))
+                            .collect();
+                        Some(p)
+                    }
                     None => {
                         ctx.warn("polygon: paths must be a list of index lists");
                         return Vec::new();
                     }
                 },
             };
+            // poly2 emits its own line for the same path, naming the
+            // sentinel; drop that one so a bad index gives exactly one.
+            let path_sentinel =
+                format!("polygon: point index {} out of range; path dropped", usize::MAX);
+            ctx.warn_all(path_notes);
             match points {
                 Some(points) => {
                     let (poly, warnings) = poly2::polygon(&points, paths.as_deref());
-                    ctx.warn_all(warnings);
+                    ctx.warn_all(warnings.into_iter().filter(|w| *w != path_sentinel));
                     no_children(name, children, ctx);
                     Shape::flat(poly).into_iter().collect()
                 }
@@ -1979,7 +1995,15 @@ fn call_builtin_module(
                     (None, Some(d)) => (d, if chamfer { csg2::Join::Chamfer } else { csg2::Join::Miter }),
                     (None, None) => (1.0, csg2::Join::Round),
                 };
-                let frags_full = resolve_fragments(dist.abs(), ctx);
+                // "$fn/$fa/$fs are consumed ONLY in r mode; delta mode
+                // produces no arcs" — so asking for the fragment count in
+                // delta mode was reading variables the join never uses, and
+                // could emit their clamp warning for a shape with no curves.
+                let frags_full = if join == csg2::Join::Round {
+                    resolve_fragments(dist.abs(), ctx)
+                } else {
+                    0
+                };
                 let result = csg2::offset2(&poly, dist, join, frags_full);
                 // A negative offset can annihilate the region — empty, no warning.
                 Shape::flat(result).into_iter().collect()

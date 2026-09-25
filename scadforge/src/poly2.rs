@@ -950,15 +950,78 @@ fn seg_cross(p: &[Vec2; 2], q: &[Vec2; 2]) -> bool {
     a != 0 && b != 0 && c != 0 && d != 0 && a != b && c != d
 }
 
-/// Does any edge of the region cross any other? A sweep ordered by the
-/// edges' lower y, so the common clean region costs about a sort rather
-/// than every pair.
+/// Is `c` on segment `a`-`b`, given that the three are collinear?
+fn between(a: Vec2, b: Vec2, c: Vec2) -> bool {
+    c[0] >= a[0].min(b[0])
+        && c[0] <= a[0].max(b[0])
+        && c[1] >= a[1].min(b[1])
+        && c[1] <= a[1].max(b[1])
+}
+
+/// Do two NON-ADJACENT edges meet at all — crossing, touching at an endpoint,
+/// or overlapping collinearly?
+///
+/// `seg_cross` answers a narrower question: it demands all four orientations
+/// be non-zero, so it sees only PROPER crossings. That is the right test for
+/// "do these two cross", and the wrong one for "is this contour simple" —
+/// which is what the fast paths were using it for. A keyhole outline that
+/// walks into a slot and back out touches itself at a vertex without ever
+/// crossing, so it was ear-clipped as though simple and the inner loop came
+/// out covered twice.
+fn seg_meets(p: &[Vec2; 2], q: &[Vec2; 2]) -> bool {
+    let o = |a: Vec2, b: Vec2, c: Vec2| {
+        let v = cross(a, b, c);
+        if v > 0.0 {
+            1
+        } else if v < 0.0 {
+            -1
+        } else {
+            0
+        }
+    };
+    let (a, b) = (o(p[0], p[1], q[0]), o(p[0], p[1], q[1]));
+    let (c, d) = (o(q[0], q[1], p[0]), o(q[0], q[1], p[1]));
+    if a != b && c != d {
+        return true; // proper crossing
+    }
+    (a == 0 && between(p[0], p[1], q[0]))
+        || (b == 0 && between(p[0], p[1], q[1]))
+        || (c == 0 && between(q[0], q[1], p[0]))
+        || (d == 0 && between(q[0], q[1], p[1]))
+}
+
+/// Is the region NOT a set of simple, disjoint contours — so the fast paths
+/// (ear clipping, raw wall segments) would be wrong and the sweep is needed?
+///
+/// Adjacent edges of one contour legitimately share their common endpoint, so
+/// they are asked a different question: whether the second doubles straight
+/// back along the first, which is the zero-area spur that used to be extruded
+/// into a visible zero-thickness fin. Every other pair is asked whether it
+/// meets at all.
 fn has_crossing(clean: &[Vec<Vec2>]) -> bool {
-    let mut segs: Vec<[Vec2; 2]> = Vec::new();
+    // A contour that folds back on itself at a vertex: (a -> b) then
+    // (b -> c) with c lying on a-b.
     for c in clean {
+        let n = c.len();
+        if n < 3 {
+            continue;
+        }
+        for i in 0..n {
+            let (a, b, d) = (c[i], c[(i + 1) % n], c[(i + 2) % n]);
+            if cross(a, b, d) == 0.0 && between(a, b, d) {
+                return true;
+            }
+        }
+    }
+    let mut segs: Vec<[Vec2; 2]> = Vec::new();
+    // (which contour, which edge, how many edges that contour has) — enough
+    // to tell an adjacent pair from any other.
+    let mut owner: Vec<(usize, usize, usize)> = Vec::new();
+    for (ci, c) in clean.iter().enumerate() {
         let n = c.len();
         for i in 0..n {
             segs.push([c[i], c[(i + 1) % n]]);
+            owner.push((ci, i, n));
         }
     }
     let ylo = |s: &[Vec2; 2]| s[0][1].min(s[1][1]);
@@ -978,7 +1041,13 @@ fn has_crossing(clean: &[Vec<Vec2>]) -> bool {
             {
                 continue;
             }
-            if seg_cross(&segs[i], &segs[j]) {
+            let (ci, ei, ni) = owner[i];
+            let (cj, ej, _) = owner[j];
+            // Adjacent edges of the same contour share an endpoint by
+            // construction; their fold-back case was handled above.
+            let adjacent = ci == cj
+                && ((ei + 1) % ni == ej || (ej + 1) % ni == ei || ei == ej);
+            if !adjacent && seg_meets(&segs[i], &segs[j]) {
                 return true;
             }
         }
@@ -1326,14 +1395,43 @@ pub fn extrude_linear(
     let mut positions: Vec<[f64; 3]> = Vec::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
     let (cap2, cap_tris) = triangulate(poly);
-    // Bottom cap at t=0, reversed to face -z.
-    let base = positions.len() as u32;
-    positions.extend(cap2.iter().map(|v| ring(*v, 0.0)));
-    tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[2], base + t[1]]));
-    // Top cap at t=1, facing +z.
-    let base = positions.len() as u32;
-    positions.extend(cap2.iter().map(|v| ring(*v, 1.0)));
-    tris.extend(cap_tris.iter().map(|t| [base + t[0], base + t[1], base + t[2]]));
+    // A cap triangle can collapse even though its 2D source did not: `scale`
+    // and `twist` move each ring's vertices, and `scale = 0` folds the whole
+    // top cap onto one apex point. The walls have always been culled by
+    // `push_tri`; the caps went out raw, so "scale=0 produces an apex" came
+    // with a fan of zero-area triangles at that apex, where the reference
+    // says "both produce valid, closed meshes ... (degenerate triangles
+    // culled)".
+    let mut cap = |tris: &mut Vec<[u32; 3]>, positions: &mut Vec<[f64; 3]>, t: f64, flip: bool| {
+        let base = positions.len() as u32;
+        positions.extend(cap2.iter().map(|v| ring(*v, t)));
+        for tr in &cap_tris {
+            let (a, b, c) = (
+                positions[(base + tr[0]) as usize],
+                positions[(base + tr[1]) as usize],
+                positions[(base + tr[2]) as usize],
+            );
+            let (u, v) = (
+                [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+                [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+            );
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            if !(n[0] * n[0] + n[1] * n[1] + n[2] * n[2] > 0.0) {
+                continue;
+            }
+            tris.push(if flip {
+                [base + tr[0], base + tr[2], base + tr[1]]
+            } else {
+                [base + tr[0], base + tr[1], base + tr[2]]
+            });
+        }
+    };
+    cap(&mut tris, &mut positions, 0.0, true); // bottom, facing -z
+    cap(&mut tris, &mut positions, 1.0, false); // top, facing +z
     // Side walls, one quad per boundary segment per slice (segments carry
     // the ink on their left, so hole walls face inward).
     for seg in &wall_segments(poly) {
@@ -1446,6 +1544,109 @@ pub fn extrude_rotate(poly: &Poly2, angle_deg: f64, frags: usize) -> Result<Mesh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Area of a triangulated region, and of its contours by the shoelace
+    /// formula — the two must agree, and the shoelace one is the truth.
+    fn tri_area(poly: &Poly2) -> f64 {
+        let (pts, tris) = triangulate(poly);
+        tris.iter()
+            .map(|t| {
+                let (a, b, c) = (pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]);
+                ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0
+            })
+            .sum()
+    }
+
+    /// A contour that TOUCHES itself is not simple, and must not take the
+    /// ear-clipping fast path.
+    ///
+    /// `seg_cross` answers "do these two cross", demanding all four
+    /// orientations be non-zero, and the fast paths were using it to ask "is
+    /// this simple". A keyhole outline walks into a slot and back out,
+    /// touching itself at a vertex without ever crossing, so it was clipped
+    /// as though simple and the inner loop came out covered twice -- and the
+    /// answer depended on which way the inner loop was wound, which even-odd
+    /// filling never may.
+    #[test]
+    fn a_self_touching_contour_is_not_simple() {
+        // A 10x10 plate with a 4x2 slot reached through a slit: 100 - 8 = 92.
+        let key = |inner_reversed: bool| {
+            let mut pts = vec![
+                [0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 6.0], [3.0, 6.0],
+            ];
+            if inner_reversed {
+                pts.extend([[7.0, 6.0], [7.0, 4.0], [3.0, 4.0]]);
+            } else {
+                pts.extend([[3.0, 4.0], [7.0, 4.0], [7.0, 6.0]]);
+            }
+            pts.extend([[3.0, 6.0], [0.0, 6.0]]);
+            Poly2::new(vec![pts])
+        };
+        for reversed in [false, true] {
+            let a = tri_area(&key(reversed));
+            assert!((a - 92.0).abs() < 1e-9, "keyhole (reversed = {reversed}) area {a}");
+        }
+
+        // A zero-area spur has no proper crossing either, and used to be
+        // extruded into a visible zero-thickness fin: "Fewer than 3 effective
+        // points in a path: degenerate, contributes nothing."
+        let spur = Poly2::new(vec![vec![
+            [0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [5.0, 10.0], [5.0, 15.0], [5.0, 10.0], [0.0, 10.0],
+        ]]);
+        assert!((tri_area(&spur) - 100.0).abs() < 1e-9);
+        let (_, tris) = extrude_linear(&spur, 3.0, false, 0.0, 1, [1.0, 1.0]);
+        assert_eq!(tris.len(), 14, "a clean box is 12 caps+walls... plus none for the spur");
+
+        // An ordinary simple polygon still takes the fast path and comes out
+        // with the minimum triangle count.
+        let sq = Poly2::new(vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]]);
+        assert!((tri_area(&sq) - 100.0).abs() < 1e-12);
+        assert_eq!(triangulate(&sq).1.len(), 2);
+    }
+
+    /// `scale` and `twist` move each ring's vertices, so a cap triangle can
+    /// collapse although its 2D source did not. The walls were always culled;
+    /// the caps went out raw, so "scale=0 produces an apex" came with a fan
+    /// of zero-area triangles at that apex.
+    #[test]
+    fn collapsed_cap_triangles_are_culled() {
+        let sq = Poly2::new(vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]]);
+        let degenerate = |positions: &[[f64; 3]], tris: &[[u32; 3]]| {
+            tris.iter()
+                .filter(|t| {
+                    let (a, b, c) = (
+                        positions[t[0] as usize],
+                        positions[t[1] as usize],
+                        positions[t[2] as usize],
+                    );
+                    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                    let n = [
+                        u[1] * v[2] - u[2] * v[1],
+                        u[2] * v[0] - u[0] * v[2],
+                        u[0] * v[1] - u[1] * v[0],
+                    ];
+                    !(n[0] * n[0] + n[1] * n[1] + n[2] * n[2] > 0.0)
+                })
+                .count()
+        };
+        for scale in [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0]] {
+            let (p, t) = extrude_linear(&sq, 5.0, false, 0.0, 1, scale);
+            assert_eq!(degenerate(&p, &t), 0, "scale = {scale:?} left a collapsed face");
+        }
+        // The pyramid is still closed and still the right size: 100 * 5 / 3.
+        let (p, t) = extrude_linear(&sq, 5.0, false, 0.0, 1, [0.0, 0.0]);
+        let vol: f64 = t
+            .iter()
+            .map(|tr| {
+                let (a, b, c) = (p[tr[0] as usize], p[tr[1] as usize], p[tr[2] as usize]);
+                (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                    + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                    / 6.0
+            })
+            .sum();
+        assert!((vol.abs() - 500.0 / 3.0).abs() < 1e-9, "apex volume {vol}");
+    }
 
     /// A shape far from the origin relative to its own size must triangulate
     /// to the same thing it does at the origin.
