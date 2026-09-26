@@ -676,61 +676,114 @@ fn note_union(fallback: bool) {
     });
 }
 
+/// What a pairwise union came to.
+enum Merge {
+    /// The two are now one solid, inside its bounds.
+    Made(Bounded),
+    /// Neither operand order stood. The pair is handed back untouched, for
+    /// the caller to try against different partners.
+    Refused(Bounded, Bounded),
+}
+
 fn union_reduce(mut items: Vec<Bounded>) -> Mesh {
     if items.is_empty() {
         return Mesh::empty();
     }
+    // Passes that merged nothing at all. A refused pair is put back for the
+    // next pass, so a pass that refuses everything would otherwise spin; at
+    // the second such pass the refusals are concatenated instead, which
+    // always shortens the list.
+    let mut stalled = 0usize;
     while items.len() > 1 {
         let mut next = Vec::with_capacity(items.len().div_ceil(2));
+        let mut deferred = Vec::new();
+        let mut made = false;
         let mut it = items.into_iter();
         while let Some(a) = it.next() {
-            match it.next() {
-                Some(b) => next.push(union_pair(a, b)),
-                None => next.push(a),
+            let Some(b) = it.next() else {
+                next.push(a);
+                break;
+            };
+            match union_pair(a, b) {
+                Merge::Made(c) => {
+                    made = true;
+                    next.push(c);
+                }
+                // A pair that will not merge is usually not a doomed pair but
+                // a badly matched one -- two shells that happen to graze each
+                // other where a third would have overlapped either cleanly.
+                // Measured on a character of 42 parts: reducing them in the
+                // order they were written left one merge that failed in both
+                // operand orders, and reducing the same 42 parts in the
+                // reverse order had no failures at all. So `b` goes back in
+                // the queue to meet someone else, and only an operand that
+                // nothing will take is given up on.
+                Merge::Refused(a, b) => {
+                    next.push(a);
+                    deferred.push(b);
+                }
             }
         }
+        if !deferred.is_empty() && (stalled >= 2 || next.len() <= 1) {
+            // Out of partners to try. Concatenation is not a union -- the
+            // result self-intersects where the operands did -- but it is
+            // every triangle that went in, which beats a merge that dropped
+            // some of them, and the caller is told.
+            for b in deferred.drain(..) {
+                note_union(true);
+                let a = next.pop().unwrap_or_else(|| Bounded {
+                    mesh: Mesh::empty(),
+                    lo: 0.0,
+                    hi: 0.0,
+                });
+                next.push(Bounded {
+                    mesh: concat(&a.mesh, &b.mesh),
+                    lo: a.lo.max(b.lo),
+                    hi: a.hi + b.hi,
+                });
+            }
+        }
+        // The deferred go to the BACK, where the next pass's pairing -- which
+        // walks a list about half as long -- gives them different partners.
+        next.append(&mut deferred);
+        stalled = if made { 0 } else { stalled + 1 };
         items = next;
     }
     items.into_iter().next().unwrap().mesh
 }
 
-fn union_pair(a: Bounded, b: Bounded) -> Bounded {
+fn union_pair(a: Bounded, b: Bounded) -> Merge {
     // Disjoint operands of a UNION need no boolean at all (see
     // `boxes_overlap`), and their volumes simply add.
     if !boxes_overlap(&a.mesh, &b.mesh) {
-        return Bounded {
+        return Merge::Made(Bounded {
             mesh: concat(&a.mesh, &b.mesh),
             lo: a.lo + b.lo,
             hi: a.hi + b.hi,
-        };
+        });
     }
     let (lo, hi) = (a.lo.max(b.lo), a.hi + b.hi);
     let holds = |m: &Mesh| {
         let v = m.signed_volume();
-        v >= lo * (1.0 - UNION_SLACK) && v <= hi * (1.0 + UNION_SLACK) + UNION_SLACK
+        v >= lo * (1.0 - UNION_SLACK) && v <= hi * (1.0 + UNION_SLACK)
     };
 
     let merged = boolean(&a.mesh, &b.mesh, Op::Union);
     if holds(&merged) {
-        let v = merged.signed_volume();
-        return Bounded { mesh: merged, lo: v, hi: v };
+        let got = merged.signed_volume();
+        return Merge::Made(Bounded { mesh: merged, lo: got, hi: got });
     }
     // A BSP is not symmetric in its operands: the first supplies the planes
     // the second is cut by, so `a ∪ b` and `b ∪ a` are two different
     // computations of the same answer, and one of them failing says nothing
     // about the other. Trying the swap costs a second boolean only on the
-    // designs that needed it, and it rescues most of them.
+    // designs that needed it.
     let swapped = boolean(&b.mesh, &a.mesh, Op::Union);
     if holds(&swapped) {
         note_union(false);
-        let v = swapped.signed_volume();
-        return Bounded { mesh: swapped, lo: v, hi: v };
+        let got = swapped.signed_volume();
+        return Merge::Made(Bounded { mesh: swapped, lo: got, hi: got });
     }
-    // Neither order stands. Concatenation is not a union -- the result
-    // self-intersects where the operands did -- but it is every triangle
-    // that went in, which is strictly better than a merge that dropped some
-    // of them, and the caller is told.
-    note_union(true);
     // The warning can only say how many merges failed -- it has no name for
     // the operands and no units, since the reduction runs in the normalised
     // frame. This says which pair and by how much, which is what actually
@@ -738,7 +791,7 @@ fn union_pair(a: Bounded, b: Bounded) -> Bounded {
     // them against each other, not as millimetres.
     if std::env::var_os("SCADFORGE_UNION_TRACE").is_some() {
         eprintln!(
-            "union fell back: a={} tris [{:.4}, {:.4}]  b={} tris [{:.4}, {:.4}]  \
+            "union refused: a={} tris [{:.4}, {:.4}]  b={} tris [{:.4}, {:.4}]  \
              merged {:.4}, swapped {:.4}, needed [{:.4}, {:.4}]",
             a.mesh.tris.len(),
             a.lo,
@@ -751,8 +804,16 @@ fn union_pair(a: Bounded, b: Bounded) -> Bounded {
             lo,
             hi
         );
+        for (tag, m) in [("a", &a.mesh), ("b", &b.mesh)] {
+            if let Some((blo, bhi)) = crate::geom::bounds(m) {
+                eprintln!(
+                    "   {tag} box [{:.3} {:.3} {:.3}] .. [{:.3} {:.3} {:.3}]",
+                    blo[0], blo[1], blo[2], bhi[0], bhi[1], bhi[2]
+                );
+            }
+        }
     }
-    Bounded { mesh: concat(&a.mesh, &b.mesh), lo, hi }
+    Merge::Refused(a, b)
 }
 
 /// The working frame a boolean is solved in.

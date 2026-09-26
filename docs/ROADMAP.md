@@ -542,6 +542,20 @@ Two more, both from the 3D lens and both left deliberately:
   edge-matched 2-manifold will reject it. Fixing it means propagating
   T-vertices during the split.
 
+- **One assembly still will not merge, and the reason is not found.** The
+  gnome's head sub-assembly reduces to a node of 2,851 triangles enclosing
+  88 working-frame units, and every union with that node loses geometry --
+  in either operand order, against three different partners, by different
+  amounts each time. Its bounds held when it was made, so it is accepted;
+  its own merge output carries two edges whose faces run the same way
+  round, which is two triangles' worth of volume and far inside the slack.
+  A postcondition rejecting a merge that produced such an edge was written
+  and BACKED OUT: a boolean's output legitimately carries T-junctions, so
+  the test needs the vertices welded, and welding on exact bits (the only
+  non-arbitrary rule available) does not bring those two faces together.
+  Making it fire needs a quantised weld whose threshold nothing justifies.
+  Recorded rather than guessed at.
+
 ## Working method (established, keep using it)
 
 1. Extract exact semantics for the phase's entries from the reference
