@@ -53,11 +53,23 @@ struct Budget {
     capped: bool,
 }
 
-/// Fences written around every spliced `include` body. They parse as calls to
-/// modules nobody defines, which is exactly why they are unmistakable, and
-/// they are removed from the AST before evaluation.
-const INC_OPEN: &str = "\n__scadforge_inc_open__();\n";
-const INC_CLOSE: &str = "\n__scadforge_inc_close__();\n";
+/// Fences written around every spliced `include` body, inside a BLOCK.
+///
+/// The markers parse as calls to modules nobody defines, which is exactly why
+/// they are unmistakable, and they are removed from the AST before
+/// evaluation. The braces are what make the splice survive the position it
+/// lands in: an `include` may be written as a bare child --
+/// `module wrap() include <body.scad>` -- and a child is exactly ONE
+/// statement, so without them the module's whole body was the opening marker
+/// and the included statements escaped into the enclosing scope. The braces
+/// also bound the splice for the reader below: whatever the included text
+/// turns out to parse as, the closing `}` ends it.
+///
+/// A block would add a scope the lexical paste must not have, so
+/// `flatten_includes` takes it away again once the parser has done its job
+/// with it.
+const INC_OPEN: &str = "\n{\n__scadforge_inc_open__();\n";
+const INC_CLOSE: &str = "\n__scadforge_inc_close__();\n}\n";
 const OPEN_NAME: &str = "__scadforge_inc_open__";
 const CLOSE_NAME: &str = "__scadforge_inc_close__";
 
@@ -74,45 +86,70 @@ const CLOSE_NAME: &str = "__scadforge_inc_close__";
 /// to a name the main file also assigns at top level is simply dropped. The
 /// main file's assignment is then the only one, which is the rule, and the
 /// spurious "was reassigned" line goes with it.
-fn apply_include_overrides(stmts: Vec<Stmt>) -> Vec<Stmt> {
-    let is_marker = |s: &Stmt, want: &str| {
-        matches!(s, Stmt::Call { name, .. } if name == want)
-    };
-    let mut depth = 0usize;
-    let mut main_names: HashSet<String> = HashSet::new();
-    for s in &stmts {
-        if is_marker(s, OPEN_NAME) {
-            depth += 1;
-        } else if is_marker(s, CLOSE_NAME) {
-            depth = depth.saturating_sub(1);
-        } else if depth == 0 {
-            if let Stmt::Assign { name, .. } = s {
-                main_names.insert(name.clone());
-            }
+fn apply_include_overrides(mut stmts: Vec<Stmt>) -> Vec<Stmt> {
+    // Whatever is left at this list's own level is the main file's: every
+    // included body is one `Stmt::Block` here, so its assignments are not
+    // counted, which is the whole point of splicing it inside braces.
+    let main_names: HashSet<String> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Assign { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    for s in stmts.iter_mut() {
+        drop_shadowed(s, &main_names);
+    }
+    flatten_includes(&mut stmts);
+    strip_markers(&mut stmts);
+    stmts
+}
+
+fn is_marker(s: &Stmt, want: &str) -> bool {
+    matches!(s, Stmt::Call { name, .. } if name == want)
+}
+
+/// A spliced include body: a block whose first statement is the open marker.
+fn is_include_block(s: &Stmt) -> bool {
+    matches!(s, Stmt::Block(v) if v.first().is_some_and(|f| is_marker(f, OPEN_NAME)))
+}
+
+/// Drop an included top-level assignment to a name the main file also
+/// assigns, at any include depth -- a file included by an included file is
+/// just as much "not the main file".
+fn drop_shadowed(s: &mut Stmt, main: &HashSet<String>) {
+    if !is_include_block(s) {
+        return;
+    }
+    let Stmt::Block(inner) = s else { return };
+    inner.retain(|st| !matches!(st, Stmt::Assign { name, .. } if main.contains(name)));
+    for st in inner.iter_mut() {
+        drop_shadowed(st, main);
+    }
+}
+
+/// Splice every include block back into the list that holds it, so the
+/// included statements sit in the including file's scope as the lexical paste
+/// requires. The braces existed only to survive parsing.
+fn flatten_includes(stmts: &mut Vec<Stmt>) {
+    for s in stmts.iter_mut() {
+        for body in stmt_bodies(s) {
+            flatten_includes(body);
         }
     }
-    let mut depth = 0usize;
+    if !stmts.iter().any(is_include_block) {
+        return;
+    }
     let mut out = Vec::with_capacity(stmts.len());
-    for s in stmts {
-        if is_marker(&s, OPEN_NAME) {
-            depth += 1;
-            continue;
-        }
-        if is_marker(&s, CLOSE_NAME) {
-            depth = depth.saturating_sub(1);
-            continue;
-        }
-        if depth > 0 {
-            if let Stmt::Assign { name, .. } = &s {
-                if main_names.contains(name) {
-                    continue; // the main file's assignment wins
-                }
+    for s in std::mem::take(stmts) {
+        match s {
+            Stmt::Block(inner) if inner.first().is_some_and(|f| is_marker(f, OPEN_NAME)) => {
+                out.extend(inner)
             }
+            other => out.push(other),
         }
-        out.push(s);
     }
-    strip_markers(&mut out);
-    out
+    *stmts = out;
 }
 
 /// Every child statement list a statement owns, for a recursive walk.
@@ -630,6 +667,137 @@ mod tests {
         assert!(!r.program.is_empty(), "the geometry before the cut must survive");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Every function name called anywhere inside an expression.
+    fn calls_in(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Call { name, args } => {
+                out.push(name.clone());
+                for a in args {
+                    calls_in(&a.value, out);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                calls_in(lhs, out);
+                calls_in(rhs, out);
+            }
+            Expr::Neg(x) | Expr::Pos(x) | Expr::Not(x) | Expr::Paren(x) => calls_in(x, out),
+            _ => {}
+        }
+    }
+
+    fn body_of(stmts: &[Stmt], want: &str) -> Expr {
+        stmts
+            .iter()
+            .find_map(|s| match s {
+                Stmt::FunctionDef { name, body, .. } if name == want => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no function {}", want))
+    }
+
+    #[test]
+    fn a_used_files_function_valued_constant_is_renamed_at_its_call_site() {
+        // `use` gives the library its own private spelling for every
+        // top-level name it declares. The call site was left alone on the
+        // grounds that a callee lives in the function namespace -- but
+        // 2021.01 resolves `name(args)` through the variable namespace too,
+        // so a library keeping a function literal in a constant and calling
+        // it as `f(x)` lost that constant at the boundary: it worked when
+        // included and answered undef when used.
+        let mut lib =
+            parser::parse("sq = function (x) x * x;\nfunction hyp(a, b) = sqrt(sq(a) + sq(b));\n")
+                .unwrap();
+        privatize(&mut lib, 0);
+        let mut names = Vec::new();
+        calls_in(&body_of(&lib, "hyp"), &mut names);
+        assert!(names.iter().any(|n| n == "__use0__sq"), "call sites: {:?}", names);
+        assert!(!names.iter().any(|n| n == "sq"), "the old spelling must be gone: {:?}", names);
+        // A name the file does not declare is still reached outward.
+        assert!(names.iter().any(|n| n == "sqrt"), "{:?}", names);
+
+        // When the file declares BOTH a variable and a named function of one
+        // name, the function wins at a call site, so that call keeps its own
+        // spelling -- renaming it would send it looking for a variable.
+        let mut both = parser::parse(
+            "f = function (x) 1;\nfunction f(x) = 2;\nfunction g(x) = f(x);\n",
+        )
+        .unwrap();
+        privatize(&mut both, 1);
+        let mut names = Vec::new();
+        calls_in(&body_of(&both, "g"), &mut names);
+        assert_eq!(names, vec!["f".to_string()], "the named function still wins");
+    }
+
+    #[test]
+    fn an_include_written_as_a_bare_child_stays_inside_that_child() {
+        // A child is exactly one statement. The fences were bare statements,
+        // so the module's whole body became the opening fence and every
+        // included statement escaped to the enclosing scope: the cube drew at
+        // the origin instead of under the module's caller, and the module
+        // itself drew nothing.
+        let dir = std::env::temp_dir().join(format!("sfpre4{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("body.scad"), "cube([3,3,3]);\n").unwrap();
+        for main in ["module wrap() include <body.scad>\n", "module wrap() { include <body.scad> }\n"] {
+            let r = resolve(main, &dir);
+            assert!(r.error.is_none(), "{:?}", r.error);
+            let body = r
+                .program
+                .iter()
+                .find_map(|s| match s {
+                    Stmt::ModuleDef { name, body, .. } if name == "wrap" => Some(body.clone()),
+                    _ => None,
+                })
+                .expect("wrap is defined");
+            assert_eq!(body.len(), 1, "the module owns the included body: {:?}", body);
+            assert!(matches!(&body[0], Stmt::Call { name, .. } if name == "cube"), "{:?}", body);
+            assert_eq!(r.program.len(), 1, "nothing escaped to the top level: {:?}", r.program);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_main_files_assignment_wins_however_the_include_is_written() {
+        // Provenance used to be counted by matching fence STATEMENTS at the
+        // top level. A fence captured as a bare child desynchronised the
+        // count, which inverted the override rule in one direction and, in
+        // the other, silently deleted a top-level assignment the main file
+        // had written itself.
+        let dir = std::env::temp_dir().join(format!("sfpre5{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("lib2.scad"), "r = 10;\nmodule ball() sphere(r);\n").unwrap();
+        let value_of = |prog: &[Stmt], want: &str| -> Vec<Expr> {
+            prog.iter()
+                .filter_map(|s| match s {
+                    Stmt::Assign { name, value } if name == want => Some(value.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for main in [
+            "r = 3;\ninclude <lib2.scad>\n",
+            "r = 3;\nmodule wrap() include <lib2.scad>\n",
+            "include <lib2.scad>\nr = 3;\n",
+        ] {
+            let r = resolve(main, &dir);
+            assert!(r.error.is_none(), "{:?}", r.error);
+            let rs = value_of(&r.program, "r");
+            assert_eq!(rs.len(), 1, "only the main file's r survives: {:?}", r.program);
+            assert!(matches!(&rs[0], Expr::Num(n) if *n == 3.0), "{:?}", rs[0]);
+        }
+
+        // And an assignment the MAIN file wrote is never deleted, whatever
+        // the included text parses as. `cube(1)` without its semicolon used
+        // to absorb the closing fence as a child, after which every later
+        // top-level statement counted as included -- and `w = 5` vanished.
+        std::fs::write(dir.join("frag.scad"), "cube(1)").unwrap();
+        let r = resolve("w = 1;\ninclude <frag.scad>\nw = 5;\n", &dir);
+        let ws = value_of(&r.program, "w");
+        assert_eq!(ws.len(), 2, "both of the main file's assignments survive: {:?}", r.program);
+        assert!(matches!(&ws[1], Expr::Num(n) if *n == 5.0), "{:?}", ws[1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // -- use<> private constants ------------------------------------------------
@@ -649,8 +817,18 @@ mod tests {
 /// inside that same file's definitions are renamed to match. A name the used
 /// file does NOT declare is left alone, so `$fn` and genuinely global
 /// identifiers still resolve outward.
+/// The names a used file owns, split by how a reference to one may be
+/// spelled. `vars` is every top-level assignment; `callable` is the subset a
+/// CALL may also mean, which is `vars` minus the names the file also defines
+/// as named functions -- for those, `f(x)` is the function and renaming the
+/// call site would send it looking for a variable instead.
+struct Owned {
+    vars: HashSet<String>,
+    callable: HashSet<String>,
+}
+
 fn privatize(stmts: &mut [Stmt], tag: usize) {
-    let owned: HashSet<String> = stmts
+    let vars: HashSet<String> = stmts
         .iter()
         .filter_map(|s| match s {
             // `$`-names are NEVER privatized. They are dynamically scoped, so
@@ -664,9 +842,22 @@ fn privatize(stmts: &mut [Stmt], tag: usize) {
             _ => None,
         })
         .collect();
-    if owned.is_empty() {
+    if vars.is_empty() {
         return;
     }
+    // A named function shadows a same-named variable at a call site, so those
+    // names keep their own spelling there.
+    let named_fns: HashSet<String> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::FunctionDef { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let owned = Owned {
+        callable: vars.difference(&named_fns).cloned().collect(),
+        vars,
+    };
     let pre = format!("__use{}__", tag);
     let mut shadow: Vec<HashSet<String>> = Vec::new();
     for s in stmts.iter_mut() {
@@ -695,7 +886,7 @@ fn body_frame(body: &[Stmt]) -> HashSet<String> {
         .collect()
 }
 
-fn rn_body(body: &mut Vec<Stmt>, owned: &HashSet<String>, shadow: &mut Vec<HashSet<String>>, pre: &str) {
+fn rn_body(body: &mut Vec<Stmt>, owned: &Owned, shadow: &mut Vec<HashSet<String>>, pre: &str) {
     shadow.push(body_frame(body));
     for s in body.iter_mut() {
         rn_stmt(s, owned, shadow, pre);
@@ -705,7 +896,7 @@ fn rn_body(body: &mut Vec<Stmt>, owned: &HashSet<String>, shadow: &mut Vec<HashS
 
 fn rn_binds(
     binds: &mut Vec<(String, Expr)>,
-    owned: &HashSet<String>,
+    owned: &Owned,
     shadow: &mut Vec<HashSet<String>>,
     pre: &str,
 ) -> HashSet<String> {
@@ -720,7 +911,7 @@ fn rn_binds(
     frame
 }
 
-fn rn_params(params: &mut [Param], owned: &HashSet<String>, shadow: &mut Vec<HashSet<String>>, pre: &str) -> HashSet<String> {
+fn rn_params(params: &mut [Param], owned: &Owned, shadow: &mut Vec<HashSet<String>>, pre: &str) -> HashSet<String> {
     let mut frame = HashSet::new();
     for p in params.iter_mut() {
         if let Some(d) = &mut p.default {
@@ -733,7 +924,7 @@ fn rn_params(params: &mut [Param], owned: &HashSet<String>, shadow: &mut Vec<Has
     frame
 }
 
-fn rn_stmt(s: &mut Stmt, owned: &HashSet<String>, shadow: &mut Vec<HashSet<String>>, pre: &str) {
+fn rn_stmt(s: &mut Stmt, owned: &Owned, shadow: &mut Vec<HashSet<String>>, pre: &str) {
     match s {
         Stmt::Modified { stmt, .. } => rn_stmt(stmt, owned, shadow, pre),
         Stmt::Assign { value, .. } => rn_expr(value, owned, shadow, pre),
@@ -776,7 +967,7 @@ fn rn_stmt(s: &mut Stmt, owned: &HashSet<String>, shadow: &mut Vec<HashSet<Strin
     }
 }
 
-fn rn_items(items: &mut Vec<VecItem>, owned: &HashSet<String>, shadow: &mut Vec<HashSet<String>>, pre: &str) {
+fn rn_items(items: &mut Vec<VecItem>, owned: &Owned, shadow: &mut Vec<HashSet<String>>, pre: &str) {
     for it in items.iter_mut() {
         match it {
             VecItem::One(e) | VecItem::Each(e) => rn_expr(e, owned, shadow, pre),
@@ -811,10 +1002,10 @@ fn rn_items(items: &mut Vec<VecItem>, owned: &HashSet<String>, shadow: &mut Vec<
     }
 }
 
-fn rn_expr(e: &mut Expr, owned: &HashSet<String>, shadow: &mut Vec<HashSet<String>>, pre: &str) {
+fn rn_expr(e: &mut Expr, owned: &Owned, shadow: &mut Vec<HashSet<String>>, pre: &str) {
     match e {
         Expr::Ident(n) => {
-            if owned.contains(n.as_str()) && !masked(n, shadow) {
+            if owned.vars.contains(n.as_str()) && !masked(n, shadow) {
                 *n = format!("{}{}", pre, n);
             }
         }
@@ -843,9 +1034,17 @@ fn rn_expr(e: &mut Expr, owned: &HashSet<String>, shadow: &mut Vec<HashSet<Strin
         }
         // The member NAME is a field, not a variable.
         Expr::Member { base, .. } => rn_expr(base, owned, shadow, pre),
-        // The callee NAME lives in the function namespace, not the variable
-        // one, and an argument's name is the callee's parameter.
-        Expr::Call { args, .. } => {
+        // An argument's name is the callee's parameter, never a variable of
+        // this file. The callee name is: 2021.01 resolves `name(args)` through
+        // the function namespace AND the variable one, so a library that keeps
+        // a function literal in a top-level constant and calls it as `f(x)`
+        // needs that call site renamed with the constant. Leaving it alone
+        // meant the constant simply vanished across a `use` boundary -- the
+        // library worked when included and answered undef when used.
+        Expr::Call { name, args } => {
+            if owned.callable.contains(name.as_str()) && !masked(name, shadow) {
+                *name = format!("{}{}", pre, name);
+            }
             for a in args.iter_mut() {
                 rn_expr(&mut a.value, owned, shadow, pre);
             }
