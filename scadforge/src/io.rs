@@ -886,18 +886,20 @@ pub fn read_stl(bytes: &[u8]) -> Result<Mesh, String> {
     // file with one mistyped line imported as three triangles enclosing a
     // volume of 6e87. A binary body that merely BEGINS "solid" is not valid
     // UTF-8 in any realistic case, and is caught by the branch below.
-    if bytes.len() >= 5 && &bytes[..5] == b"solid" && std::str::from_utf8(bytes).is_ok() {
-        return match read_stl_ascii(bytes) {
-            Ok(m) if !m.tris.is_empty() => Ok(m),
-            // Parsed cleanly but found no facets: an empty ASCII solid, or a
-            // binary body that happens to be valid UTF-8. Try binary, and
-            // keep the empty ASCII result if that finds nothing either.
-            Ok(empty) => match read_stl_binary(bytes) {
-                Ok(b) if !b.tris.is_empty() => Ok(b),
-                _ => Ok(empty),
-            },
-            Err(e) => Err(e),
-        };
+    // The keyword is conventionally lowercase and is not always written that
+    // way. An all-uppercase `SOLID` fell past this test to the binary reader,
+    // which read the letters as little-endian floats: a 191-byte file of two
+    // honest triangles imported as two facets with coordinates like
+    // 3.66e+12, silently and with a zero exit status.
+    if bytes.len() >= 5 && bytes[..5].eq_ignore_ascii_case(b"solid") && std::str::from_utf8(bytes).is_ok()
+    {
+        // No binary fallback from here. The size sniff above has already said
+        // this file's length does not match the binary layout, so reading it
+        // as binary is reading something that is not one -- which is how a
+        // valid but EMPTY ASCII solid, padded past 84 bytes by nothing more
+        // than a long solid name, came back holding two invented facets with
+        // coordinates up to 7.9e+34. An empty solid is empty.
+        return read_stl_ascii(bytes);
     }
     read_stl_binary(bytes)
 }
@@ -935,9 +937,15 @@ fn read_stl_ascii(bytes: &[u8]) -> Result<Mesh, String> {
     let mut w = Welder::new();
     let mut tris = Vec::new();
     let mut loop_verts: Vec<[f64; 3]> = Vec::new();
-    for line in text.lines() {
+    // Split on either terminator rather than with `lines()`, which knows \n
+    // and \r\n only. A file written with classic-Mac \r endings arrived as a
+    // single line, matched nothing, and parsed to zero facets -- after which
+    // it was handed to the binary reader and came back as invented geometry.
+    for line in text.split(['\n', '\r']) {
         let mut it = line.split_whitespace();
-        match it.next() {
+        // The keywords are conventionally lowercase; writers disagree.
+        let head = it.next().map(|t| t.to_ascii_lowercase());
+        match head.as_deref() {
             Some("vertex") => {
                 let c: Vec<f64> = it.filter_map(|t| t.parse().ok()).collect();
                 if c.len() != 3 {
@@ -1038,10 +1046,20 @@ pub fn read_off(text: &str) -> Result<Mesh, String> {
         if k < 3 || k > l.len() - 1 {
             continue; // not a usable face line
         }
-        let face: Vec<u32> = (0..k).map(|j| num(l[1 + j]) as u32).collect();
-        if face.iter().any(|&i| i as usize >= positions.len()) {
-            continue; // index out of range: drop the face, keep the mesh
-        }
+        // Validate each index as the number it was written as, BEFORE the
+        // cast. `f64 as u32` saturates in Rust, so `-1` and a non-numeric
+        // token both became 0 and sailed through the range check below: a
+        // file whose only face was `3 -1 1 2` imported as a triangle the file
+        // does not contain, while the same face written `3 3 1 2` was
+        // correctly dropped.
+        let ok = |t: &str| -> Option<u32> {
+            let v = num(t);
+            (v.is_finite() && v >= 0.0 && v.fract() == 0.0 && (v as usize) < positions.len())
+                .then_some(v as u32)
+        };
+        let Some(face) = (0..k).map(|j| ok(l[1 + j])).collect::<Option<Vec<u32>>>() else {
+            continue; // unusable index: drop the face, keep the mesh
+        };
         for j in 1..k - 1 {
             tris.push([face[0], face[j], face[j + 1]]);
         }
@@ -1881,6 +1899,69 @@ mod tests {
             2 * N,
             took
         );
+    }
+
+
+    #[test]
+    fn an_ascii_stl_is_read_as_the_ascii_it_is() {
+        // An empty but valid ASCII solid, padded past 84 bytes by nothing
+        // more than a long solid name, used to be handed to the binary
+        // reader when the ASCII parse found no facets -- and came back
+        // holding two invented facets with coordinates up to 7.9e+34. The
+        // size sniff has already ruled the file out as binary by then, so
+        // there was nothing to fall back to.
+        let long = "EmptyModelExportedByAToolWithARatherLongDescriptiveSolidName";
+        let empty = format!("solid {}\nendsolid {}\n", long, long);
+        assert!(empty.len() > 84, "the padding is the whole point");
+        let m = read_stl(empty.as_bytes()).unwrap();
+        assert!(m.tris.is_empty(), "an empty solid is empty, not {} facets", m.tris.len());
+
+        // Keywords are conventionally lowercase and are not always written
+        // that way. Uppercase fell past the sniff to the binary reader, which
+        // read the letters as little-endian floats.
+        let facet = |kw: &dyn Fn(&str) -> String| {
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                kw("solid t"), kw("facet normal 0 0 1"), kw("outer loop"),
+                kw("vertex 0 0 0"), kw("vertex 1 0 0"), kw("vertex 0 1 0"),
+                kw("endloop"), kw("endfacet"), kw("endsolid t"),
+            )
+        };
+        let lower = facet(&|t: &str| t.to_string());
+        let upper = facet(&|t: &str| t.to_uppercase());
+        let a = read_stl(lower.as_bytes()).unwrap();
+        let b = read_stl(upper.as_bytes()).unwrap();
+        assert_eq!(a.tris.len(), 1);
+        assert_eq!(b.tris.len(), 1, "UPPERCASE is the same file");
+        let mut pa = a.positions.clone();
+        let mut pb = b.positions.clone();
+        pa.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        pb.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        assert_eq!(pa, pb, "and the same vertices");
+
+        // `str::lines()` knows \n and \r\n only, so a file written with
+        // classic-Mac \r endings arrived as one line and matched nothing.
+        let cr = lower.replace('\n', "\r");
+        let c = read_stl(cr.as_bytes()).unwrap();
+        assert_eq!(c.tris.len(), 1, "\\r line endings are line endings");
+        let crlf = lower.replace('\n', "\r\n");
+        assert_eq!(read_stl(crlf.as_bytes()).unwrap().tris.len(), 1);
+    }
+
+    #[test]
+    fn an_off_face_index_is_checked_as_written() {
+        // `f64 as u32` saturates in Rust, so a negative index became 0 and
+        // sailed through the range check: a file whose only face was
+        // `3 -1 1 2` imported as a triangle the file does not contain, while
+        // the same face written `3 3 1 2` was correctly dropped.
+        let head = "OFF\n3 1 0\n0 0 0\n10 0 0\n0 10 0\n";
+        for bad in ["3 -1 1 2", "3 3 1 2", "3 x 1 2", "3 1.5 1 2"] {
+            let m = read_off(&format!("{}{}\n", head, bad)).unwrap();
+            assert!(m.tris.is_empty(), "`{}` must drop the face, got {:?}", bad, m.tris);
+        }
+        // A good face still reads, and so does a trailing per-face colour.
+        assert_eq!(read_off(&format!("{}3 0 1 2\n", head)).unwrap().tris.len(), 1);
+        assert_eq!(read_off(&format!("{}3 0 1 2 255 0 0\n", head)).unwrap().tris.len(), 1);
     }
 
 }
