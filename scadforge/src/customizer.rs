@@ -461,11 +461,27 @@ pub fn apply_overrides(source: &str, overrides: &[(String, String)]) -> String {
         {
             continue; // not an identifier: never paste it into the source
         }
-        let Some((kind, lit)) = classify_literal(raw.trim()) else { continue };
-        // A declared parameter keeps its kind, so the panel round-trip cannot
-        // put a string where a slider was. An undeclared name (a $-special,
-        // or one the file never assigns) has no kind to match.
-        if let Some(p) = params.iter().find(|p| p.name == name) {
+        // A bare literal carries a KIND, which the declared parameter's own
+        // kind has to match, so a panel round-trip cannot put a string where
+        // a slider was.
+        //
+        // Anything else is taken as an EXPRESSION, which is what the
+        // reference documents `-D` as accepting. It used to be dropped
+        // without a word: `-D 'w=2*3'` left the file's own `w = 2` in place
+        // and built the model at that size, exit 0 and nothing on stderr,
+        // while `-D 'w=6'` worked -- so the value's FORM alone decided
+        // whether the flag did anything. An expression has no kind to check
+        // against, and it has to be one expression: parsing it as the whole
+        // right-hand side of one assignment is what stops `w=1; cube(99)`
+        // from smuggling a second statement into the file.
+        let (kind, lit) = match classify_literal(raw.trim()) {
+            Some((k, l)) => (Some(k), l),
+            None => match sole_expression(raw.trim()) {
+                Some(src) => (None, src),
+                None => continue,
+            },
+        };
+        if let (Some(kind), Some(p)) = (kind, params.iter().find(|p| p.name == name)) {
             if kind != p.kind {
                 continue;
             }
@@ -596,7 +612,12 @@ fn json_value_as_string(v: &unbroken_test_platform::json::JsonValue) -> String {
         JsonValue::Str(s) => s.clone(),
         JsonValue::Bool(b) => b.to_string(),
         JsonValue::Number(n) => {
-            if n.fract() == 0.0 && n.is_finite() {
+            // Only where an i64 can hold it. `f64 as i64` saturates in Rust,
+            // so a preset written as a native JSON number of 1e20 came back
+            // as 9.22337e+18 -- i64::MAX -- silently, and the model was built
+            // at that size. Past 2^53 an f64 is not an exact integer anyway,
+            // and `{}` prints it in full.
+            if n.fract() == 0.0 && n.is_finite() && n.abs() <= 9.007199254740992e15 {
                 format!("{}", *n as i64)
             } else {
                 format!("{}", n)
@@ -650,8 +671,26 @@ fn value_string_to_literal(kind: &Kind, valstr: &str) -> String {
             if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
                 t.to_string()
             } else {
-                // Quote and escape (backslash and double-quote).
-                let esc = valstr.replace('\\', "\\\\").replace('"', "\\\"");
+                // Escape everything the lexer would choke on, not just
+                // backslash and quote. A preset value holding a real newline
+                // -- which the JSON reader hands over decoded -- became a
+                // literal with a raw newline inside it, which the override
+                // placer then rejected for that very reason, so the entry was
+                // dropped without a word and the file's own default rendered.
+                let mut esc = String::with_capacity(valstr.len() + 2);
+                for c in valstr.chars() {
+                    match c {
+                        '\\' => esc.push_str("\\\\"),
+                        '"' => esc.push_str("\\\""),
+                        '\n' => esc.push_str("\\n"),
+                        '\r' => esc.push_str("\\r"),
+                        '\t' => esc.push_str("\\t"),
+                        c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                            esc.push_str(&format!("\\u{:04x}", c as u32))
+                        }
+                        c => esc.push(c),
+                    }
+                }
                 format!("\"{}\"", esc)
             }
         }
@@ -659,11 +698,72 @@ fn value_string_to_literal(kind: &Kind, valstr: &str) -> String {
     }
 }
 
+/// `raw` if it is one complete OpenSCAD expression, else None.
+///
+/// Parsed as the right-hand side of a single assignment, so what comes back
+/// is exactly what may be pasted as one: a value that parses into more than
+/// one statement -- `1; cube(99)` -- is not an expression and is refused.
+fn sole_expression(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.contains('\n') || raw.contains('\r') {
+        return None;
+    }
+    let prog = crate::parser::parse(&format!("__scadforge_d__ = {};", raw)).ok()?;
+    match prog.as_slice() {
+        [crate::ast::Stmt::Assign { .. }] => Some(raw.to_string()),
+        _ => None,
+    }
+}
+
+/// The first `want` byte of `code` that is real code: not inside a string
+/// literal and not inside a comment.
+///
+/// Both statement boundaries used to be found with a plain byte search over
+/// the unscanned line, so the first `;` inside a string literal and the first
+/// `=` inside a block comment were taken for the real ones. Overriding
+/// `label = "a;b";` spliced the new value into the middle of the string and
+/// produced source that no longer parses -- `ERROR: unterminated string` from
+/// a file that was fine before the override -- and `/* a=b */ x = 1;` had its
+/// COMMENT rewritten, leaving the assignment untouched and the override
+/// silently without effect on a model that still exported.
+fn code_byte(code: &str, want: u8) -> Option<usize> {
+    let b = code.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    let mut in_block = false;
+    while i < b.len() {
+        if in_str {
+            match b[i] {
+                b'\\' => i += 1,
+                b'"' => in_str = false,
+                _ => {}
+            }
+        } else if in_block {
+            if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                in_block = false;
+                i += 1;
+            }
+        } else {
+            match b[i] {
+                b'"' => in_str = true,
+                b'/' if b.get(i + 1) == Some(&b'/') => return None,
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    in_block = true;
+                    i += 1;
+                }
+                c if c == want => return Some(i),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The name a top-level assignment line binds, or None if the line is not an
 /// assignment. Borrows from `code`, and does no widget/parameter work — the
 /// override placer calls this once per line and only wants the name.
 fn assigned_name(code: &str) -> Option<&str> {
-    let eq = code.find('=')?;
+    let eq = code_byte(code, b'=')?;
     // `==`, `<=`, `>=` and `!=` are comparisons, not assignments.
     if code.as_bytes().get(eq + 1) == Some(&b'=')
         || matches!(
@@ -685,16 +785,16 @@ fn assigned_name(code: &str) -> Option<&str> {
     // and `rewrite_rhs` — which needs the `;` to know where the value stops —
     // returned the line untouched, so the override vanished instead of
     // falling back to a trailing re-assignment.
-    code[eq + 1..].find(';')?;
+    code_byte(&code[eq + 1..], b';')?;
     Some(name)
 }
 
 /// Replace the RHS of `raw` (`indent name = <rhs> ; tail`) with `new_lit`,
 /// preserving the name, the `;`, and any trailing comment.
 fn rewrite_rhs(raw: &str, new_lit: &str) -> String {
-    let Some(eq) = raw.find('=') else { return raw.to_string() };
+    let Some(eq) = code_byte(raw, b'=') else { return raw.to_string() };
     let after = &raw[eq + 1..];
-    let Some(semi) = after.find(';') else { return raw.to_string() };
+    let Some(semi) = code_byte(after, b';') else { return raw.to_string() };
     format!("{}= {}{}", &raw[..eq], new_lit, &after[semi..])
 }
 
@@ -825,13 +925,24 @@ mod tests {
         let out = apply_overrides("$fn = 12;\nsphere(4);\n", &[("$fn".into(), "6".into())]);
         assert!(out.starts_with("$fn = 6;"), "{out:?}");
         assert_eq!(out.matches("$fn =").count(), 1, "no duplicate assignment: {out:?}");
-        // The VALUE is still strictly a literal, so nothing can be smuggled in.
-        for hostile in ["1; cube(9); //", "\"a\"; cube(9); //", "a+b", "f(1)", "[1,2]; x=1; //"] {
+        // A value carrying a SECOND STATEMENT is refused, whatever it looks
+        // like: the override is parsed as the whole right-hand side of one
+        // assignment, so anything that is not one expression is not a value.
+        for hostile in ["1; cube(9); //", "\"a\"; cube(9); //", "[1,2]; x=1; //", "1)", "*"] {
             assert_eq!(
                 apply_overrides("cube(1);\n", &[("z".into(), hostile.into())]),
                 "cube(1);\n",
                 "hostile value accepted: {hostile:?}"
             );
+        }
+        // An ordinary expression is applied, which is what `-D` documents.
+        // `-D w=2*3` used to leave the file's own `w = 2` in place and build
+        // at that size, exit 0 and nothing on stderr, while `-D w=6` worked:
+        // the value's FORM alone decided whether the flag did anything.
+        for good in ["2*3", "a+b", "f(1)", "[1, 2] + [3, 4]", "len(\"abc\")"] {
+            let out = apply_overrides("cube(1);\n", &[("z".into(), good.into())]);
+            assert!(out.contains(&format!("z = {};", good)), "{good:?} not applied: {out}");
+            assert!(!out.contains("cube(9)"));
         }
         // ...and so is the NAME.
         for bad in ["a; cube(9)", "1abc", "", "a b"] {
@@ -852,9 +963,15 @@ mod tests {
         for good in ["0", "5", "-5", "1.5", ".5", "-.5", "1e-3", "2.5E+6", "123."] {
             assert!(is_number_literal(good), "{good:?} must be a number literal");
         }
-        // `x = inf;` gets no widget, and an inf/nan override is dropped.
+        // `x = inf;` gets no widget: it is not a literal, so it is not a
+        // customizer parameter.
         assert!(parse("x = inf;\n").is_empty());
-        assert_eq!(apply_overrides("x = 1;\n", &[("x".into(), "nan".into())]), "x = 1;\n");
+        // As an OVERRIDE, `nan` is one expression -- a name this language
+        // does not define -- and `-D` takes an expression, so it is applied
+        // as written and the evaluator says "Ignoring unknown variable
+        // 'nan'". That names the real mistake, which silently dropping the
+        // flag never did.
+        assert_eq!(apply_overrides("x = 1;\n", &[("x".into(), "nan".into())]), "x = nan;\n");
     }
 
     #[test]
@@ -1027,6 +1144,81 @@ after = 99;\n"; // after the first module → not scanned
     }
 
     #[test]
+    fn an_override_reads_the_line_as_code_not_as_bytes() {
+        // Both statement boundaries were found with a plain byte search over
+        // the unscanned line, so the first `;` inside a string literal and
+        // the first `=` inside a block comment were taken for the real ones.
+        let with_semi = "label = \"a;b\";\ncube(1);\n";
+        let out = apply_overrides(with_semi, &[("label".into(), "\"z\"".into())]);
+        assert!(out.contains("label = \"z\";"), "rewritten whole: {out}");
+        assert!(!out.contains("a;b"), "the old value is gone: {out}");
+        assert!(crate::parser::parse(&out).is_ok(), "and the file still parses: {out}");
+
+        let with_eq = "/* a=b */ x = 1;\ncube(x);\n";
+        let out = apply_overrides(with_eq, &[("x".into(), "5".into())]);
+        assert!(out.contains("x = 5;"), "the assignment is what gets rewritten: {out}");
+        assert!(out.contains("/* a=b */"), "the comment is left alone: {out}");
+        assert_eq!(out.matches("x =").count(), 1, "not appended as well: {out}");
+
+        // A `//` comment cannot supply the statement's `=` or `;` either.
+        assert_eq!(assigned_name("cube(1); // n = 2"), None);
+        assert_eq!(assigned_name("n = 2; // x = 3"), Some("n"));
+        assert_eq!(assigned_name("// n = 2"), None);
+    }
+
+    #[test]
+    fn a_preset_string_survives_whatever_is_in_it() {
+        // Only backslash and quote were escaped, so a preset value holding a
+        // real newline -- which the JSON reader hands over decoded -- became
+        // a literal with a raw newline inside it, which the override placer
+        // then rejected for that very reason. The entry was dropped without a
+        // word and the file's own default rendered.
+        let src = "label = \"ab\";\ncube(len(label));\n";
+        for (raw, want_len) in [
+            ("line1\nline2", 11usize),
+            ("a\tb", 3),
+            ("a\rb", 3),
+            ("say \"hi\"", 8),
+            ("back\\slash", 10),
+        ] {
+            let lit = value_string_to_literal(&Kind::String, raw);
+            assert!(!lit.contains('\n') && !lit.contains('\r'), "{:?} -> {:?}", raw, lit);
+            let out = apply_overrides(src, &[("label".into(), lit.clone())]);
+            assert!(out.contains(&format!("label = {};", lit)), "{:?} not applied: {}", raw, out);
+            let prog = crate::parser::parse(&out).unwrap_or_else(|e| panic!("{:?}: {}", lit, e));
+            // The literal round-trips to the string it came from.
+            let bound = prog.iter().find_map(|st| match st {
+                crate::ast::Stmt::Assign { name, value } if name == "label" => Some(value.clone()),
+                _ => None,
+            });
+            match bound {
+                Some(crate::ast::Expr::Str(got)) => {
+                    assert_eq!(got, raw, "round trip of {:?}", raw);
+                    assert_eq!(got.chars().count(), want_len);
+                }
+                other => panic!("{:?} bound to {:?}", raw, other),
+            }
+        }
+    }
+
+    #[test]
+    fn a_json_number_too_big_for_an_i64_keeps_its_value() {
+        // `f64 as i64` saturates in Rust, so a preset written as a native
+        // JSON number of 1e20 came back as 9.22337e+18 -- i64::MAX --
+        // silently, and the model was built at that size.
+        use unbroken_test_platform::json::JsonValue;
+        let n = |v: f64| json_value_as_string(&JsonValue::Number(v));
+        assert_eq!(n(20.0), "20", "an ordinary integer still prints as one");
+        assert_eq!(n(-3.0), "-3");
+        assert_eq!(n(2.5), "2.5");
+        for big in [1e20_f64, -1e20, 1e300, 9.3e18] {
+            let got = n(big);
+            let back: f64 = got.parse().unwrap_or_else(|_| panic!("{} -> {:?}", big, got));
+            assert_eq!(back, big, "{} came back as {:?}", big, got);
+        }
+    }
+
+    #[test]
     fn string_override_cannot_smuggle_statements() {
         // A String parameter whose override value tries to close the string
         // early and append a statement must be REJECTED (not a single literal),
@@ -1034,7 +1226,6 @@ after = 99;\n"; // after the first module → not scanned
         let src = "name = \"a\"; // a label\ncube(1);";
         let attacks = [
             "\"a\"; cube(999); //",       // close early, append a call
-            "\"a\" + \"b\"",                // concatenation is not a literal
             "\"a\"\ncube(9); x=\"",       // embedded newline
             "\"\\\"",                        // the closing quote is escaped → unterminated
         ];
@@ -1048,7 +1239,15 @@ after = 99;\n"; // after the first module → not scanned
         // A legitimate string with an escaped interior quote IS accepted.
         let ok = apply_overrides(src, &[("name".to_string(), "\"a\\\"b\"".to_string())]);
         assert!(ok.contains("name = \"a\\\"b\";"), "valid escaped quote applied: {ok}");
-        // classify_literal itself no longer mistakes a concatenation for a literal.
+        // `"a" + "b"` is not a literal and never was, but it IS one
+        // expression, and `-D` takes an expression -- so it is applied, as
+        // itself. Whether the language gives `+` a meaning on two strings is
+        // the evaluator's business, and it says so out loud.
+        let cat = apply_overrides(src, &[("name".to_string(), "\"a\" + \"b\"".to_string())]);
+        assert!(cat.contains("name = \"a\" + \"b\";"), "applied as written: {cat}");
+        assert!(!cat.contains("cube(999)"));
+        // classify_literal itself still does not mistake a concatenation for
+        // a literal -- that is what keeps the KIND check honest.
         assert!(classify_literal("\"a\" + \"b\"").is_none());
         assert_eq!(classify_literal("\"round\"").unwrap().0, Kind::String);
         assert_eq!(classify_literal("\"\"").unwrap().0, Kind::String); // empty string ok
