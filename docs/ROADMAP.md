@@ -78,7 +78,17 @@ the boolean touches it or not, and the cost turns vertical with how
 deeply the parts interpenetrate — measured on this corpus, 16k triangles
 merge in seconds while 34k of a densely crossing hull took 299s and came
 out 33x larger. Reducing that inflation is the work that would raise the
-budget. `hull` is a
+budget, and the same work would lift a second limit: the splitter is
+chosen from the operand's own FACE planes, and on a CONVEX solid every
+face plane is a supporting plane, so no candidate can halve the set and
+the tree runs one node deep per facet. `sphere(r = 10, $fn = 91)` —
+8,368 facets — reaches `MAX_BSP_DEPTH` and comes back approximated with
+a warning, and the identical sphere at r = 0.01 reaches it in exactly the
+same place, so this is about facet count and not coordinate magnitude.
+Admitting non-face splitters (an axis-aligned median split is the
+obvious one) would fix the depth, but it is not a local change: a
+first attempt corrupted six boolean results, because a cube is convex
+too and the fallback then fires almost everywhere. `hull` is a
 from-scratch incremental 3D convex hull. `minkowski` is exact for convex
 operands (hull of pairwise vertex sums, the dominant rounding use),
 over-approximates concave ones with a warning, and caps the pairwise

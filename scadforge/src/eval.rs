@@ -381,14 +381,25 @@ fn evaluate_inner(
     }
     ctx.out.shapes.extend(shapes);
     // A BSP build that hit its no-progress guard or depth cap produced an
-    // approximate — at extreme coordinates, genuinely open — mesh. The guards
-    // are there so pathological input cannot abort the process, but handing
-    // back an open mesh without saying so is its own defect.
+    // approximate — sometimes genuinely open — mesh. The guards are there so
+    // pathological input cannot abort the process, but handing back an open
+    // mesh without saying so is its own defect.
+    //
+    // The line used to blame coordinate magnitude and prescribe moving the
+    // model nearer the origin or working at a smaller scale. That is not what
+    // triggers it: the commonest cause is a CONVEX operand with many facets,
+    // where every face plane is a supporting plane, so no candidate splitter
+    // can halve the set and the tree runs one node deep per facet until it
+    // hits the cap. `sphere(r = 10, $fn = 91)` reaches it; the identical
+    // sphere at r = 0.01 reaches it in exactly the same place, which is the
+    // proof that the remedy the message prescribed did nothing at all. The
+    // remedy that does work is fewer facets, and it is worth saying which
+    // number to turn down.
     if csg::take_degraded() {
         ctx.warn(
-            "the boolean kernel could not partition cleanly at these coordinate \
-             magnitudes and approximated the result; the mesh may not be watertight \
-             (move the model nearer the origin, or work at a smaller scale)",
+            "the boolean kernel ran out of tree depth on this design and approximated \
+             the result; the mesh may not be watertight (a smooth solid with very many \
+             facets is the usual cause — try a lower $fn)",
         );
     }
     // The root frame was never closed (nothing to close it into); take it
