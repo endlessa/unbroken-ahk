@@ -103,6 +103,12 @@ function Nout(lam, mu, th) =
              cosh_(lam)*sin(mu)*sin(th),
             -sinh_(lam)*cos(mu) ] ) v/norm(v);
 
+// Faces are wound so the RIGHT-HAND normal points INTO the solid, which
+// is the convention polyhedron() takes: a face is listed clockwise as
+// seen from outside. Wound the other way the solid is inside-out --
+// which renders identically, because shading uses |n|, and then quietly
+// ruins every boolean it touches. It cost three models before it showed.
+
 // ---- a solid of revolution whose profile ends on the axis -----------
 module revolve(prof, n, conv = 6) {
     M = len(prof);
@@ -116,10 +122,10 @@ module revolve(prof, n, conv = 6) {
     polyhedron(
       points = pts,
       faces = concat(
-        [ for (j = [0:n-1]) [ 0, 1 + (j+1)%n, 1 + j ] ],
+        [ for (j = [0:n-1]) [ 0, 1 + j, 1 + (j+1)%n ] ],
         [ for (i = [1 : M-3]) for (j = [0:n-1])
-            [ 1+(i-1)*n+j, 1+(i-1)*n+(j+1)%n, 1+i*n+(j+1)%n, 1+i*n+j ] ],
-        [ for (j = [0:n-1]) [ TOP, 1+(M-3)*n+j, 1+(M-3)*n+(j+1)%n ] ]),
+            [ 1+(i-1)*n+j, 1+i*n+j, 1+i*n+(j+1)%n, 1+(i-1)*n+(j+1)%n ] ],
+        [ for (j = [0:n-1]) [ TOP, 1+(M-3)*n+(j+1)%n, 1+(M-3)*n+j ] ]),
       convexity = conv);
 }
 
@@ -191,9 +197,9 @@ module tube(l, th0) {
     polyhedron(points = pts,
       faces = concat(
         [ for (u = [0:MU_-1]) for (v = [0:NC-1])
-            [ u*NC+v, u*NC+(v+1)%NC, (u+1)*NC+(v+1)%NC, (u+1)*NC+v ] ],
-        [ for (v = [0:NC-1]) [ B0, v, (v+1)%NC ] ],
-        [ for (v = [0:NC-1]) [ B1, MU_*NC + (v+1)%NC, MU_*NC + v ] ]),
+            [ u*NC+v, (u+1)*NC+v, (u+1)*NC+(v+1)%NC, u*NC+(v+1)%NC ] ],
+        [ for (v = [0:NC-1]) [ B0, (v+1)%NC, v ] ],
+        [ for (v = [0:NC-1]) [ B1, MU_*NC + v, MU_*NC + (v+1)%NC ] ]),
       convexity = 4);
 }
 

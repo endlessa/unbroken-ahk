@@ -115,6 +115,12 @@ function sum(v, a = 0, b = -1) =
 function centroid(p) =
   let( n = len(p) ) [ for (k = [0:2]) sum([ for (q = p) q[k] ])/n ];
 
+// Faces are wound so the RIGHT-HAND normal points INTO the solid, which
+// is the convention polyhedron() takes: a face is listed clockwise as
+// seen from outside. Wound the other way the solid is inside-out --
+// which renders identically, because shading uses |n|, and then quietly
+// ruins every boolean it touches. It cost three models before it showed.
+
 // ---- a ring grid, closed into a solid ------------------------------
 module shell(grid, conv = 6) {
     MU = len(grid) - 1;
@@ -126,9 +132,9 @@ module shell(grid, conv = 6) {
       points = pts,
       faces = concat(
         [ for (u = [0:MU-1]) for (v = [0:MV-1])
-            [ u*MV + v, u*MV + (v+1)%MV, (u+1)*MV + (v+1)%MV, (u+1)*MV + v ] ],
-        [ for (v = [0:MV-1]) [ B0, v, (v+1)%MV ] ],
-        [ for (v = [0:MV-1]) [ B1, MU*MV + (v+1)%MV, MU*MV + v ] ]),
+            [ u*MV + v, (u+1)*MV + v, (u+1)*MV + (v+1)%MV, u*MV + (v+1)%MV ] ],
+        [ for (v = [0:MV-1]) [ B0, (v+1)%MV, v ] ],
+        [ for (v = [0:MV-1]) [ B1, MU*MV + v, MU*MV + (v+1)%MV ] ]),
       convexity = conv );
 }
 
