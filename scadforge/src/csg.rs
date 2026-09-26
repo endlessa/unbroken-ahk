@@ -601,16 +601,7 @@ fn reduce_pairwise(mut items: Vec<Mesh>, op: fn() -> Op) -> Mesh {
         let mut next = Vec::with_capacity(items.len().div_ceil(2));
         let mut i = 0;
         while i + 1 < items.len() {
-            // Disjoint operands of a UNION need no boolean at all (see
-            // `boxes_overlap`). Difference and intersection have their own
-            // empty-operand identities and are left alone.
-            next.push(
-                if matches!(op(), Op::Union) && !boxes_overlap(&items[i], &items[i + 1]) {
-                    concat(&items[i], &items[i + 1])
-                } else {
-                    boolean(&items[i], &items[i + 1], op())
-                },
-            );
+            next.push(boolean(&items[i], &items[i + 1], op()));
             i += 2;
         }
         if i < items.len() {
@@ -619,6 +610,149 @@ fn reduce_pairwise(mut items: Vec<Mesh>, op: fn() -> Op) -> Mesh {
         items = next;
     }
     items.into_iter().next().unwrap()
+}
+
+/// How far a merged volume may fall outside the bounds before the merge is
+/// judged to have failed. A boolean re-tessellates everything it touches, so
+/// the volume is arrived at by a different sum of different triangles and
+/// will not match to the last bit; a tenth of a percent is far above that
+/// error and far below any real loss, which runs to halves and tenths.
+const UNION_SLACK: f64 = 1e-3;
+
+/// A partly-reduced union, carrying what is KNOWN about the volume the true
+/// union of everything underneath it encloses.
+///
+/// The bounds are the point. A union contains each of its operands, so it
+/// cannot enclose less than the larger of them; and it is covered by them
+/// together, so it cannot enclose more than their sum. Both hold for any
+/// union whatever -- no oracle, no reference implementation, one pass over
+/// the triangles each -- and between them they catch a boolean that has gone
+/// wrong in either direction.
+///
+/// Carrying the bounds down the reduction is what makes them bite. Checking
+/// only the finished union against the largest single part is far too weak:
+/// a heart of eleven shells lost a third of itself -- 168,222 mm^3 down to
+/// 135,556 -- when the aorta was merged in, and the finished mesh still sat
+/// comfortably above the 123,005 of its largest part, so nothing fired. A
+/// successful merge here REPLACES the bounds with what it measured, so the
+/// next step up is held to what the last one actually achieved.
+struct Bounded {
+    mesh: Mesh,
+    /// Volume the geometry underneath is known to enclose at least.
+    lo: f64,
+    /// ...and at most.
+    hi: f64,
+}
+
+impl Bounded {
+    fn leaf(mesh: Mesh) -> Bounded {
+        // An inside-out operand still encloses |v|; it is only the sign that
+        // is wrong. Taking the magnitude for the ceiling keeps the upper
+        // bound honest, while the floor stays at zero because a solid wound
+        // the wrong way cannot be claimed to contain anything.
+        let v = mesh.signed_volume();
+        Bounded { mesh, lo: v.max(0.0), hi: v.abs() }
+    }
+}
+
+thread_local! {
+    /// Pairwise unions that had to fall back to concatenation, and unions
+    /// that came out right only after swapping the operands. Read and
+    /// cleared by `take_union_trouble`.
+    static UNION_TROUBLE: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// (fell back to concatenation, rescued by swapping the operands) since the
+/// last call, which this clears.
+pub fn take_union_trouble() -> (usize, usize) {
+    UNION_TROUBLE.with(|c| c.replace((0, 0)))
+}
+
+fn note_union(fallback: bool) {
+    UNION_TROUBLE.with(|c| {
+        let (f, s) = c.get();
+        c.set(if fallback { (f + 1, s) } else { (f, s + 1) });
+    });
+}
+
+fn union_reduce(mut items: Vec<Bounded>) -> Mesh {
+    if items.is_empty() {
+        return Mesh::empty();
+    }
+    while items.len() > 1 {
+        let mut next = Vec::with_capacity(items.len().div_ceil(2));
+        let mut it = items.into_iter();
+        while let Some(a) = it.next() {
+            match it.next() {
+                Some(b) => next.push(union_pair(a, b)),
+                None => next.push(a),
+            }
+        }
+        items = next;
+    }
+    items.into_iter().next().unwrap().mesh
+}
+
+fn union_pair(a: Bounded, b: Bounded) -> Bounded {
+    // Disjoint operands of a UNION need no boolean at all (see
+    // `boxes_overlap`), and their volumes simply add.
+    if !boxes_overlap(&a.mesh, &b.mesh) {
+        return Bounded {
+            mesh: concat(&a.mesh, &b.mesh),
+            lo: a.lo + b.lo,
+            hi: a.hi + b.hi,
+        };
+    }
+    let (lo, hi) = (a.lo.max(b.lo), a.hi + b.hi);
+    let holds = |m: &Mesh| {
+        let v = m.signed_volume();
+        v >= lo * (1.0 - UNION_SLACK) && v <= hi * (1.0 + UNION_SLACK) + UNION_SLACK
+    };
+
+    let merged = boolean(&a.mesh, &b.mesh, Op::Union);
+    if holds(&merged) {
+        let v = merged.signed_volume();
+        return Bounded { mesh: merged, lo: v, hi: v };
+    }
+    // A BSP is not symmetric in its operands: the first supplies the planes
+    // the second is cut by, so `a ∪ b` and `b ∪ a` are two different
+    // computations of the same answer, and one of them failing says nothing
+    // about the other. Trying the swap costs a second boolean only on the
+    // designs that needed it, and it rescues most of them.
+    let swapped = boolean(&b.mesh, &a.mesh, Op::Union);
+    if holds(&swapped) {
+        note_union(false);
+        let v = swapped.signed_volume();
+        return Bounded { mesh: swapped, lo: v, hi: v };
+    }
+    // Neither order stands. Concatenation is not a union -- the result
+    // self-intersects where the operands did -- but it is every triangle
+    // that went in, which is strictly better than a merge that dropped some
+    // of them, and the caller is told.
+    note_union(true);
+    // The warning can only say how many merges failed -- it has no name for
+    // the operands and no units, since the reduction runs in the normalised
+    // frame. This says which pair and by how much, which is what actually
+    // locates the offending shell. Volumes are in the working frame, so read
+    // them against each other, not as millimetres.
+    if std::env::var_os("SCADFORGE_UNION_TRACE").is_some() {
+        eprintln!(
+            "union fell back: a={} tris [{:.4}, {:.4}]  b={} tris [{:.4}, {:.4}]  \
+             merged {:.4}, swapped {:.4}, needed [{:.4}, {:.4}]",
+            a.mesh.tris.len(),
+            a.lo,
+            a.hi,
+            b.mesh.tris.len(),
+            b.lo,
+            b.hi,
+            merged.signed_volume(),
+            swapped.signed_volume(),
+            lo,
+            hi
+        );
+    }
+    Bounded { mesh: concat(&a.mesh, &b.mesh), lo, hi }
 }
 
 /// The working frame a boolean is solved in.
@@ -758,9 +892,13 @@ pub fn union_all(meshes: &[Mesh]) -> Mesh {
 }
 
 fn union_all_raw(meshes: &[Mesh]) -> Mesh {
-    let items: Vec<Mesh> =
-        meshes.iter().filter(|m| !m.positions.is_empty()).cloned().collect();
-    reduce_pairwise(items, || Op::Union)
+    union_reduce(
+        meshes
+            .iter()
+            .filter(|m| !m.positions.is_empty())
+            .map(|m| Bounded::leaf(m.clone()))
+            .collect(),
+    )
 }
 
 /// Do two meshes' bounding boxes overlap at all?
@@ -1236,6 +1374,50 @@ mod tests {
         assert!((signed_volume(&u).abs() - 1.5).abs() < 1e-6, "vol {}", signed_volume(&u));
         let (lo, hi) = bounds(&u);
         assert!((lo[0] - 0.0).abs() < 1e-9 && (hi[0] - 1.5).abs() < 1e-9);
+    }
+
+    /// The bounds a union has to satisfy, and the report when it cannot.
+    ///
+    /// Both are checkable without an oracle: a union contains each of its
+    /// operands, so it encloses at least the largest; and it is covered by
+    /// them together, so it encloses at most their sum. Checking only the
+    /// FINISHED union against the largest single operand is far too weak --
+    /// a heart of eleven shells lost a third of itself when the aorta was
+    /// merged in and still sat above its largest part -- so the bounds are
+    /// carried down the reduction and each pairwise step is held to what the
+    /// last one achieved.
+    #[test]
+    fn a_union_is_held_to_the_volume_bounds_it_must_satisfy() {
+        let at = |x: f64, y: f64| {
+            let mut c = geom::cube([1.0, 1.0, 1.0], false);
+            for p in &mut c.positions {
+                p[0] += x;
+                p[1] += y;
+            }
+            c
+        };
+        // A staircase of eight unit cubes, each overlapping the last by half.
+        // True volume: 1 + 7*0.5 = 4.5, and every intermediate step of the
+        // reduction has to be inside its own bounds to get there.
+        let stack: Vec<Mesh> = (0..8).map(|i| at(i as f64 * 0.5, 0.0)).collect();
+        let _ = take_union_trouble();
+        let u = union_all(&stack);
+        assert!((signed_volume(&u) - 4.5).abs() < 1e-6, "vol {}", signed_volume(&u));
+        assert_eq!(take_union_trouble(), (0, 0), "an ordinary union reports no trouble");
+
+        // Disjoint operands never reach a boolean at all, and their volumes
+        // simply add -- which is the one case where the upper bound is tight.
+        let apart: Vec<Mesh> = (0..8).map(|i| at(i as f64 * 4.0, 0.0)).collect();
+        let u = union_all(&apart);
+        assert!((signed_volume(&u) - 8.0).abs() < 1e-9, "vol {}", signed_volume(&u));
+        assert_eq!(take_union_trouble(), (0, 0));
+
+        // The floor is the point: whatever else a union does, it may not come
+        // back holding less than one of the things put into it.
+        let mixed = vec![geom::cube([4.0, 4.0, 4.0], true), at(0.0, 0.0), at(0.25, 0.25)];
+        let biggest = mixed.iter().map(|m| signed_volume(m)).fold(0.0, f64::max);
+        let u = union_all(&mixed);
+        assert!(signed_volume(&u) >= biggest * (1.0 - 1e-6), "{} < {biggest}", signed_volume(&u));
     }
 
     #[test]

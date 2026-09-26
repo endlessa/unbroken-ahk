@@ -402,6 +402,19 @@ fn evaluate_inner(
              facets is the usual cause — try a lower $fn)",
         );
     }
+    // Unions that could not be made to satisfy their own volume bounds. The
+    // geometry is all still there -- the pair was concatenated rather than
+    // merged -- but where they overlap the result self-intersects, so the
+    // design is worth saying something about rather than shipping quietly.
+    let (unmerged, _) = csg::take_union_trouble();
+    if unmerged > 0 {
+        ctx.warn(&format!(
+            "{unmerged} union(s) came back enclosing less than what went into them, in \
+             either operand order, so those operands were left un-merged and the \
+             result self-intersects where they meet (solids that touch exactly, \
+             rather than overlapping, are the usual cause)"
+        ));
+    }
     // The root frame was never closed (nothing to close it into); take it
     // directly as the tree's `group()` root.
     if let Some(st) = &mut ctx.csg {
@@ -3411,7 +3424,7 @@ pub const MAX_UNION_EXPORT_TRIS: usize = 25_000;
 #[derive(Clone, Copy)]
 pub enum UnionNote {
     Budget(usize),
-    Lost { got: f64, want: f64 },
+    Fallback(usize),
 }
 
 fn union_note(set: Option<UnionNote>) -> Option<UnionNote> {
@@ -3479,27 +3492,22 @@ pub fn export_mesh(out: &EvalOutput) -> Result<Mesh, String> {
     let (combined, note) = if total > MAX_UNION_EXPORT_TRIS && overlapping(&parts) {
         (concat_all(&parts), Some(UnionNote::Budget(total)))
     } else {
-        // A union CONTAINS each of its operands, so the solid it encloses
-        // cannot be smaller than the largest one that went in. That is true
-        // of any union whatever, needs no oracle, and costs one pass over
-        // the triangles -- and it is the only thing standing between a
-        // boolean that quietly fails and a file the user ships.
+        // The merge itself is guarded: `csg::union_all` holds every pairwise
+        // step to the volume bounds a union has to satisfy, retries the
+        // failures with the operands swapped, and concatenates the pair only
+        // when neither order stands. Nothing to check again here -- only to
+        // report, because a shell left un-merged is a self-intersection in
+        // the exported file and the user should hear about it.
         //
-        // It does fail. Many thin shells that touch or interleave are the
-        // case the BSP handles worst, and when it goes wrong it does not
-        // error: a 25,000 triangle assembly of chambers and vessels merged
-        // to a tenth of its own volume, and a building merged to a
-        // three-hundredth, both silently. Caught here, the merge is thrown
-        // away and the shells are concatenated instead -- which is what the
-        // budget path already does, and is at least the geometry that went
-        // in.
+        // It does fail. Thin shells that touch or interleave are the case
+        // the BSP handles worst, and when it goes wrong it does not error: a
+        // 25,000 triangle assembly of chambers and vessels merged to a tenth
+        // of its own volume, silently.
+        csg::take_union_trouble();
         let merged = csg::union_all(&parts);
-        let biggest = parts.iter().map(|m| m.signed_volume()).fold(0.0, f64::max);
-        let got = merged.signed_volume();
-        if biggest > 0.0 && got < biggest * 0.999 {
-            (concat_all(&parts), Some(UnionNote::Lost { got, want: biggest }))
-        } else {
-            (merged, None)
+        match csg::take_union_trouble() {
+            (0, _) => (merged, None),
+            (n, _) => (merged, Some(UnionNote::Fallback(n))),
         }
     };
     if let Some(n) = note {
@@ -3701,14 +3709,14 @@ pub fn render_export_bytes_reporting(
             fmt_num(n as f64),
             fmt_num(MAX_UNION_EXPORT_TRIS as f64)
         ),
-        Some(UnionNote::Lost { got, want }) => format!(
-            "{}WARNING: the export-time union came back enclosing {} where one of \
-             its own parts encloses {}, so it lost geometry; the shells were left \
-             separate instead. Solids that touch exactly, rather than overlapping, \
-             are the usual cause.\n",
+        Some(UnionNote::Fallback(n)) => format!(
+            "{}WARNING: {} of the export-time merges came back enclosing less than \
+             what went into them, in either operand order, so those shells were \
+             left separate; the exported mesh self-intersects where they meet. \
+             Solids that touch exactly, rather than overlapping, are the usual \
+             cause.\n",
             console,
-            fmt_num(got),
-            fmt_num(want)
+            fmt_num(n as f64)
         ),
         None => console,
     };
