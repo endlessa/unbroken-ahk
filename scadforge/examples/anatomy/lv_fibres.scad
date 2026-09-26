@@ -198,8 +198,8 @@ module tube(l, th0) {
       faces = concat(
         [ for (u = [0:MU_-1]) for (v = [0:NC-1])
             [ u*NC+v, (u+1)*NC+v, (u+1)*NC+(v+1)%NC, u*NC+(v+1)%NC ] ],
-        [ for (v = [0:NC-1]) [ B0, (v+1)%NC, v ] ],
-        [ for (v = [0:NC-1]) [ B1, MU_*NC + v, MU_*NC + (v+1)%NC ] ]),
+        [ for (v = [0:NC-1]) [ B0, v, (v+1)%NC ] ],
+        [ for (v = [0:NC-1]) [ B1, MU_*NC + (v+1)%NC, MU_*NC + v ] ]),
       convexity = 4);
 }
 

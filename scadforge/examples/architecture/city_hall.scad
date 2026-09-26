@@ -133,8 +133,8 @@ module shell(grid, conv = 6) {
       faces = concat(
         [ for (u = [0:MU-1]) for (v = [0:MV-1])
             [ u*MV + v, (u+1)*MV + v, (u+1)*MV + (v+1)%MV, u*MV + (v+1)%MV ] ],
-        [ for (v = [0:MV-1]) [ B0, (v+1)%MV, v ] ],
-        [ for (v = [0:MV-1]) [ B1, MU*MV + v, MU*MV + (v+1)%MV ] ]),
+        [ for (v = [0:MV-1]) [ B0, v, (v+1)%MV ] ],
+        [ for (v = [0:MV-1]) [ B1, MU*MV + (v+1)%MV, MU*MV + v ] ]),
       convexity = conv );
 }
 

@@ -253,8 +253,8 @@ module gsweep(grid, cap0 = true, cap1 = true, conv = 10) {
       faces = concat(
         [ for (u=[0:NU-1]) for (v=[0:NV-1])
             [ u*NV + v, u*NV + (v+1)%NV, (u+1)*NV + (v+1)%NV, (u+1)*NV + v ] ],
-        cap0 ? [ for (v=[0:NV-1]) [ B0, v, (v+1)%NV ] ] : [],
-        cap1 ? [ for (v=[0:NV-1]) [ B1, NU*NV + (v+1)%NV, NU*NV + v ] ] : [] ),
+        cap0 ? [ for (v=[0:NV-1]) [ B0, (v+1)%NV, v ] ] : [],
+        cap1 ? [ for (v=[0:NV-1]) [ B1, NU*NV + v, NU*NV + (v+1)%NV ] ] : [] ),
       convexity = conv );
 }
 
