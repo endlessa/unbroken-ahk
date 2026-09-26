@@ -195,7 +195,19 @@ pub fn write_dxf_2d(regions: &[Poly2]) -> String {
 /// stitched into closed loops by endpoint matching, and CIRCLE / ARC are
 /// tessellated with the given fragment parameters. Unsupported entities are
 /// skipped with a warning. Z is ignored (2D only).
-pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) {
+///
+/// `layer` is `import(..., layer = "name")`: only entities carrying that
+/// layer name (group code 8) are read. The parameter was accepted by the
+/// evaluator and written into the .csg dump, and then had no effect
+/// whatsoever, because the reader had nowhere to put it.
+///
+/// Only the ENTITIES section is drawing. A DXF also carries TABLES (the
+/// symbol tables every real file has) and BLOCKS (block DEFINITIONS, which
+/// are drawn only where an INSERT references them). With no notion of
+/// sections, the reader took a LAYER table record for an unsupported
+/// *entity* and warned about it on every real-world file, and drew every
+/// block definition as though it were on the page.
+pub fn read_dxf(text: &str, layer: Option<&str>, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) {
     let mut warnings = Vec::new();
     let mut contours: Vec<Vec<[f64; 2]>> = Vec::new();
     let mut segs: Vec<([f64; 2], [f64; 2])> = Vec::new();
@@ -217,6 +229,9 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
     // A POLYLINE run in progress: its closed flag and the vertices gathered
     // from the VERTEX entities that follow it.
     let mut open_polyline: Option<(bool, Vec<[f64; 2]>)> = None;
+    // The section this entity is in. Only ENTITIES is drawing.
+    let mut section = String::new();
+    let mut blocks_held_geometry = false;
     // Walk entities: an entity starts at a `0` code naming its type.
     let mut i = 0;
     while i < pairs.len() {
@@ -239,6 +254,36 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
             i += 1;
         }
         let body = &pairs[start..i];
+        if etype == "SECTION" {
+            section = body
+                .iter()
+                .find(|(c, _)| *c == 2)
+                .map(|(_, v)| v.to_ascii_uppercase())
+                .unwrap_or_default();
+            continue;
+        }
+        if etype == "ENDSEC" {
+            section.clear();
+            continue;
+        }
+        if section != "ENTITIES" {
+            // A block DEFINITION is a stencil, not a drawing. Saying so beats
+            // drawing it, which is what used to happen, and beats silence,
+            // since a file whose page is nothing but INSERTs now imports
+            // empty.
+            if section == "BLOCKS" && !matches!(etype.as_str(), "BLOCK" | "ENDBLK" | "") {
+                blocks_held_geometry = true;
+            }
+            continue;
+        }
+        // `import(..., layer = "name")`: group code 8 carries an entity's
+        // layer. An entity on any other layer is not part of this import.
+        if let Some(want) = layer {
+            let on = body.iter().find(|(c, _)| *c == 8).map(|(_, v)| v.as_str());
+            if on != Some(want) {
+                continue;
+            }
+        }
         match etype.as_str() {
             "LINE" => {
                 let (mut x1, mut y1, mut x2, mut y2) = (0.0, 0.0, 0.0, 0.0);
@@ -367,8 +412,7 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
                 }
             }
             // A VERTEX outside any POLYLINE run has nothing to attach to.
-            "SECTION" | "ENDSEC" | "EOF" | "TABLE" | "ENDTAB" | "VERTEX"
-            | "BLOCK" | "ENDBLK" | "" => {}
+            "EOF" | "TABLE" | "ENDTAB" | "VERTEX" | "BLOCK" | "ENDBLK" | "" => {}
             other => {
                 unsupported.insert(other.to_string());
             }
@@ -382,6 +426,12 @@ pub fn read_dxf(text: &str, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec<String>) 
     contours.extend(stitch_loops(&segs));
     for u in &unsupported {
         warnings.push(format!("WARNING: DXF entity '{}' is not supported; skipped.", u));
+    }
+    if blocks_held_geometry {
+        warnings.push(
+            "WARNING: DXF block definitions are not supported; their contents are not drawn."
+                .to_string(),
+        );
     }
     (Poly2::new(contours), warnings)
 }
@@ -424,6 +474,11 @@ fn stitch_loops(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
     }
     let ends = |s: &([f64; 2], [f64; 2]), e: usize| if e == 0 { (s.0, s.1) } else { (s.1, s.0) };
     let mut used = vec![false; segs.len()];
+    // Segments the CURRENT walk has taken, stamped with the walk's number so
+    // the marks need no clearing between walks.
+    let mut walking = vec![0u32; segs.len()];
+    let mut walk_no = 0u32;
+    let mut taken: Vec<usize> = Vec::new();
     let mut loops = Vec::new();
     for start in 0..segs.len() {
         if used[start] {
@@ -434,8 +489,11 @@ fn stitch_loops(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
         let mut cur = start;
         let mut from_end = 0usize;
         let mut ok = false;
+        walk_no += 1;
+        taken.clear();
         for _ in 0..segs.len() + 1 {
-            used[cur] = true;
+            walking[cur] = walk_no;
+            taken.push(cur);
             let (_, tail) = ends(&segs[cur], from_end);
             loop_pts.push(tail);
             if key(tail) == key(a0) {
@@ -443,9 +501,10 @@ fn stitch_loops(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
                 ok = loop_pts.len() >= 3;
                 break;
             }
-            // find an unused segment continuing from `tail`
+            // find a segment continuing from `tail` that is neither already
+            // committed to a finished loop nor already taken by THIS walk
             let next = adj.get(&key(tail)).and_then(|cands| {
-                cands.iter().find(|&&(si, _)| !used[si]).copied()
+                cands.iter().find(|&&(si, _)| !used[si] && walking[si] != walk_no).copied()
             });
             match next {
                 Some((si, e)) => {
@@ -455,7 +514,16 @@ fn stitch_loops(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
                 None => break, // open chain — dropped
             }
         }
+        // A walk only consumes its segments if it CLOSED. It used to mark
+        // them as it entered them and never give them back, so one stray LINE
+        // touching a corner of a valid square could walk out along the stray,
+        // dead-end, and leave an edge of the square marked consumed -- after
+        // which the square could never close and the whole outline vanished,
+        // silently, from a file that was perfectly good apart from the stray.
         if ok {
+            for &t in &taken {
+                used[t] = true;
+            }
             loops.push(loop_pts);
         }
     }
@@ -1407,7 +1475,7 @@ mod tests {
             format!("0\nSECTION\n2\nENTITIES\n0\nARC\n8\n0\n10\n0\n20\n0\n40\n10\n50\n0\n51\n{sweep}\n0\nENDSEC\n0\nEOF\n")
         };
         for sweep in ["1e18", "1000000", "360", "90", "1e308", "-1e18"] {
-            let (poly, warns) = read_dxf(&arc(sweep), 0.0, 12.0, 2.0);
+            let (poly, warns) = read_dxf(&arc(sweep), None, 0.0, 12.0, 2.0);
             let pts: usize = poly.contours.iter().map(|c| c.len()).sum();
             assert!(
                 pts <= crate::geom::MAX_FRAGMENTS as usize + 8,
@@ -1471,7 +1539,7 @@ mod tests {
 
         // ...and the DXF round trip through our own reader preserves the area
         // instead of cutting the overlap out of it.
-        let (back, warns) = read_dxf(&dxf, 0.0, 12.0, 2.0);
+        let (back, warns) = read_dxf(&dxf, None, 0.0, 12.0, 2.0);
         assert!(warns.is_empty(), "{warns:?}");
         let got = region_area(&back);
         assert!((got - want).abs() / want < 1e-6, "DXF round trip lost ink: {want} -> {got}");
@@ -1482,7 +1550,7 @@ mod tests {
             vec![[3.0, 3.0], [3.0, 7.0], [7.0, 7.0], [7.0, 3.0]],
         ]);
         assert_eq!(write_dxf_2d(std::slice::from_ref(&ring)).matches("LWPOLYLINE").count(), 2);
-        assert!((region_area(&read_dxf(&write_dxf_2d(std::slice::from_ref(&ring)), 0.0, 12.0, 2.0).0)
+        assert!((region_area(&read_dxf(&write_dxf_2d(std::slice::from_ref(&ring)), None, 0.0, 12.0, 2.0).0)
             - 84.0)
             .abs()
             < 1e-6);
@@ -1557,7 +1625,7 @@ mod tests {
         let closed = format!("{}0\nSEQEND\n0\nENDSEC\n0\nEOF\n", dxf);
         for text in [closed.as_str(), dxf.as_str()] {
             // The second case omits SEQEND: end-of-file must still flush it.
-            let (poly, warns) = read_dxf(text, 0.0, 12.0, 2.0);
+            let (poly, warns) = read_dxf(text, None, 0.0, 12.0, 2.0);
             assert_eq!(poly.contours.len(), 1, "one rectangle");
             assert_eq!(poly.contours[0].len(), 4);
             let a = crate::poly2::signed_area2(&poly.contours[0]).abs() / 2.0;
@@ -1766,7 +1834,7 @@ mod tests {
         ]);
         let dxf = write_dxf_2d(std::slice::from_ref(&ring));
         assert!(dxf.contains("LWPOLYLINE") && dxf.contains("EOF"));
-        let (back, warns) = read_dxf(&dxf, 0.0, 12.0, 2.0);
+        let (back, warns) = read_dxf(&dxf, None, 0.0, 12.0, 2.0);
         assert!(warns.is_empty());
         assert_eq!(back.contours.len(), 2, "outer + hole");
         assert!((area2(&back) - 84.0).abs() < 1e-6, "area {}", area2(&back));
@@ -1783,7 +1851,7 @@ mod tests {
             0\nCIRCLE\n10\n20\n20\n0\n40\n3\n\
             0\nSPLINE\n\
             0\nENDSEC\n0\nEOF\n";
-        let (poly, warns) = read_dxf(dxf, 32.0, 12.0, 2.0);
+        let (poly, warns) = read_dxf(dxf, None, 32.0, 12.0, 2.0);
         assert_eq!(poly.contours.len(), 2, "the square loop + the circle");
         // area = 25 (square) + ~π·9 (circle) ≈ 53.3
         assert!((area2(&poly) - (25.0 + std::f64::consts::PI * 9.0)).abs() < 0.5, "area {}", area2(&poly));
@@ -1962,6 +2030,82 @@ mod tests {
         // A good face still reads, and so does a trailing per-face colour.
         assert_eq!(read_off(&format!("{}3 0 1 2\n", head)).unwrap().tris.len(), 1);
         assert_eq!(read_off(&format!("{}3 0 1 2 255 0 0\n", head)).unwrap().tris.len(), 1);
+    }
+
+
+    #[test]
+    fn a_dxf_is_read_from_its_entities_section_and_its_chosen_layer() {
+        let sec = |name: &str, body: &str| format!("0\nSECTION\n2\n{}\n{}0\nENDSEC\n", name, body);
+        let square = |layer: &str, x: f64| {
+            let l = if layer.is_empty() { String::new() } else { format!("8\n{}\n", layer) };
+            format!(
+                "0\nLWPOLYLINE\n{}90\n4\n70\n1\n10\n{}\n20\n0\n10\n{}\n20\n0\n\
+                 10\n{}\n20\n10\n10\n{}\n20\n10\n",
+                l, x, x + 10.0, x + 10.0, x
+            )
+        };
+
+        // Only ENTITIES is drawing. A BLOCKS section holds block DEFINITIONS,
+        // which are stencils an INSERT places; they used to be drawn on the
+        // page. And a TABLES record -- every real DXF carries a layer table --
+        // was reported as an unsupported ENTITY.
+        let doc = format!(
+            "{}{}{}0\nEOF\n",
+            sec("TABLES", "0\nTABLE\n2\nLAYER\n0\nLAYER\n2\n0\n0\nENDTAB\n"),
+            sec("BLOCKS", &format!("0\nBLOCK\n2\nM\n{}0\nENDBLK\n", square("", 100.0))),
+            sec("ENTITIES", &format!("{}{}", square("OUTLINE", 0.0), square("HOLES", 20.0))),
+        );
+        let (all, warns) = read_dxf(&doc, None, 0.0, 12.0, 2.0);
+        assert!(
+            !warns.iter().any(|w| w.contains("'LAYER'")),
+            "a table record is not an entity: {:?}",
+            warns
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("block definitions are not supported")),
+            "a skipped block definition says so: {:?}",
+            warns
+        );
+        assert_eq!(all.contours.len(), 2, "the two drawn squares, not the block's");
+        let far = all.contours.iter().flatten().any(|p| p[0] > 50.0);
+        assert!(!far, "the block definition at x=100 is not on the page");
+
+        // layer= picks one of them. It was accepted, written into the .csg
+        // dump, and then ignored entirely.
+        let (one, _) = read_dxf(&doc, Some("OUTLINE"), 0.0, 12.0, 2.0);
+        assert_eq!(one.contours.len(), 1);
+        assert!(one.contours[0].iter().all(|p| p[0] <= 10.0), "{:?}", one.contours[0]);
+        let (other, _) = read_dxf(&doc, Some("HOLES"), 0.0, 12.0, 2.0);
+        assert_eq!(other.contours.len(), 1);
+        assert!(other.contours[0].iter().all(|p| p[0] >= 20.0), "{:?}", other.contours[0]);
+        assert_eq!(read_dxf(&doc, Some("NOSUCH"), 0.0, 12.0, 2.0).0.contours.len(), 0);
+    }
+
+    #[test]
+    fn a_stray_line_does_not_consume_the_outline_it_touches() {
+        // The stitcher marked a segment consumed as it walked INTO it and
+        // never gave it back when the walk dead-ended. So a single stray LINE
+        // hanging off a corner of a valid square could be walked first, take
+        // an edge of the square with it, and leave the square unable to
+        // close -- the whole outline vanishing, silently, from a file that
+        // was good apart from the stray.
+        let line = |x1: f64, y1: f64, x2: f64, y2: f64| {
+            format!("0\nLINE\n10\n{}\n20\n{}\n11\n{}\n21\n{}\n", x1, y1, x2, y2)
+        };
+        let mut body = String::new();
+        body.push_str(&line(0.0, 0.0, 10.0, 0.0));
+        body.push_str(&line(10.0, 10.0, 20.0, 20.0)); // the stray, off a corner
+        body.push_str(&line(10.0, 0.0, 10.0, 10.0));
+        body.push_str(&line(10.0, 10.0, 0.0, 10.0));
+        body.push_str(&line(0.0, 10.0, 0.0, 0.0));
+        let doc = format!("0\nSECTION\n2\nENTITIES\n{}0\nENDSEC\n0\nEOF\n", body);
+        let (poly, _) = read_dxf(&doc, None, 0.0, 12.0, 2.0);
+        assert_eq!(poly.contours.len(), 1, "the square survives the stray");
+        assert!(
+            (region_area(&poly) - 100.0).abs() < 1e-9,
+            "and it is the whole square: area {}",
+            region_area(&poly)
+        );
     }
 
 }

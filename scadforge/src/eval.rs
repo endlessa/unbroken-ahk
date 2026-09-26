@@ -2093,7 +2093,11 @@ fn call_builtin_module(
                     frags,
                 ));
             }
-            import_file(&path, dpi, ctx)
+            let layer = bound.get("layer").and_then(|v| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            });
+            import_file(&path, layer.as_deref(), dpi, ctx)
         }
         "projection" => {
             let groups = eval_children_grouped(children, scope, ctx);
@@ -2362,7 +2366,12 @@ fn call_builtin_module(
                 Some(Value::Str(s)) => s.clone(),
                 _ => return Vec::new(),
             };
-            let poly = import_file(&path, 96.0, ctx).into_iter().find_map(|s| s.outline);
+            let layer = bound.get("layer").and_then(|v| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            });
+            let poly =
+                import_file(&path, layer.as_deref(), 96.0, ctx).into_iter().find_map(|s| s.outline);
             let poly = match poly {
                 Some(p) if !p.is_empty() => p,
                 _ => return Vec::new(),
@@ -3240,7 +3249,7 @@ fn sandboxed_path(base: &std::path::Path, path: &str) -> Option<std::path::PathB
     }
 }
 
-fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
+fn import_file(path: &str, layer: Option<&str>, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     // DXF and SVG are 2D vector formats — they import as a 2D shape, not a mesh.
     // Their curve tessellation follows the $fn/$fa/$fs in scope at the call.
@@ -3264,7 +3273,7 @@ fn import_file(path: &str, dpi: f64, ctx: &mut Ctx) -> Vec<Shape> {
         let (poly, warns) = if ext == "svg" {
             crate::svg::read_svg(&text, dpi, fn_, fa, fs)
         } else {
-            io::read_dxf(&text, fn_, fa, fs)
+            io::read_dxf(&text, layer, fn_, fa, fs)
         };
         ctx.warn_all(warns);
         return Shape::flat(poly).into_iter().collect();
