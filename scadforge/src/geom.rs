@@ -145,6 +145,13 @@ impl Mesh {
                 && binary.is_finite()
                 && raw >= 1e-12
                 && text >= 1e-12
+                // The same 1e-12 applies to the f32 form, because that is
+                // the rule the READER applies to it: `triangle_normal` gives
+                // up below it and `read_stl` drops such a triangle on the way
+                // back in. Writing one the reader would refuse is a
+                // disagreement between two halves of this crate, whether or
+                // not any file has hit it yet.
+                && binary >= 1e-12
                 && binary >= floor
         };
         Mesh {

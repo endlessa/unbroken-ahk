@@ -108,7 +108,15 @@ for seed in range(lo, hi):
             failed.append((fmt, "could not re-export the re-import as ASCII STL"))
             continue
         n = tris_of(flat)
-        if n != base_tris:
+        # A single-precision format may legitimately lose a sliver on the way
+        # through: f32 rounding can make a triangle that was fine in f64 come
+        # out collinear at the writer's six decimals, and the export drops it
+        # rather than emit a facet with no normal. That is the same reason
+        # pass 1 is excluded from the fixed point above. The count is held
+        # exactly for the formats that store full precision, and loosely for
+        # the one that does not.
+        slack = max(4, base_tris // 1000) if fmt == "binstl" else 0
+        if abs(n - base_tris) > slack:
             failed.append((fmt, "%d triangles after the round trip, %d before"
                            % (n, base_tris)))
             continue
