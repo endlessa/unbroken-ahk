@@ -529,30 +529,78 @@ fn closedness_note(mesh: &Mesh) -> Option<String> {
         }
     }
     // An edge used ONCE is a boundary: the surface has a hole there, and that
-    // is exactly what "not closed" means. Nothing else is reported.
+    // is exactly what "not closed" means.
     //
-    // Two tempting stronger tests were tried and rejected on evidence. An
-    // edge used more than twice looked like non-manifoldness, but quads are
-    // fanned into triangles here and a quad that collapses at a pole leaves a
-    // zero-area flap whose edges double up legitimately. An edge whose two
-    // faces are wound the SAME way looked like an inversion, but welding by
-    // position merges vertices that a sweep placed separately -- a hull whose
-    // bow section closes to a point, say -- and faces that were distinct
-    // before the weld can end up sharing an edge in agreement. Eight of the
-    // twenty-four example models tripped that, all of them meshes whose
-    // volumes and silhouettes have been checked against independent oracles.
-    // Welding can close a seam; it can never open one, so the boundary count
-    // is the signal that survives it.
+    // An edge used more than twice is NOT reported. Quads are fanned into
+    // triangles here, and a quad that collapses at a pole leaves a zero-area
+    // flap whose edges legitimately double up.
     let holes = edges.values().filter(|(f, r)| f + r == 1).count();
-    if holes == 0 {
-        return None;
+    // Closed is not the same as consistently wound, and the difference is
+    // invisible until a boolean runs.
+    //
+    // A surface with a hole leaks. A surface whose two faces meet along an
+    // edge and traverse it the SAME way does not leak -- every edge is used
+    // twice, the parity test passes, the volume comes out near enough right
+    // and it renders correctly, because shading uses |n|. What it has is no
+    // consistent inside: the BSP asks "which side of this face is solid?"
+    // and gets opposite answers from neighbours. An aorta built this way,
+    // 576 triangles with 36 such edges and no holes at all, deleted a fifth
+    // of a 101,301-triangle heart when it was merged in, in either operand
+    // order.
+    //
+    // The test is made on the INDEX graph, before the weld, and that is the
+    // whole reason it can be made at all. Tried on the welded graph it fired
+    // on eight of the twenty-four example models, every one of them a sweep
+    // whose separately-placed vertices happen to coincide -- a hull closing
+    // to a point at the bow -- where welding brings two faces together that
+    // were never adjacent and they can agree by accident. Two faces sharing
+    // an INDEX edge were built adjacent on purpose, so their disagreement is
+    // the author's, not the weld's. Edges whose partner is only found after
+    // welding are simply not tested, which is conservative: this misses some
+    // real inversions rather than inventing any.
+    let mut by_index: HashMap<(u32, u32), (i32, i32)> = HashMap::new();
+    for t in &mesh.tris {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            if a == b {
+                continue;
+            }
+            let slot = by_index.entry(if a < b { (a, b) } else { (b, a) }).or_insert((0, 0));
+            if a < b {
+                slot.0 += 1;
+            } else {
+                slot.1 += 1;
+            }
+        }
     }
-    Some(format!(
-        "polyhedron: the given mesh is not closed ({} boundary edge{}); \
-         booleans and exports on it are undefined",
-        holes,
-        if holes == 1 { "" } else { "s" }
-    ))
+    let flipped =
+        by_index.values().filter(|(f, r)| (*f == 2 && *r == 0) || (*f == 0 && *r == 2)).count();
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    match (holes, flipped) {
+        (0, 0) => None,
+        (0, n) => Some(format!(
+            "polyhedron: the given mesh is closed but not consistently wound ({} edge{} \
+             where the two faces run the same way round rather than opposite ways); \
+             booleans on it are undefined and will silently lose geometry",
+            n,
+            plural(n)
+        )),
+        (h, 0) => Some(format!(
+            "polyhedron: the given mesh is not closed ({} boundary edge{}); \
+             booleans and exports on it are undefined",
+            h,
+            plural(h)
+        )),
+        (h, n) => Some(format!(
+            "polyhedron: the given mesh is not closed ({} boundary edge{}) and is not \
+             consistently wound ({} edge{} whose two faces run the same way round); \
+             booleans and exports on it are undefined",
+            h,
+            plural(h),
+            n,
+            plural(n)
+        )),
+    }
 }
 
 /// Axis-aligned bounding box of a mesh's vertices (None if empty).
@@ -783,12 +831,14 @@ mod tests {
         // A face missing leaves three edges with nothing on the other side.
         let w = tet(&[&[0, 2, 1], &[0, 1, 3], &[0, 3, 2]]);
         assert!(w.iter().any(|m| m.contains("not closed") && m.contains("3 boundary")), "{w:?}");
-        // A face wound the WRONG way is NOT reported: it leaves no boundary,
-        // and the stronger winding test that would catch it fires on ordinary
-        // swept meshes once vertices are welded by position (see the note in
-        // `closedness_note`). A missed inversion beats warning about eight of
-        // the example models.
-        assert!(tet(&[&[0, 2, 1], &[0, 1, 3], &[1, 2, 3], &[0, 2, 3]]).is_empty());
+        // A face wound the WRONG way leaves no boundary at all -- the parity
+        // test passes, the mesh renders correctly, and every boolean on it is
+        // undefined. Reported separately, and by name.
+        let w = tet(&[&[0, 2, 1], &[0, 1, 3], &[1, 2, 3], &[0, 2, 3]]);
+        assert!(
+            w.iter().any(|m| m.contains("not consistently wound") && m.contains("3 edges")),
+            "{w:?}"
+        );
 
         // Duplicate points close a seam as well as one point does: the
         // reference accepts them silently, so edges match by POSITION.
@@ -809,6 +859,43 @@ mod tests {
             "a quad that collapses at a pole fans into a zero-area flap whose edges \
              double up legitimately"
         );
+
+        // The winding test is made on the INDEX graph, which is what keeps it
+        // usable. Two faces that share no index but whose vertices coincide
+        // -- a sweep closing to a point, and the reason the welded form of
+        // this test fired on eight example models -- are not compared at all.
+        let bow = [
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+        ];
+        let split_seam = vec![vec![0, 2, 1], vec![4, 5, 3], vec![1, 2, 3], vec![0, 3, 2]];
+        let w = polyhedron(&bow, &split_seam).1;
+        assert!(
+            !w.iter().any(|m| m.contains("not consistently wound")),
+            "faces brought together only by the weld are not judged: {w:?}"
+        );
+    }
+
+    /// A closed, consistently wound cube says nothing -- the winding test must
+    /// not fire on the most ordinary mesh there is.
+    #[test]
+    fn a_well_wound_box_is_silent() {
+        let pts = [
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0],
+        ];
+        let faces: Vec<Vec<usize>> = vec![
+            vec![0, 1, 2, 3],
+            vec![4, 7, 6, 5],
+            vec![0, 4, 5, 1],
+            vec![1, 5, 6, 2],
+            vec![2, 6, 7, 3],
+            vec![3, 7, 4, 0],
+        ];
+        let (mesh, warnings) = polyhedron(&pts, &faces);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // ...and it is wound the way this kernel reads, so it encloses +1.
+        assert!((mesh.signed_volume() - 1.0).abs() < 1e-12, "{}", mesh.signed_volume());
     }
 
     /// The 2D fill sweep resolves crossings numerically, so two scanline
