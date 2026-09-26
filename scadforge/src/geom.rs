@@ -72,9 +72,10 @@ impl Mesh {
     /// The test is the writers' own resolution, not a magic number. The text
     /// formats print coordinates with `{:.6}`, so they land on a 1e-6 grid;
     /// binary STL stores f32, whose spacing near a coordinate is about
-    /// `|x| * f32::EPSILON`. On a grid of spacing `res` the thinnest triangle
-    /// that is still a triangle has `|cross| == res * res`, so anything below
-    /// that is collinear as written however it is written. Dropping it
+    /// `|x| * f32::EPSILON` -- so its step is per-axis, read off each axis's
+    /// own coordinates. On a grid of spacing `res` the thinnest triangle that
+    /// is still a triangle has `|cross| == res * res`, so anything below that
+    /// is collinear as written however it is written. Dropping it
     /// removes no surface -- volume and area over the whole corpus are
     /// unchanged to twelve significant digits -- and it happens ONCE, at the
     /// export funnel, so every format agrees on the triangle list.
@@ -99,19 +100,52 @@ impl Mesh {
                 self.positions[t[1] as usize],
                 self.positions[t[2] as usize],
             ];
-            let mag = pts.iter().flatten().fold(0.0f64, |m, c| m.max(c.abs()));
             // The text writers print `{:.6}`, landing on a 1e-6 grid; binary
             // STL stores f32. The vertices are SNAPPED before the test, not
             // just compared against the grid: rounding moves each corner by
             // up to half a step, which is itself enough to flatten a triangle
             // that was thin but real beforehand.
             let text = cross_on_grid(pts, |x| (x * 1e6).round() / 1e6);
-            let f32_res = (mag * f32::EPSILON as f64).max(f32::MIN_POSITIVE as f64);
             let binary = cross_on_grid(pts, |x| x as f32 as f64);
-            text.is_finite()
+            // f32's grid is not uniform the way the text one is -- its step
+            // is proportional to the magnitude it is near -- so the step has
+            // to be read off EACH AXIS separately. It used to come from the
+            // single largest coordinate of the triangle, over all three axes
+            // at once, which judged a triangle by an axis it is not thin
+            // along: a 0.1 x 0.1 end cap lifted to z = 1e6 was measured
+            // against z's step of 0.119 and deleted, though its own corners
+            // sit on x and y steps of 1.2e-8 and it is written out exactly by
+            // every format. A 0.1 x 0.1 x 100 post 1e6 from the origin came
+            // back as an open tube with both caps missing and a third of its
+            // volume gone, and a sphere far enough out vanished entirely --
+            // reported, untruthfully, as "Current top level object is empty".
+            //
+            // A cross component pairs two axes, so it lands on a grid of
+            // their two steps multiplied; the thinnest triangle that is still
+            // a triangle is the smallest of those three products. Comparing
+            // against that keeps the guard doing its real job -- dropping a
+            // triangle whose corners come out exactly collinear once written,
+            // which no reader can assign a normal to -- and makes it
+            // independent of where the model sits, which is what it always
+            // claimed to be.
+            let step = |axis: usize| {
+                let m = pts.iter().fold(0.0f64, |m, p| m.max(p[axis].abs()));
+                (m * f32::EPSILON as f64).max(f32::MIN_POSITIVE as f64)
+            };
+            let (sx, sy, sz) = (step(0), step(1), step(2));
+            let floor = (sx * sy).min(sy * sz).min(sz * sx);
+            // And the writers' own condition, which is about the triangle as
+            // the evaluator built it rather than as any grid renders it:
+            // `triangle_normal` gives up below |cross| = 1e-12 and writes
+            // `0 0 0`. The old magnitude-scaled floor happened to catch those
+            // too, so making that floor honest meant stating this separately.
+            let raw = cross_on_grid(pts, |x| x);
+            raw.is_finite()
+                && text.is_finite()
                 && binary.is_finite()
+                && raw >= 1e-12
                 && text >= 1e-12
-                && binary >= f32_res * f32_res
+                && binary >= floor
         };
         Mesh {
             positions: self.positions.clone(),
@@ -754,6 +788,53 @@ mod tests {
     /// significant digits. Every one of those exported as
     /// `facet normal 0 0 0` -- a facet whose normal the STL format requires
     /// and which no reader can recover from three collinear vertices.
+    #[test]
+    fn a_face_far_from_the_origin_is_judged_by_its_own_axes() {
+        // The f32 floor used to come from the single largest coordinate of
+        // the triangle, over all three axes at once. So a face that is thin
+        // along x and y was measured against z's step: a 0.1 x 0.1 x 100 post
+        // lifted to z = 1e6 lost BOTH end caps and exported as an open tube
+        // with a third of its volume missing, and a sphere far enough out
+        // vanished altogether -- reported as "Current top level object is
+        // empty", which it was not.
+        let at = |dz: f64| {
+            let mut m = cube([0.1, 0.1, 100.0], false);
+            for p in m.positions.iter_mut() {
+                p[2] += dz;
+            }
+            m
+        };
+        for dz in [0.0, 1e6, 1e7] {
+            let m = at(dz);
+            let clean = m.without_unrepresentable();
+            assert_eq!(clean.tris.len(), 12, "every face survives at z + {}", dz);
+            assert_eq!(
+                closedness_note(&clean),
+                None,
+                "and the solid is still closed at z + {}",
+                dz
+            );
+        }
+
+        // The guard still does its own job there: a triangle whose corners
+        // come out collinear is dropped wherever it sits, because no reader
+        // can assign it a normal.
+        let mut flat = cube([0.1, 0.1, 100.0], false);
+        for p in flat.positions.iter_mut() {
+            p[2] += 1e6;
+        }
+        let n = flat.positions.len() as u32;
+        flat.positions.push([0.0, 0.0, 1e6]);
+        flat.positions.push([0.05, 0.0, 1e6]);
+        flat.positions.push([0.1, 0.0, 1e6]);
+        flat.tris.push([n, n + 1, n + 2]);
+        assert_eq!(
+            flat.without_unrepresentable().tris.len(),
+            12,
+            "the collinear triangle goes, the twelve real ones stay"
+        );
+    }
+
     #[test]
     fn unrepresentable_slivers_leave_the_export() {
         // A unit cube plus one sliver whose two far corners are an ULP apart
