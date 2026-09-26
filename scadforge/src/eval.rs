@@ -5471,9 +5471,22 @@ impl Prng {
     }
 }
 
-/// Documented positional-parameter names for the builtin FUNCTIONS, so
-/// named arguments (rands(..., seed_value=7), search(..., index_col_num=1))
-/// resolve to the right slot instead of being dropped.
+/// Documented parameter names for the builtin FUNCTIONS, so named arguments
+/// (rands(..., seed_value=7), search(..., index_col_num=1)) resolve to the
+/// right slot instead of being dropped.
+///
+/// The reference declares a name for every one of these, and the table used
+/// to hold only the multi-argument ones -- so `atan2(y = 1, x = 1)` worked
+/// while `atan(x = 1)` warned about an unknown parameter and came back undef,
+/// which is the same mechanism refusing the same kind of call. The one-
+/// argument functions are listed too now, under the names the reference gives
+/// them: `x` for most of the maths, `degrees` for the three trig functions
+/// that take an angle, and the odd ones out (`norm(v)`, `ord(s)`,
+/// `len(value)`, `is_function(value)`) as written there.
+///
+/// The variadic ones -- str, chr, concat, min, max -- stay out: the reference
+/// spells their parameter "a, b, ...", which is a count rather than a name,
+/// and there is no slot for a named argument to land in.
 fn builtin_param_names(name: &str) -> &'static [&'static str] {
     match name {
         "atan2" => &["y", "x"],
@@ -5482,7 +5495,16 @@ fn builtin_param_names(name: &str) -> &'static [&'static str] {
         "search" => &["match_value", "string_or_vector", "num_returns_per_match", "index_col_num"],
         "lookup" => &["key", "table"],
         "rands" => &["min_value", "max_value", "value_count", "seed_value"],
-        "parent_module" => &["index"],
+        // The reference calls this one `n`; it was reading `index`, so the
+        // only spelling that worked was the positional one.
+        "parent_module" => &["n"],
+        "sin" | "cos" | "tan" => &["degrees"],
+        "abs" | "sign" | "asin" | "acos" | "atan" | "floor" | "ceil" | "round" | "ln" | "log"
+        | "exp" | "sqrt" | "is_undef" | "is_num" | "is_bool" | "is_string" | "is_list"
+        | "is_object" => &["x"],
+        "norm" => &["v"],
+        "ord" => &["s"],
+        "len" | "is_function" => &["value"],
         _ => &[],
     }
 }
@@ -7437,10 +7459,13 @@ mod tests {
         assert_eq!(echoes("echo(-[\"a\",\"b\"]);"), "ECHO: [undef, undef]");
 
         // "unknown named arguments warn and are ignored" — builtins with no
-        // parameter table dropped them in silence, so `len(value = [1,2])`
-        // returned undef with nothing to say.
-        assert!(said("echo(len(value = [1,2]));").contains("len: unknown parameter 'value' ignored"));
-        assert!(said("echo(abs(x = -3));").contains("abs: unknown parameter 'x' ignored"));
+        // parameter table dropped them in silence, so a named argument
+        // returned undef with nothing to say. The names below are ones the
+        // reference does NOT give these functions; the ones it does give
+        // (`len(value)`, `abs(x)`) now resolve, which
+        // `a_builtin_takes_its_documented_parameter_by_name` covers.
+        assert!(said("echo(len(vector = [1,2]));").contains("len: unknown parameter 'vector' ignored"));
+        assert!(said("echo(abs(magnitude = -3));").contains("abs: unknown parameter 'magnitude' ignored"));
         // $-named arguments are the documented exception.
         assert_eq!(warn_count("echo(abs(-3, $q = 1));"), 0);
         // A builtin that HAS a table still resolves its names.
@@ -9178,6 +9203,55 @@ mod tests {
              outer();",
         );
         assert_eq!(out.echoes, vec!["ECHO: \"inner\", \"outer\", 2"]);
+    }
+
+    #[test]
+    fn a_builtin_takes_its_documented_parameter_by_name() {
+        // Named arguments used to resolve for the multi-argument builtins
+        // only, so `atan2(y = 1, x = 1)` worked while `atan(x = 1)` warned
+        // about an unknown parameter and came back undef -- the same
+        // mechanism refusing the same kind of call. And parent_module's slot
+        // was spelled `index` while the reference calls it `n`, so the only
+        // spelling that worked there was the positional one.
+        for (call, want) in [
+            ("abs(x = -3)", 3.0),
+            ("sign(x = -3)", -1.0),
+            ("sin(degrees = 30)", 0.5),
+            ("cos(degrees = 60)", 0.5),
+            ("tan(degrees = 45)", 1.0),
+            ("floor(x = 2.7)", 2.0),
+            ("ceil(x = 2.1)", 3.0),
+            ("round(x = 2.5)", 3.0),
+            ("sqrt(x = 9)", 3.0),
+            ("exp(x = 0)", 1.0),
+            ("ln(x = 1)", 0.0),
+            ("log(x = 10)", 1.0),
+            ("atan(x = 1)", 45.0),
+            ("norm(v = [3, 4])", 5.0),
+            ("len(value = \"abc\")", 3.0),
+            ("ord(s = \"A\")", 65.0),
+            ("atan2(y = 1, x = 1)", 45.0),
+            ("pow(base = 2, exponent = 3)", 8.0),
+        ] {
+            let (v, warns) = ev(call);
+            assert_eq!(v, Value::Num(want), "{} gave {:?}", call, v);
+            assert!(warns.is_empty(), "{} should not warn, said {:?}", call, warns);
+        }
+        assert!(b("is_num(x = 1)"));
+        assert!(b("is_string(x = \"a\")"));
+        let out = run("module i() echo(parent_module(n = 0)); module o() i(); o();");
+        assert_eq!(out.echoes, vec!["ECHO: \"i\""]);
+
+        // A name the reference does not give is still an unknown parameter,
+        // and the variadic builtins keep taking positionals only -- the
+        // reference spells their parameter "a, b, ...", which is a count and
+        // not a slot anything could be named into.
+        let bad = ev("abs(y = -3)").1;
+        assert!(bad.iter().any(|w| w.contains("unknown parameter 'y'")), "{:?}", bad);
+        let va = ev("str(value = 1)").1;
+        assert!(va.iter().any(|w| w.contains("unknown parameter 'value'")), "{:?}", va);
+        assert_eq!(n("abs(-3)"), 3.0, "positional calls are untouched");
+        assert_eq!(n("atan2(1, 1)"), 45.0);
     }
 
     #[test]
