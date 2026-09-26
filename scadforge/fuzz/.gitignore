@@ -5,5 +5,9 @@
 *.svg
 *.csg
 *.off
+*.3mf
+*.amf
+*.png
+*.json
 *.log
 __pycache__/
