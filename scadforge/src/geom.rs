@@ -79,6 +79,28 @@ impl Mesh {
     /// removes no surface -- volume and area over the whole corpus are
     /// unchanged to twelve significant digits -- and it happens ONCE, at the
     /// export funnel, so every format agrees on the triangle list.
+    /// The volume the mesh encloses, SIGNED by its orientation: positive
+    /// when the faces are wound so the solid is on the inside of them,
+    /// negative when the mesh is inside-out.
+    ///
+    /// The divergence theorem over a closed surface, which costs one pass
+    /// and needs no adjacency, so it is cheap enough to ask at an export.
+    /// It answers two questions that are otherwise expensive: whether a
+    /// mesh is inside-out, and whether a boolean lost something.
+    pub fn signed_volume(&self) -> f64 {
+        let mut v = 0.0;
+        for t in &self.tris {
+            let a = self.positions[t[0] as usize];
+            let b = self.positions[t[1] as usize];
+            let c = self.positions[t[2] as usize];
+            v += (a[0] * (b[1] * c[2] - b[2] * c[1])
+                + a[1] * (b[2] * c[0] - b[0] * c[2])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                / 6.0;
+        }
+        v
+    }
+
     pub fn without_unrepresentable(&self) -> Mesh {
         /// |cross| -- twice the area -- of a triangle whose vertices have
         /// been moved onto the grid a writer will put them on.

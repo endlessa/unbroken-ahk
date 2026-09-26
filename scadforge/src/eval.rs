@@ -3406,11 +3406,19 @@ pub const MAX_UNION_EXPORT_TRIS: usize = 25_000;
 /// `export_mesh`, read once by the reporting wrapper -- the same one-shot
 /// channel `csg::take_degraded` uses, for the same reason: the mesh assembly
 /// has no `Ctx` to warn into.
-fn union_skipped(set: Option<usize>) -> Option<usize> {
+/// Why the export-time union did not stand: it was too big to attempt, or
+/// it was attempted and came back holding less than it was given.
+#[derive(Clone, Copy)]
+pub enum UnionNote {
+    Budget(usize),
+    Lost { got: f64, want: f64 },
+}
+
+fn union_note(set: Option<UnionNote>) -> Option<UnionNote> {
     thread_local! {
-        static SKIPPED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+        static NOTE: std::cell::Cell<Option<UnionNote>> = const { std::cell::Cell::new(None) };
     }
-    SKIPPED.with(|c| if set.is_some() { c.replace(set) } else { c.replace(None) })
+    NOTE.with(|c| if set.is_some() { c.replace(set) } else { c.replace(None) })
 }
 
 /// Do any two parts' bounding boxes overlap? If none do, the union is a
@@ -3469,12 +3477,33 @@ pub fn export_mesh(out: &EvalOutput) -> Result<Mesh, String> {
     // one a validator complains about.
     let total: usize = parts.iter().map(|m| m.tris.len()).sum();
     let (combined, note) = if total > MAX_UNION_EXPORT_TRIS && overlapping(&parts) {
-        (concat_all(&parts), Some(total))
+        (concat_all(&parts), Some(UnionNote::Budget(total)))
     } else {
-        (csg::union_all(&parts), None)
+        // A union CONTAINS each of its operands, so the solid it encloses
+        // cannot be smaller than the largest one that went in. That is true
+        // of any union whatever, needs no oracle, and costs one pass over
+        // the triangles -- and it is the only thing standing between a
+        // boolean that quietly fails and a file the user ships.
+        //
+        // It does fail. Many thin shells that touch or interleave are the
+        // case the BSP handles worst, and when it goes wrong it does not
+        // error: a 25,000 triangle assembly of chambers and vessels merged
+        // to a tenth of its own volume, and a building merged to a
+        // three-hundredth, both silently. Caught here, the merge is thrown
+        // away and the shells are concatenated instead -- which is what the
+        // budget path already does, and is at least the geometry that went
+        // in.
+        let merged = csg::union_all(&parts);
+        let biggest = parts.iter().map(|m| m.signed_volume()).fold(0.0, f64::max);
+        let got = merged.signed_volume();
+        if biggest > 0.0 && got < biggest * 0.999 {
+            (concat_all(&parts), Some(UnionNote::Lost { got, want: biggest }))
+        } else {
+            (merged, None)
+        }
     };
     if let Some(n) = note {
-        union_skipped(Some(n));
+        union_note(Some(n));
     }
     // Weld once here rather than per-format, and drop the slivers the 2D
     // fill sweep leaves behind: they are below the resolution the files can
@@ -3664,13 +3693,22 @@ pub fn render_export_bytes_reporting(
     let bytes = export_bytes(&out, format).map_err(as_error);
     // The mesh assembly has no Ctx; pick its one note up here so it lands in
     // the console stream with everything else.
-    let console = match union_skipped(None) {
-        Some(n) => format!(
+    let console = match union_note(None) {
+        Some(UnionNote::Budget(n)) => format!(
             "{}WARNING: {} triangles is past the {} the export-time union will \
              merge; overlapping shells were left separate.\n",
             console,
             fmt_num(n as f64),
             fmt_num(MAX_UNION_EXPORT_TRIS as f64)
+        ),
+        Some(UnionNote::Lost { got, want }) => format!(
+            "{}WARNING: the export-time union came back enclosing {} where one of \
+             its own parts encloses {}, so it lost geometry; the shells were left \
+             separate instead. Solids that touch exactly, rather than overlapping, \
+             are the usual cause.\n",
+            console,
+            fmt_num(got),
+            fmt_num(want)
         ),
         None => console,
     };
@@ -7357,6 +7395,61 @@ mod tests {
     /// preview draws them that way -- but concatenating overlapping shells
     /// into a file wrote a self-intersecting mesh, correct only to a reader
     /// that fills by parity.
+    #[test]
+    fn an_export_never_encloses_less_than_one_of_its_own_parts() {
+        // A union contains each of its operands, so the solid it encloses
+        // cannot be smaller than the largest that went in. The export checks
+        // that now, because the BSP does fail on assemblies of thin shells
+        // that touch rather than overlap -- and when it fails it does not
+        // error. A 25,000 triangle model of chambers and vessels merged to a
+        // tenth of its own volume, and a building to a three-hundredth, both
+        // silently, both written out as if fine.
+        let check = |src: &str| {
+            let out = run(src);
+            let m = export_mesh(&out).expect("exported");
+            let whole = m.signed_volume();
+            let biggest = out
+                .shapes
+                .iter()
+                .filter(|s| !s.background && s.outline.is_none())
+                .map(|s| s.mesh.signed_volume())
+                .fold(0.0, f64::max);
+            assert!(whole > 0.0, "an export is never inside-out: {} for {}", whole, src);
+            assert!(
+                whole >= biggest * 0.999,
+                "{} encloses {} but one part alone encloses {}",
+                src,
+                whole,
+                biggest
+            );
+            whole
+        };
+        assert!((check("union(){ cube(4); translate([2,0,0]) cube(4); }") - 96.0).abs() < 1e-6);
+        assert!((check("cube(4); translate([2,0,0]) cube(4);") - 96.0).abs() < 1e-6);
+        assert!((check("union(){ sphere(r=5,$fn=16); translate([4,0,0]) sphere(r=5,$fn=16); }")
+            > 4.0 / 3.0 * std::f64::consts::PI * 125.0 * 0.85));
+        // Nested, and sharing a whole face -- the touching case the guard is
+        // there for.
+        check("cube([4,4,4]); translate([4,0,0]) cube([4,4,4]);");
+        check("cube(10, center=true); cube(4, center=true);");
+    }
+
+    #[test]
+    fn signed_volume_knows_which_way_a_mesh_faces() {
+        let out = run("cube(3);");
+        let m = &out.shapes[0].mesh;
+        assert!((m.signed_volume() - 27.0).abs() < 1e-9, "{}", m.signed_volume());
+        // The same mesh with every face reversed encloses the same magnitude
+        // and the opposite sign -- which is the whole content of the test:
+        // an inside-out solid renders identically, because shading uses the
+        // normal's magnitude, and only an integral like this one notices.
+        let flipped = crate::geom::Mesh {
+            positions: m.positions.clone(),
+            tris: m.tris.iter().map(|t| [t[0], t[2], t[1]]).collect(),
+        };
+        assert!((flipped.signed_volume() + 27.0).abs() < 1e-9, "{}", flipped.signed_volume());
+    }
+
     #[test]
     fn the_export_merges_overlapping_shells() {
         let vol = |src: &str| {
