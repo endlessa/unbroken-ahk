@@ -354,9 +354,15 @@ pub fn builtin_head(module: &str, b: &HashMap<String, Value>, f: Frags) -> Optio
             num(num_of("size").unwrap_or(10.0)),
             num(num_of("spacing").unwrap_or(1.0)),
             string(&str_of("font").unwrap_or_default()),
-            string(&str_of("direction").unwrap_or_default()),
+            // The RESOLVED defaults, as the neighbouring arguments already
+            // write. Spelling an unbound direction or script as "" made the
+            // dump say something the evaluator rejects, so re-running a .csg
+            // this kernel had just written raised two warnings the original
+            // script never did -- "unknown direction ''" and "unknown script
+            // ''" -- and the round trip was no longer silent.
+            string(&str_of("direction").unwrap_or_else(|| "ltr".into())),
             string(&str_of("language").unwrap_or_else(|| "en".into())),
-            string(&str_of("script").unwrap_or_default()),
+            string(&str_of("script").unwrap_or_else(|| "latin".into())),
             string(&str_of("halign").unwrap_or_else(|| "left".into())),
             string(&str_of("valign").unwrap_or_else(|| "baseline".into())),
             f.spell()
@@ -522,6 +528,32 @@ mod tests {
         assert_eq!(num(f64::NAN), "(0/0)");
         assert!(num(f64::INFINITY).parse::<f64>().unwrap().is_infinite());
         assert!(num(f64::NEG_INFINITY).parse::<f64>().unwrap() < 0.0);
+    }
+
+    #[test]
+    fn an_unbound_text_argument_is_written_as_its_resolved_default() {
+        // The dump spelled an unbound direction and script as "", which the
+        // evaluator rejects, so re-running a .csg this kernel had just
+        // written raised two warnings the original script never did --
+        // "unknown direction ''" and "unknown script ''" -- and a round trip
+        // that is supposed to be silent no longer was.
+        let mut b: HashMap<String, Value> = HashMap::new();
+        b.insert("text".into(), Value::Str("Hi".into()));
+        let head = builtin_head("text", &b, Frags { fn_: 0.0, fa: 12.0, fs: 2.0 }).expect("text has a head");
+        assert!(head.contains("direction = \"ltr\""), "{}", head);
+        assert!(head.contains("script = \"latin\""), "{}", head);
+        assert!(head.contains("language = \"en\""), "{}", head);
+        // `font = ""` is fine and stays: an empty font names the default
+        // face, and the evaluator reads it back without a word. It is the
+        // three the evaluator VALIDATES that may not be written empty.
+        for arg in ["direction", "language", "script"] {
+            assert!(
+                !head.contains(&format!("{} = \"\"", arg)),
+                "{} must carry its resolved default: {}",
+                arg,
+                head
+            );
+        }
     }
 
     #[test]

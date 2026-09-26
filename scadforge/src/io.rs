@@ -695,22 +695,19 @@ pub fn write_amf(mesh: &Mesh) -> String {
 /// being searched for once per element.
 struct Tags<'a> {
     text: &'a str,
-    names: [&'static str; 3],
-    at: [usize; 3],
+    names: &'static [&'static str],
+    at: Vec<usize>,
 }
 
 impl<'a> Tags<'a> {
-    fn new(text: &'a str, names: [&'static str; 3]) -> Tags<'a> {
-        let mut at = [usize::MAX; 3];
-        for (slot, name) in at.iter_mut().zip(names) {
-            *slot = text.find(name).unwrap_or(usize::MAX);
-        }
+    fn new(text: &'a str, names: &'static [&'static str]) -> Tags<'a> {
+        let at = names.iter().map(|n| text.find(n).unwrap_or(usize::MAX)).collect();
         Tags { text, names, at }
     }
 
     /// The earliest of the tags at or after `from`, as (which one, where).
     fn next(&mut self, from: usize) -> Option<(usize, usize)> {
-        for (slot, name) in self.at.iter_mut().zip(self.names) {
+        for (slot, name) in self.at.iter_mut().zip(self.names.iter()) {
             if *slot >= from {
                 continue; // still ahead of the cursor, or already exhausted
             }
@@ -753,7 +750,7 @@ pub fn read_amf(text: &str) -> Mesh {
     let mut positions: Vec<[f64; 3]> = Vec::new();
     let mut tris = Vec::new();
     let mut base = 0usize;
-    let mut tags = Tags::new(text, ["<mesh", "<vertex>", "<triangle>"]);
+    let mut tags = Tags::new(text, &["<mesh", "<vertex>", "<triangle>"]);
     let mut at = 0usize;
     while let Some((which, p)) = tags.next(at) {
         match which {
@@ -854,6 +851,43 @@ pub fn read_3mf(bytes: &[u8]) -> Result<Mesh, String> {
 }
 
 /// Parse the 3MF model XML's vertices and triangles (attribute-based).
+/// A 3MF item transform: twelve numbers, three basis columns then the
+/// translation, applied to a row vector.
+fn apply_3mf(m: &[f64; 12], p: [f64; 3]) -> [f64; 3] {
+    [
+        m[0] * p[0] + m[3] * p[1] + m[6] * p[2] + m[9],
+        m[1] * p[0] + m[4] * p[1] + m[7] * p[2] + m[10],
+        m[2] * p[0] + m[5] * p[1] + m[8] * p[2] + m[11],
+    ]
+}
+
+/// `<build><item objectid=".." transform=".."/></build>`: where each object
+/// is placed. An item with no transform is placed at the identity and is not
+/// recorded; the first item naming an object wins.
+fn build_items(xml: &str) -> HashMap<String, [f64; 12]> {
+    let attr = crate::svg::attr;
+    let mut out: HashMap<String, [f64; 12]> = HashMap::new();
+    let Some(b) = xml.find("<build") else { return out };
+    let end = xml[b..].find("</build>").map_or(xml.len(), |d| d + b);
+    let mut tags = Tags::new(&xml[b..end], &["<item"]);
+    let mut at = 0usize;
+    while let Some((_, p)) = tags.next(at) {
+        let (chunk, e) = upto(&xml[b..end], p + 5, ">");
+        at = e;
+        let (Some(id), Some(t)) = (attr(chunk, "objectid"), attr(chunk, "transform")) else {
+            continue;
+        };
+        let v: Vec<f64> = t.split_whitespace().filter_map(|n| n.parse().ok()).collect();
+        if v.len() != 12 || !v.iter().all(|n: &f64| n.is_finite()) {
+            continue;
+        }
+        let mut m = [0.0; 12];
+        m.copy_from_slice(&v);
+        out.entry(id).or_insert(m);
+    }
+    out
+}
+
 fn parse_3mf_model(xml: &str) -> Mesh {
     // Extract the attribute substring of each `<tag ...>` occurrence and read
     // its attributes via the shared, boundary-safe attribute reader.
@@ -864,13 +898,40 @@ fn parse_3mf_model(xml: &str) -> Mesh {
     let mut tris = Vec::new();
     // As in AMF, a triangle indexes its own `<mesh>`'s vertices, so walk the
     // document in order and rebase at each mesh.
+    // Where <build> puts each object. 3MF separates the resource -- an object
+    // at its own coordinates -- from its PLACEMENT on the plate, and the
+    // placement was not read at all, so an object a writer had positioned with
+    // an item transform imported at its raw resource coordinates. Our own
+    // writer places at the identity, so this only ever showed on a file from
+    // somewhere else, which is exactly the slicer round trip.
+    //
+    // Which objects import is a separate question the reference leaves
+    // unpinned, and is left as it was: every mesh in the part is read.
+    let placed = build_items(xml);
+    let mut object: Option<String> = None;
     let mut base = 0usize;
-    let mut tags = Tags::new(xml, ["<mesh", "<vertex", "<triangle"]);
+    let mut mesh_from = 0usize; // first vertex of the mesh being read
+    let mut tags = Tags::new(xml, &["<mesh", "<vertex", "<triangle", "<object", "</object"]);
     let mut at = 0usize;
     while let Some((which, p)) = tags.next(at) {
         match which {
+            3 => {
+                let (chunk, end) = upto(xml, p + 7, ">");
+                object = crate::svg::attr(chunk, "id");
+                at = end;
+            }
+            4 => {
+                // Closing an object: place the vertices it contributed.
+                if let Some(m) = object.take().and_then(|id| placed.get(&id)).copied() {
+                    for v in positions[mesh_from..].iter_mut() {
+                        *v = apply_3mf(&m, *v);
+                    }
+                }
+                at = p + 8;
+            }
             0 => {
                 base = positions.len();
+                mesh_from = positions.len();
                 at = p + 5;
             }
             1 => {
@@ -2107,5 +2168,68 @@ mod tests {
             region_area(&poly)
         );
     }
+
+
+    #[test]
+    fn a_3mf_object_lands_where_build_puts_it() {
+        // 3MF keeps a resource -- the object at its own coordinates -- apart
+        // from its PLACEMENT on the plate. The placement was not read at all,
+        // so an object a writer had positioned with an item transform
+        // imported at its raw resource coordinates. Our own writer places at
+        // the identity, so this only ever showed on a file from somewhere
+        // else -- which is exactly the slicer round trip.
+        let cube_xml = |id: &str| {
+            format!(
+                "<object id=\"{}\" type=\"model\"><mesh><vertices>\
+                 <vertex x=\"0\" y=\"0\" z=\"0\"/><vertex x=\"1\" y=\"0\" z=\"0\"/>\
+                 <vertex x=\"0\" y=\"1\" z=\"0\"/><vertex x=\"0\" y=\"0\" z=\"1\"/>\
+                 </vertices><triangles>\
+                 <triangle v1=\"0\" v2=\"2\" v3=\"1\"/><triangle v1=\"0\" v2=\"1\" v3=\"3\"/>\
+                 <triangle v1=\"1\" v2=\"2\" v3=\"3\"/><triangle v1=\"2\" v2=\"0\" v3=\"3\"/>\
+                 </triangles></mesh></object>",
+                id
+            )
+        };
+        let doc = |build: &str| {
+            format!("<model><resources>{}</resources>{}</model>", cube_xml("1"), build)
+        };
+
+        let plain = parse_3mf_model(&doc(""));
+        assert_eq!(plain.tris.len(), 4);
+        assert!(plain.positions.iter().all(|p| p[0] <= 1.0), "no build: raw coordinates");
+
+        let placed = parse_3mf_model(&doc(
+            "<build><item objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 1 50 0 0\"/></build>",
+        ));
+        assert_eq!(placed.tris.len(), 4, "the same mesh");
+        let xs: Vec<f64> = placed.positions.iter().map(|p| p[0]).collect();
+        assert!(
+            xs.iter().all(|&x| (50.0..=51.0).contains(&x)),
+            "placed 50 along x, got {:?}",
+            xs
+        );
+
+        // The basis is read too, not just the translation.
+        let turned = parse_3mf_model(&doc(
+            "<build><item objectid=\"1\" transform=\"0 1 0 -1 0 0 0 0 1 0 0 0\"/></build>",
+        ));
+        assert!(
+            turned.positions.iter().any(|p| (p[1] - 1.0).abs() < 1e-12 && p[0].abs() < 1e-12),
+            "the x unit vector turns into y: {:?}",
+            turned.positions
+        );
+
+        // An item with no transform, a malformed one, and one naming an
+        // object that is not there all leave the mesh where it was.
+        for build in [
+            "<build><item objectid=\"1\"/></build>",
+            "<build><item objectid=\"1\" transform=\"1 0 0\"/></build>",
+            "<build><item objectid=\"9\" transform=\"1 0 0 0 1 0 0 0 1 50 0 0\"/></build>",
+        ] {
+            let m = parse_3mf_model(&doc(build));
+            assert!(m.positions.iter().all(|p| p[0] <= 1.0), "{} moved it", build);
+        }
+    }
+
 
 }

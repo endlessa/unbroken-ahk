@@ -70,6 +70,39 @@ fn fill_rule_of(attrs: &str) -> Option<Rule> {
     })
 }
 
+/// True when this element declares itself not to paint.
+///
+/// `display:none` is what a drawing tool writes for a hidden layer -- it is
+/// the ordinary way an Inkscape file carries a construction layer -- and it
+/// was not read at all, so those layers imported as visible filled geometry
+/// with no warning. The reference lists `display` beside fill and fill-rule
+/// as honored. `visibility:hidden` is not the same property in SVG (it hides
+/// the element but still lays it out) but it equally means "does not paint",
+/// and nothing fillable comes of it either.
+fn hidden(attrs: &str) -> bool {
+    let off = |k: &str, v: &str| match k {
+        "display" => v.trim().eq_ignore_ascii_case("none"),
+        "visibility" => {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("hidden") || v.eq_ignore_ascii_case("collapse")
+        }
+        _ => false,
+    };
+    for k in ["display", "visibility"] {
+        if let Some(v) = attr(attrs, k) {
+            if off(k, &v) {
+                return true;
+            }
+        }
+    }
+    attr(attrs, "style").is_some_and(|style| {
+        style.split(';').any(|decl| {
+            decl.split_once(':')
+                .is_some_and(|(k, v)| off(k.trim().to_ascii_lowercase().as_str(), v))
+        })
+    })
+}
+
 /// Read an SVG document into one 2D region plus warnings. Malformed or
 /// unsupported constructs are skipped (with a warning for `<text>`); a document
 /// with no fillable geometry yields an empty region, never an error.
@@ -92,6 +125,8 @@ pub fn read_svg(text: &str, dpi: f64, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec
     // under the rule that element declared, never across elements.
     let mut groups: Vec<(Rule, Vec<Vec<Vec2>>)> = Vec::new();
     let frag = |r: f64| fragments(r.abs().max(1e-6), fn_, fa, fs).max(3) as usize;
+    // The depth of the outermost hidden <g>, while one is open.
+    let mut hide_from: Option<usize> = None;
 
     for tok in ElementScanner::new(text) {
         let cur = *stack.last().unwrap();
@@ -101,14 +136,26 @@ pub fn read_svg(text: &str, dpi: f64, fn_: f64, fa: f64, fs: f64) -> (Poly2, Vec
                 let t = attr(&attrs, "transform").map(|s| parse_transform(&s)).unwrap_or(IDENTITY);
                 stack.push(mul(&cur, &t));
                 rules.push(fill_rule_of(&attrs).unwrap_or(cur_rule));
+                // A hidden <g> hides everything inside it, so the depth at
+                // which it opened is remembered and nothing paints until it
+                // closes again.
+                if hidden(&attrs) && hide_from.is_none() {
+                    hide_from = Some(stack.len());
+                }
             }
             Element::GroupClose => {
                 if stack.len() > 1 {
+                    if hide_from == Some(stack.len()) {
+                        hide_from = None;
+                    }
                     stack.pop();
                     rules.pop();
                 }
             }
             Element::Shape(name, attrs) => {
+                if hide_from.is_some() || hidden(&attrs) {
+                    continue;
+                }
                 // An element may carry its own transform on top of the stack.
                 let local =
                     attr(&attrs, "transform").map(|s| mul(&cur, &parse_transform(&s))).unwrap_or(cur);
@@ -1202,4 +1249,47 @@ mod tests {
         let a = area(&p);
         assert!((a - 25.4 * 25.4).abs() < 1e-6, "px→mm area {}", a);
     }
+
+    #[test]
+    fn a_hidden_svg_layer_does_not_paint() {
+        // `display:none` is what a drawing tool writes for a hidden layer --
+        // the ordinary way an Inkscape file carries a construction layer --
+        // and it was not read at all, so those layers imported as visible
+        // filled geometry with no warning. The reference lists `display`
+        // beside fill and fill-rule as honored.
+        let doc = |body: &str| {
+            format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100mm\" \
+                 height=\"100mm\" viewBox=\"0 0 100 100\">{}</svg>",
+                body
+            )
+        };
+        let visible = "<rect x=\"50\" y=\"50\" width=\"20\" height=\"20\"/>";
+        let area = |body: &str| {
+            let (poly, _) = read_svg(&doc(body), 96.0, 0.0, 12.0, 2.0);
+            poly.contours.len()
+        };
+        assert_eq!(area(visible), 1, "the control paints");
+        for hidden in [
+            "<g style=\"display:none\"><rect x=\"10\" y=\"10\" width=\"20\" height=\"20\"/></g>",
+            "<g display=\"none\"><rect x=\"10\" y=\"10\" width=\"20\" height=\"20\"/></g>",
+            "<rect x=\"10\" y=\"10\" width=\"20\" height=\"20\" display=\"none\"/>",
+            "<rect x=\"10\" y=\"10\" width=\"20\" height=\"20\" style=\"display: none\"/>",
+            "<g style=\"visibility:hidden\"><rect x=\"10\" y=\"10\" width=\"20\" height=\"20\"/></g>",
+        ] {
+            assert_eq!(area(hidden), 0, "nothing paints from: {}", hidden);
+            assert_eq!(
+                area(&format!("{}{}", hidden, visible)),
+                1,
+                "and the visible one still does, beside: {}",
+                hidden
+            );
+        }
+        // A hidden group closes again -- what follows it is not hidden too.
+        assert_eq!(
+            area(&format!("<g display=\"none\"><rect x=\"1\" y=\"1\" width=\"2\" height=\"2\"/></g>{}", visible)),
+            1
+        );
+    }
+
 }
