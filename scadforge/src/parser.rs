@@ -617,7 +617,16 @@ impl Parser {
 
     /// Postfix operators bind tightest: f(x), v[i], v.x — chainable
     /// (m[1].z, f(x)[0], fs[i](x), adder(2)(3)).
+    ///
+    /// This is a left-associative fold like the binary ones, and it counts
+    /// like them. It used not to: the depth guard was given to the operator
+    /// folds and not to this one, so `v[0][0][0]...` and `v.x.x.x...` still
+    /// built an arbitrarily deep tree and then overflowed the stack when
+    /// something walked it — abort, SIGABRT, no diagnostic, no output file —
+    /// while a `+` chain of the same length errored politely. Depth is depth
+    /// however it is spelled, including when it is spelled with brackets.
     fn postfix(&mut self) -> Result<Expr, String> {
+        let start = self.depth;
         let mut e = self.primary()?;
         loop {
             match self.peek() {
@@ -625,6 +634,7 @@ impl Parser {
                     self.pos += 1;
                     let index = self.expr()?;
                     self.expect(&Tok::RBracket, "to close '[' index")?;
+                    self.enter()?; // each fold deepens the tree by one level
                     e = Expr::Index { base: Box::new(e), index: Box::new(index) };
                 }
                 Some(Tok::Dot) => {
@@ -633,12 +643,14 @@ impl Parser {
                         Some(Tok::Ident(s)) => s,
                         _ => return Err(format!("expected member name after '.', found {}", self.here())),
                     };
+                    self.enter()?; // each fold deepens the tree by one level
                     e = Expr::Member { base: Box::new(e), name };
                 }
                 Some(Tok::LParen) => {
                     self.pos += 1;
                     let args = self.args()?;
                     self.expect(&Tok::RParen, "to close the call")?;
+                    self.enter()?; // each fold deepens the tree by one level
                     e = match e {
                         // An identifier callee resolves through the
                         // function namespace; anything else is a
@@ -650,6 +662,7 @@ impl Parser {
                 _ => break,
             }
         }
+        self.unwind(start);
         Ok(e)
     }
 
@@ -907,5 +920,44 @@ mod tests {
         let err = parse("translate() {").unwrap_err();
         assert!(err.contains("unterminated"), "got: {}", err);
         assert!(parse("module for() {}").is_err());
+    }
+
+    #[test]
+    fn a_postfix_chain_is_as_deep_as_any_other_chain() {
+        // The depth guard was given to the operator folds and not to the
+        // postfix one, so `v[0][0][0]...` and `v.x.x.x...` built an
+        // arbitrarily deep tree and then overflowed the stack when something
+        // walked it -- abort, SIGABRT, no diagnostic and no output file --
+        // while a `+` chain of the same length errored politely. 150,000
+        // index links were enough to kill the process.
+        let deep_index = format!("x = v{};", "[0]".repeat(MAX_PARSE_DEPTH + 50));
+        let deep_member = format!("x = v{};", ".m".repeat(MAX_PARSE_DEPTH + 50));
+        let deep_call = format!("x = f(1){};", "(1)".repeat(MAX_PARSE_DEPTH + 50));
+        let deep_plus = format!("x = {};", vec!["1"; MAX_PARSE_DEPTH + 50].join(" + "));
+        for src in [&deep_index, &deep_member, &deep_call, &deep_plus] {
+            let err = parse(src).unwrap_err();
+            assert!(
+                err.contains("expression nesting exceeds"),
+                "should refuse gracefully, said: {}",
+                err
+            );
+        }
+
+        // And the guard is per-chain, not cumulative: many short chains in
+        // one file are ordinary code, so the fold has to give its levels back.
+        let many = (0..5000)
+            .map(|i| format!("x{} = v[0][1].m(2)[3];", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse(&many).is_ok(), "5000 short postfix chains must still parse");
+        // Chained postfix still parses and still nests the right way round.
+        let ast = parse("y = m[1].z;").unwrap();
+        match &ast[0] {
+            Stmt::Assign { value: Expr::Member { base, name }, .. } => {
+                assert_eq!(name, "z");
+                assert!(matches!(**base, Expr::Index { .. }), "m[1] is the base of .z");
+            }
+            other => panic!("expected member of index, got {:?}", other),
+        }
     }
 }
