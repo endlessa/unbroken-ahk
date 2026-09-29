@@ -619,6 +619,30 @@ fn reduce_pairwise(mut items: Vec<Mesh>, op: fn() -> Op) -> Mesh {
 /// error and far below any real loss, which runs to halves and tenths.
 const UNION_SLACK: f64 = 1e-3;
 
+/// How close a merged volume must be to the SUM of its operands before the
+/// merge is judged to have joined nothing.
+///
+/// Chosen from the measurement, because the two populations it has to
+/// separate are far apart and neither is where theory would put it.
+///
+/// Solids that never met have volumes that simply add, so the ideal
+/// threshold is zero. The BSP does not oblige: it rewrites every triangle it
+/// touches, and across the 247 pairwise merges of a suspension bridge whose
+/// 501 solids are provably disjoint -- the model leaves 20 mm of air
+/// everywhere two members meet, precisely so this is checkable -- 239 came
+/// back within 1e-8 of the sum and the remaining eight drifted as far as
+/// 1.2e-5. Meanwhile the smallest REAL overlap anywhere in the example corpus
+/// is 3.2e-4, on a heart whose chambers genuinely interpenetrate. Between
+/// 1.2e-5 and 3.2e-4 there is nothing, and 1e-4 sits in the gap.
+///
+/// The threshold has to be that generous because the alternative compounds.
+/// A pair that keeps its BSP result hands a re-tessellated mesh to the next
+/// merge up, whose volume is then further off, so it keeps its BSP result
+/// too. Swept the whole range on the bridge: at 1e-9 the export is 452,007
+/// triangles, at 1e-6 it is 235,420, at 1e-5 it is 49,951, and at 1e-4 it is
+/// 18,808 -- which is the mesh the model actually wrote, face for face.
+const DISJOINT_SLACK: f64 = 1e-4;
+
 /// A partly-reduced union, carrying what is KNOWN about the volume the true
 /// union of everything underneath it encloses.
 ///
@@ -771,6 +795,26 @@ fn union_pair(a: Bounded, b: Bounded) -> Merge {
     let merged = boolean(&a.mesh, &b.mesh, Op::Union);
     if holds(&merged) {
         let got = merged.signed_volume();
+        // A union that came back holding the SUM of its operands merged
+        // nothing: the two solids never met, and the bounding boxes that
+        // said otherwise were only boxes. Keep the concatenation instead.
+        //
+        // This is not a micro-optimisation. `boxes_overlap` is the only
+        // cheap disjointness test available, and on any model with a long
+        // part it is useless -- a suspension bridge's girder has a bounding
+        // box containing every hanger, tower and anchorage in the model, so
+        // all 501 solids "overlap" and every pair goes to the BSP. The
+        // answer it returns is right, and it costs 18,808 triangles turned
+        // into 695,916, with 52,617 T-junctions that were not there before,
+        // to say what concatenation says exactly. The volume is already
+        // measured, so recognising the case is free.
+        if got >= hi * (1.0 - DISJOINT_SLACK) {
+            return Merge::Made(Bounded {
+                mesh: concat(&a.mesh, &b.mesh),
+                lo: a.lo + b.lo,
+                hi: a.hi + b.hi,
+            });
+        }
         return Merge::Made(Bounded { mesh: merged, lo: got, hi: got });
     }
     // A BSP is not symmetric in its operands: the first supplies the planes
