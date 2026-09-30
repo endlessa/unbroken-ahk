@@ -20,8 +20,21 @@ group tabs (`scadforge/src/customizer.rs`), preset JSON (`parameterSets`
 sidecar, round-tripped), `-D name=value` overrides, plus a headless CLI
 (`scadforge -o out.stl -D w=40 -p sets.json -P Big in.scad`) and a live web
 panel (grouped sliders/checkbox/dropdown, in-place value rewrite, preset
-save/load). Remaining untouched are the honest tail (PDF/3MF export, SVG
-import, `$vp*` viewport vars, DXF-era deprecated functions).
+save/load).
+
+This paragraph used to close by naming what was left untouched: PDF and 3MF
+export, SVG import, the `$vp*` viewport variables, and the DXF-era
+deprecated functions. Every one of those has since landed. `write_3mf` and
+`read_3mf` round-trip real deflate-compressed OPC files; `pdf` and `svg`
+are export tags and `svg::read_svg` imports; the `$vp*` quartet is wired
+through the dynamic environment; `dxf_linear_extrude`, `dxf_rotate_extrude`,
+`import_dxf`, `import_stl` and `import_off` are all handled. `dxf_cross`
+and `dxf_dim` are the two that genuinely are not.
+
+Which means the 155/22/6 score above, from the audit of 2026-09-11,
+UNDERSTATES where the project stands. It is left as written rather than
+guessed upwards: a number in this file has to come from a pass over all 183
+entries, and that pass has not been run since.
 
 Ground rules (from the project owner, non-negotiable):
 
