@@ -266,7 +266,7 @@ function sl_ghub(g, ext) = ext ? max(0.25*g, g - TF - 2.5*(TA+TF))   // (14)
                                : g + TF + 2.5*(TA+TF);
 GHS = sl_ghub(GS, true);            // sun bore
 GHP = sl_ghub(GP, true);            // planet bore
-GHR = sl_ghub(GR, false);           // ring back cone
+GHR = GHR;           // ring back cone
 
 // ---- carrier, in (cone distance, colatitude) ------------------------
 GJ    = GHS - deg(SL_CJ/LM);        // sun journal cone
@@ -426,8 +426,9 @@ function sl_arc(cldeg, g) = rad(cldeg)*LO*sin(g);
 //  REPORT
 // ===================================================================
 echo("=== slice: row 1 of the design table, assembled ===");
-echo(str("row ", ROW[0], "   Nr=", NR_, " D=", D, " Np=", NP_, " k=", K,
-         "   Ns=", NS_, "  m=", M, " mm  phi=", PHI, " deg  jt=", JT, " m"));
+echo(str(ROW[0], ":  Nr=", NR_, " D=", D, " Np=", NP_, " k=", K,
+         "   Ns=", NS_, "   m=", M, " mm   phi=", PHI, " deg   jt=", JT,
+         " modules = ", JT*M, " mm per mesh"));
 echo(str("gs = asin(", NS_, "/", D, ") = ", GS,
          "   gp = asin(", NP_, "/", D, ") = ", GP,
          "   gr = asin(", NR_, "/", D, ") = ", GR));
@@ -471,7 +472,10 @@ for (i = [0:K-1])
            sl_phase_rat(i), " deg   (6) gives ", sl_phase(i),
            "   difference ", sl_phase(i) - sl_phase_rat(i)));
 echo(str("   (Np-1)/2 = ", (NP_-1)/2, ", a whole number of pitches, which is",
-         " why (6) collapses to (7); frac((Np-1)/2) = ", sl_frac((NP_-1)/2)));
+         " why (6) collapses to (7); frac((Np-1)/2) = ", sl_frac((NP_-1)/2),
+         ";  the phases are the ", K, " multiples of 360/(k Np) = 360/", K*NP_,
+         " = ", 360/(K*NP_), " deg, in the order ",
+         [ for (i=[0:K-1]) (NS_*i) % K ]));
 echo(str("ring clocking (10): alpha_r = ", sl_clock(), " deg = 180/", NR_,
          " = ", 180/NR_, "   Nr alpha_r/360 = ", NR_*sl_clock()/360,
          "   against 1/2 = ", 0.5));
@@ -533,7 +537,7 @@ SUNRING = [ for (u = SUN_D) sl_cl_i(u, NR_, sl_clock()) ];
 echo(str("   sun/ring   sun pts engaged in the ring's colatitude band ",
          sl_engaged(SUNRING), " -- the two never share a colatitude: sun spans ",
          sl_ghub(GS,true), " to ", GS+TA, ", ring spans ", GR-TA, " to ",
-         sl_ghub(GR,false)));
+         GHR));
 
 echo("--- neighbouring planets, equation (13) ---");
 SEP = acos(cos(BETA)*cos(BETA) + sin(BETA)*sin(BETA)*cos(360/K));
@@ -579,8 +583,8 @@ echo(str("   pin seated at r = ", RPIN0, " on the web face at r = ", RW1,
 echo(str("   pin boss band spans colat ", GRIM0, " to ", GRIM1,
          ", which is beta +/- 2 GPIN = ", BETA, " +/- ", 2*GPIN));
 
-echo("--- predicted volumes; the mesh must come in under, every chord",
-     " cuts inside its arc ---");
+echo(str("--- predicted volumes; the mesh must come in under, because",
+         " every chord cuts inside its arc ---"));
 VS = sg_vol(NS_, NS_, D, true,  SL_F, M);
 VP = sg_vol(NP_, NP_, D, true,  SL_F, M);
 VRG= sg_vol(NR_, NR_, D, false, SL_F, M);

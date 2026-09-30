@@ -4,12 +4,13 @@
 //
 //  Built on spherical_gear.scad, which is the contract.  Every number
 //  that belongs to the design table is READ from that file through
-//  `use`; nothing from the table is restated here.  The three Lewis
-//  inputs of section 5 below are the only constants this file declares
-//  that the library also uses internally, because the library
-//  publishes gate 7's CONCLUSION but not its inputs; the file
-//  reproduces gate 7's printed ceiling from them and prints the
-//  difference, and that reproduction is the drift check.
+//  `use`; nothing from the table is restated here.  Three numbers come
+//  from outside it and are named as such: the two Lewis inputs sigma
+//  and Y of section 3 (the third, the face width b, is the face this
+//  file actually builds), and gate 7's echoed ceiling, quoted only so
+//  the file can print the difference against its own recomputation of
+//  it.  The library publishes gate 7's CONCLUSION but not its inputs,
+//  and that recomputation is the drift check.
 //
 //  ---------------------------------------------------------------
 //  0.  WHAT THE CAP IS, AND WHY IT IS FOUR MEMBERS
@@ -29,15 +30,21 @@
 //  interface is a seat with a clearance, and every one of those
 //  clearances is computed and printed below; they are the whole
 //  statement that nothing overlaps.  The export cannot be made to
-//  confirm it, and this file does not pretend otherwise: this kernel
-//  skips its export-time union above 25000 triangles and says so in a
-//  warning, so at this size overlapping shells would be left separate
-//  rather than showing up as a leak.  The numbers have to carry it.
+//  confirm it, and this file does not pretend otherwise.  At this size
+//  the kernel prints
+//
+//      WARNING: 132776 triangles is past the 25000 the export-time
+//      union will merge; overlapping shells were left separate.
+//
+//  and a scene past that threshold that DOES overlap comes back with
+//  holes = 0 and a volume that double counts the overlap, so a clean
+//  leak count is not by itself evidence of anything.  The printed
+//  clearances have to carry it, and they are all computed, not assumed.
 //
 //  ---------------------------------------------------------------
 //  1.  THE RADIAL STACK-UP, FROM THE AXIS OUT
 //
-//  Nothing here is placed by eye.  Each radius is the previous one
+//  No radius below is a number written down: each is the previous one
 //  plus a declared width, and the report prints the whole chain:
 //
 //      r_bore                                        bore wall
@@ -183,7 +190,7 @@
 //  The asked-for property is a count that divides both Ns = 46 and the
 //  row's planet count k.  It does not exist.  46 = 2 * 23, so its only
 //  divisors are 1, 2, 23 and 46, and the table's planet counts are 7
-//  and 3, both prime and neither 2 nor 23.  gcd(46, 7) = 1 and
+//  and 3, neither of which is 2 or 23.  gcd(46, 7) = 1 and
 //  gcd(46, 3) = 1, so the only common divisor is 1 on every row.  The
 //  report prints gcd(Ns, k) for all four rows and the divisor list.
 //
@@ -195,6 +202,8 @@
 //  also symmetric under the reflection that mates the two caps, which
 //  the quarter-pitch crown offset needs: {360 i / 23} maps to itself
 //  under azimuth reflection while the crown teeth move half a pitch.
+//  The report prints the largest distance from a reflected bolt azimuth
+//  to the nearest bolt azimuth, which is zero.
 //
 //  The holes are real holes, walled all the way through, cut as a
 //  polygon with 23 inner paths rather than by subtracting anything.
@@ -256,8 +265,9 @@
 use <spherical_gear.scad>
 
 // ---- the cap's own declared parameters ------------------------------
-// Widths and clearances only.  Every radius, every count and every
-// angle below is derived from these and from the library's table.
+// Declared: the bore radius, a set of widths and depths, and the
+// clearances.  Everything else -- every other radius, every count,
+// every angle -- is derived from these and from the library's table.
 PC_BORE_R   = 8.0;    // central bore radius, sun shaft clearance
 PC_SLEEVE_W = 3.0;    // radial room over the spline tip for the coupling sleeve
 PC_PILOT_W  = 4.0;    // pilot (socket) wall thickness
@@ -518,9 +528,12 @@ module polar_cap(balls = true) {
 // ===================================================================
 echo("=== polar cap: what it is made of ===");
 echo("four members, sharing no volume: web, crown ring, bolt ring, balls.");
-echo("every interface is a seat with a printed clearance; because this");
-echo("kernel's boolean leaves T junctions, holes = 0 on the export is");
-echo("itself the proof that no two members overlap.");
+echo("every interface is a seat, and every clearance is computed and");
+echo("printed at the end of this report.  It is the clearances that say");
+echo("nothing overlaps, not the export: past 25000 triangles this kernel");
+echo("skips the export-time union and says so, and a scene that overlaps");
+echo("then comes back with holes = 0 and a volume that counts the overlap");
+echo("twice.  A clean leak count is not evidence here.");
 
 echo("=== 1. the radial chain, from the axis out ===");
 echo(str("   bore radius                 ", PC_BORE_R,
@@ -692,6 +705,12 @@ echo(str("   the bolt circle is symmetric under the reflection that mates",
          " the two caps -- {360 i/", NBOLT,
          "} maps to itself -- while the crown moves half a pitch, which is",
          " what the quarter-pitch offset in section 3 is for"));
+echo(str("      largest distance from a reflected bolt azimuth to the",
+         " nearest bolt azimuth = ",
+         max([ for (i=[0:NBOLT-1])
+                 let (a = -360*i/NBOLT, b = 360/NBOLT)
+                   let (d_ = a - b*round(a/b)) d_ < 0 ? -d_ : d_ ]),
+         " deg over all ", NBOLT, " bolts"));
 echo(str("   holes are cut as ", NBOLT,
          " inner paths of one polygon, walled through the full ",
          PC_RING_T, " mm; nothing is subtracted"));
