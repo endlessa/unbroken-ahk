@@ -401,7 +401,7 @@ DQ      = atan2(QY, QX);            // its azimuth off the seat centre
 UX      = sin(AE);  UY = cos(AE);   // flank direction, tangent to the seat
 QU      = QX*UX + QY*UY;
 HFL     = abs(QX*UY - QY*UX);       // flank line's distance from the axis
-PSI0    = atan2(QY - QU*UY, QX - QU*UX);   // azimuth of the foot of that normal
+PSI0    = atan2(QY - QU*UY, QX - QU*UX);   // azimuth of that foot
 RTIP    = CC_P*(0.6 + cos(BETA)/sin(BETA))/2;          // topping circle
 SFL     = -QU + sqrt(QU*QU + RTIP*RTIP - QX*QX - QY*QY);   // flank length
 TX      = QX + SFL*UX;  TY = QY + SFL*UY;
@@ -422,7 +422,7 @@ PAD_RO  = sqrt(R_HUB*R_HUB - pow(CC_GAPMM/2 + CC_PADL, 2));  // pad outer face
 RP2     = CC_P/(2*sin(180/CC_N2));                  // pinion pitch radius
 L_NOM   = 2*CC_C0/CC_P + (NCH + CC_N2)/2
           + pow((NCH - CC_N2)/(2*PI), 2)*CC_P/CC_C0;
-NL      = 2*ceil(L_NOM/2);                          // a roller chain closes even
+NL      = 2*ceil(L_NOM/2);                       // a chain closes even
 // taut-band length on the two pitch circles, less the loop asked for
 function cc_flen(C) =
   let (ph = asin((RP - RP2)/C))
@@ -431,12 +431,12 @@ function cc_bis(lo, hi, n) =
   n <= 0 ? (lo + hi)/2
          : let (mid = (lo + hi)/2)
              cc_flen(mid) > 0 ? cc_bis(lo, mid, n-1) : cc_bis(mid, hi, n-1);
-CDIST   = cc_bis(CC_P*NL/8, CC_P*NL/2, 60);         // the exact centre distance
+CDIST   = cc_bis(CC_P*NL/8, CC_P*NL/2, 60);      // exact centre distance
 PHIW    = asin((RP - RP2)/CDIST);
 WRAP    = 180 + 2*PHIW;                             // wrap on the collar
 WRAP2   = 180 - 2*PHIW;                             // wrap on the pinion
 TANG0   = 90 - PHIW;                                // first tangency azimuth
-TANG1   = 270 + PHIW;                               // second, going the long way
+TANG1   = 270 + PHIW;                            // the second one
 NENG    = WRAP/(2*BETA);                            // seats under the chain
 // arc minus chord over the wrapped runs: the band formula uses the arcs
 DEFC    = NENG*2*RP*(rad(BETA) - sin(BETA))
@@ -444,11 +444,11 @@ DEFC    = NENG*2*RP*(rad(BETA) - sin(BETA))
 
 // 6. backlash, gate 3
 BL_MM   = 2*CC_CS + CC_CJ;                          // at the pitch radius
-BL_DEG  = deg(BL_MM/RP);                            // at the collar = at the band
-BL_BAND = rad(BL_DEG)*RSPH;                         // as an arc at the register
-NR_EQ   = sg_row(3)[1];                             // the equator row's ring count
+BL_DEG  = deg(BL_MM/RP);                     // at the collar = the band
+BL_BAND = rad(BL_DEG)*RSPH;                  // as an arc at the register
+NR_EQ   = sg_row(3)[1];                      // the equator ring count
 BL_SUN  = BL_DEG*NR_EQ/NS;                          // referred to the sun
-BL_GEAR = deg(4*JT_*M_/(NS*M_));                    // gate 6's figure, recomputed
+BL_GEAR = deg(4*JT_*M_/(NS*M_));             // gate 6, recomputed
 
 // 7. the clamp
 L_GRIP  = 2*CC_RIBW;                                // bore length on the ribs
@@ -493,7 +493,8 @@ CC_PROF = [
   [R_TIN , -H_TON ], [R_BORE, -H_TON ], [R_BORE, -CC_HHUB], [R_HUB , -CC_HHUB],
   [R_HUB , -CC_HWEB], [R_PLT , -CC_HWEB], [R_PLT , -H_RIM ], [RTIP  , -H_RIM ],
   [RTIP  ,  H_RIM ], [R_PLT ,  H_RIM ], [R_PLT ,  CC_HWEB], [R_HUB ,  CC_HWEB],
-  [R_HUB ,  CC_HHUB], [R_BORE,  CC_HHUB], [R_BORE,  H_TON ], [R_TIN ,  H_TON ] ];
+  [R_HUB ,  CC_HHUB], [R_BORE,  CC_HHUB], [R_BORE,  H_TON ],
+  [R_TIN ,  H_TON ] ];
 CC_FLG  = [ false,false,false,false, false,false,false,true,
             true ,false,false,false, false,false,false,false ];
 
@@ -538,13 +539,14 @@ module cc_arc(a0, a1, j0, j1) { cc_sweep(cc_grid(a0, a1, j0, j1)); }
 // inner path.  dir = +1 puts it on the +x side of the split plane.
 module cc_pad(dir, zlo, zhi, zb) {
     n = CC_NPAD;
+    // sketch x is the axial coordinate, sketch y the radial one; the
+    // rotate below sends sketch x to world z with dir's sign on it
     sk = concat(
-      [ for (q = [ [-dir*zlo, R_BORE], [-dir*zhi, R_BORE],
-                   [-dir*zhi, PAD_RO], [-dir*zlo, PAD_RO] ])
-          q ],
+      [ [-dir*zlo, R_BORE], [-dir*zhi, R_BORE],
+        [-dir*zhi, PAD_RO], [-dir*zlo, PAD_RO] ],
       [ for (i = [0:n-1])
           [ -dir*zb + CC_BHOLE*sin(360*i/n),
-             R_BOLT      + CC_BHOLE*cos(360*i/n) ] ] );
+            R_BOLT  + CC_BHOLE*cos(360*i/n) ] ] );
     translate([dir*CC_GAPMM/2, 0, 0])
       rotate([0, dir*90, 0])
         linear_extrude(height = CC_PADL)
@@ -554,7 +556,8 @@ module cc_pad(dir, zlo, zhi, zb) {
 // the clamp bolt: head and shank, drawn at the shank's major diameter
 // with a clearance in both bores, so it shares no volume with the pads
 module cc_bolt(z) {
-    translate([-(CC_GAPMM/2 + CC_PADL + CC_BHH + CC_PART), R_BOLT, z]) rotate([0, 90, 0]) {
+    translate([-(CC_GAPMM/2 + CC_PADL + CC_BHH + CC_PART), R_BOLT, z])
+      rotate([0, 90, 0]) {
         cylinder(r = CC_BHR, h = CC_BHH, $fn = CC_FNB);
         translate([0, 0, CC_BHH])
           cylinder(r = CC_BSH, h = CC_GAPMM + 2*CC_PADL, $fn = CC_FNB);
@@ -596,14 +599,17 @@ function cc_mesh_vol(G) =
                         [ cc_det(p,q,u) + cc_det(p,u,v),
                           cc_det(p,q,v) + cc_det(q,u,v) ] ]),
        // both caps are planar, so any fan of them carries the same volume
-       caps = sum([ for (t = [1:T-2]) cc_det(G[T-1][0], G[T-1-t][0], G[T-2-t][0]) ])
-            + sum([ for (t = [1:T-2]) cc_det(G[0][MM-1], G[t][MM-1], G[t+1][MM-1]) ]) )
+       caps = sum([ for (t = [1:T-2])
+                      cc_det(G[T-1][0], G[T-1-t][0], G[T-2-t][0]) ])
+            + sum([ for (t = [1:T-2])
+                      cc_det(G[0][MM-1], G[t][MM-1], G[t+1][MM-1]) ]) )
     -(side + [caps, caps])/6;
 // a regular n-gon of circumradius R, inscribed: area
 function cc_ngon(n, R) = n/2*R*R*sin(360/n);
 
 V_ARC  = cc_mesh_vol(cc_grid(A0, A1, J0, J1));
-V_PAD  = CC_PADL*CC_PADH*(PAD_RO - R_BORE) - cc_ngon(CC_NPAD, CC_BHOLE)*CC_PADL;
+V_PAD  = CC_PADL*CC_PADH*(PAD_RO - R_BORE)
+       - cc_ngon(CC_NPAD, CC_BHOLE)*CC_PADL;
 V_BOLT = cc_ngon(CC_FNB, CC_BHR)*CC_BHH
        + cc_ngon(CC_FNB, CC_BSH)*(CC_GAPMM + 2*CC_PADL);
 V_TOT  = 2*V_ARC[0] + 8*V_PAD + 4*V_BOLT;
@@ -626,7 +632,8 @@ echo("=== 1. the chain, declared, not derived ===");
 echo(str("   pitch p = ", CC_P, " mm   roller diameter d = ", CC_DR,
          " mm   inner width ", CC_BI, " mm"));
 echo(str("   plate depth ", CC_HP, " mm   width over the pin heads ", CC_WO,
-         " mm   joint clearance ", CC_CJ, " mm   working tension ", CC_FW, " N"));
+         " mm   joint clearance ", CC_CJ, " mm   working tension ",
+         CC_FW, " N"));
 
 echo("=== 2. the pitch polygon closes ===");
 echo(str("   (1) p = 2 r_p sin(180/N): 2*", RP, "*sin(", BETA, ") = ",
