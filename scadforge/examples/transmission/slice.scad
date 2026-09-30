@@ -251,6 +251,17 @@ SL_CS    = 0.05;   // seating clearance where a pin meets a plate
 SL_THUB  = 3.0;    // carrier hub wall, mm at mean cone distance
 SL_TWEB  = 3.0;    // carrier web thickness, mm of cone distance
 SL_TBOSS = 2.0;    // extra depth of the pin boss band, mm
+SL_CBOSS = 2.0;    // how far the boss band reaches past the pin's own
+                   // cone, mm at the mean cone distance.  This was a bare
+                   // factor of two on the pin cone -- beta +/- 2 GPIN --
+                   // which is a 12 degree margin on row 1, where it was
+                   // written, and a 36 degree one on the equator row,
+                   // whose planets are 154 teeth.  There the retainer
+                   // came out as a near-hemispherical shell reaching
+                   // colatitude 123 and cut straight through the band's
+                   // register lands.  A boss covers its pin plus a
+                   // declared margin; the factor covered the row it was
+                   // measured on and nothing else.
 SL_TRET  = 3.0;    // retainer band thickness, mm of cone distance
 SL_NRV   = 120;    // facets per revolution, revolved carrier bodies
 SL_NRP   = 48;     // facets per revolution, pins
@@ -286,8 +297,9 @@ function sl_gj(i)    = sl_ghs(i) - deg(SL_CJ/sl_lm(i));   // sun journal cone
 function sl_ghi(i)   = sl_gj(i)  - deg(SL_THUB/sl_lm(i)); // hub bore cone
 function sl_gpin(i)  = sl_ghp(i) - deg(SL_CP/sl_lm(i));   // planet pin cone
 function sl_gbore(i) = sl_gpin(i)/3;                      // oil bore
-function sl_grim0(i) = sl_beta(i) - 2*sl_gpin(i);         // boss band, inner
-function sl_grim1(i) = sl_beta(i) + 2*sl_gpin(i);         // boss band, outer
+function sl_bossm(i) = sl_gpin(i) + deg(SL_CBOSS/sl_lm(i));
+function sl_grim0(i) = sl_beta(i) - sl_bossm(i);          // boss band, inner
+function sl_grim1(i) = sl_beta(i) + sl_bossm(i);          // boss band, outer
 
 function sl_rw1(i)   = sl_li(i) - SL_CA;       // web outer face (a thrust face)
 function sl_rw0(i)   = sl_rw1(i) - SL_TWEB;    // web inner face
@@ -657,7 +669,12 @@ echo(str("   pin seated at r = ", RPIN0, " on the web face at r = ", RW1,
          " (", RPIN0-RW1, " mm), outer end r = ", RPIN1,
          " under the retainer at r = ", RRET0, " (", RRET0-RPIN1, " mm)"));
 echo(str("   pin boss band spans colat ", GRIM0, " to ", GRIM1,
-         ", which is beta +/- 2 GPIN = ", BETA, " +/- ", 2*GPIN));
+         ", which is beta +/- (GPIN + deg(CBOSS/Lm)) = ", BETA, " +/- (",
+         GPIN, " + ", deg(SL_CBOSS/LM), ") = ", BETA, " +/- ",
+         sl_bossm(SL_I), ";  at the retainer's outer face r = ", RRET1,
+         " that band runs from z = ", RRET1*cos(GRIM1), " to ",
+         RRET1*cos(GRIM0), " and out to r = ",
+         RRET1*sin(max(GRIM0, min(GRIM1, 90)))));
 
 echo(str("--- predicted volumes; the mesh must come in under, because",
          " every chord cuts inside its arc ---"));

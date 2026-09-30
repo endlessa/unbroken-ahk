@@ -49,9 +49,15 @@
 //  the report prints all three: the radius, the clamp width (18 mm
 //  against a register 20 mm long), and the anti-rotation feature -- an
 //  azimuthal keyway tongue, where the band offers a circumferential
-//  groove.  The tongue is now a circumferential RIB, the same feature
-//  the chain collar uses, so the two collars are interchangeable in
-//  fact and not only in claim.
+//  groove.  The tongue is now a circumferential RIB of the band's own
+//  width, the same feature the chain collar uses, and because both
+//  collars READ that width from eb_if_*() they bore the same cylinder
+//  and sit in the same groove BY CONSTRUCTION rather than by claim.
+//  What the change trades away is in section 6 and in the report: a
+//  keyway is a positive drive and a rib is not, so torque now reaches
+//  the band by friction at the bore, and this file does not compute
+//  that grip.  The four collar-side numbers -- wall, bolt circle, bolt
+//  size, pinch ears -- are still published and still unchecked.
 //
 //  The clamp is genuinely split: two halves, each spanning
 //
@@ -870,25 +876,40 @@ echo(str("   the seat was R + off with off = 24 mm chosen, giving ", RSPH+24,
 echo(str("   the clamp was 18 mm wide against a register ",
          2*EB_LND[1] + EB_GRV[0], " mm long, so it could not have covered",
          " both lands even at the right radius"));
-echo(str("   and the anti-rotation feature was an azimuthal keyway tongue,",
-         " where the band offers a circumferential groove.  It is now a",
-         " circumferential rib, which is the chain collar's feature, so the",
-         " two collars are interchangeable in fact"));
+echo(str("   and the register feature was an azimuthal keyway tongue, where",
+         " the band offers a circumferential groove.  It is now a",
+         " circumferential rib of the band's own width, read from",
+         " eb_if_collar()[2].  What that trades away is stated rather than",
+         " hidden: a keyway is a positive drive and a rib is not, so torque",
+         " now reaches the band by friction at the bore alone, and this file",
+         " does not compute that grip (see section 6, left open).  What it",
+         " buys is that both collars now READ their register from the same",
+         " eb_if_*(), so both bore the same cylinder and sit in the same",
+         " groove by construction.  That much is shared; the four",
+         " collar-side numbers above are not, and nothing here compares one",
+         " collar's file with the other's"));
 echo(str("   none of the three could be noticed while the interface was",
          " PUBLISHED rather than READ.  Assembling the stack is what",
          " noticed, and eb_if_*() is what fixed it"));
 
 echo("--- 1b. which way round it goes on, computed ---");
+EM_HEAD = eb_if_span()[1] - EB_GRV[1];   // flange underside over the groove centre
+EM_FOUL = ZTB1 - EM_HEAD;                // positive means the tabs run into it
 echo(str("   the collar-side tabs reach z = ", ZTB1, " out to r = ", RLGX,
-         "; the band's spur flange underside stands ",
-         eb_if_span()[1] - EB_GRV[1], " mm above the groove centre, and the",
-         " band reaches r = ", EB_RCH[1], " there.  Tabs towards the flange",
-         " would foul it by ", ZTB1 - (eb_if_span()[1] - EB_GRV[1]),
-         " mm, so the collar is fitted with its machine facing AWAY from the",
-         " crown: mirrored in z about the groove centre.  Fitted that way",
-         " the tabs end at ", EB_GRV[1] - ZTB1, " against the band's skirt",
-         " end at ", EB_RCH[2], ", clear by ", EB_RCH[2] - (EB_GRV[1] - ZTB1),
-         " mm"));
+         "; the band's spur flange underside stands ", EM_HEAD,
+         " mm above the groove centre and the band reaches r = ", EB_RCH[1],
+         " there, so tabs towards the flange ",
+         EM_FOUL > 0 ? str("FOUL it by ", EM_FOUL,
+                           " mm: the collar has to go on with its machine",
+                           " facing away from the crown, mirrored in z",
+                           " about the groove centre")
+                     : str("clear it by ", -EM_FOUL,
+                           " mm, so the collar goes on either way up.  The",
+                           " stack fits it with the machine away from the",
+                           " crown anyway, which is the side with room")));
+echo(str("   the other way up the tabs end at ", EB_GRV[1] - ZTB1,
+         " against the band's skirt end at ", EB_RCH[2], ", clear by ",
+         EB_RCH[2] - (EB_GRV[1] - ZTB1), " mm"));
 
 echo("--- 2. the winding arithmetic ---");
 echo(str("   (3) q = S/(3P) = ", SLOTS, "/", 3*POLES, " = ",

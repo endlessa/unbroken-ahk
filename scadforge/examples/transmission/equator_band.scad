@@ -5,14 +5,18 @@
 //
 //  Built on spherical_gear.scad, which is the contract.  Every number
 //  that belongs to the design table is READ from that file through
-//  `use`; nothing from the table is restated here.  Four numbers come
-//  from outside it and are named as such at the head of the file: the
-//  port ratio and the pinion count (from which the outer tooth count
-//  is a product, not a written-down integer), and the two Lewis
-//  inputs sigma and Y.  The library echoes an outer count and a pinion
-//  count of its own; both are quoted at the bottom of the file ONLY so
-//  that the report can print the difference against this file's
-//  product, which is the drift check.
+//  `use`; nothing from the table is restated here.  Everything else is
+//  declared in one block at the head of the file under DECLARED INPUTS
+//  and derived from there -- the register's dimensions, the wall and
+//  web thicknesses, the mesh densities.  Four of those declarations
+//  are not free geometry choices but design data in their own right:
+//  the port ratio and the pinion count (from which the outer tooth
+//  count is a product, not a written-down integer), and the two Lewis
+//  inputs sigma and Y that the port's force estimate rests on.  The
+//  library echoes an outer count and a pinion count of its own as
+//  VARIABLES, which `use` does not import; both are therefore quoted in
+//  the declarations ONLY so that the report can print the difference
+//  against this file's product, which is the drift check.
 //
 //  ---------------------------------------------------------------
 //  0.  WHAT THE BAND IS
@@ -88,11 +92,26 @@
 //      inv(25)      = 1.71746 deg      the planar one
 //      ratio        = 5.417
 //
-//  A factor of 5.4 is not a degeneracy.  The crown's flank half width
-//  is ht +/- (INVS(Gamma) - INVS(90)), and the file prints how much
-//  azimuth that sweeps across the working depth, against the tooth
-//  pitch 360/Nr, so the size of the thing being got wrong is on the
-//  record next to the ratio.
+//  A factor of 5.4 is not a degeneracy.  But the ratio is not the
+//  sharpest way to say it, because both profiles are PLACED so as to
+//  have the right thickness at the pitch circle; what differs is the
+//  shape away from it.  So the file prints the quantity that decides
+//  the tooth: the crown's flank half width is ht + (INVS(Gamma) -
+//  INVS(90)), and the azimuth it sweeps between the root cone 90 + tf
+//  and the tip cone 90 - ta is
+//
+//      hw(90+tf) - hw(90-ta) = 0.496763 deg = 0.333935 tooth pitches
+//
+//  at a pitch of 360/Nr = 1.487603 deg.  A planar involute of the same
+//  base circle, asked for the same two surfaces, is asked for them at
+//  radii L sin(90+tf) = 120.99354 and L sin(90-ta) = 120.99587 -- BOTH
+//  BELOW the pitch radius 121, because colatitude 90 is where radius is
+//  greatest -- and sweeps 0.000513 deg across them, 968 times less.  A
+//  crown gear's working depth is almost entirely axial, so a profile
+//  parameterised by radius cannot even tell its tip cone from its root
+//  cone.  That, and not the factor of 5.4, is why the spec's equator
+//  degeneracy has to be refused here.  The file prints all four
+//  numbers.
 //
 //  What DOES survive, intact, at every latitude including this one, is
 //  the RATIO of base circle to pitch circle.  Divide the contract's (1)
@@ -128,7 +147,7 @@
 //      centre distance = (Nout + Npin) m / 2 = 154 mm
 //
 //  The pinion's tooth count is above the undercut limit 2/sin^2(phi)
-//  = 11.21 at phi = 25, which is printed.  The flank is the planar
+//  = 11.1978 at phi = 25, which is printed.  The flank is the planar
 //  involute of the base circle r_b = r_p cos(phi), built with the
 //  library's sg_ptp / sg_invp branch of the same function family: the
 //  half tooth width at radius r is
@@ -140,14 +159,18 @@
 //  as every mesh in the machine, which the file prints as
 //  pi m - 2 t = jt m at the pitch circle.
 //
-//  The flank is not built from (6).  It is built from the library's
-//  sg_ptp, the planar involute POINT of base radius r_b at roll
-//  parameter th, taken at th = deg(tan(alpha_r)) and swung onto the
-//  tooth centre line; (6) is then the CHECK, and the file prints the
-//  largest disagreement between the two over a whole flank, in mm and
-//  in degrees.  Every flank sample therefore lies ON the involute and
-//  the only faceting is the chord between samples, whose deviation
-//  from the curve the file also measures and prints.
+//  The flank IS built from (6): every sample is placed by its angle.
+//  The CHECK on it is the library's sg_ptp, the planar involute POINT
+//  of base radius r_b at roll parameter th, which is an independent
+//  construction of the same curve -- a Cartesian point rather than an
+//  angle.  Take th = deg(tan(alpha_r)); then |sg_ptp| = r and its
+//  argument is inv(alpha_r), so mirroring it in the x axis and turning
+//  it through ht + inv(phi) must land it exactly where (6) puts the
+//  sample.  The file prints the largest disagreement between the two
+//  over a whole flank, in mm and in degrees.  Every flank sample
+//  therefore lies ON the involute and the only faceting is the chord
+//  between samples, whose deviation from the curve the file also
+//  measures and prints.
 //
 //  The addendum and dedendum are not written down either.  The
 //  contract gives them as ANGLES, sg_ta(D) = atan(2/D) and
@@ -203,19 +226,39 @@
 //
 //  and the crown ring seats in the body: its back cone lands on a seat
 //  cut to the same cone, and its sphere stands in a bore cut at
-//  sg_r().  The two seats are computed, not assumed, and their
-//  clearances are printed.
+//  sg_r().  Both seats are computed, and the file prints both fits:
+//  the cone is a CONTACT, the two surfaces coincide to 0 mm and the
+//  file prints that residual, and the bore is a locating fit of
+//  0.016529 mm at its lip opening to 0.195248 mm at the seat.
 //
 //  This is what the parts are -- a fine-pitch crown ring at m = 1 is a
 //  wear part and is made separately from the member that carries the
 //  power port -- and it is also what keeps the export off the boolean
 //  path, so that the exported mesh is face for face what this file
-//  writes.  What the export CANNOT do is confirm the two members do
-//  not overlap: past 25000 triangles this kernel skips its export-time
-//  union and says so, and a scene past that threshold that DOES
-//  overlap comes back with holes = 0 and a volume that counts the
-//  overlap twice.  So a clean leak count is not by itself evidence.
-//  The printed seat clearances are the statement.
+//  writes.  The export cannot CHECK that the two members do not
+//  overlap: this kernel groups shells whose bounding boxes meet and
+//  unions each group only if the group is under 25000 triangles, and
+//  these two are one such group at 393204, so the union is skipped and
+//  it says so.  A scene in that state that DOES overlap comes back
+//  with holes = 0 and a volume that counts the overlap twice, so a
+//  clean leak count is not by itself evidence.  The file therefore
+//  proves the separation itself, in three printed parts under gate M:
+//
+//    (i)   the crown ring lies on or above the cone z = rho cot(Ghub),
+//          because the greatest colatitude sg_boundary returns for it,
+//          90 + tf, is less than Ghub;
+//    (ii)  the crown ring lies within rho <= L_o = R_BORE, being cut
+//          from the sphere of radius L_o, and reaches rho = R_BORE
+//          only on the equator z = 0, which is Z_SH above the highest
+//          body material at that radius;
+//    (iii) every meridian vertex of the body with rho < R_BORE lies on
+//          or below the same cone, and the file prints the worst
+//          margin.
+//
+//  Below R_BORE the body is under the cone and the crown is over it;
+//  at R_BORE the body stops 1.99993 mm short of the one circle the
+//  crown reaches; past R_BORE the crown has no material at all.  That
+//  is a proof from the vertex lists, not a leak count.
 //
 //  The body's shell is a torus in index space: the meridian loop is
 //  cyclic and the azimuth ring is cyclic, so every edge is used
@@ -249,10 +292,11 @@ use <spherical_gear.scad>
 // ===================================================================
 EB_PORT  = 10;      // outer port ratio, declared
 EB_NPIN  = 28;      // pinion teeth, declared; undercut checked below
-EB_F     = 0.25;    // crown face as a fraction of cone distance.  This is
-                    // sg_sector's own default, written here so the seat
-                    // this file cuts and the sector it seats agree; it is
-                    // passed to sg_sector explicitly.
+EB_F     = 0.25;    // crown face as a fraction of cone distance, declared
+                    // here and passed to sg_sector EXPLICITLY, so the seat
+                    // this file cuts and the sector it seats are cut from
+                    // one number and no library default is relied on.
+                    // Gate I holds it inside the usual L/3.
 EB_SPURB = 12;      // spur face width, mm
 EB_REL   = 0.75;    // relief: how far the wall's top face clears the
                     // crown's root plane
@@ -264,7 +308,18 @@ EB_SKW   = 8.00;    // register skirt wall
 EB_LANDH = 2.50;    // land height above the band's outer face
 EB_LANDW = 7.00;    // axial width of one land
 EB_GRW   = 6.00;    // axial width of the groove between the lands
-EB_RELG  = 2.00;    // relief between the spur flange and the upper land
+EB_RELG  = 10.50;   // relief between the spur flange and the upper land.
+                    // This was 2.00, which put the flange underside 12 mm
+                    // above the groove centre.  Both collars publish an
+                    // envelope taller than that -- the chain collar's
+                    // clamp lugs stand 19.2 mm off its own centre line and
+                    // the EM collar's tabs 16.05 -- so either one's lugs
+                    // ran into the flange.  Each file published its
+                    // envelope and nothing compared them; stack.scad now
+                    // does, and it is what found this.  10.50 puts the
+                    // flange 20.5 mm up, which clears the taller of the
+                    // two by 1.3 mm.  A collar taller than that is a gate
+                    // failure the stack will print.
 EB_CR    = 0.30;    // radial clearance the collar is to use
 EB_CA    = 0.20;    // axial clearance the collar is to use, per side
 
@@ -313,12 +368,32 @@ FACE  = LO - LI;
 ADD   = LO*tan(TA);             // (7) addendum, mm
 DED   = LO*tan(TF);             // (7) dedendum, mm
 
-// sg_sector's INTERNAL hub rule, rebuilt from the published sg_ta/sg_tf
-// so that the seat this file cuts follows the sector's own back cone.
-// If the library's rule moves, the seat moves with it.
+// sg_sector's INTERNAL hub rule.  The library computes Ghub inside
+// sg_sector and publishes no accessor for it, so this is a DUPLICATE and
+// nothing about writing it here makes it track the library.  What makes
+// it track the library is gate L, which RECOVERS the angle sg_sector
+// actually used from two published functions and compares.  sg_omega
+// sums dpsi*(mean cos(G) - cos(Ghub)) over sg_boundary's own samples, so
+// with S0 = sum dpsi and S1 = sum dpsi * mean cos(G), both rebuilt here
+// from the same published sg_boundary,
+//
+//      cos(Ghub_library) = (S1 - sg_omega) / S0                    (10)
+//
+// exactly.  If the library's rule moves, gate L fails and the seat is
+// known to be wrong instead of quietly being wrong.
 function eb_ghub_i(g, D) = g + sg_tf(D) + 2.5*(sg_ta(D) + sg_tf(D));
 GHUB  = eb_ghub_i(GR, D);
 COTH  = cos(GHUB)/sin(GHUB);    // the seat cone is z = rho * COTH
+
+CRHT   = sg_ht(NR, JT_*M_, M_);                     // the crown's half tooth
+CRB    = sg_boundary(NR, NR, GR, GB, CRHT, TA, TF, false);
+CRS0   = sum([ for (i=[0:len(CRB)-2]) rad(CRB[i+1][1] - CRB[i][1]) ]);
+CRS1   = sum([ for (i=[0:len(CRB)-2]) rad(CRB[i+1][1] - CRB[i][1])
+                  *(cos(CRB[i][0]) + cos(CRB[i+1][0]))/2 ]);
+OMG    = sg_omega(NR, NR, D, false, PHI, JT_, M_);
+GHUB_L = acos((CRS1 - OMG)/CRS0);                   // (10)
+CR_GMAX= max([ for (p = CRB) p[0] ]);   // the crown's greatest colatitude
+CR_TRIS= 4 + 8*(len(CRB) - 1);          // sg_shell's face word, in triangles
 
 CR_RMAX = LO*sin(GR - TA);      // crown ring's widest MESH vertex
 CR_RROOT= LO*sin(GR + TF);      // its radius at the root cone
@@ -349,6 +424,9 @@ ZMIN  = 2/(sin(PHI)*sin(PHI));            // undercut limit
 PN_RP = EB_NPIN*M_/2;
 PN_RB = PN_RP*cos(PHI);
 PN_RA = PN_RP + ADD;
+PN_RF = PN_RP - DED;
+CLR_B = CDIST - RA2 - PN_RF;    // band tip to pinion root
+CLR_P = CDIST - PN_RA - RF2;    // pinion tip to band root
 CRAT  = (sqrt(RA2*RA2 - RB2*RB2) + sqrt(PN_RA*PN_RA - PN_RB*PN_RB)
          - CDIST*sin(PHI)) / (PI*M_*cos(PHI));
 
@@ -378,6 +456,22 @@ MER = [ [R_BIN,  R_BIN*COTH],   [R_BORE, R_BORE*COTH], [R_BORE, Z_SH],
 FLG = [ false, false, false, true,  true,
         false, false, false, false, false,
         false, false, false, false, false, false ];
+
+// The separation proof of header section 6, as numbers.  SEP_CONE is the
+// worst margin of a body meridian vertex inside R_BORE below the seat
+// cone; a flagged station's smallest possible radius is RF2, which is
+// outside R_BORE, so those are not inside and take the sentinel.
+SEP_CONE = min([ for (t=[0:len(MER)-1])
+                   let( r = FLG[t] ? RF2 : MER[t][0] )
+                     r >= R_BORE ? LO : r*COTH - MER[t][1] ]);
+SEP_TOP  = 0 - Z_SH;   // the crown reaches rho = R_BORE only at z = 0
+// and the seat fit itself: the crown's back cone against this file's cone
+SEP_SEAT = max([ for (i=[0:1]) let( L = i == 0 ? LI : LO )
+                   abs(L*cos(GHUB) - L*sin(GHUB)*COTH) ]);
+// the crown ring's bore fit, as the least radial gap over the bore's run
+EB_NBG   = 24;
+BORE_GAP = min([ for (i=[0:EB_NBG]) let( z = Z_SH + (R_BORE*COTH - Z_SH)*i/EB_NBG )
+                   R_BORE - sqrt(LO*LO - z*z) ]);
 
 // what the collar must be built to
 COL_BORE = R_LAND + EB_CR;      // collar bore, over the land crests
@@ -443,6 +537,29 @@ FLK_CHD = max([ for (i=[0:EB_NFL-1])
 TIP_SAG = RA2*(1 - cos(HRA/EB_NTA));
 RT_SAG  = RF2*(1 - cos((180/NOUT - HRF)/(2*EB_NRA)));
 
+// The independent check on the flank.  sg_ptp(th, r_b) is the library's
+// planar involute POINT; at th = deg(tan(alpha_r)) it has modulus r and
+// argument inv(alpha_r).  Mirror it in the x axis and turn it through
+// ht + inv(phi) and it must land on eb_fp(r), which (6) placed by angle
+// alone.  Two constructions, one curve; the disagreement is the check.
+function eb_qp(r) =
+  let( al = acos(RB2/r), Q = sg_ptp(deg(tan(al)), RB2), a = HT2 + INVP )
+    [ Q[0]*cos(a) + Q[1]*sin(a), Q[0]*sin(a) - Q[1]*cos(a) ];
+PTP_MM  = max([ for (i=[0:EB_NFL]) let( r = RF2 + (RA2-RF2)*i/EB_NFL )
+                  norm(eb_qp(r) - eb_fp(r)) ]);
+PTP_DEG = max([ for (i=[0:EB_NFL]) let( r = RF2 + (RA2-RF2)*i/EB_NFL,
+                     Q = eb_qp(r), P = eb_fp(r) )
+                  abs(atan2(Q[1],Q[0]) - atan2(P[1],P[0])) ]);
+
+// The crown's flank half width across its working depth, which is the
+// number section 2 of the header turns on, and the same sweep a planar
+// involute of the same base circle gives over the same two radii.
+CR_HWF = CRHT + sg_invs(GR + TF, GB) - sg_invs(GR, GB);   // at the root cone
+CR_HWA = CRHT + sg_invs(GR - TA, GB) - sg_invs(GR, GB);   // at the tip cone
+CR_RB  = LO*cos(PHI);                                     // (4) r_b = r_p cos phi
+CR_PLF = sg_invp(acos(CR_RB/CR_RROOT));
+CR_PLA = sg_invp(acos(CR_RB/CR_RMAX));
+
 // ===================================================================
 //  THE SHELL
 //  A closed meridian loop swept through a closed ring of azimuths is a
@@ -470,8 +587,13 @@ module eb_lathe(MER, FLG, AZ, RSP) {
 }
 
 // The exact volume of the mesh eb_lathe writes: the divergence theorem
-// over the two triangles the writer fans out of each quad.  Not a
-// bound -- the exported number itself, to the f32 the writer rounds to.
+// over the two triangles the writer fans out of each quad, in the same
+// double precision the writer places the vertices in.  Not a bound: the
+// mesh's own volume, face for face.  It is NOT the number a tool
+// measuring an exported file reports back, because an export puts every
+// vertex on that format's grid first -- a binary STL's f32, a .off's
+// decimals -- and at this size that moves the total in the second
+// decimal.  A disagreement down there is the file format, not the mesh.
 function eb_det(a,b,c) = a[0]*(b[1]*c[2]-b[2]*c[1])
                        + a[1]*(b[2]*c[0]-b[0]*c[2])
                        + a[2]*(b[0]*c[1]-b[1]*c[0]);
@@ -539,12 +661,38 @@ echo(str("H  port contact ratio > 1.2  ", CRAT > 1.2 ? "PASS" : "FAIL",
          ", CR = ", CRAT));
 echo(str("I  crown face within L/3     ", FACE <= LO/3 ? "PASS" : "FAIL",
          ", face = ", FACE, " <= L/3 = ", LO/3));
-echo(str("J  crown ring clears the bore ",
-         LO - sqrt(LO*LO - Z_SH*Z_SH) > 0 ? "PASS" : "FAIL",
-         ", least radial gap = ", LO - sqrt(LO*LO - Z_SH*Z_SH), " mm"));
+echo(str("J  crown sphere inside bore  ",
+         BORE_GAP > 0 ? "PASS" : "FAIL",
+         ", least radial gap over the bore's whole run = ", BORE_GAP,
+         " mm, which is under the collar clearance EB_CR = ", EB_CR,
+         ", so the bore LOCATES the crown ring, it does not clear it"));
 echo(str("K  body mesh volume bracketed ",
          V_BODY > V_LO && V_BODY < V_HI ? "PASS" : "FAIL",
          ", ", V_LO, " < ", V_BODY, " < ", V_HI));
+echo(str("L  library hub angle (10)    ",
+         abs(GHUB_L - GHUB) < 1e-9 ? "PASS" : "FAIL",
+         ", acos((S1 - sg_omega)/S0) = ", GHUB_L, " against this file's ",
+         GHUB, ", difference ", GHUB_L - GHUB, " deg"));
+echo(str("M  members share no volume   ",
+         CR_GMAX < GHUB && SEP_CONE >= 0 && SEP_TOP > 0 ? "PASS" : "FAIL",
+         ";  (i) crown's greatest colatitude ", CR_GMAX, " < Ghub ", GHUB,
+         ";  (ii) crown reaches rho = R_BORE only at z = 0, and the body",
+         " stops ", SEP_TOP, " mm below that;  (iii) worst body vertex",
+         " inside R_BORE stands ", SEP_CONE, " mm below the seat cone"));
+echo(str("N  triangles written         body ", 2*len(AZ)*len(MER),
+         " + crown ", CR_TRIS, " = ", 2*len(AZ)*len(MER) + CR_TRIS,
+         ".  This is a PREDICTION, not a gate: a shell that lost a",
+         " zero-area quad would come out short, and only the exported",
+         " count answers that."));
+echo(str("O  port tip-root clearance   ",
+         abs(CLR_B - CLR_P) < 1e-12 && abs(CLR_B - 0.25*M_) < 1e-12
+           ? "PASS" : "FAIL",
+         ", band tip to pinion root ", CLR_B, " = pinion tip to band root ",
+         CLR_P, " = 0.25 m = ", 0.25*M_, " mm"));
+echo(str("P  flank is on the involute  ",
+         PTP_MM < 1e-9 ? "PASS" : "FAIL",
+         ", (6) against sg_ptp over a whole flank: ", PTP_MM, " mm, ",
+         PTP_DEG, " deg"));
 echo("SPEC EQUATOR DEGENERACY     FAIL as stated, and this is the one");
 echo("  place in the machine where it would be acted on.  Numbers below.");
 
@@ -582,9 +730,25 @@ echo(str("   INVS(90; ", GB, ") = ", sg_invs(90, GB),
          "   90(sec phi - 1) = ", 90*(1/cos(PHI) - 1),
          "   planar inv(phi) = ", INVP,
          "   ratio = ", sg_invs(90, GB)/INVP));
-echo(str("   a planar flank on this crown would be ",
-         sg_invs(90, GB) - INVP, " deg of azimuth wrong at the tip, = ",
-         (sg_invs(90, GB) - INVP)/(360/NR), " tooth pitches at Nr = ", NR));
+echo(str("   the two involute functions part by ", sg_invs(90, GB) - INVP,
+         " deg of azimuth AT THE PITCH CIRCLE, = ",
+         (sg_invs(90, GB) - INVP)/(360/NR), " tooth pitches at Nr = ", NR,
+         ".  But both profiles are placed to be right there, so the ratio",
+         " is not yet the defect; the sweep across the working depth is."));
+echo(str("   the crown's half width: hw(90+tf) = ", CR_HWF,
+         " deg at the root cone, hw(90-ta) = ", CR_HWA,
+         " deg at the tip cone, sweep ", CR_HWF - CR_HWA, " deg = ",
+         (CR_HWF - CR_HWA)/(360/NR), " tooth pitches at a pitch of ",
+         360/NR, " deg"));
+echo(str("   a planar involute of the same base circle r_b = L cos(phi) = ",
+         CR_RB, " asked for the same two surfaces is asked for them at",
+         " radii ", CR_RROOT, " and ", CR_RMAX, ", BOTH under the pitch",
+         " radius ", LO, " because colatitude 90 is where radius is",
+         " greatest, and sweeps ", abs(CR_PLF - CR_PLA), " deg across",
+         " them: ", (CR_HWF - CR_HWA)/abs(CR_PLF - CR_PLA),
+         " times less.  A crown gear's working depth is axial, so a",
+         " profile parameterised by radius cannot tell its tip cone from",
+         " its root cone.  That is the degeneracy claim's real cost."));
 echo("   what survives is (4), r_b/r_p = cos(phi), at EVERY gamma:");
 for (g = [10, 30, 60, 90])
   echo(str("      gamma = ", g, "   sin(gamma_b)/sin(gamma) = ",
@@ -615,14 +779,22 @@ echo(str("   (6) at the pitch circle: h(r_p) = ", eb_h(RP2),
          "   difference = ", eb_h(RP2) - HT2));
 echo(str("   h(r_f) = ", HRF, "   h(r_a) = ", HRA,
          "   tip is not pointed: h(r_a) > 0 is ", HRA > 0));
-echo(str("   tooth thickness at r_p = ", 2*rad(HT2)*RP2,
+echo(str("   tooth thickness t = 2 r_p ht = ", 2*rad(HT2)*RP2,
          " mm; circular pitch pi m = ", PI*M_,
-         "; backlash pi m - 2 t = ", PI*M_ - 2*(2*rad(HT2)*RP2)/2,
-         " = jt m = ", JT_*M_));
+         "; backlash pi m - 2 t = ", PI*M_ - 2*(2*rad(HT2)*RP2),
+         " = jt m = ", JT_*M_, ", difference ",
+         PI*M_ - 2*(2*rad(HT2)*RP2) - JT_*M_));
 echo(str("   space width at the root circle = ",
          2*rad(180/NOUT - HRF)*RF2, " mm; tip land = ", 2*rad(HRA)*RA2,
          " mm.  The root space is the printability limit on this face."));
 echo(str("   contact ratio with the ", EB_NPIN, " tooth pinion = ", CRAT));
+echo(str("   the teeth clear: centre distance ", CDIST, " - r_a ", RA2,
+         " - pinion r_f ", PN_RF, " = ", CLR_B, " mm, and ", CDIST,
+         " - pinion r_a ", PN_RA, " - r_f ", RF2, " = ", CLR_P,
+         " mm, both 0.25 m = ", 0.25*M_));
+echo(str("   (6) against the library's sg_ptp over a whole flank: ",
+         PTP_MM, " mm, ", PTP_DEG, " deg.  Every flank sample is ON the",
+         " involute; what follows is the chord between samples."));
 echo(str("   faceting, measured: ", EB_NFL, " chords on a flank, longest ",
          FLK_CHD, " mm, greatest deviation from the involute ", FLK_SAG,
          " mm; tip arc sagitta ", TIP_SAG, " mm; root arc sagitta ",
@@ -649,11 +821,18 @@ echo(str("   the bore is cut at sg_r() = ", R_BORE,
          " equator: L - sqrt(L^2 - z^2) at z = ", Z_SH, " is ",
          LO - sqrt(LO*LO - Z_SH*Z_SH), " mm, opening to ",
          LO - CR_HUBO, " mm at the seat"));
-echo(str("   seat: both the sector's back cone and this file's seat are",
-         " cut at GHUB = ", GHUB, " deg from the same rule, cot = ", COTH,
-         "; the seat runs from r = ", R_BIN, " to ", R_BORE,
+echo(str("   seat: the sector's back cone is at GHUB = ", GHUB_L,
+         " deg, recovered by (10) from sg_omega, and this file's seat is",
+         " cut at ", GHUB, ", cot = ", COTH, ", difference ", GHUB_L - GHUB,
+         " deg; the seat runs from r = ", R_BIN, " to ", R_BORE,
          " and the crown ring's back cone from ", CR_HUBI, " to ", CR_HUBO,
          ", so the lip stands ", CR_HUBI - R_BIN, " mm inboard"));
+echo(str("   the seat fit is a CONTACT, not a clearance: the crown's back",
+         " cone and this file's seat cone are the same surface, and the",
+         " worst residual over the crown's two end radii is ", SEP_SEAT,
+         " mm.  The bore fit is ", BORE_GAP, " mm least, against the ",
+         EB_CR, " mm this file gives the collar: the bore locates the",
+         " crown ring and the cone carries it."));
 echo(str("   the crown ring's widest mesh vertex is at r = ", CR_RMAX,
          ", which is ", R_BORE - CR_RMAX, " mm inside the bore; the exact",
          " sphere reaches ", LO, " at z = 0, which is ", -Z_SH,
@@ -672,6 +851,10 @@ echo(str("   register length = ", REGL, " mm = relief ", EB_RELG,
 echo(str("   a collar built to these takes bore ", COL_BORE, " (= r_land + ",
          EB_CR, "), tongue inner face ", COL_TONG, " (= sg_r() + ", EB_CR,
          "), tongue width ", COL_TW, " (= groove - 2*", EB_CA, ")"));
+echo(str("   the collar must be radially split: its tongue inner face ",
+         COL_TONG, " is ", R_LAND - COL_TONG, " mm inside the land crests ",
+         R_LAND, ", so a continuous tongue cannot pass a land axially: ",
+         COL_TONG < R_LAND));
 echo(str("   groove centre at z = ", (Z_L1 + Z_L2)/2,
          "; a collar hub symmetric about it may be up to ",
          2*(Z_SB - (Z_L1+Z_L2)/2), " mm tall before it fouls the flange"));
@@ -717,10 +900,14 @@ echo(str("   envelope: r from ", R_BIN, " to ", RA2, " mm, z from ", Z_L3,
 echo(str("   mesh: body ", len(AZ), " azimuth stations * ", len(MER),
          " meridian points = ", len(AZ)*len(MER), " quads = ",
          2*len(AZ)*len(MER), " triangles, no end walls (a torus in both",
-         " indices); crown ring as sg_sector writes it"));
-echo(str("   the two members share no volume.  Past 25000 triangles this",
-         " kernel skips the export-time union, so the export cannot",
-         " confirm that; the seat clearances above are the statement."));
+         " indices); crown ring ", len(CRB), " boundary points, which is",
+         " 2 end walls + 4*", len(CRB)-1, " quads = ", CR_TRIS,
+         " triangles; total ", 2*len(AZ)*len(MER) + CR_TRIS));
+echo(str("   this kernel groups shells whose bounding boxes meet and",
+         " unions each group only under 25000 triangles; these two are",
+         " one group at ", 2*len(AZ)*len(MER) + CR_TRIS, ", so the union",
+         " is skipped and the export cannot confirm the members are",
+         " disjoint.  Gate M proves it from the vertex lists instead."));
 
 // ===================================================================
 //  THE BAND
