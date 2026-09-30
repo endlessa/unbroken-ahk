@@ -842,6 +842,20 @@ pub fn weld_tjunctions(mesh: &Mesh) -> Mesh {
             u[2] * v[0] - u[0] * v[2],
             u[0] * v[1] - u[1] * v[0],
         ];
+        // A triangle with no area has no orientation, so there is nothing to
+        // check a re-cut against: `dot(piece, plane) < 0` is false whatever
+        // the piece does, the guard below is vacuous, and whatever the ear
+        // clip decided stands. That is the gap the third tier could not
+        // close on its own -- a lattice hull kept two inconsistently wound
+        // edges through all three tiers.
+        //
+        // Such a triangle contributes no surface and will be dropped by the
+        // writer anyway, so splitting it can only invent an orientation
+        // nobody asked for. It goes through unchanged.
+        if dot(plane, plane) <= 0.0 {
+            out.push(*t);
+            continue;
+        }
         // Which plane to project in is a choice with no winner, so it is
         // made by checking rather than by argument. Newell's normal is the
         // better conditioned of the two for choosing ears -- using the
