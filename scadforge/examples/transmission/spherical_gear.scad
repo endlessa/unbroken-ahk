@@ -289,6 +289,24 @@ CAP_F    = 12;          // supercapacitor bank per slice, farad
 CAP_VLO  = 12;
 CAP_VHI  = 24;
 
+// ---- the contract, reachable through `use <>` -----------------------
+// `use` imports modules and functions but NOT variables, which is the
+// right default -- a part file that said `include` would instantiate
+// this file's demonstration sectors as well.  So the design table is
+// published as functions.  A part file reads its numbers HERE; it never
+// restates them, because a restated constant is a constant that can
+// drift from the one the closure identities were checked against.
+function sg_m()     = MODULE_MM;
+function sg_phi()   = PHI_P;
+function sg_jt()    = JT;
+function sg_ns()    = NS;
+function sg_dref()  = DREF;
+function sg_r()     = RSPH;
+function sg_rows()  = ROWS;
+function sg_row(i)  = ROWS[i];
+function sg_em()    = [EM_SLOTS, EM_POLES];
+function sg_cap()   = [CAP_F, CAP_VLO, CAP_VHI];
+
 // ===================================================================
 //  REPORT
 // ===================================================================
