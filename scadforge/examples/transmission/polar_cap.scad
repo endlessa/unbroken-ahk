@@ -130,6 +130,11 @@
 //  multiple of Ns above the bound is the answer, and the report prints
 //  the bound, the count, the margin in teeth and the margin in mm.
 //
+//  Ghub itself depends on the count, through sg_ta and sg_tf, so this
+//  is a FIXED POINT of N -> Ns ceil(bound(Ghub(N))/Ns) and not a closed
+//  form.  The report runs the map from four seeds and prints where each
+//  one lands, so the reader can see which value maps to itself.
+//
 //  Gate 7 bounds it from above: the crown cannot exceed 2R, which is
 //  N_cap <= Dref.  Both bounds are printed.
 //
@@ -157,13 +162,16 @@
 //  pitch, and their difference.
 //
 //  TIP CLEARANCE falls out of the library's own addendum and dedendum
-//  angles.  With the pitch plane on the parting plane, a tip stands
-//  Lo sin(ta) proud and a root lies Lo sin(tf) deep, so the running
-//  clearance between a tip and the facing root is
+//  angles.  A bevel tooth's proportions scale with cone distance, so
+//  nothing here is constant across the face: at cone distance L a tip
+//  stands L sin(ta) proud of the parting plane and the facing root lies
+//  L sin(tf) beyond it, and the running clearance is
 //
-//      Lo ( sin(tf) - sin(ta) ),                                 (6)
+//      L ( sin(tf) - sin(ta) ),   Li <= L <= Lo.                 (6)
 //
-//  printed below in mm and in modules.
+//  The report prints (6) at both ends of the face, in mm and in
+//  modules, and the tooth height at both ends with it.  The tightest
+//  clearance is the inner one, and that is the number that matters.
 //
 //  ---------------------------------------------------------------
 //  4.  THE THRUST RACE
@@ -379,7 +387,8 @@ CR_TF   = sg_tf(NCAP);
 CR_OD   = 2*LO*sin(90 + CR_TA);                    // over the tips
 CR_TIPZ = LO*sin(CR_TA);                           // tip above the parting plane
 CR_ROOTZ= LO*sin(CR_TF);                           // root below it
-CR_CLR  = LO*(sin(CR_TF) - sin(CR_TA));            // (6)
+CR_CLR  = LO*(sin(CR_TF) - sin(CR_TA));            // (6) at the outer end
+CR_CLRI = LI*(sin(CR_TF) - sin(CR_TA));            // (6) at the inner end
 CR_COT  = cos(GHUB)/sin(GHUB);
 CR_P    = 360/NCAP;
 R_RIM   = CR_OD/2 + PC_RIM_C;
@@ -621,16 +630,34 @@ echo(str("   crown ring bore Li sin(Ghub) = ", CR_BORE,
          " mm asked for -- that surplus IS the rounding up to ", NCAP));
 echo(str("   crown outside diameter over the tips ", CR_OD,
          " mm;  back-cone outer radius ", CR_HUBO, " mm"));
-echo(str("   addendum angle sg_ta = ", CR_TA, " deg -> tip stands ", CR_TIPZ,
-         " mm proud;  dedendum sg_tf = ", CR_TF, " deg -> root lies ",
-         CR_ROOTZ, " mm deep"));
-echo(str("   (6) tip clearance Lo(sin tf - sin ta) = ", LO, "*(",
-         sin(CR_TF), " - ", sin(CR_TA), ") = ", CR_CLR, " mm = ",
-         CR_CLR/M_, " m"));
+echo(str("   addendum angle sg_ta = ", CR_TA, " deg;  tip stands L sin(ta) proud:",
+         " at Li ", LI*sin(CR_TA), " mm, at Lo ", CR_TIPZ, " mm"));
+echo(str("   dedendum angle sg_tf = ", CR_TF, " deg;  root lies L sin(tf) deep:",
+         " at Li ", LI*sin(CR_TF), " mm, at Lo ", CR_ROOTZ, " mm"));
+echo(str("   (6) running clearance L(sin tf - sin ta), sin tf = ", sin(CR_TF),
+         " sin ta = ", sin(CR_TA), ": at Li = ", LI, " it is ", CR_CLRI,
+         " mm = ", CR_CLRI/M_, " m;  at Lo = ", LO, " it is ", CR_CLR,
+         " mm = ", CR_CLR/M_, " m.  The inner one is the tight one."));
 echo(str("   crown seat is cut parallel to the back cone, z = -r cot(Ghub) - ",
-         PC_SEAT_Z, ": at r = ", R_SPIG, " seat ", -R_SPIG*CR_COT - PC_SEAT_Z,
-         " vs crown ", -R_SPIG*CR_COT, ";  at r = ", CR_HUBO, " seat ",
-         -CR_HUBO*CR_COT - PC_SEAT_Z, " vs crown ", -CR_HUBO*CR_COT));
+         PC_SEAT_Z, ", so the gap under the ring is ", PC_SEAT_Z,
+         " mm at every radius it covers: at the ring bore r = ", CR_BORE,
+         " seat ", -CR_BORE*CR_COT - PC_SEAT_Z, " vs ring ", -CR_BORE*CR_COT,
+         ";  at the back-cone rim r = ", CR_HUBO, " seat ",
+         -CR_HUBO*CR_COT - PC_SEAT_Z, " vs ring ", -CR_HUBO*CR_COT));
+echo(str("   the bound (3) needs sin(Ghub), which depends on the count it is",
+         " solving for, so the answer is a FIXED POINT of the map",
+         " N -> Ns ceil(bound(Ghub(N))/Ns), not a closed form.  Seeded at",
+         " Ns, 2Ns, 3Ns and 4Ns it goes:"));
+for (sd = [1:4])
+  let (gh = pc_ghub(90, sd*NS),
+       nmin = 2*((R_SPIG + PC_CROWN_C)/sin(gh) + PC_CROWN_B)/M_)
+    echo(str("      seed ", sd*NS, "  Ghub ", gh, "  bound ", nmin,
+             "  least multiple of Ns above it ", NS*ceil(nmin/NS)));
+echo(str("      so ", NCAP, " maps to itself and is the fixed point; ",
+         4*NS, " maps to ", NCAP, " and is not one.  The seed this file uses",
+         " is ", 3*NS, ", Ghub ", GH0, ", and Ghub at the answer is ", GHUB,
+         ", difference ", GHUB - GH0, " -- the same number, which is what",
+         " makes the bound printed above the right one."));
 echo("   TORQUE, Lewis, with b the face width actually built:");
 echo(str("      F = sigma b m Y = ", PC_SIGMA_F, "*", PC_CROWN_B, "*", M_,
          "*", PC_LEWIS_Y, " = ", FT, " N per tooth pair"));

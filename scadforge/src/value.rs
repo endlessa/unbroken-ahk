@@ -25,7 +25,18 @@ pub enum Value {
     Num(f64),
     Bool(bool),
     Str(String),
-    Vector(Vec<Value>),
+    /// Shared, never mutated in place.
+    ///
+    /// OpenSCAD values are immutable, so a list can be shared rather than
+    /// copied -- and it has to be, because the evaluator hands values back
+    /// BY VALUE from every variable read and every argument bind. With a
+    /// plain `Vec` each of those deep-copied the whole list, which made
+    /// reading a list of n elements once per element O(n^2): 8,000 floats
+    /// read 8,000 times took 0.72 s where 2,000 took 0.06, and passing the
+    /// same list down a recursive function -- the only way to fold one in
+    /// this language -- took 6.90 s against 0.25. Both are the same copy.
+    /// `Rc` makes the clone a refcount bump and the whole shape linear.
+    Vector(Rc<Vec<Value>>),
     /// implicit_step records the two-part [a:b] spelling — only that form
     /// gets the legacy reversed-range swap; [10:1:0] iterates zero times.
     /// Semantic equality (value_eq) compares begin/step/end only.
@@ -55,6 +66,11 @@ impl PartialEq for Value {
 }
 
 impl Value {
+    /// Build a list value. The one place `Rc::new` is spelled.
+    pub fn vec(items: Vec<Value>) -> Value {
+        Value::Vector(Rc::new(items))
+    }
+
     pub fn as_num(&self) -> Option<f64> {
         match self {
             Value::Num(n) => Some(*n),
@@ -136,5 +152,47 @@ impl Value {
             Value::Function(_) => "function",
             Value::Undef => "undef",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A list is SHARED when a value is copied, never duplicated.
+    ///
+    /// This is a property test rather than a timing one, because it is the
+    /// property that matters and a stopwatch would be flaky. But the timing
+    /// is what found it: the evaluator returns values by value from every
+    /// variable read and every argument bind, so a deep-copying list made
+    /// both of those O(n). Reading 8,000 floats once each took 0.72 s and
+    /// folding the same list through a recursive function took 6.90 s; with
+    /// the clone a refcount bump they are 0.01 s and 0.42 s, and the gear
+    /// library -- which is nothing but table lookups -- went from 1.74 s to
+    /// 0.25 s for the same 10,268 triangles.
+    ///
+    /// Sharing is safe because the language has no mutation: a list value,
+    /// once built, is never written to.
+    #[test]
+    fn cloning_a_list_shares_it_rather_than_copying_it() {
+        let big = Value::vec((0..1000).map(|i| Value::Num(i as f64)).collect());
+        let Value::Vector(first) = &big else { panic!("built a list") };
+        assert_eq!(Rc::strong_count(first), 1);
+
+        let copy = big.clone();
+        let Value::Vector(second) = &copy else { panic!("cloned a list") };
+        assert_eq!(Rc::strong_count(second), 2, "the clone shares the list");
+        assert!(Rc::ptr_eq(first, second), "and shares the SAME allocation");
+
+        // Nested lists share all the way down, which is what makes a table
+        // of rows cheap to pass around.
+        let table = Value::vec(vec![big.clone(), copy.clone()]);
+        let Value::Vector(rows) = &table else { panic!() };
+        let Value::Vector(row0) = &rows[0] else { panic!() };
+        assert!(Rc::ptr_eq(first, row0));
+
+        drop(copy);
+        drop(table);
+        assert_eq!(Rc::strong_count(first), 1, "and the count comes back down");
     }
 }

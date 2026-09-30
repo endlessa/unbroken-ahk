@@ -266,7 +266,7 @@ function sl_ghub(g, ext) = ext ? max(0.25*g, g - TF - 2.5*(TA+TF))   // (14)
                                : g + TF + 2.5*(TA+TF);
 GHS = sl_ghub(GS, true);            // sun bore
 GHP = sl_ghub(GP, true);            // planet bore
-GHR = GHR;           // ring back cone
+GHR = sl_ghub(GR, false);           // ring back cone
 
 // ---- carrier, in (cone distance, colatitude) ------------------------
 GJ    = GHS - deg(SL_CJ/LM);        // sun journal cone

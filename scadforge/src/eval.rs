@@ -152,7 +152,7 @@ impl Camera {
 
     fn bindings(&self) -> [(&'static str, Value); 4] {
         let v3 = |a: [f64; 3]| {
-            Value::Vector(vec![Value::Num(a[0]), Value::Num(a[1]), Value::Num(a[2])])
+            Value::vec(vec![Value::Num(a[0]), Value::Num(a[1]), Value::Num(a[2])])
         };
         [
             ("$vpr", v3(self.rot)),
@@ -1224,7 +1224,7 @@ fn cross_product<'a>(
 /// exactly once.
 fn iterate(v: &Value, ctx: &mut Ctx) -> Vec<Value> {
     match v {
-        Value::Vector(items) => items.clone(),
+        Value::Vector(items) => items.as_ref().clone(),
         Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
         Value::Range { start, step, end, implicit_step } => {
             let mut items = Vec::new();
@@ -4445,7 +4445,7 @@ fn eval_expr(expr: &Expr, scope: &Rc<Scope>, ctx: &mut Ctx) -> Value {
         Expr::Vector(items) => {
             let mut out = Vec::new();
             eval_vec_items(items, scope, ctx, &mut out);
-            Value::Vector(out)
+            Value::vec(out)
         }
         Expr::Range { start, step, end } => {
             let implicit_step = step.is_none();
@@ -4859,7 +4859,7 @@ fn eval_vec_items(items: &[VecItem], scope: &Rc<Scope>, ctx: &mut Ctx, out: &mut
             VecItem::Each(e) => {
                 let v = eval_expr(e, scope, ctx);
                 match v {
-                    Value::Vector(inner) => out.extend(inner),
+                    Value::Vector(inner) => out.extend(inner.iter().cloned()),
                     Value::Str(s) => {
                         out.extend(s.chars().map(|c| Value::Str(c.to_string())));
                     }
@@ -4978,7 +4978,7 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Undef, Value::Undef) => true,
         (Value::Vector(x), Value::Vector(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| value_eq(a, b))
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_eq(a, b))
         }
         (
             Value::Range { start: s1, step: t1, end: e1, .. },
@@ -5081,7 +5081,7 @@ fn negate_elems(v: Value, fault: &mut Option<String>) -> Value {
         Value::Num(n) => Value::Num(-n),
         // Recursive so -matrix works.
         Value::Vector(items) => {
-            Value::Vector(items.into_iter().map(|item| negate_elems(item, fault)).collect())
+            Value::vec(items.iter().map(|item| negate_elems(item.clone(), fault)).collect())
         }
         other => {
             if fault.is_none() {
@@ -5107,8 +5107,8 @@ fn add_sub(sub: bool, l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
 fn add_sub_elems(sub: bool, l: &Value, r: &Value, fault: &mut Option<String>) -> Value {
     match (l, r) {
         (Value::Num(a), Value::Num(b)) => Value::Num(if sub { a - b } else { a + b }),
-        (Value::Vector(x), Value::Vector(y)) if x.len() == y.len() => Value::Vector(
-            x.iter().zip(y).map(|(a, b)| add_sub_elems(sub, a, b, fault)).collect(),
+        (Value::Vector(x), Value::Vector(y)) if x.len() == y.len() => Value::vec(
+            x.iter().zip(y.iter()).map(|(a, b)| add_sub_elems(sub, a, b, fault)).collect(),
         ),
         _ => {
             if fault.is_none() {
@@ -5147,7 +5147,7 @@ fn matrix_rows(v: &[Value]) -> Option<Vec<Vec<f64>>> {
 }
 
 fn num_vector(v: Vec<f64>) -> Value {
-    Value::Vector(v.into_iter().map(Value::Num).collect())
+    Value::vec(v.into_iter().map(Value::Num).collect())
 }
 
 /// * dispatches by shape: num*num, num*vector (elementwise, recursive),
@@ -5159,7 +5159,7 @@ fn multiply(l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
         match v {
             Value::Num(m) => Value::Num(n * m),
             Value::Vector(items) => {
-                Value::Vector(items.iter().map(|item| scale_elems(n, item, fault)).collect())
+                Value::vec(items.iter().map(|item| scale_elems(n, item, fault)).collect())
             }
             other => {
                 if fault.is_none() {
@@ -5200,7 +5200,7 @@ fn multiply(l: &Value, r: &Value, ctx: &mut Ctx) -> Value {
                         .collect(),
                 ),
                 // matrix * matrix.
-                (_, _, Some(a), Some(b)) if a[0].len() == b.len() => Value::Vector(
+                (_, _, Some(a), Some(b)) if a[0].len() == b.len() => Value::vec(
                     a.iter()
                         .map(|row| {
                             num_vector(
@@ -5256,10 +5256,10 @@ fn divide_elems(l: &Value, r: &Value, fault: &mut Option<String>) -> Value {
             Value::Num(a / b)
         }
         (Value::Vector(items), Value::Num(_)) => {
-            Value::Vector(items.iter().map(|item| divide_elems(item, r, fault)).collect())
+            Value::vec(items.iter().map(|item| divide_elems(item, r, fault)).collect())
         }
         (Value::Num(_), Value::Vector(items)) => {
-            Value::Vector(items.iter().map(|item| divide_elems(l, item, fault)).collect())
+            Value::vec(items.iter().map(|item| divide_elems(l, item, fault)).collect())
         }
         _ => {
             if fault.is_none() {
@@ -5839,7 +5839,7 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
                     other => items.push(other.clone()),
                 }
             }
-            Value::Vector(items)
+            Value::vec(items)
         }
         "str" => {
             // Top-level strings are UNQUOTED (the concatenation idiom);
@@ -5863,7 +5863,7 @@ fn call_builtin(name: &str, ev: &[EvArg], scope: &Rc<Scope>, ctx: &mut Ctx) -> V
         "search" => search_builtin(&vals, ctx),
         "lookup" => lookup_builtin(&vals, ctx),
         "rands" => rands_builtin(&vals, ctx),
-        "version" => Value::Vector(vec![Value::Num(2021.0), Value::Num(1.0)]),
+        "version" => Value::vec(vec![Value::Num(2021.0), Value::Num(1.0)]),
         "version_num" => Value::Num(20210100.0),
         "parent_module" => {
             let n = match num(0) {
@@ -5919,7 +5919,7 @@ fn chr_append(v: &Value, s: &mut String, ctx: &mut Ctx) {
             }
         }
         Value::Vector(items) => {
-            for item in items {
+            for item in items.iter() {
                 // Nested vectors contribute nothing (only numbers do).
                 if matches!(item, Value::Num(_)) {
                     chr_append(item, s, ctx);
@@ -5968,7 +5968,7 @@ fn search_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
     // A string match_value explodes into per-character terms.
     let terms: Vec<Value> = match match_value {
         Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
-        Value::Vector(items) => items.clone(),
+        Value::Vector(items) => items.as_ref().clone(),
         other => vec![other.clone()],
     };
 
@@ -6008,13 +6008,13 @@ fn search_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
             }
         } else {
             let take = if per_match == 0 { matches.len() } else { per_match };
-            nested.push(Value::Vector(matches.into_iter().take(take).collect()));
+            nested.push(Value::vec(matches.into_iter().take(take).collect()));
         }
     }
     if per_match == 1 {
-        Value::Vector(flat)
+        Value::vec(flat)
     } else {
-        Value::Vector(nested)
+        Value::vec(nested)
     }
 }
 
@@ -6036,7 +6036,7 @@ fn lookup_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
         }
     };
     let mut pairs: Vec<(f64, f64)> = Vec::new();
-    for row in table {
+    for row in table.iter() {
         match row {
             Value::Vector(kv) if kv.len() >= 2 => {
                 match (kv[0].as_num(), kv[1].as_num()) {
@@ -6099,7 +6099,7 @@ fn rands_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
     };
     if !count.is_finite() || count < 0.0 {
         ctx.warn("rands: cannot create a negative number of random values");
-        return Value::Vector(Vec::new());
+        return Value::vec(Vec::new());
     }
     // Capped like every other unbounded generator here. Uncapped,
     // rands(0, 1, 1e10) asked for 320 GB in one allocation and ABORTED the
@@ -6120,11 +6120,7 @@ fn rands_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
         Some(seed) => Prng::seeded(seed),
         None => Prng::unseeded(),
     };
-    Value::Vector(
-        (0..n)
-            .map(|_| Value::Num(lo + rng.next_unit() * (hi - lo)))
-            .collect(),
-    )
+    Value::vec((0..n).map(|_| Value::Num(lo + rng.next_unit() * (hi - lo))).collect())
 }
 
 /// min/max: with 2+ arguments the extreme of the arguments; with exactly
@@ -6133,7 +6129,7 @@ fn rands_builtin(vals: &[Value], ctx: &mut Ctx) -> Value {
 /// non-vector argument is undef with a warning.
 fn min_max(name: &str, vals: &[Value], ctx: &mut Ctx) -> Value {
     let items: Vec<Value> = match vals {
-        [Value::Vector(items)] => items.clone(),
+        [Value::Vector(items)] => items.as_ref().clone(),
         // "the n-ary form min(a,b,...) is numbers-only (a non-number
         // argument yields the conversion WARNING + undef), but the
         // single-vector form uses the generic relational less-than, so
@@ -9009,7 +9005,7 @@ mod tests {
         assert_eq!(ev("concat([1], [2, 3], 4)").0, ev("[1, 2, 3, 4]").0);
         assert_eq!(ev("concat([[1]], [2])").0, ev("[[1], 2]").0);
         assert_eq!(ev("concat(\"ab\", \"cd\")").0, ev("[\"ab\", \"cd\"]").0);
-        assert_eq!(ev("concat()").0, Value::Vector(vec![]));
+        assert_eq!(ev("concat()").0, Value::vec(vec![]));
         assert_eq!(n("round(2.5)"), 3.0);
         assert_eq!(n("round(-2.5)"), -3.0);
         assert_eq!(n("sign(-0)"), 0.0);
@@ -9245,7 +9241,7 @@ mod tests {
         // Mixing plain literals with clauses (2019.05).
         assert_eq!(ev("[0, for (i = [1:2]) i, 9]").0, ev("[0, 1, 2, 9]").0);
         // A lone if; let before the element; if/else arms.
-        assert_eq!(ev("[if (false) 1]").0, Value::Vector(vec![]));
+        assert_eq!(ev("[if (false) 1]").0, Value::vec(vec![]));
         assert_eq!(ev("[let (a = 1) a]").0, ev("[1]").0);
         assert_eq!(
             ev("[for (i = [0:3]) if (i % 2 == 0) i else -i]").0,
@@ -9255,7 +9251,7 @@ mod tests {
         assert_eq!(ev("[for (i = 5) i]").0, ev("[5]").0);
         assert_eq!(ev("[for (c = \"abc\") c]").0, ev("[\"a\", \"b\", \"c\"]").0);
         let (v, _) = ev("[for (i = undef) i]");
-        assert_eq!(v, Value::Vector(vec![Value::Undef]));
+        assert_eq!(v, Value::vec(vec![Value::Undef]));
     }
 
     #[test]
@@ -9355,7 +9351,7 @@ mod tests {
         assert_eq!(ev("search(\"a\", \"abcdabcd\", 0)").0, ev("[[0, 4]]").0);
         // Unmatched terms are SKIPPED from the flat default-mode output.
         let (v, w) = ev("search(\"e\", \"abcdabcd\")");
-        assert_eq!(v, Value::Vector(vec![]));
+        assert_eq!(v, Value::vec(vec![]));
         assert!(w.iter().any(|m| m.contains("not found")));
         // Modes 0/N keep an [] slot instead.
         assert_eq!(ev("search(\"abe\", \"abcd\", 0)").0, ev("[[0], [1], []]").0);
@@ -9388,7 +9384,7 @@ mod tests {
         // Seeded calls are reproducible; count and bounds behave.
         let out = run("a = rands(0, 1, 3, 42); c = rands(0, 1, 3, 42); echo(a == c, len(a));");
         assert_eq!(out.echoes, vec!["ECHO: true, 3"]);
-        assert_eq!(ev("rands(0, 1, 0)").0, Value::Vector(vec![]));
+        assert_eq!(ev("rands(0, 1, 0)").0, Value::vec(vec![]));
         assert_eq!(ev("rands(7, 7, 2)").0, ev("[7, 7]").0);
         assert!(b("version() == [2021, 1]"));
         assert_eq!(n("version_num()"), 20210100.0);
