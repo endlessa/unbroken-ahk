@@ -556,6 +556,29 @@ Two more, both from the 3D lens and both left deliberately:
   Making it fire needs a quantised weld whose threshold nothing justifies.
   Recorded rather than guessed at.
 
+- **An almost-flat corner still costs three edges per cap.** With the walls
+  now taken from the cap triangulation's boundary, an extruded region with
+  holes closes exactly -- a letter went from 44 boundary edges to none, a
+  sheet of type from 38,618 to six. The six that remain are one shape: a
+  256-point superellipse plate, whose caps come back with 253 triangles
+  where a 256-gon owes 254, and whose walls are the full 256 segments. Some
+  corner of that outline is flat enough that a vertex is dropped without its
+  triangle being emitted, so the triangulation covers slightly less than the
+  region the walls were raised for, and three edges per cap are left with
+  nothing on the other side.
+
+  Three repairs were tried and NONE of them moved the number, which is why
+  this is a note rather than a commit: filtering the cap triangles in 2D on
+  a squared cross product, to mirror exactly the test the cap applies to its
+  own 3D normal; emitting the degenerate ear from `ear_clip` instead of
+  dropping the vertex silently; and removing the cap's 3D cull altogether,
+  which also broke `collapsed_cap_triangles_are_culled` and is the wrong
+  trade anyway. The vertex is therefore being dropped somewhere earlier than
+  any of those, most likely in `clean_contours` before `ear_clip` ever sees
+  the ring, and the fix has to reconcile that with the deliberate culling of
+  collapsed caps rather than fight it one site at a time. Six boundary edges
+  in 167,242 triangles is worth doing properly or not at all.
+
 ## Working method (established, keep using it)
 
 1. Extract exact semantics for the phase's entries from the reference
