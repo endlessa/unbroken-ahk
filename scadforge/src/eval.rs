@@ -3422,7 +3422,7 @@ pub fn export_2d(out: &EvalOutput) -> Result<Vec<Poly2>, String> {
 /// with many crossing parts took 299 seconds and came out at 1,122,789, a
 /// 33x explosion, while 69,656 triangles of a gear took 206. This is the
 /// last count that was reliably affordable.
-pub const MAX_UNION_EXPORT_TRIS: usize = 25_000;
+
 
 /// Whether the export-time union was skipped for the last export on this
 /// thread, and how many triangles it was asked to merge. Set by
@@ -3445,27 +3445,6 @@ fn union_note(set: Option<UnionNote>) -> Option<UnionNote> {
         static NOTE: std::cell::Cell<Option<UnionNote>> = const { std::cell::Cell::new(None) };
     }
     NOTE.with(|c| if set.is_some() { c.replace(set) } else { c.replace(None) })
-}
-
-/// Do any two parts' bounding boxes overlap? If none do, the union is a
-/// concatenation anyway and there is nothing to skip.
-fn overlapping(parts: &[Mesh]) -> bool {
-    let boxes: Vec<_> = parts.iter().filter_map(geom::bounds).collect();
-    boxes.iter().enumerate().any(|(i, (alo, ahi))| {
-        boxes[i + 1..]
-            .iter()
-            .any(|(blo, bhi)| (0..3).all(|k| alo[k] <= bhi[k] && blo[k] <= ahi[k]))
-    })
-}
-
-fn concat_all(parts: &[Mesh]) -> Mesh {
-    let mut out = Mesh::empty();
-    for m in parts {
-        let base = out.positions.len() as u32;
-        out.positions.extend_from_slice(&m.positions);
-        out.tris.extend(m.tris.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));
-    }
-    out
 }
 
 pub fn export_mesh(out: &EvalOutput, grid: Grid) -> Result<Mesh, String> {
@@ -3501,10 +3480,7 @@ pub fn export_mesh(out: &EvalOutput, grid: Grid) -> Result<Mesh, String> {
     // and more do not finish in four minutes. Above the budget the merge is
     // SKIPPED and said so, because an export that never returns is worse than
     // one a validator complains about.
-    let total: usize = parts.iter().map(|m| m.tris.len()).sum();
-    let (combined, note) = if total > MAX_UNION_EXPORT_TRIS && overlapping(&parts) {
-        (concat_all(&parts), Some(UnionNote::Budget(total)))
-    } else {
+    let (combined, note) = {
         // The merge itself is guarded: `csg::union_all` holds every pairwise
         // step to the volume bounds a union has to satisfy, retries the
         // failures with the operands swapped, and concatenates the pair only
@@ -3517,10 +3493,13 @@ pub fn export_mesh(out: &EvalOutput, grid: Grid) -> Result<Mesh, String> {
         // 25,000 triangle assembly of chambers and vessels merged to a tenth
         // of its own volume, silently.
         csg::take_union_trouble();
+        csg::take_union_budget();
         let merged = csg::union_all(&parts);
-        match csg::take_union_trouble() {
-            (0, _) => (merged, None),
-            (n, _) => (merged, Some(UnionNote::Fallback(n))),
+        let budget = csg::take_union_budget();
+        match (csg::take_union_trouble(), budget) {
+            (_, n) if n > 0 => (merged, Some(UnionNote::Budget(n))),
+            ((0, _), _) => (merged, None),
+            ((n, _), _) => (merged, Some(UnionNote::Fallback(n))),
         }
     };
     if let Some(n) = note {
@@ -3761,7 +3740,7 @@ pub fn render_export_bytes_reporting(
              merge; overlapping shells were left separate.\n",
             console,
             fmt_num(n as f64),
-            fmt_num(MAX_UNION_EXPORT_TRIS as f64)
+            fmt_num(csg::MAX_MERGE_TRIS as f64)
         ),
         Some(UnionNote::Fallback(n)) => format!(
             "{}WARNING: {} of the export-time merges came back enclosing less than \
@@ -7566,19 +7545,19 @@ mod tests {
         // BSP plane is infinite, so every polygon straddling one is cut
         // whether the boolean touches it or not, and the cost turns vertical
         // with how deeply the parts interpenetrate.
-        assert!(MAX_UNION_EXPORT_TRIS >= 16_000, "everything measured under 16k merged in seconds");
-        // `overlapping` is what decides whether skipping would change
-        // anything: parts that never meet are already their own union.
-        let apart = [geom::cube([1.0, 1.0, 1.0], false), {
-            let mut m = geom::cube([1.0, 1.0, 1.0], false);
-            for p in &mut m.positions {
-                p[0] += 10.0;
-            }
-            m
-        }];
-        assert!(!overlapping(&apart));
-        let together = [geom::cube([1.0, 1.0, 1.0], false), geom::cube([1.0, 1.0, 1.0], false)];
-        assert!(overlapping(&together));
+        assert!(csg::MAX_MERGE_TRIS >= 16_000, "everything measured under 16k merged in seconds");
+
+        // And it is a budget on ONE CONNECTED COMPONENT, because only a
+        // component ever reaches a BSP. Parts that never meet are already
+        // their own union, so no number of them may be refused: 2,400 cubes
+        // is 28,800 triangles, past the budget, and comes out concatenated
+        // exactly -- every triangle that went in, none of them cut. The old
+        // test was the whole model's count gated on whether any two boxes
+        // overlapped, which a model with one long part always passes, so
+        // this is the case it got wrong.
+        let many = vol("for (i = [0:2399]) translate([i*2, 0, 0]) cube(1);");
+        assert!((many.0 - 2400.0).abs() < 1e-6, "{many:?}");
+        assert_eq!(many.1, 2400 * 12, "concatenated exactly, nothing cut");
     }
 
     /// A tail loop that binds a `$`-name must not grow the dynamic chain.

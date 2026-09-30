@@ -1006,12 +1006,48 @@ fn surfaces_may_touch(a: &Mesh, b: &Mesh) -> bool {
     false
 }
 
+/// The most triangles ONE CONNECTED COMPONENT will be put through a BSP.
+///
+/// A BSP plane is infinite, so every polygon that straddles one is cut
+/// whether or not the boolean touches it, and a merged mesh comes back ten
+/// times the triangle count it went in with -- two spheres of 23,800
+/// triangles came out at 220,531. Past some size that has to be refused,
+/// because an export that never returns is worse than one a validator
+/// complains about.
+///
+/// What it is measured AGAINST is the fix. It used to be the whole model's
+/// triangle count, gated on whether any two bounding boxes overlapped --
+/// and a box test on a model with one long part is always true, so a
+/// suspension bridge of 501 solids that share no volume at all, and need no
+/// boolean at all, was one triangle over the line from being refused
+/// wholesale. Only a connected component of "these two might share volume"
+/// ever reaches a BSP, so only a component is weighed, and a model of a
+/// million disjoint triangles now merges without hesitating because there
+/// is nothing to merge.
+///
+/// The refusal is still a refusal: the component is concatenated, which
+/// self-intersects where its parts do, and the caller is told which and how
+/// big. The old behaviour was worse than that -- it skipped SILENTLY past
+/// the threshold in the sense that the clean-looking answer was the wrong
+/// one: two overlapping spheres exported at 8,369 mm^3 against a true union
+/// of 7,506, with holes 0 and two components, while the side of the
+/// threshold that did the work reported 15,919 boundary edges.
+pub const MAX_MERGE_TRIS: usize = 25_000;
+
 thread_local! {
     /// Pairwise unions that had to fall back to concatenation, and unions
     /// that came out right only after swapping the operands. Read and
     /// cleared by `take_union_trouble`.
     static UNION_TROUBLE: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
+    /// The largest component the budget refused, if any.
+    static UNION_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Triangles in the largest component the budget refused since the last
+/// call, or 0 if none. Clears.
+pub fn take_union_budget() -> usize {
+    UNION_BUDGET.with(|c| c.replace(0))
 }
 
 /// (fell back to concatenation, rescued by swapping the operands) since the
@@ -1170,11 +1206,25 @@ fn merge_component(
     // Smallest first, so the growing result meets the big operand last and
     // is re-tessellated by it once rather than at every step.
     solids.sort_by_key(|p| p.mesh.tris.len());
+    let total: usize = solids.iter().map(|p| p.mesh.tris.len()).sum();
+    if total > MAX_MERGE_TRIS {
+        UNION_BUDGET.with(|c| c.set(c.get().max(total)));
+        let mut it = solids.into_iter();
+        let mut acc = it.next().expect("a component has at least one class");
+        for p in it {
+            acc = Piece::glued(acc, p);
+        }
+        return acc;
+    }
     let mut it = solids.into_iter();
     let mut acc = it.next().expect("a component has at least one class");
     for p in it {
         acc = merge(acc, p);
     }
+    // Only a component that actually went through a BSP can carry
+    // T-junctions, so this is asked exactly where it can answer and never
+    // of the concatenations, which are the bulk of a large model.
+    acc.mesh = crate::geom::weld_tjunctions(&acc.mesh);
     acc
 }
 
@@ -1412,7 +1462,7 @@ pub fn difference(first: &Mesh, rest: &[Mesh]) -> Mesh {
     let mut all = Vec::with_capacity(1 + rest.len());
     all.push(first.clone());
     all.extend_from_slice(rest);
-    framed(&all, |m| difference_raw(&m[0], &m[1..])).welded()
+    crate::geom::weld_tjunctions(&framed(&all, |m| difference_raw(&m[0], &m[1..])))
 }
 
 fn difference_raw(first: &Mesh, rest: &[Mesh]) -> Mesh {
@@ -1429,7 +1479,7 @@ fn difference_raw(first: &Mesh, rest: &[Mesh]) -> Mesh {
 /// n-ary intersection: the region common to every mesh. An empty operand
 /// annihilates the result (A ∩ ∅ = ∅), so intersection is commutative.
 pub fn intersection_all(meshes: &[Mesh]) -> Mesh {
-    framed(meshes, intersection_all_raw).welded()
+    crate::geom::weld_tjunctions(&framed(meshes, intersection_all_raw))
 }
 
 fn intersection_all_raw(meshes: &[Mesh]) -> Mesh {

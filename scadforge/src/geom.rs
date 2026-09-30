@@ -639,6 +639,140 @@ pub fn polyhedron(points: &[Vec3], faces: &[Vec<usize>]) -> (Mesh, Vec<String>) 
     (mesh, warnings)
 }
 
+/// Split every triangle edge that another vertex lands in the middle of.
+///
+/// A BSP cuts one side's polygons against the other side's planes, so a
+/// vertex of one surface routinely comes to rest partway along an edge of
+/// the other. The surface stays continuous and the volume stays right; the
+/// TOPOLOGY does not. That edge is used once by the triangle that owns it
+/// and twice by the pair on the other side, so the undirected edge is used
+/// an odd number of times and reads as a hole. Two cubes overlapping by a
+/// quarter union to exactly 5,000 mm^3 and twelve boundary edges; two
+/// spheres to the right volume and 15,919 of them.
+///
+/// It is a real defect and not a cosmetic one. Every downstream test of a
+/// mesh -- is it closed, is it manifold, can it be printed -- fails on a
+/// T-junction, and so does the next boolean, because a surface it cannot
+/// walk is a surface it cannot classify. It also meant no union of solids
+/// that actually MEET could ever come out clean, which is a large part of
+/// what the modeller is for.
+///
+/// The repair adds no geometry: a vertex already on an edge is inserted
+/// into the triangle that owns that edge, and the triangle is re-cut around
+/// it. Nothing moves, so volume and area are unchanged.
+pub fn weld_tjunctions(mesh: &Mesh) -> Mesh {
+    use std::collections::HashMap;
+    // Coincident points must share an index first, or a "T-junction" that is
+    // really two copies of the same point is never seen.
+    let mesh = mesh.welded();
+    let Some((lo, hi)) = bounds(&mesh) else { return mesh };
+    let extent = (0..3).fold(0.0f64, |m, k| m.max(hi[k] - lo[k]));
+    if !(extent > 0.0) {
+        return mesh;
+    }
+    // A point this far off an edge is on it as far as any writer is
+    // concerned, and inserting it moves the surface by no more than that.
+    // A point this far off an edge is on it as far as any writer is
+    // concerned, and inserting it moves the surface by no more than that.
+    //
+    // Tight on purpose, and swept to find out: at 1e-7 a character model
+    // went from 1,459 boundary edges to 1,500 and grew its first
+    // inconsistently wound edge; at 1e-4 it went to 6,565 and 75. Loosening
+    // does not catch more T-junctions, it MANUFACTURES them -- a vertex
+    // inserted into an edge it is not really on moves that edge, and the
+    // triangle on the other side, which did not get the same insertion, no
+    // longer matches. The residue at 1e-9 is not a T-junction problem at
+    // all: those vertices sit 1e-5 to 1e-4 of the model off the edge, which
+    // is a crack in the BSP's arithmetic and wants fixing there.
+    let eps = extent * 1e-9;
+
+    // Vertices on a grid, so an edge asks only its own neighbourhood.
+    let n = ((mesh.positions.len() as f64).cbrt().ceil() as i64).clamp(4, 128);
+    let step: Vec<f64> = (0..3).map(|k| ((hi[k] - lo[k]) / n as f64).max(1e-300)).collect();
+    let cell = |v: f64, k: usize| (((v - lo[k]) / step[k]).floor() as i64).clamp(0, n - 1);
+    let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+    for (i, p) in mesh.positions.iter().enumerate() {
+        grid.entry((cell(p[0], 0), cell(p[1], 1), cell(p[2], 2))).or_default().push(i as u32);
+    }
+
+    let sub = |a: Vec3, b: Vec3| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let dot = |a: Vec3, b: Vec3| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    let mut out: Vec<[u32; 3]> = Vec::with_capacity(mesh.tris.len());
+    let mut splits: Vec<Vec<(f64, u32)>> = vec![Vec::new(); 3];
+    for t in &mesh.tris {
+        for e in 0..3 {
+            splits[e].clear();
+            let (ia, ib) = (t[e], t[(e + 1) % 3]);
+            let (a, b) = (mesh.positions[ia as usize], mesh.positions[ib as usize]);
+            let ab = sub(b, a);
+            let len2 = dot(ab, ab);
+            if len2 <= 0.0 {
+                continue;
+            }
+            // Endpoints are excluded by the same tolerance, measured along
+            // the edge, so a point at a corner is never "in the middle".
+            let m = eps / len2.sqrt();
+            let (mut c0, mut c1) = ([0i64; 3], [0i64; 3]);
+            for k in 0..3 {
+                let (u, v) = (a[k].min(b[k]) - eps, a[k].max(b[k]) + eps);
+                c0[k] = cell(u, k);
+                c1[k] = cell(v, k);
+            }
+            // A long edge crossing the whole model would ask every cell;
+            // giving up on it leaves that one edge unwelded, which is the
+            // safe direction.
+            let span = (c1[0] - c0[0] + 1) * (c1[1] - c0[1] + 1) * (c1[2] - c0[2] + 1);
+            if span > 8192 {
+                continue;
+            }
+            for x in c0[0]..=c1[0] {
+                for y in c0[1]..=c1[1] {
+                    for z in c0[2]..=c1[2] {
+                        let Some(list) = grid.get(&(x, y, z)) else { continue };
+                        for &k in list {
+                            if k == ia || k == ib || k == t[(e + 2) % 3] {
+                                continue;
+                            }
+                            let ak = sub(mesh.positions[k as usize], a);
+                            let u = dot(ak, ab) / len2;
+                            if u <= m || u >= 1.0 - m {
+                                continue;
+                            }
+                            let perp =
+                                [ak[0] - ab[0] * u, ak[1] - ab[1] * u, ak[2] - ab[2] * u];
+                            if dot(perp, perp) > eps * eps {
+                                continue;
+                            }
+                            splits[e].push((u, k));
+                        }
+                    }
+                }
+            }
+            splits[e].sort_by(|p, q| p.0.total_cmp(&q.0));
+            splits[e].dedup_by_key(|p| p.1);
+        }
+        if splits.iter().all(|s| s.is_empty()) {
+            out.push(*t);
+            continue;
+        }
+        // The triangle becomes a polygon: each corner, then whatever landed
+        // on the edge leaving it, in order along that edge.
+        let mut face: Vec<usize> = Vec::with_capacity(3 + splits.iter().map(Vec::len).sum::<usize>());
+        for e in 0..3 {
+            face.push(t[e] as usize);
+            face.extend(splits[e].iter().map(|&(_, k)| k as usize));
+        }
+        // Ear clipping in the face's own plane, which is what handles the
+        // collinear corners the inserted points create. The loop order is
+        // the triangle's own, so the pieces keep its winding.
+        for f in face_tris(&mesh.positions, &face) {
+            out.push([f[0] as u32, f[1] as u32, f[2] as u32]);
+        }
+    }
+    Mesh { positions: mesh.positions, tris: out }
+}
+
 /// Report an IMPORTED mesh that is inside out.
 ///
 /// Imports get this one test and not the other two, and the asymmetry is
@@ -1390,6 +1524,80 @@ mod tests {
         assert_eq!(binary.tris.len(), mesh.tris.len() - 2, "one cap triangle at each end");
         let note = closedness_note(&binary).expect("and the binary file is open");
         assert!(note.contains("6 boundary edges"), "{note}");
+    }
+
+    /// A boolean's T-junctions are closed without moving any surface.
+    ///
+    /// The BSP cuts one side against the other's planes, so a vertex of one
+    /// surface lands partway along an edge of the other: the volume is
+    /// right, the surface is continuous, and the mesh is open. Two cubes
+    /// overlapping by a quarter come out at exactly 5,000 with twelve
+    /// boundary edges. Inserting the stray vertex into the triangle that
+    /// owns the edge closes it and adds no geometry.
+    #[test]
+    fn a_t_junction_closes_without_moving_anything() {
+        // A unit square split into two triangles, and beside it a square
+        // split into four along a middle vertex that lands on the shared
+        // edge. As written the shared edge is used once on the left and
+        // twice on the right.
+        let pts: Vec<Vec3> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.5, 0.0],  // the T: on the edge 1-2, and a corner on the right
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ];
+        let mesh = Mesh {
+            positions: pts,
+            tris: vec![
+                [0, 1, 2],
+                [0, 2, 3],
+                [1, 5, 4],
+                [5, 6, 4],
+                [4, 6, 2],
+            ],
+        };
+        let before = area(&mesh);
+        let open = boundary_edges(&mesh);
+        assert!(open.contains(&(1, 2)), "the long edge is unmatched: {open:?}");
+
+        let fixed = weld_tjunctions(&mesh);
+        assert_eq!(fixed.tris.len(), 6, "the long triangle is cut in two");
+        assert!((area(&fixed) - before).abs() < 1e-12, "and nothing moved");
+        // Every interior edge is now shared; only the outer rim is boundary.
+        let rim = boundary_edges(&fixed);
+        assert_eq!(rim.len(), 6, "the outline of a 2x1 rectangle, split at the T: {rim:?}");
+    }
+
+    /// Total area, for checking that a repair moved no surface.
+    fn area(m: &Mesh) -> f64 {
+        m.tris
+            .iter()
+            .map(|t| {
+                let (a, b, c) = (m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]);
+                let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() / 2.0
+            })
+            .sum()
+    }
+
+    /// Undirected edges used an odd number of times, as (lo, hi) pairs.
+    fn boundary_edges(m: &Mesh) -> Vec<(u32, u32)> {
+        use std::collections::HashMap;
+        let mut count: HashMap<(u32, u32), usize> = HashMap::new();
+        for t in &m.tris {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                *count.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<_> = count.into_iter().filter(|(_, c)| c % 2 == 1).map(|(e, _)| e).collect();
+        out.sort();
+        out
     }
 
     /// A face binary STL cannot hold is not a face the text formats may drop.
