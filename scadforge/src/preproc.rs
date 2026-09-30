@@ -206,80 +206,114 @@ pub fn resolve(source: &str, base: &Path) -> Resolved {
     let mut used_defs: Vec<Stmt> = Vec::new();
     let mut used_seen: HashSet<PathBuf> = HashSet::new();
     let mut used_tag = 0usize;
-    // A WORKLIST, not a fixed list: a used file's own `use` directives were
-    // collected into `inner_uses` below and then dropped on the floor, so a
-    // library that used another library lost every definition it depended on
-    // -- `use <libA.scad>` where libA says `use <libB.scad>` reported
-    // "Ignoring unknown module 'b'" and drew nothing. The reference is
-    // explicit that those are "available inside the used file".
-    //
-    // They are added to the same flat definition table the direct uses go
-    // into, so a transitively-used module is also reachable from the MAIN
-    // file, where the reference says it should not be ("use is not
-    // transitive ... NOT re-exported"). A script relying on that is not
-    // portable, but nothing it writes breaks; the alternative -- a private
-    // namespace per used file, with call sites rewritten -- is a much larger
-    // change, and losing the library outright was the worse of the two.
-    let mut queue = uses;
-    let mut qi = 0usize;
-    while qi < queue.len() {
-        let (path, dir, spelled) = queue[qi].clone();
-        qi += 1;
-        if !used_seen.insert(path.clone()) {
-            continue; // using the same file twice is idempotent
-        }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(_) => {
-                // The directive's own text, not the resolved absolute path:
-                // a user who wrote `use <lib.scad>` gets that name back.
-                warnings.push(format!("WARNING: Can't open library '{}'.", spelled));
-                continue;
-            }
-        };
-        let mut inner_seen = HashSet::new();
-        let mut inner_uses = Vec::new();
-        let inner = inline_includes(
-            &text, &dir, &root, &mut inner_seen, &mut warnings, &mut inner_uses, &mut budget, 0,
+    for entry in uses {
+        collect_used(
+            entry,
+            &root,
+            &mut used_seen,
+            &mut used_tag,
+            &mut used_defs,
+            &mut warnings,
+            &mut budget,
+            0,
         );
-        // Whatever this file `use`s is resolved next. `used_seen` keeps a
-        // cycle from looping and a diamond from being read twice.
-        queue.extend(inner_uses);
-        match parser::parse(&inner) {
-            Ok(stmts) => {
-                let mut stmts = apply_include_overrides(stmts);
-                // The used file's own top-level constants come across too,
-                // renamed into a private namespace so its definitions can
-                // see them while the user cannot.
-                privatize(&mut stmts, used_tag);
-                used_tag += 1;
-                for s in stmts {
-                    // A `$`-assignment at the top of a USED file is not run:
-                    // the reference says a used file's top-level variables do
-                    // not execute, and a dynamic one would otherwise
-                    // reconfigure the WHOLE design -- `use <lib>` where lib
-                    // opens with `$fn = 64;` would silently re-tessellate the
-                    // caller's own geometry. The library's reads of it
-                    // resolve from the caller instead, which is the dynamic
-                    // scoping the reference asks for.
-                    if matches!(&s, Stmt::Assign { name, .. } if name.starts_with('$')) {
-                        continue;
-                    }
-                    if matches!(
-                        s,
-                        Stmt::ModuleDef { .. } | Stmt::FunctionDef { .. } | Stmt::Assign { .. }
-                    ) {
-                        used_defs.push(s);
-                    }
-                }
-            }
-            Err(e) => {
-                warnings.push(format!("WARNING: parse error in used file '{}': {}", display(&path), e));
-            }
-        }
     }
 
     Resolved { program: main, used: used_defs, warnings, error: None }
+}
+
+/// Emit one used file's definitions, and first those of every file IT uses.
+///
+/// A used file's top-level constants ARE evaluated, and they may call into a
+/// library that file uses -- `M = sg_m();` at the top of a part file, where
+/// `sg_m` comes from the contract the part uses. The definitions all land in
+/// one flat table that the evaluator walks IN ORDER, so the table has to be a
+/// topological order of the `use` graph: every file after the files it
+/// depends on.
+///
+/// This was a breadth-first worklist, which is the opposite order --
+/// dependents first, dependencies after. A chain `main -> part -> contract`
+/// evaluated the part's constants while the contract's were still unassigned,
+/// so each came back undef with "Ignoring unknown variable '__use1__NAME'",
+/// and every number the part had read from the contract it used was lost. One
+/// level deep it worked, which is why it stood: the direct case has nothing
+/// to order.
+///
+/// So: depth first, POST-order. `used_seen` is inserted before recursing, so
+/// a cycle terminates and a diamond is read once; the depth check comes
+/// first, so a file refused for depth on one route can still arrive by a
+/// shorter one.
+#[allow(clippy::too_many_arguments)]
+fn collect_used(
+    entry: (PathBuf, PathBuf, String),
+    root: &Path,
+    used_seen: &mut HashSet<PathBuf>,
+    used_tag: &mut usize,
+    out: &mut Vec<Stmt>,
+    warnings: &mut Vec<String>,
+    budget: &mut Budget,
+    depth: usize,
+) {
+    if depth > MAX_INCLUDE_DEPTH {
+        warn_once(budget, warnings, "WARNING: use nesting too deep; truncated.");
+        return;
+    }
+    let (path, dir, spelled) = entry;
+    if !used_seen.insert(path.clone()) {
+        return; // using the same file twice is idempotent
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => {
+            // The directive's own text, not the resolved absolute path: a
+            // user who wrote `use <lib.scad>` gets that name back.
+            warnings.push(format!("WARNING: Can't open library '{}'.", spelled));
+            return;
+        }
+    };
+    let mut inner_seen = HashSet::new();
+    let mut inner_uses = Vec::new();
+    let inner =
+        inline_includes(&text, &dir, root, &mut inner_seen, warnings, &mut inner_uses, budget, 0);
+    for u in inner_uses {
+        collect_used(u, root, used_seen, used_tag, out, warnings, budget, depth + 1);
+    }
+    let stmts = match parser::parse(&inner) {
+        Ok(stmts) => stmts,
+        Err(e) => {
+            warnings
+                .push(format!("WARNING: parse error in used file '{}': {}", display(&path), e));
+            return;
+        }
+    };
+    let mut stmts = apply_include_overrides(stmts);
+    // The used file's own top-level constants come across too, renamed into a
+    // private namespace so its definitions can see them while the user cannot.
+    //
+    // A transitively-used definition lands in the same flat table, so it is
+    // also reachable from the MAIN file, where the reference says it should
+    // not be ("use is not transitive ... NOT re-exported"). A script relying
+    // on that is not portable, but nothing it writes breaks; the alternative
+    // -- a private namespace per used file, with call sites rewritten -- is a
+    // much larger change, and losing the library outright was the worse of
+    // the two.
+    privatize(&mut stmts, *used_tag);
+    *used_tag += 1;
+    for s in stmts {
+        // A `$`-assignment at the top of a USED file is not run: the
+        // reference says a used file's top-level variables do not execute,
+        // and a dynamic one would otherwise reconfigure the WHOLE design --
+        // `use <lib>` where lib opens with `$fn = 64;` would silently
+        // re-tessellate the caller's own geometry. The library's reads of it
+        // resolve from the caller instead, which is the dynamic scoping the
+        // reference asks for.
+        if matches!(&s, Stmt::Assign { name, .. } if name.starts_with('$')) {
+            continue;
+        }
+        if matches!(s, Stmt::ModuleDef { .. } | Stmt::FunctionDef { .. } | Stmt::Assign { .. }) {
+            out.push(s);
+        }
+    }
 }
 
 /// Return `source` with each `include` directive replaced by the (recursively
@@ -727,6 +761,41 @@ mod tests {
         let mut names = Vec::new();
         calls_in(&body_of(&both, "g"), &mut names);
         assert_eq!(names, vec!["f".to_string()], "the named function still wins");
+    }
+
+    #[test]
+    fn a_library_a_library_uses_is_loaded_before_the_one_that_reads_it() {
+        // The definition table is walked IN ORDER, so `use` has to hand it a
+        // topological order of the use graph. It handed over a breadth-first
+        // one -- dependents first -- and a part file that opened with
+        // `M = contract_m();` read the contract's constants before they were
+        // assigned. Every number the part took from its contract came back
+        // undef, and only at two levels deep, which is why it stood.
+        let dir = std::env::temp_dir().join(format!("sfpre5{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("contract.scad"), "M = 7;\nfunction c_m() = M;\n").unwrap();
+        std::fs::write(
+            dir.join("part.scad"),
+            "use <contract.scad>\nPM = c_m();\nfunction p_m() = PM;\n",
+        )
+        .unwrap();
+        let r = resolve("use <part.scad>\ncube(p_m());\n", &dir);
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert!(r.warnings.is_empty(), "no dangling reference: {:?}", r.warnings);
+        // Every assignment the two libraries own, in the order the evaluator
+        // will run them: the contract's before the part's.
+        let order: Vec<&String> = r
+            .used
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Assign { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        let m = order.iter().position(|n| n.ends_with("__M")).expect("contract's M");
+        let pm = order.iter().position(|n| n.ends_with("__PM")).expect("part's PM");
+        assert!(m < pm, "the contract is assigned first: {:?}", order);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

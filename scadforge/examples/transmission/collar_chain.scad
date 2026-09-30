@@ -81,13 +81,16 @@
 //      R_rib  = R_gf  + rib height     the register rib crest
 //      R_bore = R_rib + c_r            the collar bore
 //      R_hub  = R_bore + hub wall
-//      R_web  = R_hub  + web
+//      R_wmin = R_hub  + web           the LEAST rim base -- a BOUND,
+//                                      not a face: nothing is built at
+//                                      this radius.  Section 3 says
+//                                      where the web really ends.
 //      r_s    = d/2 + c_s              the roller seat's arc radius   (4)
-//      r_p   >= R_web + rim + r_s                                     (5)
+//      r_p   >= R_wmin + rim + r_s                                    (5)
 //
-//  (5) is the whole of the sizing: the seat floor is r_p - r_s, and it
-//  has to stand a declared rim depth outside the web.  r_p rises with
-//  N, so (1) turns (5) into a bound on the count:
+//  (5) is the whole of the COUNT's sizing, and only that: the seat
+//  floor is r_p - r_s, and it has to stand a declared rim depth
+//  outside the least rim base.  r_p rises with
 //
 //      N >= 180 / asin( p / (2 r_p_min) )                         (6)
 //
@@ -165,11 +168,16 @@
 //  The rim carrying all this is thin, because the tooth has to fit
 //  between the chain's inner plates; it steps out to the full web
 //  thickness a declared clearance inside where those plates reach,
-//  at r_p - plate depth/2 - c_p.  The report prints that step against
-//  the web and against the seat floor, checks that every seat lies in
-//  the thin part, and checks that the web -- which is taller than the
-//  chain's own envelope, so it would foul it -- stops short of the
-//  plates.
+//  at R_plt = r_p - plate depth/2 - c_p.  THAT is where the web ends,
+//  not R_wmin, and the report prints the step against both, against
+//  the seat floor, and checks that every seat lies in the thin part.
+//  The web is taller than the chain's own envelope over the pin heads,
+//  so it would foul the chain if it reached it: its clearance from the
+//  plates' inner edge is c_p exactly, by the definition of R_plt, and
+//  the report prints that residual rather than a larger number taken
+//  off the bound R_wmin.  What stands under the seat floor in the THIN
+//  section is r_p - r_s - R_plt, which is smaller than the rim depth of
+//  (5) and is set by the plate depth, not by (5); it too is printed.
 //
 //  ---------------------------------------------------------------
 //  4.  THE WRAP, AND THE LOOP THAT CLOSES ON IT
@@ -221,8 +229,11 @@
 //  and L cancels, so the grip does not depend on how long the bore is
 //  -- only the pressure does, and both are printed.  F is the bolts of
 //  one joint at a declared preload.  The result is printed against the
-//  chain's own working tension at r_p and against gate 7's quoted
-//  ceiling, and the file says which one is the limit.
+//  chain's own working tension at r_p, and of the two torques this file
+//  computes the report names the limit: the chain, with the ratio.
+//  Gate 7's 17.4 Nm is printed beside them and is NOT adjudicated
+//  against them, because it is a per-tooth-pair figure at the POLAR
+//  crown and not a torque at this port; the report says so.
 //
 //  The gap is declared as a width at the bolt radius and is therefore
 //  an angle; between two radial faces it measures differently at the
@@ -280,9 +291,10 @@
 //  shells that touch and leaves T junctions in the weld.  Nothing else
 //  in the file is separated that is not separate in the machine.
 //
-//  Not modelled, and not claimed: the bolt thread (the shank is drawn
-//  at its major diameter, with the clearance in the bore printed), and
-//  the band itself: its register groove is declared here, as this
+//  Not modelled, and not claimed: the bolt thread and its nut -- the
+//  shank is drawn at its major diameter, and BOTH pad bores are
+//  clearance bores, so the joint takes a nut, which is neither drawn
+//  nor counted in any volume here -- and the band itself: its register groove is declared here, as this
 //  collar's own interface to it, with the floor put on sg_r() because
 //  that is the one radius the contract fixes.  The report prints
 //  sg_r() against Dref m/2 with a zero residual.
@@ -297,7 +309,10 @@ use <spherical_gear.scad>
 
 // ===================================================================
 //  DECLARED INPUTS
-//  Six groups, and nothing else in this file is a written-down number:
+//  Six groups.  Nothing else in this file is a written-down DIMENSION
+//  or standard constant; every other number below is a pure geometric
+//  one (2, 90, 180, 360), a unit conversion, an integer count, a mesh
+//  index or a colour.  The groups are:
 //  the chain, which is a standard part; the band's register groove,
 //  declared here as this collar's own interface to the band, with its
 //  floor put on the one radius the contract fixes, sg_r(); the
@@ -317,6 +332,7 @@ CC_CJ    = 0.10;    // pin-bushing clearance at one joint, mm
 CC_FW    = 630;     // working tension, N
 CC_N2    = 19;      // the pinion this collar drives against
 CC_C0    = 400;     // nominal centre distance, mm
+CC_TOP   = 0.60;    // the standard's topping constant: D_o = p(c + cot(180/N))
 
 // -- the band's register groove ---------------------------------------
 CC_RIBH  = 2.50;    // rib height above the equatorial radius sg_r()
@@ -327,8 +343,12 @@ CC_CA    = 0.20;    // axial clearance, tongue in the groove, per side
 
 // -- the collar's own widths ------------------------------------------
 CC_THUB  = 9.00;    // hub wall, bore to hub outside
-CC_TWEB  = 5.00;    // web, hub outside to rim base
-CC_TRIM  = 3.20;    // least rim depth under the seat floor
+CC_TWEB  = 5.00;    // web, hub outside to the LEAST rim base R_WMIN, a
+                    // bound on the count only; the built web runs out
+                    // to R_PLT, which is further
+CC_TRIM  = 3.20;    // least rim depth from the least rim base R_WMIN up to
+                    // the seat floor.  NOT the thin rim under the seat
+                    // floor, which is r_p - r_s - R_PLT and is printed.
 CC_HHUB  = 11.00;   // hub half height
 CC_HWEB  = 5.00;    // web half height
 CC_CP    = 0.40;    // radial clearance to the chain plate's inner edge
@@ -378,13 +398,14 @@ R_RIB   = R_GF + CC_RIBH;           // rib crest
 R_TIN   = R_GF + CC_CR;             // tongue inner face
 R_BORE  = R_RIB + CC_CR;            // collar bore
 R_HUB   = R_BORE + CC_THUB;
-R_WEB   = R_HUB  + CC_TWEB;
+R_WMIN  = R_HUB  + CC_TWEB;         // LEAST rim base: a bound, not a face
 RS      = CC_DR/2 + CC_CS;          // roller seat arc radius
-RP_MIN  = R_WEB + CC_TRIM + RS;     // least admissible pitch radius
+RP_MIN  = R_WMIN + CC_TRIM + RS;    // least admissible pitch radius
 
 // 2. the count: least multiple of 6 whose pitch circle clears RP_MIN
 N_MIN   = 180/asin(CC_P/(2*RP_MIN));
-NCH     = 6*ceil(ceil(N_MIN)/6);
+NDIV    = lcm_(2,3);                // even to halve, /3 for the k=3 rows
+NCH     = NDIV*ceil(ceil(N_MIN)/NDIV);
 BETA    = 180/NCH;                  // half pitch angle
 RP      = CC_P/(2*sin(BETA));       // pitch radius
 R_FLOOR = RP - RS;                  // seat floor
@@ -402,7 +423,7 @@ UX      = sin(AE);  UY = cos(AE);   // flank direction, tangent to the seat
 QU      = QX*UX + QY*UY;
 HFL     = abs(QX*UY - QY*UX);       // flank line's distance from the axis
 PSI0    = atan2(QY - QU*UY, QX - QU*UX);   // azimuth of that foot
-RTIP    = CC_P*(0.6 + cos(BETA)/sin(BETA))/2;          // topping circle
+RTIP    = CC_P*(CC_TOP + cos(BETA)/sin(BETA))/2;       // topping circle
 SFL     = -QU + sqrt(QU*QU + RTIP*RTIP - QX*QX - QY*QY);   // flank length
 TX      = QX + SFL*UX;  TY = QY + SFL*UY;
 DT      = atan2(TY, TX);            // azimuth where the flank meets the tip
@@ -656,11 +677,13 @@ echo(str("   rib crest    floor + ", CC_RIBH, " = ", R_RIB));
 echo(str("   tongue face  floor + ", CC_CR, " = ", R_TIN));
 echo(str("   collar bore  crest + ", CC_CR, " = ", R_BORE));
 echo(str("   hub outside  bore  + ", CC_THUB, " = ", R_HUB));
-echo(str("   rim base     hub   + ", CC_TWEB, " = ", R_WEB));
+echo(str("   LEAST rim base  hub   + ", CC_TWEB, " = ", R_WMIN,
+         " -- a bound on the count only.  Nothing is built at this",
+         " radius; the web really ends at R_plt, section 5."));
 echo(str("   seat arc radius r_s = d/2 + c_s = ", CC_DR/2, " + ", CC_CS,
          " = ", RS));
-echo(str("   least pitch radius r_p >= rim base + ", CC_TRIM, " + r_s = ",
-         RP_MIN, " mm"));
+echo(str("   least pitch radius r_p >= least rim base + ", CC_TRIM,
+         " + r_s = ", RP_MIN, " mm"));
 
 echo("=== 4. the tooth count, and every divisibility it is asked for ===");
 echo(str("   r_p(N) = p/(2 sin(180/N)) rises with N, so r_p >= ", RP_MIN,
@@ -669,9 +692,10 @@ echo(str("   r_p(N) = p/(2 sin(180/N)) rises with N, so r_p >= ", RP_MIN,
 echo(str("   N must also be even, so the collar parts into two arcs with a",
          " whole number of seats each, and divisible by 3, so the sprocket",
          " carries the three-planet rows' own symmetry.  lcm(2,3) = ",
-         lcm_(2,3), ", so N is the least multiple of 6 at or above ",
+         NDIV, ", so N is the least multiple of ", NDIV, " at or above ",
          ceil(N_MIN), ":"));
-echo(str("   N = 6*ceil(", ceil(N_MIN), "/6) = 6*", ceil(ceil(N_MIN)/6),
+echo(str("   N = ", NDIV, "*ceil(", ceil(N_MIN), "/", NDIV, ") = ", NDIV,
+         "*", ceil(ceil(N_MIN)/NDIV),
          " = ", NCH, "   and ", NCH, " = 2*", NCH/2, " = 3*", NCH/3,
          " = 6*", NCH/6));
 echo(str("   N/2 = ", NCH/2, "   integer: ", NCH%2 == 0,
@@ -694,9 +718,12 @@ echo(str("   the library's report echoes a ", CC_ECHO_N,
          " tooth chain collar; this file derives ", NCH,
          "   difference ", NCH - CC_ECHO_N));
 echo(str("   margin: r_p - r_p_min = ", RP - RP_MIN,
-         " mm, so the rim under the seat floor is ", R_FLOOR - R_WEB,
-         " mm against the ", CC_TRIM, " mm asked for; that surplus IS the",
-         " rounding up to the next multiple of 6"));
+         " mm, so the depth from the least rim base to the seat floor is ",
+         R_FLOOR - R_WMIN, " mm against the ", CC_TRIM,
+         " mm asked for -- satisfied: ", R_FLOOR - R_WMIN >= CC_TRIM,
+         ".  That surplus IS the rounding up to the next multiple of ",
+         NDIV, ".  The THIN rim under the seat floor is a different and",
+         " smaller number, printed in section 5."));
 
 echo("=== 5. the roller seat and the tooth it sits between ===");
 echo(str("   seat floor r_p - r_s = ", R_FLOOR,
@@ -713,14 +740,15 @@ echo(str("   flank = the straight line tangent to the seat circle there.",
          "   residual ", abs((RP - QX)*UY + QY*UX) - RS));
 echo(str("   its foot stands at azimuth ", PSI0, " = -AE = ", -AE,
          "   residual ", PSI0 + AE));
-echo(str("   its distance from the axis ", HFL, " = r_p sin(phi) - r_s = ",
+echo(str("   its distance from the axis ", HFL,
+         " = r_p sin(phi_ch) - r_s = ",
          RP*sin(CC_PA), " - ", RS, " = ", RP*sin(CC_PA) - RS,
          "   residual ", HFL - (RP*sin(CC_PA) - RS)));
 echo(str("   seat meets flank at azimuth ", DQ, " deg, radius ", RQ,
          ";  seat form gives ", cc_seat_r(DQ), " residual ",
          cc_seat_r(DQ) - RQ, ";  flank form gives ", cc_flank_r(DQ),
          " residual ", cc_flank_r(DQ) - RQ));
-echo(str("   topping circle r_tip = p(0.6 + cot(180/N))/2 = ", RTIP,
+echo(str("   topping circle r_tip = p(", CC_TOP, " + cot(180/N))/2 = ", RTIP,
          ";  flank form at the tip azimuth ", DT, " deg gives ",
          cc_flank_r(DT), " residual ", cc_flank_r(DT) - RTIP));
 echo(str("   tooth height above the pitch circle ", RTIP - RP, " mm = ",
@@ -730,11 +758,18 @@ echo(str("   tooth height above the pitch circle ", RTIP - RP, " mm = ",
 echo(str("   rim thickness 2*", H_RIM, " = ", 2*H_RIM,
          " mm inside the chain's ", CC_BI, " mm, clearance ", CC_CW,
          " mm a side"));
-echo(str("   rim thins at r = r_p - plate/2 - ", CC_CP, " = ", R_PLT,
-         ", which is ", R_PLT - R_WEB, " mm outside the rim base and ",
-         R_FLOOR - R_PLT,
+echo(str("   the web ENDS and the rim thins at R_plt = r_p - plate/2 - ",
+         CC_CP, " = ", R_PLT, ", which is ", R_PLT - R_WMIN,
+         " mm outside the least rim base (so (5) is satisfied with room: ",
+         R_PLT > R_WMIN, ") and ", R_FLOOR - R_PLT,
          " mm inside the seat floor, so every seat lies in the thin rim: ",
          R_FLOOR > R_PLT));
+echo(str("   that ", R_FLOOR - R_PLT, " mm IS the thin rim under the seat",
+         " floor, and it is NOT the ", CC_TRIM, " mm of (5): (5) bounds",
+         " r_p - r_s - R_wmin = ", R_FLOOR - R_WMIN,
+         ", while the thin section is r_p - r_s - R_plt = plate/2 + c_p",
+         " - r_s = ", CC_HP/2 + CC_CP - RS, "   residual ",
+         (R_FLOOR - R_PLT) - (CC_HP/2 + CC_CP - RS)));
 echo(str("   samples: ", 2*CC_NH+1, " on each seat arc, 3 on each tip land",
          ", and the flank sampled at its two ends ONLY, so the chord",
          " between them is the straight flank itself; the faceting on a",
@@ -743,8 +778,13 @@ echo(str("   web half height ", CC_HWEB,
          " mm is more than the chain's own half envelope over the pin",
          " heads, ", CC_WO/2, " mm, so the web would foul the chain if it",
          " reached it: the plates' inner edge is at r = ", RP - CC_HP/2,
-         " and the web stops at ", R_WEB, ", short by ",
-         RP - CC_HP/2 - R_WEB, " mm   clear: ", R_WEB < RP - CC_HP/2));
+         " and the web stops at R_plt = ", R_PLT, ", short by ",
+         RP - CC_HP/2 - R_PLT, " mm   clear: ", R_PLT < RP - CC_HP/2));
+echo(str("      that margin is c_p = ", CC_CP,
+         " by the definition of R_plt, not a larger figure taken off the",
+         " bound R_wmin = ", R_WMIN, "   residual ",
+         (RP - CC_HP/2 - R_PLT) - CC_CP,
+         ".  It is the tightest clearance in the part and it is declared."));
 
 echo("=== 6. the wrap, and the loop that closes on it ===");
 echo(str("   pinion ", CC_N2, " teeth, pitch radius ", RP2,
@@ -799,6 +839,11 @@ echo(str("   seats either side of the 90 split: ", 2*BETA*(NCH/4 - 0.5),
          " on the other, both whole, and the crest between them carries no",
          " roller, which is why the chain crosses the split without",
          " meeting it (the wrap covers it: ", TANG0, " to ", TANG1, ")"));
+echo(str("   cc_joint draws one boss above and one below the chain plane on",
+         " each arc, so the bolts per joint are 2 BY CONSTRUCTION and",
+         " CC_NBJ only names it: CC_NBJ = ", CC_NBJ, "   equals 2: ",
+         CC_NBJ == 2, " -- every count and every hoop tension below is",
+         " wrong if that is ever false"));
 echo(str("   lugs: ", 2*CC_NBJ, " pads a joint, ", CC_NBJ,
          " on each arc's end, one above and one below the chain plane,",
          " because a one-sided clamp twists the arc.  Pad ", CC_PADL, " x ",
@@ -810,7 +855,9 @@ echo(str("   bolt: bore radius ", CC_BHOLE, " a ", CC_NPAD,
          "-gon, least radius ", CC_BHOLE*cos(180/CC_NPAD),
          ", shank radius ", CC_BSH, ", clearance ",
          CC_BHOLE*cos(180/CC_NPAD) - CC_BSH,
-         " mm; the thread is not modelled"));
+         " mm.  Neither the thread NOR THE NUT is modelled: both pad bores",
+         " are clearance bores at ", CC_BHOLE,
+         ", so the joint takes a nut, and no volume below counts one."));
 echo(str("   wrench access: the bolt axis is at z = ", Z_BOLT,
          " and the hub's top is at z = ", CC_HHUB, ", so the axis clears",
          " the collar by ", Z_BOLT - CC_HHUB,
@@ -826,9 +873,16 @@ echo(str("      F = ", CC_NBJ, " bolts * ", CC_FB, " N = ", F_HOOP,
          " N/mm^2"));
 echo(str("      T = 2 pi * ", CC_MU, " * ", F_HOOP, " * ", R_BORE,
          " = ", T_CLAMP, " Nm, against the chain's own ", CC_FW, " N * ",
-         RP, " mm = ", T_CHAIN, " Nm and gate 7's echoed ", CC_ECHO_G7,
-         " Nm a tooth pair.  The clamp is not the limit: ",
-         T_CLAMP > T_CHAIN));
+         RP, " mm = ", T_CHAIN, " Nm"));
+echo(str("      of the two torques this file computes the CHAIN is the",
+         " limit, not the clamp: T_chain/T_clamp = ", T_CHAIN/T_CLAMP,
+         ", chain is the smaller: ", T_CHAIN < T_CLAMP,
+         ".  So the port's own ceiling is ", T_CHAIN, " Nm."));
+echo(str("      gate 7's echoed ", CC_ECHO_G7, " Nm is printed beside them",
+         " and is NOT adjudicated against them: it is a per-tooth-pair",
+         " figure at the POLAR crown, a different member and a different",
+         " quantity.  Their quotient ", T_CHAIN/CC_ECHO_G7,
+         " is a ratio of two unlike things and is offered as nothing more."));
 
 echo("=== 8. backlash, gate 3 ===");
 echo("   the chain's lost motion is the freedom of the engaging roller:");
@@ -883,11 +937,34 @@ echo(str("   one bolt: ", cc_ngon(CC_FNB, CC_BHR), "*", CC_BHH, " + ",
 echo(str("   total 2*arc + ", 4*CC_NBJ, "*pad + ", 2*CC_NBJ, "*bolt = ",
          floor(V_TOT), " + ", V_TOT - floor(V_TOT), " mm^3"));
 echo(str("   the members share no volume, so that total is the volume of",
-         " the mesh itself, not a bound on it; the exporter rounds every",
-         " coordinate to f32, and that rounding is the whole of the",
-         " difference between this figure and the one the file reports"));
+         " the mesh itself, not a bound on it.  It is exact for the mesh as",
+         " this file holds it, in f64.  An exporter writes coordinates at",
+         " its format's own resolution -- f32 in a binary STL, six decimals",
+         " in an OFF -- so a validator measuring the FILE will differ from",
+         " the figure above at about that resolution.  This file cannot",
+         " measure the written file, and does not claim to: it claims only",
+         " the f64 figure, and where the two disagree the file is the",
+         " coarser of the two."));
 echo(str("   mesh: ", len(CC_PROF), " stations * ",
          len(cc_az(A0,A1,J0,J1)), " azimuth samples an arc"));
+
+echo("=== 11. the envelope the collar occupies, for an assembly ===");
+echo(str("   everywhere: r from the tongue face ", R_TIN, " out to r_tip ",
+         RTIP, ", |z| <= ", CC_HHUB, " on the bore and ", H_RIM,
+         " on the teeth; the register mid-plane is z = 0"));
+echo(str("   AT EACH JOINT, beyond that: a boss from r = ", R_BORE, " to ",
+         PAD_RO, " over |z| = ", Z_PAD0, " to ", Z_PAD0 + CC_PADH,
+         ", and a bolt head reaching ",
+         CC_GAPMM/2 + CC_PADL + CC_BHH + CC_PART,
+         " mm either side of the split plane at r = ", R_BOLT - CC_BHR,
+         " to ", R_BOLT + CC_BHR, ", |z| = ", Z_BOLT - CC_BHR, " to ",
+         Z_BOLT + CC_BHR));
+echo(str("   so the collar's full axial envelope is |z| <= ",
+         Z_PAD0 + CC_PADH, " mm about the register mid-plane, against ",
+         CC_HHUB, " mm for the clamped bore alone.  The band is not",
+         " modelled here, so whether it leaves that space above and below",
+         " its groove is the ASSEMBLY's check and this file does not make",
+         " it."));
 
 // ===================================================================
 //  THE PART
