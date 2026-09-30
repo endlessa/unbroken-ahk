@@ -462,6 +462,25 @@ pub fn polyhedron(points: &[Vec3], faces: &[Vec<usize>]) -> (Mesh, Vec<String>) 
     (mesh, warnings)
 }
 
+/// Report an IMPORTED mesh that is inside out.
+///
+/// Imports get this one test and not the other two, and the asymmetry is
+/// deliberate. A file written by another tool may legitimately carry
+/// T-junctions -- this kernel's own boolean output does, which is recorded in
+/// the roadmap -- and the boundary-edge test cannot tell those from a hole,
+/// so running it on every import would cry wolf on the kernel's own exports.
+/// Enclosing a negative volume admits no such reading: the file is turned
+/// through, and every boolean it takes part in will quietly lose geometry.
+pub fn import_note(mesh: &Mesh, what: &str) -> Option<String> {
+    if mesh.tris.is_empty() || mesh.signed_volume() >= 0.0 {
+        return None;
+    }
+    Some(format!(
+        "{what} encloses a negative volume, so it is inside out; booleans on it will \
+         silently lose geometry (mirror it, or reverse the winding in whatever wrote it)"
+    ))
+}
+
 /// Report a polyhedron that is not a closed surface.
 ///
 /// The reference: "A polyhedron that is non-manifold only fails when it
@@ -575,7 +594,30 @@ fn closedness_note(mesh: &Mesh) -> Option<String> {
     }
     let flipped =
         by_index.values().filter(|(f, r)| (*f == 2 && *r == 0) || (*f == 0 && *r == 2)).count();
+    // Closed, consistently wound, and still inside out.
+    //
+    // This is the last member of the family and the one that hides longest.
+    // Every edge is used twice and every pair of faces disagrees about the
+    // edge between them in the right way, so both tests above pass; the
+    // whole surface is simply turned through. It renders correctly, because
+    // shading uses the absolute value of the normal, and the triangle count
+    // and silhouette are right. What it encloses is a negative volume, which
+    // is not a quantity a solid can have.
+    //
+    // It cost this project three models before it showed, and the thing that
+    // finally showed it was a boolean losing geometry three steps later. A
+    // solid's own volume is one pass over its triangles and says it outright.
+    let inverted = holes == 0 && mesh.signed_volume() < 0.0;
     let plural = |n: usize| if n == 1 { "" } else { "s" };
+    if inverted && flipped == 0 {
+        return Some(
+            "polyhedron: the given mesh is closed and consistently wound, but inside out \
+             (it encloses a negative volume); every face is listed the other way round \
+             from the way this kernel reads them, so booleans on it will silently lose \
+             geometry"
+                .into(),
+        );
+    }
     match (holes, flipped) {
         (0, 0) => None,
         (0, n) => Some(format!(
@@ -825,37 +867,55 @@ mod tests {
             let f: Vec<Vec<usize>> = faces.iter().map(|x| x.to_vec()).collect();
             polyhedron(&pts, &f).1
         };
-        let closed: &[&[usize]] = &[&[0, 2, 1], &[0, 1, 3], &[1, 2, 3], &[0, 3, 2]];
+        // Wound the way this kernel reads a solid: every face's right-hand
+        // normal points INTO it. Check it against the arithmetic rather than
+        // against intuition -- the fixture that stood here before was the
+        // other way round, and since the test only asked about closure,
+        // nothing caught it for the life of the file.
+        let closed: &[&[usize]] = &[&[0, 1, 2], &[0, 3, 1], &[1, 3, 2], &[0, 2, 3]];
+        {
+            let f: Vec<Vec<usize>> = closed.iter().map(|x| x.to_vec()).collect();
+            let pts = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+            let v = polyhedron(&pts, &f).0.signed_volume();
+            assert!((v - 1.0 / 6.0).abs() < 1e-12, "the fixture encloses {v}, not +1/6");
+        }
         assert!(tet(closed).is_empty(), "a closed tetrahedron says nothing");
 
         // A face missing leaves three edges with nothing on the other side.
-        let w = tet(&[&[0, 2, 1], &[0, 1, 3], &[0, 3, 2]]);
+        let w = tet(&[&[0, 1, 2], &[0, 3, 1], &[1, 3, 2]]);
         assert!(w.iter().any(|m| m.contains("not closed") && m.contains("3 boundary")), "{w:?}");
-        // A face wound the WRONG way leaves no boundary at all -- the parity
-        // test passes, the mesh renders correctly, and every boolean on it is
-        // undefined. Reported separately, and by name.
-        let w = tet(&[&[0, 2, 1], &[0, 1, 3], &[1, 2, 3], &[0, 2, 3]]);
+
+        // ONE face wound the wrong way leaves no boundary at all -- the
+        // parity test passes, the mesh renders correctly, and every boolean
+        // on it is undefined. Reported separately, and by name.
+        let w = tet(&[&[0, 1, 2], &[0, 3, 1], &[1, 3, 2], &[0, 3, 2]]);
         assert!(
             w.iter().any(|m| m.contains("not consistently wound") && m.contains("3 edges")),
             "{w:?}"
         );
+
+        // EVERY face wound the other way is the case that hides longest:
+        // closed, consistently wound, renders correctly, and encloses a
+        // negative volume. Three models shipped like this before the kernel
+        // could say so.
+        let w = tet(&[&[0, 2, 1], &[0, 1, 3], &[1, 2, 3], &[0, 3, 2]]);
+        assert!(w.iter().any(|m| m.contains("inside out")), "{w:?}");
 
         // Duplicate points close a seam as well as one point does: the
         // reference accepts them silently, so edges match by POSITION.
         let pts = [
             [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0],
         ];
-        let faces = vec![vec![0, 2, 1], vec![0, 1, 3], vec![1, 2, 3], vec![4, 3, 2]];
+        let faces = vec![vec![0, 1, 2], vec![0, 3, 1], vec![1, 3, 2], vec![4, 2, 3]];
         assert!(polyhedron(&pts, &faces).1.is_empty(), "a duplicated corner still closes");
 
         // A quad that closes on itself at a pole fans into a degenerate
-        // triangle plus a real one. Dropping the degenerate orphans its edges,
-        // which flagged every capped sweep in the example corpus; kept, the
-        // flap seals its own edge.
-        let ring = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let with_pole = vec![vec![0, 2, 1], vec![0, 1, 3], vec![1, 2, 3], vec![0, 3, 3, 2]];
+        // triangle plus a real one. Dropping the degenerate orphans its
+        // edges, which flagged every capped sweep in the example corpus;
+        // kept, the flap seals its own edge.
+        let with_pole = vec![vec![0, 1, 2], vec![0, 3, 1], vec![1, 3, 2], vec![0, 2, 3, 3]];
         assert!(
-            polyhedron(&ring, &with_pole).1.is_empty(),
+            polyhedron(&pts[..4], &with_pole).1.is_empty(),
             "a quad that collapses at a pole fans into a zero-area flap whose edges \
              double up legitimately"
         );
@@ -874,6 +934,24 @@ mod tests {
             !w.iter().any(|m| m.contains("not consistently wound")),
             "faces brought together only by the weld are not judged: {w:?}"
         );
+    }
+
+    /// An imported mesh gets one test, and it is the one no other reading
+    /// can explain away.
+    #[test]
+    fn an_imported_mesh_is_judged_only_on_its_volume() {
+        let pts = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let right: Vec<Vec<usize>> = vec![vec![0, 1, 2], vec![0, 3, 1], vec![1, 3, 2], vec![0, 2, 3]];
+        let wrong: Vec<Vec<usize>> = vec![vec![0, 2, 1], vec![0, 1, 3], vec![1, 2, 3], vec![0, 3, 2]];
+        assert!(import_note(&polyhedron(&pts, &right).0, "import('x.stl')").is_none());
+        let w = import_note(&polyhedron(&pts, &wrong).0, "import('x.stl')").unwrap();
+        assert!(w.contains("inside out") && w.contains("x.stl"), "{w}");
+        // An open mesh is NOT reported here: a file from another tool may
+        // carry T-junctions, this kernel's own boolean output does, and the
+        // boundary test cannot tell those from a hole.
+        let open: Vec<Vec<usize>> = vec![vec![0, 1, 2], vec![0, 3, 1], vec![1, 3, 2]];
+        assert!(import_note(&polyhedron(&pts, &open).0, "import('x.stl')").is_none());
+        assert!(import_note(&Mesh::empty(), "import('x.stl')").is_none());
     }
 
     /// A closed, consistently wound cube says nothing -- the winding test must

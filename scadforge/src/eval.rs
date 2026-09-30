@@ -3312,7 +3312,12 @@ fn import_file(path: &str, layer: Option<&str>, dpi: f64, ctx: &mut Ctx) -> Vec<
             }
         };
         return match std::fs::read(&resolved).ok().map(|b| io::read_3mf(&b)) {
-            Some(Ok(m)) if !m.tris.is_empty() => leaf(m),
+            Some(Ok(m)) if !m.tris.is_empty() => {
+                if let Some(w) = geom::import_note(&m, &format!("import('{path}')")) {
+                    ctx.warn(w);
+                }
+                leaf(m)
+            }
             Some(Ok(_)) => Vec::new(),
             _ => {
                 ctx.warn(format!("WARNING: Can't open import file '{}'.", path));
@@ -3352,7 +3357,12 @@ fn import_file(path: &str, layer: Option<&str>, dpi: f64, ctx: &mut Ctx) -> Vec<
         },
     };
     match mesh {
-        Ok(m) if !m.tris.is_empty() => leaf(m),
+        Ok(m) if !m.tris.is_empty() => {
+            if let Some(w) = geom::import_note(&m, &format!("import('{path}')")) {
+                ctx.warn(w);
+            }
+            leaf(m)
+        }
         Ok(_) => Vec::new(), // parsed but empty
         // An unreadable file and a CORRUPT one are different problems and
         // the user needs to be told which. The readers' own message was
