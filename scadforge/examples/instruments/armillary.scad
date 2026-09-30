@@ -1,5 +1,301 @@
 // ===================================================================
-//  PLACEHOLDER HEADER, rewritten once the numbers are in
+//  An armillary sphere, every ring placed by rotation from first
+//  principles
+//
+//  Nine flat rings stand inside one another here and not one of them is
+//  put where it looks right.  Each is a rectangle swept round a circle
+//  and closed into a single polyhedron, and each is carried onto the
+//  celestial sphere by a rotation written out from the definition of the
+//  coordinate system it belongs to.  The model then measures the
+//  consequences.  Where the ecliptic crosses the equator, how close the
+//  ecliptic passes to the tropic it is tangent to, how far the pole
+//  stands above the horizon, how much metal there is: all of those are
+//  read back off the geometry, and none of them is asserted anywhere in
+//  the file.
+//
+//  THE FRAME, WRITTEN OUT
+//
+//  Take x east, y north, z up, which is right handed.  At latitude phi
+//  the north celestial pole stands in the meridian plane at altitude
+//  phi, so
+//
+//      p = (0, cos phi, sin phi).
+//
+//  The celestial equator is the great circle perpendicular to p, and its
+//  point on the meridian, at hour angle zero, is due south at altitude
+//  90 - phi:
+//
+//      e1 = (0, -sin phi, cos phi).
+//
+//  Complete the triad and
+//
+//      e2 = p x e1 = (1, 0, 0),
+//
+//  which is due east.  That is worth a pause.  The east point of the
+//  horizon is a point of the celestial equator at every latitude, and
+//  here it falls out of a cross product rather than being put there by
+//  hand.  It is also why the celestial equator meets the horizon at the
+//  east and west points at every latitude and at every setting of the
+//  sphere: the two planes share that line whatever else moves.  The two
+//  rings here are nested and never touch, but their planes still cross
+//  there, and the model reports the altitude of that crossing as zero.
+//
+//  A ring drawn in the xy plane is carried onto the equator by the map
+//  sending (x, y, z) to (e1, e2, p).  Rx(phi - 90) sends (x, y, z) to
+//  (e2, -e1, p), which is the triad wanted turned a quarter turn about
+//  p, so the map is Rx(phi - 90) . Rz(-90).  Hour angle runs westward
+//  from the meridian while the drawn ring's own angle runs
+//  anticlockwise, so a point at hour angle H sits at local angle -H, and
+//  the whole placement is one line:
+//
+//      sky(H) = Rx(phi - 90) . Rz(-90 - H).
+//
+//  Every celestial ring in the file is sky() of a ring in the xy plane.
+//  The equator is sky(0).  The tropics are the same ring shrunk to
+//  radius R cos d and lifted to R sin d, at declination d = +-EPS; the
+//  polar circles are the same at d = +-(90 - EPS), the complement, which
+//  is the whole of what makes them polar circles.  A circle of constant
+//  declination is a surface of revolution about p, so the hour angle it
+//  is drawn at does not matter and none is chosen.
+//
+//  WHY THE ECLIPTIC CROSSES THE EQUATOR WHERE IT DOES
+//
+//  Hour angle and right ascension are related by H = LST - RA, so the
+//  vernal equinox, RA zero, sits at hour angle LST.  Go to the frame
+//  sky(LST).  Its local x is that equinox.  Its local z is the pole.
+//  Its local y is z cross x, which has hour angle LST - 90 and therefore
+//  RA 90, six hours: the June solstice point of the equator.  Now tip
+//  the ring by the obliquity about local x.  The x axis is fixed, so the
+//  equinoxes stay on the equator, and local y rises to declination
+//  +EPS, which is the June solstice.  That is the ecliptic, and its own
+//  ring parameter is ecliptic longitude measured from the equinox, with
+//  no further conversion:
+//
+//      ecliptic = sky(LST) . Rx(EPS) . (ring in the xy plane).
+//
+//  Nothing in that is a placement to taste.  Change LST and the whole
+//  sphere turns about its polar axis, which is what the instrument is
+//  for; the ecliptic's relation to the equator does not move, because
+//  both are built in the same frame.
+//
+//  The model then refuses to take its own word for it.  It walks the
+//  ecliptic's centreline station by station, carries each station into
+//  equatorial coordinates and reads its declination.  The declination
+//  crosses zero at longitudes 0 and 180 and reaches its extremes at 90
+//  and 270, and the extreme value comes back as the obliquity to the
+//  last digit carried.  The line of nodes is then computed a second
+//  time by a route that knows nothing about how either ring was placed,
+//  as the cross product of the two rings' poles, and the two answers
+//  agree to zero.  At the stated setting the equinoxes lie 18.1441
+//  degrees above and below the horizon on azimuths 114.309 and 294.309,
+//  and the ring reports that as a measurement.
+//
+//  The crossing is shown as well as stated.  The ecliptic carries twelve
+//  marks, one for each sign, and the equator carries two, placed in the
+//  frame sky(LST) at longitudes 0 and 180.  Neither mark knows the other
+//  exists.  Dropping each back into its own band's plane, to take out
+//  the stand-off along that band's normal, leaves two rays that agree to
+//  zero degrees and agree with the node from the ring poles to nine
+//  millionth of a degree.
+//
+//  THE RINGS ARE NESTED, AND THE NESTING IS DERIVED
+//
+//  A real armillary's rings are nested, each turning inside the last,
+//  and that is what is built here.  It also buys something this model
+//  needs: if no two solids share any volume, the exported mesh is
+//  exactly the mesh that was written, face for face, so the volume audit
+//  is a prediction and any disagreement at all is a finding.
+//
+//  The radii are not chosen.  Each ring's outer corner is set one
+//  clearance inside the previous ring's inner surface, and the chain is
+//  solved rather than measured.  For the equatorial family the step is a
+//  quadratic.  A band at declination d on a sphere of radius R reaches
+//
+//      R^2 + R (W cos d + T sin d) + (W^2 + T^2)/4
+//
+//  from the centre, squared, and among the five declinations the
+//  bracket is largest at d = EPS.  It is the tropics and not the equator
+//  that come nearest the meridian ring, because tipping a band towards
+//  the pole loses less in radius than it gains in height.  Setting that
+//  reach equal to the meridian ring's inner clearance gives one positive
+//  root for R, and the equatorial sphere's radius is whatever that root
+//  is.
+//
+//  The ecliptic is then the largest band clearing all five of them.  At
+//  the solstices it is TANGENT to the tropics, which is the defining
+//  relation between the two and the single worst case a boolean can be
+//  handed: two surfaces that touch without crossing.  Carrying the
+//  ecliptic on a smaller sphere turns the touch into a clearance that
+//  can be measured, and the model measures it exactly rather than
+//  sampling a distance field, because the distance from a point to a
+//  flat annular band about the polar axis is closed form.  It comes back
+//  as 0.600186 mm where 0.600 was designed, and that residue is the
+//  chording, which is the next paragraph.
+//
+//  A ring is a polygon, not a circle, and the clearances live on its
+//  INNER surface.  The outer vertices sit exactly on the outer radius,
+//  but the inner surface is a ring of flats whose middles lie at
+//  ri cos(180/n), inside the inner radius by ri (1 - cos(180/n)).  The
+//  first version of this chain took every clearance from the
+//  circumradius, and the model's own clearance audit came back at 0.5845
+//  where 0.600 had been designed.  Fifteen microns is nothing.  Not
+//  being able to predict them is not nothing, and the fix is to take
+//  every clearance from the chord, which is what the file does now and
+//  why IN_H, IN_M and IN_C exist.  Station counts are therefore settled
+//  first, from a chord tolerance of 0.02 mm, before any radius is
+//  derived from any other.
+//
+//  NO TWO OF THE THIRTY-FOUR SOLIDS SHARE A CUBIC MILLIMETRE
+//
+//  That is proved in the file, for all 561 pairs, and it has to be,
+//  because the kernel would not have said so.  Measured on this build:
+//  two 40 mm boxes overlapping by 8 microns export as two separate
+//  shells, self-intersecting, enclosing 6400 where their union is
+//  6399.36, with no warning of any kind; at 8.2 microns the same pair
+//  merges and gives the union exactly.  The threshold scales with the
+//  size of the solids, about two parts in ten thousand of it, and not
+//  with where they sit.  So on an instrument 300 mm across, an
+//  accidental overlap of up to about 0.03 mm would pass in silence and
+//  the volume audit would pass with it.  Proving disjointness inside the
+//  model is the only way the audit means anything.
+//
+//  The proof is a separating-axis certificate.  A pair is apart if the
+//  shells they occupy, measured from the centre of the instrument, do
+//  not overlap, or if their extents along any of six directions do not:
+//  the three world axes, the polar axis, the pole of the ecliptic, and
+//  the line joining the two solids' own centroids.  The polar axis is
+//  the one that cannot be left out.  The five equatorial bands lie in
+//  the same spherical shell and in overlapping boxes, and what separates
+//  them is declination, which is exactly a slab test along p.  The
+//  smallest margin over all 561 pairs is 0.600 mm, the clearance the
+//  chain was built with, and thirty-three different pairs achieve it,
+//  which is what a chain solved rather than measured looks like.
+//
+//  Getting a solid's inner reach right is half of that.  The outermost
+//  point of a polyhedron is always a vertex, so rmax is a maximum over
+//  vertices and is exact.  The innermost point is not: for a band it is
+//  the middle of a flat, for a lofted prism it can be anywhere on a
+//  face.  So the bands use the closed form and the lofts use the clamped
+//  barycentric closest-point-on-triangle, which is exact and costs
+//  nothing on the few hundred triangles they have between them.
+//
+//  WINDING, AND THE ONLY DIAGNOSTIC THERE IS FOR IT
+//
+//  polyhedron() wants each face wound clockwise seen from outside, so
+//  the right-hand normal points INTO the solid.  For a sweep advancing
+//  along d whose faces are [ring u vertex v, ring u+1 vertex v, ring u+1
+//  vertex v+1, ring u vertex v+1], that forces the section perimeter to
+//  be traversed in the direction d x n_out.  For a band the advance is
+//  the azimuth and the outer face's outward normal is radial, so
+//  traversal is theta x rho = -z: the section runs (ro, +t/2),
+//  (ro, -t/2), (ri, -t/2), (ri, +t/2), which looks clockwise when the
+//  radial and axial axes are drawn the ordinary way.  The cap at the
+//  START of a loft takes the section order as given and the cap at the
+//  END takes it reversed.
+//
+//  A solid wound the other way round renders identically and then loses
+//  geometry in every boolean it touches.  The kernel does warn about it,
+//  but only for a mesh it can see is closed and consistent, and a model
+//  that hands it thirty-four polyhedra wants to know WHICH one.  So the
+//  file sums the divergence theorem over each part's own triangles,
+//  turns the sign once for the clockwise convention, and prints a
+//  per-part volume; a part that comes back negative is marked.  The
+//  nine bands also have a closed form, because their end faces are plane
+//  annuli of polygons and their walls are plane rectangles, so no
+//  triangulation choice can move them: t (n/2) sin(360/n) (ro^2 - ri^2).
+//  The two routes agree to 1.3e-9 mm^3 on 965864.
+//
+//  Every quadrilateral in this model is planar.  That is not luck.  A
+//  band's walls are vertical rectangles between two stations at one
+//  radius, and a lofted prism's side face lies in the plane x = a z + b
+//  through both of its rectangles, whatever the taper.  So unlike a
+//  twisting sweep, where the two triangulations of a saddle straddle the
+//  patch they stand for, nothing here depends on which diagonal is
+//  taken, and the volume is exact rather than second order.
+//
+//  THE ALIDADE IS ONE POLYHEDRON
+//
+//  A sighting rule wants a slit at each end, and a slit is a subtraction
+//  this model does not have.  So the alidade is a single closed
+//  polyhedron swept along the sight line whose SECTION carries the slit:
+//  an eight-sided polygon, a rectangle with a notch cut in from one
+//  side, swept through fourteen stations.  Along the rule the notch is a
+//  shallow groove; at each pinnule the section jumps to a tall plate and
+//  the groove becomes a slit seven millimetres deep and four and a half
+//  wide.  Sighting is through both slits, 183 mm apart, which is about a
+//  degree and a half of resolution.  The notch is never allowed to close
+//  to zero, because a section that degenerates puts zero-area triangles
+//  with repeated vertices into the mesh and those read as leaks.
+//
+//  The caps are triangulated here rather than handed over.  A non-convex
+//  polygon fanned from one corner throws triangles across the notch.
+//  This kernel in fact ear-clips a non-convex coplanar face correctly, a
+//  five-sided dart test comes back at exactly its true volume, but the
+//  reference only promises "fan/ear" triangulation, and on a face whose
+//  shape is the whole point it is better not to find out.  Six triangles
+//  by hand, checked by the rule that every ear must see only interior.
+//
+//  The rule is laid on Arcturus.  Its hour angle is LST - RA and its
+//  direction is sky(H) . Ry(90 - dec) applied to the local z axis; the
+//  model reports the altitude that comes out of that frame and, beside
+//  it, the altitude from the spherical triangle,
+//  sin a = sin phi sin dec + cos phi cos dec cos H.  They agree to zero.
+//  The rule's half length is not chosen either: it is the longest that
+//  keeps its furthest corner one clearance inside the ecliptic's inner
+//  flats, and the model prints that corner's distance beside the
+//  allowance.
+//
+//  THE STAND, AND WHERE THE LATITUDE ENTERS IT
+//
+//  The plinth is the ninth flat ring, and it stands one horizon radius
+//  below the horizon plane.  Four legs splay from it to the underside of
+//  the horizon ring at the cardinal points.  The polar axis is the
+//  column, which rises along -p from the plinth to the south celestial
+//  pole of the meridian ring, and the stub, which continues along +p on
+//  the far side; the model checks that the two are 180 degrees apart and
+//  that the stub points at altitude phi, which is the latitude.  Set the
+//  model to another latitude and the column swings, the plinth stays
+//  level, and every ring follows, because nothing downstream of LAT is
+//  written down anywhere.
+//
+//  The column's sections are square and normal to the polar axis, so its
+//  foot is a plane cut at the latitude angle standing over a level
+//  plinth.  The two faces meet at 51.5 degrees and the air between them
+//  opens from 0.6 mm at the low corner to 16.8 mm at the high one, which
+//  is where the column's foot length comes from: it is set so the lowest
+//  corner clears the plinth by exactly GAP, and the rest follows from
+//  the angle.  Which is the honest place to say what all the clearances
+//  are.  Nothing in this model is fastened to anything.
+//  Where a real instrument has a rivet, a tenon or a pivot in a drilled
+//  hole, this one has GAP = 0.6 mm of air, because a hole is a
+//  subtraction and a rivet is an overlap, and either would cost the
+//  exact volume that the whole audit rests on.  The clearances are
+//  stated rather than hidden, and they are the same 0.6 mm everywhere.
+//
+//  WHAT WENT WRONG
+//
+//  Twice, and both times the kernel's diagnostics pointed somewhere
+//  else.  The first was a placement function applied to a list of
+//  SECTIONS as though it were a flat list of points.  Rotating a list of
+//  four points as if it were one point produces something shaped enough
+//  like a point to survive, so polyhedron() received a points array a
+//  quarter of the length it expected and reported "point index 6 out of
+//  bounds; face dropped" six times over, followed by "closed and
+//  consistently wound, but inside out" on the wreckage.  Neither message
+//  is wrong and neither is near the mistake.  The file now keeps the two
+//  kinds of placement visibly apart, place_ for points and placeS_ for
+//  sections, and says why.
+//
+//  The second was the chording of the clearances above, which nothing
+//  diagnosed at all and which only the model's own audit found, by
+//  measuring a clearance it had designed and getting a different number
+//  back.  That is the argument for building the audit before believing
+//  the picture.
+//
+//  Total: 34 solids, 12484 triangles, 1128444.52 mm^3 predicted from the
+//  closed forms and 1128444.49 measured in the exported mesh, a
+//  disagreement of three parts in a hundred million, which is the f32
+//  the STL is written in and nothing else.
 // ===================================================================
 
 // ---- the sky -------------------------------------------------------
@@ -17,7 +313,7 @@ RO_H = 150;  W_H = 16;  T_H = 5;    // horizon ring
 W_M  = 14;   T_M = 5;               // meridian ring
 W_E  = 11;   T_E = 4;               // the five equatorial bands
 W_C  = 10;   T_C = 4;               // the ecliptic band
-T_B  = 14;                          // plinth thickness
+T_B  = 10;                          // plinth thickness
 
 // ---- vector rotations, applied in the function layer so every ------
 // ---- vertex is known in world coordinates and can be audited -------
@@ -36,60 +332,77 @@ function sum(v, a = 0, b = -1) =
 // ===================================================================
 //  DERIVED DIMENSIONS
 // ===================================================================
-RI_H = RO_H - W_H;
-SH_H = norm([RO_H, T_H/2]);                 // horizon ring, outermost point
+// Station counts come first, because the clearances below are measured
+// against the POLYGON each ring really is and not against the circle it
+// approximates.  A ring's outer vertices sit exactly on its outer
+// radius, but its inner surface is a ring of flats whose middles lie at
+// ri cos(180/n), inside the inner radius by ri (1 - cos(180/n)).  Every
+// clearance in the chain is a gap left inside an inner surface, so every
+// one of them has to be taken from the chord.
+function nst(ro) = 4*ceil(180/acos(1 - TOL/ro)/4);
 
-RO_M = sqrt(pow(RI_H - GAP, 2) - pow(T_M/2, 2));
-RI_M = RO_M - W_M;
-SH_M = norm([RO_M, T_M/2]);
+RI_H   = RO_H - W_H;
+N_H    = nst(RO_H);
+IN_H   = RI_H*cos(180/N_H);
+SH_H   = norm([RO_H, T_H/2]);
+
+RO_M   = sqrt(pow(IN_H - GAP, 2) - pow(T_M/2, 2));
+RI_M   = RO_M - W_M;
+N_M    = nst(RO_M);
+IN_M   = RI_M*cos(180/N_M);
+SH_M   = norm([RO_M, T_M/2]);
 
 // The equatorial family is five flat bands on one sphere: the equator,
 // the two tropics at declination +-EPS, and the two polar circles at
 // +-(90 - EPS).  The band that reaches furthest from the centre is a
 // tropic, not the equator, because tipping a band towards the pole buys
 // less in radius than it costs in height.  Write the family's outer
-// reach for declination d and it is
+// reach at declination d and it is
 //     R^2 + R (W cos d + T sin d) + (W^2 + T^2)/4,
-// largest at d = EPS among the five.  Setting that equal to the meridian
-// ring's inner clearance is a quadratic in R with one positive root.
-BQ   = W_E*cos(EPS) + T_E*sin(EPS);
-CQ   = (W_E*W_E + T_E*T_E)/4;
-KQ   = pow(RI_M - GAP, 2);
-R_S  = (-BQ + sqrt(BQ*BQ - 4*CQ + 4*KQ))/2;
+// and among the five declinations the bracket is largest at d = EPS.
+// Setting that equal to the meridian ring's inner clearance leaves a
+// quadratic in R with one positive root.  The sphere's radius is
+// therefore not a choice: it is the largest that puts the tropics'
+// outer corners one clearance inside the meridian ring.
+BQ     = W_E*cos(EPS) + T_E*sin(EPS);
+CQ     = (W_E*W_E + T_E*T_E)/4;
+KQ     = pow(IN_M - GAP, 2);
+R_S    = (-BQ + sqrt(BQ*BQ - 4*CQ + 4*KQ))/2;
 
-DECS = [0, EPS, -EPS, 90 - EPS, -(90 - EPS)];
+DECS   = [0, EPS, -EPS, 90 - EPS, -(90 - EPS)];
 function fam_r(d)   = R_S*cos(d);
 function fam_z(d)   = R_S*sin(d);
-function fam_in(d)  = norm([fam_r(d) - W_E/2, max(abs(fam_z(d)) - T_E/2, 0)]);
-function fam_out(d) = norm([fam_r(d) + W_E/2, abs(fam_z(d)) + T_E/2]);
-FIN  = min([ for (d = DECS) fam_in(d) ]);
-FOUT = max([ for (d = DECS) fam_out(d) ]);
+function n_fam(d)   = nst(fam_r(d) + W_E/2);
+function fam_in(d)  = norm([ (fam_r(d) - W_E/2)*cos(180/n_fam(d)),
+                             max(abs(fam_z(d)) - T_E/2, 0) ]);
+function fam_out(d) = norm([ fam_r(d) + W_E/2, abs(fam_z(d)) + T_E/2 ]);
+FIN    = min([ for (d = DECS) fam_in(d) ]);
+FOUT   = max([ for (d = DECS) fam_out(d) ]);
 
 // The ecliptic is the largest band whose outer corner clears the whole
 // equatorial family by GAP.
-R_C  = sqrt(pow(FIN - GAP, 2) - pow(T_C/2, 2)) - W_C/2;
-SH_C = norm([R_C + W_C/2, T_C/2]);
-
-// Station counts: enough that the outer edge's sagitta is under TOL.
-function nst(ro) = 4*ceil(180/acos(1 - TOL/ro)/4);
+R_C    = sqrt(pow(FIN - GAP, 2) - pow(T_C/2, 2)) - W_C/2;
+N_C    = nst(R_C + W_C/2);
+SH_C   = norm([R_C + W_C/2, T_C/2]);
+IN_C   = (R_C - W_C/2)*cos(180/N_C);
 
 // ---- the stand -----------------------------------------------------
 Z_PL = -RO_H;                       // plinth top, one horizon radius down
 R_LT = (RO_H + RI_H)/2;  Z_LT = -T_H/2 - GAP;     // leg top
-R_LF = 165;              Z_LF = Z_PL + GAP;       // leg foot
-A_LT = 8;   B_LT = 7;
-A_LF = 11;  B_LF = 12;
+R_LF = 162;              Z_LF = Z_PL + GAP;       // leg foot
+A_LT = 6;   B_LT = 5.5;
+A_LF = 8.5; B_LF = 9.5;
 A_CT = 8.5; A_CF = 13;
 Z_CT = -(RO_M + GAP);                             // column top, along -p
 Z_CF = (Z_PL + GAP + A_CF*cos(LAT))/sin(LAT);     // column foot, see header
-RO_B = R_LF + A_LF + 6;
-RI_B = 95;
+RO_B = R_LF + A_LF + 7;
+RI_B = 96;
 
 // ---- the alidade ---------------------------------------------------
 AW = 3.2;  AV = 2.6;  AG = 1.0;  AD = 0.8;        // the rule's section
 PW = 9.5;  PV = 11.5; PG = 2.2;  PD = 7.0;        // a pinnule
 BW = 4.6;  BV = 3.8;  BG = 1.2;  BD = 1.2;        // the pivot swell
-ALLOW = R_C - W_C/2 - GAP;
+ALLOW = IN_C - GAP;
 L_A   = sqrt(ALLOW*ALLOW - AW*AW - AV*AV);
 H_A   = LST - RA_A;                               // Arcturus, hour angle
 
@@ -167,6 +480,7 @@ function place_mer(P)    = [ for (q = P) ryv(90, q) ];
 function placeS_z(S, a)        = [ for (s = S) [ for (q = s) rzv(a, q) ] ];
 function placeS_ecl(S)         = [ for (s = S) [ for (q = s) rxv(LAT-90, rzv(-90-LST, rxv(EPS, q))) ] ];
 function placeS_pol(S)         = [ for (s = S) [ for (q = s) rxv(LAT-90, q) ] ];
+function placeS_sky(S, H)      = [ for (s = S) [ for (q = s) rxv(LAT-90, rzv(-90-H, q)) ] ];
 function placeS_star(S, H, dc) = [ for (s = S) [ for (q = s) rxv(LAT-90, rzv(-90-H, ryv(90-dc, q))) ] ];
 function shift(P, d)     = [ for (q = P) q + d ];
 function skyv(H, v)      = rxv(LAT-90, rzv(-90-H, v));
@@ -174,22 +488,39 @@ function skyv(H, v)      = rxv(LAT-90, rzv(-90-H, v));
 // ===================================================================
 //  THE PARTS
 // ===================================================================
-N_H = nst(RO_H);
-N_M = nst(RO_M);
-N_C = nst(R_C + W_C/2);
 N_B = nst(RO_B);
-function n_fam(d) = nst(fam_r(d) + W_E/2);
 
 function fam_band(d) =
   let( n = n_fam(d) )
   shift(band_pts(fam_r(d) + W_E/2, fam_r(d) - W_E/2, T_E, n), [0, 0, fam_z(d)]);
 
-// Ecliptic markers.  The two equinox marks are tall and thin, the two
-// solstice marks low and square, so which is which survives a render.
+// The ecliptic carries the twelve signs, one mark every thirty degrees
+// of longitude.  The two equinox marks are tall and thin, the two
+// solstice marks square and lower, the other eight small, so which is
+// which survives a render with no colour.  Each stands GAP clear of the
+// band's face on the ecliptic's own north side.
 function ecl_mark(lam, a, b, h) =
   placeS_ecl(placeS_z(
     [ rect_sec(R_C, 0, T_C/2 + GAP,     a, b),
       rect_sec(R_C, 0, T_C/2 + GAP + h, a, b) ], lam));
+
+// The equator carries two marks, on the rays where the ecliptic crosses
+// it.  Placing them in the sky(LST) frame at longitudes 0 and 180 puts
+// them on the SAME two rays from the centre as the ecliptic's equinox
+// fins, without either mark knowing about the other, so the two rings
+// pointing at the same place is a thing the model shows and not a thing
+// it claims.
+function equ_mark(lam, a, b, h) =
+  placeS_sky(placeS_z(
+    [ rect_sec(R_S, 0, T_E/2 + GAP,     a, b),
+      rect_sec(R_S, 0, T_E/2 + GAP + h, a, b) ], lam), LST);
+
+ZNAME = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo","Libra","Scorpio",
+         "Sagittarius","Capricorn","Aquarius","Pisces"];
+// radial half, tangential half, height
+function zsize(k) = k == 0 || k == 6 ? [1.6, 3.0, 9]
+                  : k == 3 || k == 9 ? [2.6, 2.6, 5]
+                                     : [1.4, 2.0, 3];
 
 // Horizon marks, at the four cardinal azimuths measured from north.
 function hor_mark(az, a, b, h) =
@@ -298,10 +629,13 @@ PARTS = concat(
        leg(90*i), RECT_CAP, STEEL) ],
   [ loftpart("polar column", COLUMN, RECT_CAP, STEEL),
     loftpart("polar stub",   STUB,   RECT_CAP, STEEL) ],
-  [ loftpart("mark vernal equinox",    ecl_mark(  0, 1.6, 3.0, 9), RECT_CAP, STEEL),
-    loftpart("mark June solstice",     ecl_mark( 90, 2.6, 2.6, 4), RECT_CAP, STEEL),
-    loftpart("mark autumnal equinox",  ecl_mark(180, 1.6, 3.0, 9), RECT_CAP, STEEL),
-    loftpart("mark December solstice", ecl_mark(270, 2.6, 2.6, 4), RECT_CAP, STEEL) ],
+  [ for (k = [0 : 11]) let( z = zsize(k) )
+      loftpart(str("sign ", ZNAME[k], " lon ", 30*k),
+               ecl_mark(30*k, z[0], z[1], z[2]), RECT_CAP, GOLD) ],
+  [ loftpart("node mark on the equator, vernal",
+             equ_mark(  0, 2.0, 2.4, 4.5), RECT_CAP, STEEL),
+    loftpart("node mark on the equator, autumnal",
+             equ_mark(180, 2.0, 2.4, 4.5), RECT_CAP, STEEL) ],
   [ for (i = [0 : 3]) loftpart(str("mark ", ["N","E","S","W"][i]),
        hor_mark(90*i, 2.4, 2.4, i == 0 ? 10 : 5), RECT_CAP, STEEL) ],
   // The alidade is the one solid that encloses the centre of the
@@ -329,8 +663,11 @@ function mesh_vol(P, F) =
 function unitv(v) = v/norm(v);
 function altof(v) = asin(v[2]/norm(v));
 function azof(v)  = (atan2(v[0], v[1]) + 360) % 360;
-function dms(a)   = str(floor(a), "d ", floor((a - floor(a))*60), "' ",
-                        round(((a - floor(a))*60 - floor((a - floor(a))*60))*600)/10, "\"");
+function dms(a)   = let( x = abs(a), m = (x - floor(x))*60 )
+  str(a < 0 ? "-" : "", floor(x), "d ", floor(m), "' ",
+      round((m - floor(m))*600)/10, "\"");
+function hms(a)   = let( h = a/15, m = (h - floor(h))*60 )
+  str(floor(h), "h ", floor(m), "m ", round((m - floor(m))*600)/10, "s");
 
 VOLS  = [ for (P = PARTS) mesh_vol(P[1], P[2]) ];
 NTRI  = sum([ for (P = PARTS) len(P[2]) ]);
@@ -356,6 +693,15 @@ echo("SET TO     polar axis altitude", altof(NCP), "= the latitude, azimuth", az
 // second is the intersection of the two ring planes, computed from their
 // poles alone and knowing nothing about how either ring was placed.  If
 // the placement is right they are the same line.
+// Where the equator meets the horizon, from the two planes' poles and
+// nothing else.  It has to be the east and west points, at altitude
+// zero, at every latitude, because e2 = p x e1 came out as due east.
+EW = unitv(cross(NCP, [0,0,1]));
+echo("FRAME      equator meets horizon at alt", altof(EW), " azimuths",
+     azof(EW), "and", azof(-EW),
+     " ; e1, the equator on the meridian, is", skyv(0, [1,0,0]),
+     "and p x e1 is", cross(NCP, skyv(0, [1,0,0])), "which is due east");
+
 echo("EQUINOX    frame axis  alt", altof(VEQ), " az", azof(VEQ));
 echo("EQUINOX    plane cross alt", altof(NODE), " az", azof(NODE),
      " ; angle between the two routes", acos(max(-1, min(1, unitv(VEQ)*NODE))), "degrees");
@@ -374,20 +720,22 @@ echo("ECLIPTIC   ", N_C, "stations; declination crosses zero at longitudes", CRO
      " (worst |dec| there", DMIN, "degrees) and reaches its extremes at", SOLST);
 echo("ECLIPTIC   extreme declination", DMAX, "against the obliquity", EPS,
      " difference", DMAX - EPS, "degrees");
-echo("ECLIPTIC   the crossing at longitude 0 sits at alt", altof(ECL_C[0]),
-     " az", azof(rxv(LAT-90, rzv(-90-LST, ECL_C[0]))),
-     " and its opposite at alt", altof(ECL_C[N_C/2]));
+CIDX  = [ for (i = [0 : N_C-1]) if (abs(ECL_D[i]) <= DMIN) i ];
+CW    = [ for (i = CIDX) rxv(LAT-90, rzv(-90-LST, ECL_C[i])) ];
+echo("EQUINOX    read off the ring: altitudes", [ for (v = CW) altof(v) ],
+     " azimuths", [ for (v = CW) azof(v) ],
+     " ; the two are", acos(max(-1, min(1, unitv(CW[0])*unitv(CW[1])))), "degrees apart");
 
 // ---- the nesting ---------------------------------------------------
-echo("NESTING    horizon  Ro", RO_H, "Ri", RI_H, "t", T_H, "-> shell [",
-     RI_H*cos(180/N_H), ",", SH_H, "]");
-echo("NESTING    meridian Ro", RO_M, "Ri", RI_M, "t", T_M, "-> shell [",
-     RI_M*cos(180/N_M), ",", SH_M, "]  clear of the horizon by", RI_H - GAP - SH_M + GAP);
-echo("NESTING    equatorial sphere R", R_S, "-> family shell [", FIN, ",", FOUT,
-     "]  binding band is the tropic, at declination", EPS);
-echo("NESTING    ecliptic sphere R", R_C, "-> shell [", R_C - W_C/2, ",", SH_C, "]");
-echo("NESTING    the four clearances", RI_H - SH_M, RI_M - FOUT, FIN - SH_C,
-     ALLOW - L_A > 0 ? "and the alidade fits" : "AND THE ALIDADE DOES NOT FIT");
+echo("NESTING    horizon  Ro", RO_H, "Ri", RI_H, "t", T_H,
+     "-> reaches [", IN_H, ",", SH_H, "] from the centre");
+echo("NESTING    meridian Ro", RO_M, "Ri", RI_M, "t", T_M,
+     "-> reaches [", IN_M, ",", SH_M, "]");
+echo("NESTING    equatorial sphere R", R_S, "-> family reaches [", FIN, ",", FOUT,
+     "], the binding band being a tropic at declination", EPS);
+echo("NESTING    ecliptic sphere R", R_C, "-> reaches [", IN_C, ",", SH_C, "]");
+echo("NESTING    the chain of clearances", IN_H - SH_M, IN_M - FOUT, FIN - SH_C,
+     IN_C - PARTS[len(PARTS)-1][5], " all of which should be", GAP);
 
 // ---- the near tangency the subject is really about -----------------
 // At the solstices the ecliptic touches the tropics.  That is the one
@@ -400,12 +748,15 @@ echo("NESTING    the four clearances", RI_H - SH_M, RI_M - FOUT, FIN - SH_C,
 function ann_d(rho, zz, ri, ro, z0, t) =
   norm([ max(max(ri - rho, rho - ro), 0), max(abs(zz - z0) - t/2, 0) ]);
 
+// Every vertex of the ecliptic band, and every midpoint of the edges
+// that run along it, carried into equatorial coordinates.  The band's
+// four section vertices ARE its four corner curves, so this samples the
+// whole of the surface that can come nearest a ring of the family.
+ECL_P = band_pts(R_C + W_C/2, R_C - W_C/2, T_C, N_C);
 ECL_V = concat(
-  [ for (q = band_pts(R_C + W_C/2, R_C - W_C/2, T_C, N_C)) rxv(EPS, q) ],
+  [ for (q = ECL_P) rxv(EPS, q) ],
   [ for (i = [0 : N_C-1]) for (k = [0 : 3])
-      let( a = band_pts(R_C + W_C/2, R_C - W_C/2, T_C, N_C)[4*i + k],
-           b = band_pts(R_C + W_C/2, R_C - W_C/2, T_C, N_C)[4*((i+1)%N_C) + k] )
-        rxv(EPS, (a + b)/2) ]);
+      rxv(EPS, (ECL_P[4*i + k] + ECL_P[4*((i+1)%N_C) + k])/2) ]);
 
 function ecl_gap(d) =
   let( n = n_fam(d) )
@@ -417,35 +768,88 @@ echo("TANGENCY   ecliptic to equator", ecl_gap(0),
      " to tropic of Cancer", ecl_gap(EPS), " to tropic of Capricorn", ecl_gap(-EPS));
 echo("TANGENCY   ecliptic to arctic circle", ecl_gap(90-EPS),
      " to antarctic circle", ecl_gap(-(90-EPS)), " ; the guarantee was", FIN - SH_C);
+// The tropics are named after the signs the sun stands in when it
+// reaches them, and the model can show that rather than repeat it: the
+// ecliptic's extreme declinations fall at longitudes 90 and 270, which
+// are the first points of Cancer and Capricorn, and those declinations
+// are the declinations of the two tropic bands.
+echo("TROPICS    the ecliptic is extreme at longitudes", SOLST,
+     "which are the first points of", ZNAME[3], "and", ZNAME[9],
+     "; its declinations there are", DMAX, "and", -DMAX,
+     "and the two tropic bands sit at", EPS, "and", -EPS);
 
 // ---- no two of the solids share a cubic millimetre -----------------
-// Each solid is certified against each other one by two sufficient
-// tests.  Either the shells they lie in, measured from the centre of the
-// instrument, do not overlap, or their axis-aligned boxes do not.  The
-// bands' inner reach is the CHORD of the inner polygon, not its
+// A separating-axis certificate over every pair.  A pair is apart if the
+// shells they occupy, measured from the centre of the instrument, do not
+// overlap, or if their extents along any one of six directions do not:
+// the three world axes, the polar axis, the pole of the ecliptic, and
+// the line joining the two solids' own centroids.  The world axes and
+// the centroid line do most of the work.  The polar axis is the one that
+// cannot be left out, because the five equatorial bands lie in the same
+// spherical shell and in overlapping boxes, and what separates them is
+// declination, which is exactly a slab test along the polar axis.
+//
+// The bands' inner reach is the CHORD of the inner polygon and not its
 // circumradius, because the closest point of an n-gon band to the centre
-// is the middle of a flat, not a vertex.  Getting that wrong overstates
-// every clearance by about fifteen microns here, which is four percent
-// of the clearance being claimed.
-function pmin(P, k) = min([ for (q = P) q[k] ]);
-function pmax(P, k) = max([ for (q = P) q[k] ]);
-BOXES = [ for (P = PARTS) [ pmin(P[1],0), pmax(P[1],0), pmin(P[1],1),
-                            pmax(P[1],1), pmin(P[1],2), pmax(P[1],2) ] ];
+// is the middle of a flat.  Getting that wrong overstates every
+// clearance here by about fifteen microns, four percent of the clearance
+// being claimed, and that is how it was found.
+AXES  = [ [1,0,0], [0,1,0], [0,0,1], NCP, ECP ];
+SPANS = [ for (P = PARTS) [ for (u = AXES)
+            let( d = [ for (q = P[1]) q*u ] ) [ min(d), max(d) ] ] ];
 SHELL = [ for (P = PARTS) [ P[4], P[5] ] ];
-NP = len(PARTS);
-function sep(i, j) =
-  let( A = SHELL[i], B = SHELL[j], X = BOXES[i], Y = BOXES[j] )
-    max([ A[0]-B[1], B[0]-A[1],
-          X[0]-Y[1], Y[0]-X[1], X[2]-Y[3], Y[2]-X[3], X[4]-Y[5], Y[4]-X[5] ]);
-SEPS = [ for (i = [0 : NP-2]) for (j = [i+1 : NP-1]) sep(i, j) ];
-SMIN = min(SEPS);
-echo(str("DISJOINT   ", len(SEPS), " pairs, ",
-         len([ for (s = SEPS) if (s > 0) s ]), " certified apart, tightest ", SMIN, " mm"));
+CENT  = [ for (P = PARTS) sum(P[1])/len(P[1]) ];
+NP    = len(PARTS);
+function axsep(i, j, u) =
+  let( a = [ for (q = PARTS[i][1]) q*u ], b = [ for (q = PARTS[j][1]) q*u ] )
+    max(min(a) - max(b), min(b) - max(a));
+function sep(i, j) = max(concat(
+  [ SHELL[i][0] - SHELL[j][1], SHELL[j][0] - SHELL[i][1] ],
+  [ for (k = [0 : len(AXES)-1])
+      max(SPANS[i][k][0] - SPANS[j][k][1], SPANS[j][k][0] - SPANS[i][k][1]) ],
+  [ axsep(i, j, unitv(CENT[j] - CENT[i])) ] ));
+SEPS  = [ for (i = [0 : NP-2]) for (j = [i+1 : NP-1]) [i, j, sep(i, j)] ];
+SMIN  = min([ for (e = SEPS) e[2] ]);
+NGOOD = len([ for (e = SEPS) if (e[2] > 0) 1 ]);
+echo(str("DISJOINT   ", len(SEPS), " pairs, ", NGOOD, " certified apart, tightest ",
+         SMIN, " mm", NGOOD == len(SEPS) ? "" : "   *** SOME PAIR MAY OVERLAP ***"));
 echo("DISJOINT   the tightest pairs are",
-     [ for (i = [0 : NP-2]) for (j = [i+1 : NP-1])
-         if (sep(i,j) < SMIN + 1e-9) str(PARTS[i][0], " | ", PARTS[j][0]) ]);
+     [ for (e = SEPS) if (e[2] < SMIN + 1e-9) str(PARTS[e[0]][0], " | ", PARTS[e[1]][0]) ]);
 
-// ---- volume, three ways --------------------------------------------
+// The two rings really do point at the same place.  Each node mark's
+// centroid is compared with the equinox fin's on the other ring; the
+// small residue is the stand-off, which is along each band's own normal
+// and so along two different directions.
+NA = len(PARTS);
+function findpart(t) = [ for (i = [0 : NA-1]) if (PARTS[i][0] == t) i ][0];
+IV = findpart("sign Aries lon 0");
+IL = findpart("sign Libra lon 180");
+JV = findpart("node mark on the equator, vernal");
+JL = findpart("node mark on the equator, autumnal");
+// Each mark stands off its own band along that band's normal, and the
+// two normals are the obliquity apart, so comparing mark centroids
+// directly compares two points that are deliberately off the ray.  Drop
+// each centroid back into its own band's plane and what is left is the
+// ray the band is pointing along.
+function inplane(v, n) = unitv(v - n*(v*n));
+echo("CROSSING   vernal node: the ecliptic's Aries mark lies over a point of its band",
+     "at alt", altof(inplane(CENT[IV], ECP)), "az", azof(inplane(CENT[IV], ECP)),
+     "and the equator's mark over a point at alt", altof(inplane(CENT[JV], NCP)),
+     "az", azof(inplane(CENT[JV], NCP)));
+echo("CROSSING   vernal node: those two rays differ by",
+     acos(max(-1, min(1, inplane(CENT[IV], ECP)*inplane(CENT[JV], NCP)))),
+     "degrees, and each differs from the node computed from the two ring poles by",
+     acos(max(-1, min(1, inplane(CENT[IV], ECP)*NODE))),
+     acos(max(-1, min(1, inplane(CENT[JV], NCP)*NODE))));
+echo("CROSSING   autumnal node: rays at alt", altof(inplane(CENT[IL], ECP)),
+     "and", altof(inplane(CENT[JL], NCP)), ", differing by",
+     acos(max(-1, min(1, inplane(CENT[IL], ECP)*inplane(CENT[JL], NCP)))), "degrees");
+echo("CROSSING   the marks themselves sit",
+     acos(unitv(CENT[IV])*inplane(CENT[IV], ECP)), "and",
+     acos(unitv(CENT[JV])*inplane(CENT[JV], NCP)),
+     "degrees off their rays, which is the stand-off and nothing else");
+
+// ---- volume, two routes in here and a third in the export ----------
 // The bands have a closed form: the end faces are plane annuli of
 // n-gons and the walls are plane rectangles, so the volume is the
 // prism formula and no triangulation choice can move it.  The mesh sum
@@ -467,7 +871,10 @@ for (i = [0 : len(PARTS)-1])
            "  shell [", PARTS[i][4], ", ", PARTS[i][5], "]",
            VOLS[i] > 0 ? "" : "   *** INSIDE OUT ***"));
 
-echo("VOLUME     mesh sum over every triangle", VTOT, "mm3");
+echo("VOLUME     mesh sum over every triangle", VTOT, "mm3, of which the nine",
+     "bands are", sum([ for (i = [0:8]) VOLS[i] ]), ", the stand",
+     sum([ for (i = [9:14]) VOLS[i] ]), ", the alidade", VOLS[len(VOLS)-1],
+     "and the", len(VOLS) - 16, "marks", sum([ for (i = [15:len(VOLS)-2]) VOLS[i] ]));
 echo("VOLUME     closed form for the nine bands",
      sum([ for (b = BANDV) b[1] ]), " mesh sum for the same nine",
      sum([ for (i = [0:8]) VOLS[i] ]));
@@ -484,7 +891,7 @@ echo("CHORDING   station counts", [N_H, N_M, n_fam(0), n_fam(EPS), n_fam(90-EPS)
 // ---- the alidade ----------------------------------------------------
 SDIR = rxv(LAT-90, rzv(-90-H_A, ryv(90-DEC_A, [0,0,1])));
 ALTC = asin(sin(LAT)*sin(DEC_A) + cos(LAT)*cos(DEC_A)*cos(H_A));
-echo("ALIDADE    laid on Arcturus, RA", dms(RA_A/15*15), " dec", dms(DEC_A),
+echo("ALIDADE    laid on Arcturus, RA", hms(RA_A), " dec", dms(DEC_A),
      " hour angle", H_A);
 echo("ALIDADE    direction from the frame: alt", altof(SDIR), " az", azof(SDIR));
 echo("ALIDADE    altitude from the spherical triangle:", ALTC,
