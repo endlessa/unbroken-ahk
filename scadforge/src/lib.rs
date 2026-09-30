@@ -21,6 +21,7 @@ pub mod io;
 pub mod lexer;
 pub mod parser;
 pub mod preproc;
+pub mod render;
 pub mod offset;
 pub mod png;
 pub mod poly2;

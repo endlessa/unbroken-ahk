@@ -3564,8 +3564,23 @@ pub fn render_export(
 /// are produced directly; every text format delegates to `export_string`. This
 /// is the CLI's export core, so it covers the binary formats the String-based
 /// HTTP path can't.
+/// Render the design to an image.
+///
+/// This is the one implementation; `export_bytes` reaches it with default
+/// framing and the CLI reaches it with whatever `--size`, `--view` and the
+/// rest asked for. Unlike every other export it needs the SHAPES rather than
+/// the merged mesh, because a picture has colours in it and a `%` background
+/// block has to stay a background block.
+pub fn export_image(out: &EvalOutput, view: &crate::render::View) -> Vec<u8> {
+    let scene: Vec<_> =
+        out.shapes.iter().map(|s| (s.mesh.clone(), s.color, s.background)).collect();
+    let px = crate::render::render(&scene, view);
+    crate::png::encode_rgb(view.width, view.height, &px)
+}
+
 pub fn export_bytes(out: &EvalOutput, format: &str) -> Result<Vec<u8>, String> {
     match format {
+        "png" => Ok(export_image(out, &crate::render::View::default())),
         "3mf" => Ok(crate::io::write_3mf(&export_mesh(out)?)),
         // `.stl` is BINARY. The reference says so three times over — the
         // summary ("binary STL (default for .stl)"), the signature's

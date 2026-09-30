@@ -25,6 +25,7 @@ fn main() {
     let mut preset_file: Option<String> = None;
     let mut preset_name: Option<String> = None;
     let mut camera = scadforge::eval::Camera::DEFAULT;
+    let mut image = ImageOpts::default();
     // `--export-format TAG` overrides what the output extension implies. The
     // reference spells it with either an `=` or a following word, and it is
     // the only way to ask for ASCII STL, since `.stl` means binary.
@@ -82,6 +83,70 @@ fn main() {
             // unknown-argument arm, so the comment below promised something
             // the code refused. Both spellings now work; the eye/center form
             // is not supported and says so rather than guessing.
+            a if a.starts_with("--size=") => {
+                let spec = &a["--size=".len()..];
+                match spec.split_once(['x', 'X']).and_then(|(w, h)| {
+                    Some((w.trim().parse::<usize>().ok()?, h.trim().parse::<usize>().ok()?))
+                }) {
+                    Some((w, h)) if w > 0 && h > 0 && w <= 8192 && h <= 8192 => {
+                        image.view.width = w;
+                        image.view.height = h;
+                    }
+                    _ => {
+                        eprintln!("--size expects WIDTHxHEIGHT, up to 8192 each");
+                        exit(2);
+                    }
+                }
+                i += 1;
+            }
+            a if a.starts_with("--view=") => {
+                let spec = &a["--view=".len()..];
+                match spec.split_once(',').and_then(|(az, el)| {
+                    Some((az.trim().parse::<f64>().ok()?, el.trim().parse::<f64>().ok()?))
+                }) {
+                    Some((az, el)) => {
+                        image.view.azimuth = az;
+                        image.view.elevation = el;
+                    }
+                    None => {
+                        eprintln!("--view expects AZIMUTH,ELEVATION in degrees");
+                        exit(2);
+                    }
+                }
+                i += 1;
+            }
+            a if a.starts_with("--samples=") => {
+                match a["--samples=".len()..].trim().parse::<usize>() {
+                    Ok(n) if (1..=4).contains(&n) => image.view.samples = n,
+                    _ => {
+                        eprintln!("--samples expects 1 to 4");
+                        exit(2);
+                    }
+                }
+                i += 1;
+            }
+            "--ortho" => {
+                image.view.fov = 0.0;
+                i += 1;
+            }
+            a if a.starts_with("--fov=") => {
+                match a["--fov=".len()..].trim().parse::<f64>() {
+                    Ok(f) if (0.0..=120.0).contains(&f) => image.view.fov = f,
+                    _ => {
+                        eprintln!("--fov expects 0 to 120 degrees (0 is orthographic)");
+                        exit(2);
+                    }
+                }
+                i += 1;
+            }
+            "--no-shadows" => {
+                image.view.shadows = false;
+                i += 1;
+            }
+            "--no-occlusion" => {
+                image.view.occlusion = false;
+                i += 1;
+            }
             a if a == "--camera" || a.starts_with("--camera=") => {
                 let (spec, step) = match a.strip_prefix("--camera=") {
                     Some(v) => (v.to_string(), 1),
@@ -153,7 +218,9 @@ fn main() {
                     "unknown argument '{}'; usage: scadforge [--port N] | \
                      scadforge -o OUT [--export-format TAG] \
                      [-D name=value ...] \
-                     [--camera=tx,ty,tz,rx,ry,rz,dist] INPUT.scad",
+                     [--camera=tx,ty,tz,rx,ry,rz,dist] \
+                     [--size=WxH] [--view=AZ,EL] [--fov=DEG|--ortho] \
+                     [--samples=1..4] [--no-shadows] [--no-occlusion] INPUT.scad",
                     other
                 );
                 exit(2);
@@ -171,6 +238,7 @@ fn main() {
             preset_file,
             preset_name,
             camera,
+            &image,
         ));
     }
 
@@ -202,8 +270,22 @@ fn parse_camera(spec: &str) -> Option<scadforge::eval::Camera> {
 /// them. `stl` is an alias of `binstl` (the extension default); `asciistl` is
 /// the only way to ask for text STL.
 const EXPORT_FORMATS: &[&str] = &[
-    "stl", "binstl", "asciistl", "off", "amf", "3mf", "svg", "dxf", "pdf", "echo", "csg",
+    "stl", "binstl", "asciistl", "off", "amf", "3mf", "svg", "dxf", "pdf", "echo", "csg", "png",
 ];
+
+/// How `-o shot.png` should be framed and lit. Everything has a default that
+/// produces a usable picture of an unfamiliar model, because the common case
+/// is wanting to SEE something, not to art-direct it.
+#[derive(Clone)]
+pub struct ImageOpts {
+    pub view: scadforge::render::View,
+}
+
+impl Default for ImageOpts {
+    fn default() -> ImageOpts {
+        ImageOpts { view: scadforge::render::View::default() }
+    }
+}
 
 fn render_headless(
     input: Option<String>,
@@ -213,6 +295,7 @@ fn render_headless(
     preset_file: Option<String>,
     preset_name: Option<String>,
     camera: scadforge::eval::Camera,
+    image: &ImageOpts,
 ) -> i32 {
     let (input, output) = match (input, output) {
         (Some(i), Some(o)) => (i, o),
@@ -233,7 +316,7 @@ fn render_headless(
             // `.stl` is BINARY STL, per the reference: "--export-format
             // asciistl|binstl ... needed for ASCII STL since .stl defaults to
             // binary". `--export-format asciistl` is how a caller asks for text.
-            "stl" | "off" | "amf" | "svg" | "dxf" | "pdf" | "3mf" | "echo" | "csg" => ext,
+            "stl" | "off" | "amf" | "svg" | "dxf" | "pdf" | "3mf" | "echo" | "csg" | "png" => ext,
             // Known 2021.01 debug formats we deliberately do not produce. The
             // reference recommends refusing the CGAL dumps outright rather than
             // emulating kernel internals; `.ast`/`.term` are re-serializations
@@ -313,6 +396,49 @@ fn render_headless(
     // every ECHO, WARNING and DEPRECATED the evaluation produced used to be
     // dropped on the floor for any format but `.echo`, so a headless render
     // reported "wrote part.stl" and nothing about what went wrong in it.
+    // PNG is not a geometry format, so it does not go through
+    // `export_bytes`: it needs the SHAPES, with their colours, rather than
+    // the single merged mesh an STL wants. Taking the shapes also means a
+    // `%` background block stays a background block in the picture.
+    if format == "png" {
+        let effective = scadforge::customizer::apply_overrides(&source, &overrides);
+        let out = scadforge::eval::evaluate_source_with_camera(
+            &effective,
+            &base,
+            false,
+            scadforge::eval::Mode::Render,
+            camera,
+        );
+        let console: String = scadforge::eval::console_stream(&out)
+            .iter()
+            .map(|(_, l)| format!("{l}\n"))
+            .collect();
+        if !console.is_empty() {
+            eprint!("{console}");
+        }
+        if let Some(e) = &out.error {
+            eprintln!("{e}");
+            return 1;
+        }
+        let png = scadforge::eval::export_image(&out, &image.view);
+        return match std::fs::write(&output, &png) {
+            Ok(()) => {
+                eprintln!(
+                    "wrote {} ({}x{}, {} shapes, {} bytes)",
+                    output,
+                    image.view.width,
+                    image.view.height,
+                    out.shapes.len(),
+                    png.len()
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("cannot write '{}': {}", output, e);
+                1
+            }
+        };
+    }
     let (result, console) =
         scadforge::eval::render_export_bytes_reporting(&source, &base, &overrides, &format, camera);
     if !console.is_empty() {
