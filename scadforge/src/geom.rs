@@ -610,13 +610,25 @@ fn closedness_note(mesh: &Mesh) -> Option<String> {
     let inverted = holes == 0 && mesh.signed_volume() < 0.0;
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     if inverted && flipped == 0 {
-        return Some(
+        // Say WHICH one. A polyhedron has no name, and a model that builds
+        // three hundred of them in a loop needs more than the fact that one
+        // of them is wrong; the box and the size locate it at a glance.
+        let (blo, bhi) = bounds(mesh).unwrap_or(([0.0; 3], [0.0; 3]));
+        return Some(format!(
             "polyhedron: the given mesh is closed and consistently wound, but inside out \
-             (it encloses a negative volume); every face is listed the other way round \
-             from the way this kernel reads them, so booleans on it will silently lose \
-             geometry"
-                .into(),
-        );
+             (it encloses {:.6} where a solid must enclose a positive volume); every face \
+             is listed the other way round from the way this kernel reads them, so \
+             booleans on it will silently lose geometry. {} triangles, spanning \
+             [{:.3} {:.3} {:.3}] to [{:.3} {:.3} {:.3}]",
+            mesh.signed_volume(),
+            mesh.tris.len(),
+            blo[0],
+            blo[1],
+            blo[2],
+            bhi[0],
+            bhi[1],
+            bhi[2]
+        ));
     }
     match (holes, flipped) {
         (0, 0) => None,
