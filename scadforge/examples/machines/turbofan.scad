@@ -115,10 +115,12 @@
 //  normal points INTO the solid.  Wound the other way the solid renders
 //  identically and then loses geometry in any boolean it meets.  A
 //  hundred overlapping cubes wound correctly export as one shell holding
-//  the 60,400 cubic millimetres of their union; wound outward the same
+//  the 60,400 cubic millimetres of their union.  Wound outward the same
 //  hundred export as a hundred separate shells holding minus 100,000,
-//  and the exporter reports that two of its merges came back enclosing
-//  less than what went into them.
+//  because the union will not merge a solid whose inside it cannot find.
+//  The kernel reports that at each polyhedron.  This file does not lean
+//  on it: it computes the signed area of every profile loop and echoes
+//  the number, so the claim is arithmetic the model can settle alone.
 //
 //  Every mesh in this file is emitted with one quad template,
 //
