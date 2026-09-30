@@ -14,8 +14,25 @@ and failed, the failure is here too.
 
 Each section states the DEFECT first — usually as an exported mesh that was
 wrong — then the decision, then the evidence. Measurements are quoted as
-they came out, not rounded to flatter. Where a figure was taken on a loaded
-machine and is therefore unreliable, it says so.
+they came out, not rounded to flatter.
+
+**Three kinds of claim appear here and they are not equally strong.**
+
+- *Proved.* Very few: the greedy-colouring bound, the bounding-box shortcut,
+  and the two operand-volume bounds on a union.
+- *Pinned by a test.* Reproducible by anyone, forever: the twist convergence,
+  the disjoint-concatenation budget case, the sharing of list values, the
+  T-junction repair, order-independence of the solid.
+- *Measured.* Most of the numbers. Those from the CURRENT code can be
+  re-run; those in a "before" column cannot, because the code that produced
+  them is gone. Every "before" figure below is testimony from the commit
+  record, not evidence you can check, and should be read that way.
+
+**Timings are the weakest of all**, and the same model appears at very
+different numbers here because it appears at different code states and under
+different machine loads. The suspension bridge is quoted at 2.9 s, 82 s,
+84 s and 0.8 s; each says which state it belongs to, and the appendix
+explains why a fifth figure, 93 s, means nothing at all.
 
 The validator referred to throughout reports, for an exported mesh: the
 triangle count, the signed volume (positive iff the solid is wound the right
@@ -51,8 +68,43 @@ Three exports show why that cannot work.
   export carried four triangles on the shared plane — an interior wall in a
   solid the reference says is one solid, its *"interior face dissolves"*.
 
-**Decision: remove the tolerance rather than tune it.** No value of it fixes
+**Decision: remove THAT tolerance rather than tune it.** No value of it fixes
 any of the three.
+
+### 1.1a The tolerance that remains, and why it is a different thing
+
+Not to overstate this: the union still has a volume tolerance. It is a
+different tolerance doing a different job, and the distinction is the point.
+
+`UNION_SLACK = 1e-3` is a BOUNDS CHECK on a merge. A union contains each of
+its operands, so it cannot enclose less than the larger; it is covered by
+them together, so it cannot enclose more than their sum. Both hold for any
+union, need no oracle, and cost one pass over the triangles each. Every
+pairwise merge is held to `max(lo) ≤ V ≤ hi_a + hi_b` with a tenth of a
+percent of slack for the re-tessellation. A merge that fails is retried with
+the operands SWAPPED — a BSP is not symmetric, the first operand supplies
+the planes the second is cut by — and if neither order stands, the pair is
+concatenated and the user is warned.
+
+The two differ in what they are bounds ON. `UNION_SLACK` bounds the two
+operands being merged, and both bounds are theorems. The one that was
+removed was a fraction of the whole accumulated subtree, and nothing made it
+a bound on anything — it was being used to answer a question it could not
+answer, namely "did this merge join anything?"
+
+### 1.1b It still fails, and says so
+
+The bounds exist because the boolean fails on real geometry. Thin shells
+that touch or interleave are the case a BSP handles worst, and when it goes
+wrong it does not error: a 25,000-triangle assembly of chambers and vessels
+once merged to a TENTH of its own volume, silently, and a heart of eleven
+shells lost a third of itself — 168,222 mm³ down to 135,556 — when the aorta
+was merged in. Those are what the bounds catch.
+
+Catching is not fixing. A pair that fails in both orders is concatenated,
+which self-intersects where the operands did, and the export reports how
+many such pairs there were. That is the honest floor of the present design,
+not a solved problem.
 
 ### 1.2 What replaced it
 
@@ -64,16 +116,44 @@ share volume", where the relation is answered geometrically:
    — the case a surface test cannot see;
 3. a separating axis between every pair of triangles in the shared region.
 
-The separating-axis test is exact for triangles (two face normals and nine
-edge-edge cross products) and answers in the SUFFICIENT direction only:
-"certainly apart" or "cannot say". "Cannot say" costs the boolean that was
-going to run anyway, so a wrong answer in that direction is never a
-correctness problem — only a cost.
+The separating-axis test uses the axis set that is complete for triangles —
+two face normals and nine edge-edge cross products — but the implementation
+is SOUND rather than complete: it skips an axis whose direction underflows,
+and it demands a strictly positive gap. Both make it conservative. It
+answers "certainly apart" or "cannot say", never "certainly together". It is
+also not asked of every pair: a grid culls pairs sharing no cell, and two
+budgets abandon the test outright and answer "cannot say" (§1.5).
 
-Components are independent, and that is where order-independence comes from:
-the set of components does not depend on the order the children were written
-in. The pairwise tree this replaced could not manage it, because it merged
-neighbours in written order.
+"Cannot say" is not free, and §1.5 is the case where it was not. A
+conservative answer feeds the pair into a connected component, and a
+component over the merge budget is concatenated rather than merged, which
+self-intersects. The direction is safe; the consequence is real. The broad
+phase has to be good in practice, not merely sound.
+
+Components are an order-independent SET: which solids end up merged together
+does not depend on the order the children were written in. That is the
+property the old design broke, and it broke it in the worst way — a 1,600 mm³
+overlap was merged under one ordering and lost under another, so the SOLID
+changed.
+
+**What is order-independent now, and what is not — measured.** Four mutually
+overlapping spheres, written forwards and backwards:
+
+| | triangles | volume | boundary edges |
+|---|---|---|---|
+| forwards | 24,509 | 9,299.206724 | 269 |
+| backwards | 24,061 | 9,299.206753 | 285 |
+
+The solid agrees to nine significant figures — 3e-9 relative, the BSP's own
+arithmetic. The MESH does not agree at all. Within a component the colouring
+walks in index order and the classes merge smallest-first with ties broken by
+class order, so a BSP sees its operands differently arranged and cuts them
+differently.
+
+So the reference's "Order of children never affects the result" is met for
+the solid and not for the triangulation. That distinction is pinned by
+`a_union_is_order_independent_in_the_solid_not_in_the_mesh`, which asserts
+the volumes and deliberately does not assert the triangle counts.
 
 ### 1.3 Ordering the merges inside a component
 
@@ -105,17 +185,20 @@ centres 12 apart have an exact union of 7,506.31 mm³:
 
 | | input triangles | result | volume | holes |
 |---|---|---|---|---|
-| `$fn` = 110 | 23,800 | union runs | 7,476.12 | 190 |
+| `$fn` = 110 | 24,192 | union runs | 7,476.12 | 190 |
 | `$fn` = 130 | 33,792 | union refused | 8,369.43 | 0 |
 
-An 11.8% volume error crossing a triangle-count threshold, and **the side of
+An 11.5% volume error crossing a triangle-count threshold, and **the side of
 it that is wrong is the side that validates clean**. Nothing downstream can
 tell.
 
 **Decision: weigh a connected component, not a model.** Only a component
-ever reaches a BSP. A model of any number of disjoint parts now merges
-without hesitating because there is nothing to merge — 2,400 cubes, 28,800
-triangles, comes out concatenated exactly, and that is pinned by a test. A
+ever reaches a BSP. A model of disjoint parts now merges
+without hesitating whatever its TRIANGLE count, because there is nothing to
+merge — 2,400 cubes, 28,800 triangles, comes out concatenated exactly, and
+that is pinned by a test. It is not free in the number of PARTS: the relation
+is built by an exhaustive double loop, so it stays quadratic in the piece
+count even when every box test misses. A
 component genuinely over the budget is still refused, and still says so.
 
 The threshold itself (25,000) rests on measurements taken before this
@@ -138,10 +221,13 @@ eighteen solids that share no volume were declared one component and refused
 by the merge budget.
 
 **Decision: size the cell to the mean triangle, not the triangle count**, so
-a cell holds a few triangles whatever the mix. The mean is SAMPLED over 64
-triangles rather than summed over all of them — this test's whole job is to
-be cheaper than the boolean, and a bridge asks it 125,250 times; summing
-took the bridge from 2.9 seconds to 82.
+a cell holds a few triangles whatever the mix. The mean is SAMPLED rather than summed — stride
+`len/64`, so 64 to 127 triangles for a mesh above 127 and all of them below
+that, taken from the smaller of the two meshes, and the quantity averaged is
+a triangle's longest bounding-box axis rather than an area. It only has to be
+right to within a factor. Summing instead took the bridge from 2.9 seconds
+to 82, because a bridge runs 125,250 box tests and this work sits behind
+them.
 
 | | before | after |
 |---|---|---|
@@ -171,8 +257,10 @@ over 10 mm encloses exactly 4,000 mm³ whatever the slice count:
 | 64 | 4,032.32 | 3,999.60 |
 | 256 | 4,008.16 | 3,999.97 |
 
-The diagonal is first order — still 0.2% wrong after 256 slices — and it is
-OVER, which no chordal approximation of a convex profile can honestly be.
+The diagonal is first order — still 0.2% wrong after 256 slices — and for
+this profile it is OVER, which no chordal approximation of a CONVEX profile
+can honestly be. (The sign argument is about the square. The annulus below is
+not convex, and is offered for the size of the error rather than its sign.)
 
 **Decision: fan the quad through the mean of its four corners.** The ruled
 patch's volume is exactly halfway between the two diagonals, so a fan
@@ -184,6 +272,12 @@ untwisted extrusion's walls are planar, and so are a uniformly scaled one's
 — those are cone faces through the apex — so both keep two triangles per
 quad, which is exact for them. The test is a planarity check on the quad,
 not a check of the twist parameter.
+
+This is in `linear_extrude` ONLY. `rotate_extrude` emits two triangles per
+quad unconditionally, bent or not. It has not been shown to matter there — a
+torus converges from below at second order, because the profile's own
+chordal error dominates — but the sentence above is not a kernel-wide
+invariant and should not be read as one.
 
 A square annulus at the default slice count went from 3,338.45 — 11.3% over
 3,000 — to 2,980.79. A letterform went from 0.77% OVER its own predicted
@@ -200,14 +294,26 @@ on two ordinary faces:
 - **A concave face** fanned from a reflex corner covers ground outside
   itself. An L-shaped face is the smallest example.
 - **A face with a collinear vertex at the fan apex** makes a zero-area
-  triangle. That one is worse, because the mesh looks fine until export: no
-  format can write a facet whose three corners are collinear, the export
-  funnel drops it, and two edges of a closed mesh go with it.
+  triangle. That one is worse, because the mesh looks fine until export: the
+  export funnel drops it and two edges of a closed mesh go with it. (Why it
+  is dropped is narrower than "no format can write it" — OFF, AMF and 3MF
+  store indices and no facet normal, so a collinear triple is nothing to
+  them. It goes because STL requires a normal, this kernel's
+  `triangle_normal` gives up below |cross| = 1e-12 and writes `0 0 0`, and
+  this kernel's own STL reader would then refuse it. A choice made once at
+  the funnel so a format never disagrees with itself, not a limitation every
+  format has.)
 
 **Decision: ear-clip in the face's own plane by Newell's normal**, with one
-step of lookahead so a flat corner is never stranded as the last three
-vertices. The lookahead matters: a plain "largest ear" rule leaves the
-collinear triple to the end, where it is emitted with no choice at all.
+step of lookahead that PREFERS a clip leaving no flat corner behind. It
+matters: a plain "largest ear" rule leaves the collinear triple to the end,
+where it is emitted with no choice at all.
+
+It is a preference, not a guarantee. A degenerate ear ranks last so it loses
+to any ear with area — but if every available ear is degenerate one is still
+cut, and a face that is not simple falls back to a plain fan. Nothing here
+promises a face can always be triangulated without a zero-area piece, and no
+test claims it.
 
 ### 2.3 The weld's projection plane: checked, not argued
 
@@ -254,14 +360,17 @@ of one surface comes to rest partway along an edge of the other. The volume
 is right and the surface is continuous, but that edge is used once by the
 triangle that owns it and twice by the pair opposite, so it reads as a hole.
 
-Two cubes overlapping by a quarter unioned to exactly 5,000 mm³ with twelve
-boundary edges. **It meant no union of solids that actually MEET could ever
+Two 20 × 20 × 10 boxes offset by 5 mm along one axis — so they share three
+quarters of their length — union to exactly 5,000 mm³ (2 × 4,000 − 3,000)
+with twelve boundary edges. **It meant no union of solids that actually MEET could ever
 come out clean**, which is a large part of what the modeller is for.
 
 **Decision: insert the stray vertex into the triangle that owns the edge and
-re-cut the triangle around it.** No geometry is added — the point is already
-a vertex of the mesh and already lies on the edge — so volume and area are
-unchanged.
+re-cut the triangle around it.** No geometry is added: the point is already a
+vertex of the mesh, and it lies on the edge to within the tolerance below —
+1e-9 of the model extent — so volume and area move by at most that order.
+"Unchanged" would be too strong, for the same reason a looser tolerance fails
+two paragraphs down.
 
 | | before | after |
 |---|---|---|
@@ -273,7 +382,7 @@ unchanged.
 | city hall | 6,753 | 98 |
 | elliptical | 2,332 | 89 |
 | two spheres | 15,919 | 190 |
-| two cubes | 12 | 0 (28 triangles instead of 24) |
+| the two boxes above | 12 | 0 (28 triangles instead of 24) |
 
 ### The tolerance was swept, not chosen
 
@@ -292,10 +401,21 @@ A vertex inserted into an edge it is not really on MOVES that edge, and the
 triangle on the other side — which got no such insertion — stops matching.
 The volume moves too.
 
+### The weld has a give-up of its own
+
+An edge whose bounding cells span more than 8,192 of the vertex grid is
+skipped rather than queried. Giving up leaves that one edge unwelded, which
+is the safe direction, but it means a long edge across a large model is a
+SECOND source of surviving T-junctions, unrelated to the BSP cracks of §8.1.
+The residue analysis there does not separate the two.
+
 One other idea was tried and did nothing: excluding split points closer to a
 corner than the writer can resolve, on the theory that they make triangles
-the export funnel will drop. Measured change: human 1,442 → 1,438, the rest
-identical. It was reverted rather than kept as unjustified code.
+the export funnel will drop. It moved one model by four boundary edges and
+left the others identical, and was reverted rather than kept as unjustified
+code. (That measurement was taken against the own-plane variant of §2.3,
+which is not the code that shipped, so the four is indicative and not a
+figure to carry forward.)
 
 ---
 
@@ -303,15 +423,18 @@ identical. It was reverted rather than kept as unjustified code.
 
 ### 4.1 Representability is per format
 
-A triangle whose three corners land on one point in the target file's
-coordinate grid cannot be written, and the export funnel drops it. That
-guard used to apply f32's answer — binary STL's — to EVERY format.
+A triangle whose three corners come out COLLINEAR once moved onto the target
+file's coordinate grid cannot be given a normal, and the export funnel drops
+it. (Collinear, not coincident — the §4.2 case has three distinct y
+coordinates and only its x collapses.) That guard used to apply f32's answer
+— binary STL's — to EVERY format.
 
 f32's step at a coordinate of 1e6 is 0.119, so a millimetre-sized face a
 kilometre from the origin has all three corners on one f32 point. But OFF,
-AMF, 3MF and ASCII STL print `{:.6}` and resolve it a thousand times over.
-One guard for all of them lost it from every format, for a limitation only
-one of them has.
+AMF, 3MF and ASCII STL print `{:.6}` — an absolute grid of 1e-6 against
+f32's 0.119 out there, finer by a factor of about 119,000. One guard for all
+of them lost the face from every format, for a limitation only one of them
+has.
 
 **Decision: drop only what the CHOSEN format cannot write.**
 
@@ -341,10 +464,25 @@ geometry.**
 warn**, naming the count, the format's step, and the three ways out —
 another format, nearer the origin, or a coarser outline.
 
-This made two silent losses visible immediately: `cycloidal` loses 48
-triangles and 62 edges, and `epicyclic` loses 1,988 of 7.9 million faces —
-a 170 mm model tessellated finer than binary STL can carry at that size,
-which is a format limit rather than a bug.
+This made real losses visible immediately: `epicyclic` loses 1,988 of 7.9
+million faces — a 170 mm model tessellated finer than binary STL can carry
+at that size, which is a format limit rather than a bug.
+
+**And it made the warning itself wrong twice, which an audit caught.** It
+hard-coded "at a coordinate of 62 is 3.8e-06" — 62 being the letterform's
+semi-axis, where the case was found — so every other model was told a
+resolution that was not its own. And it counted boundary edges in the f64
+mesh left after the drop, which is not the file: the same rounding that
+collapses a triangle also brings its neighbours' corners together and can
+close the gap the collapse opened. A cycloidal gear drops 48 triangles and
+the f64 remainder has 62 boundary edges, while the binary STL it writes
+validates CLOSED. It was warning about a file that was fine.
+
+The step is now computed from the model's own largest coordinate, and the
+edge count is taken from the mesh AS WRITTEN — coordinates on the format's
+grid, coincident points treated as one, and every triangle kept, because a
+facet whose corners coincide is still a facet in the file. Cycloidal no
+longer warns. The letterform still does, and its six edges are still there.
 
 ---
 
@@ -410,10 +548,10 @@ worst relief under the drawn cable and under the ideal circular cable —
 both come out at 20 mm.
 
 The export is 501 solids in 501 components, 18,808 triangles, no boundary
-edges, and no boolean at all. Through OFF it measures 80,997.784281 mm³
-against the file's predicted 80,997.8: agreement to every digit the echo
-prints. Through binary STL it reads 80,997.92, which is 1.7 ppm of f32 — the
-file, not the model.
+edges, and no boolean at all. Through OFF it measures 80,997.784281 **m³** — the
+model works in metres — against the file's predicted 80,997.8: agreement to
+every digit the echo prints. Through binary STL it reads 80,997.92, which is
+1.7 ppm of f32 — the file, not the model.
 
 ### And the repair was quadratic
 
@@ -431,13 +569,13 @@ polyline is built once now: **0.8 seconds**, same 18,808 triangles.
 |---|---|---|
 | Union by disjointness proof | a volume tolerance | overlaps of 9.6 mm³ and 1,600 mm³ lost silently; order-dependence |
 | Components, then graph colouring | pairwise reduction | 32 tris into 18,746 into 24,377 into 30,140; ten minutes, unfinished |
-| Budget per component | budget per model | 501 disjoint solids one triangle from refusal; 11.8% error on the clean-looking side |
+| Budget per component | budget per model | 501 disjoint solids refused wholesale; 11.5% error on the clean-looking side |
 | Grid sized by triangle size | sized by triangle count | 107 million pair tests, then a give-up |
 | Ruled fan on bent walls | a diagonal | 4,408.75 against an exact 4,000, first order, and over |
 | Ear clip in `polyhedron` | fan from vertex 0 | concave faces covered; zero-area triangles dropped at export |
 | Weld plane chosen by checking | either plane fixed | 89 vs 329 boundary edges one way, 2 flipped edges the other |
 | Weld tolerance 1e-9 | anything looser | 1e-4 gives 6,565 holes and 75 flipped, from 1,459 and 0 |
-| Per-format representability | one guard for all | a face OFF resolves a thousand times over, lost from OFF |
+| Per-format representability | one guard for all | a face OFF resolves 119,000× over, lost from OFF |
 | Warn when a drop opens a mesh | silence | six boundary edges chased for days that were the file format |
 | `Rc<Vec<Value>>` | deep copy | 6.90 s to 0.42 s; gear library 1.74 s to 0.25 s |
 
@@ -460,6 +598,10 @@ points are computed — the plane-segment intersection in the BSP split — and
 probably means snapping a new vertex to an existing one when it lands within
 the plane tolerance of it, rather than emitting a fresh point.
 
+(A source comment in `weld_tjunctions` still gives the range as 1e-5 to
+1e-4, which was the first estimate. The distribution above supersedes it and
+the comment is stale.)
+
 ### 8.2 Passing a list to a function still costs O(|V|^0.7) per call
 
 Sharing list values took the fold from 6.90 s to 0.42 s at n = 8,000. It is
@@ -467,9 +609,12 @@ not linear yet, and the residue has been narrowed without being found.
 
 What is ruled out, by counting rather than reasoning:
 
-- **Not indexing.** Reading by index is linear now — 0.01, 0.03, 0.05 s at
-  n = 8,000, 16,000, 32,000 — and a fold that never reads the list costs the
-  same as one that does (0.67 vs 0.64 s).
+- **Not indexing.** Reading by index is at worst very weakly superlinear now
+  — 0.01, 0.03, 0.05 s at n = 8,000, 16,000, 32,000, which is three points at
+  the stopwatch's own 10 ms resolution and fixes an order of magnitude rather
+  than an asymptote. And a fold that never reads the list costs within 5% of
+  one that does (0.67 vs 0.64 s), which is the part that matters: whatever
+  the cost is, reading is not it.
 - **Not the clone, and not a rebuild.** A probe on the clone and on list
   construction says the list is built exactly ONCE (128,012 elements for
   |V| = 128,000, the surplus being other lists) and cloned 8,004 times for
@@ -492,9 +637,21 @@ evaluator runs on its own 256 MB stack, so a thread-local counter read from
 the union rewrite and before list values were shared — "models up to about
 16,000 merge in three to seven seconds". The gear library alone went from
 1.74 s to 0.25 s on the second of those changes. It wants re-measuring on a
-quiet machine and probably raising; until then two spheres at `$fn` = 130
-are one component of 33,792 triangles and are refused, which is reported but
-is a worse answer than the merge would be.
+quiet machine; until then two spheres at `$fn` = 130 are one component of
+33,792 triangles and are refused, which is reported but is a worse answer
+than the merge would be.
+
+**Raising it is not obviously the fix, and the record says why.** The cost
+is not a function of size alone but of how deeply the parts interpenetrate,
+and it turns vertical: 34,288 triangles of a hull with many crossing parts
+took 299 seconds and came out at 1,122,789 — a 33× explosion — while 69,656
+triangles of a gear took 206. A threshold that is not really a function of
+triangle count cannot be repaired by choosing a different triangle count.
+Whatever replaces it probably has to measure the interpenetration, which is
+what the BSP was going to compute anyway.
+
+The corpus makes the urgency plain: **thirteen models trip this budget**,
+with components from 28,872 to 252,304 triangles. It is not a corner case.
 
 ### 8.4 The completeness score is stale in the other direction
 
@@ -504,6 +661,42 @@ variables and the DXF-era deprecated functions as the remaining tail. All of
 those have since landed except `dxf_cross` and `dxf_dim`. The score
 UNDERSTATES the project, and is left as written because a number in that
 file has to come from a pass over all 183 reference entries.
+
+---
+
+## 9. This document was audited, and it was wrong in six places
+
+It was checked by an independent reader whose brief was to refute it. Worth
+recording what that found, because the failures are of a kind that will
+recur.
+
+- **Two figures were simply wrong.** Two spheres at `$fn` = 110 are 24,192
+  triangles, not 23,800 — a sphere at that `$fn` is 12,096, and the adjacent
+  row (`$fn` = 130 → 33,792 = 2 × 16,896) was exact, which should have made
+  the inconsistency obvious. And the volume error across the budget
+  threshold is 11.5%, not 11.8%; 11.8 had been copied in from a report and
+  matched neither of the two numbers printed beside it.
+- **A unit was wrong by 1e9.** The bridge's 80,997.784281 is m³, not mm³.
+- **A claim about the code was wrong, and the code was wrong with it.** The
+  warning does not name "the format's step" — it named 62 for everything.
+  Fixed in the code, not just here.
+- **A description did not match its model.** "Two cubes overlapping by a
+  quarter" are two 20 × 20 × 10 boxes offset by a quarter of their length,
+  which means they SHARE three quarters of it. The 5,000 mm³ was right; the
+  words were not, and an auditor checking the arithmetic of the words found
+  them unreachable.
+- **The central claim was overstated.** Order-independence held for the
+  solid and not for the mesh, and the document did not distinguish them.
+  That is now measured, stated, and pinned by a test.
+- **The largest omission was not a number**: the union still carries
+  `UNION_SLACK`, an operand-swap retry and a concatenate-and-warn fallback,
+  and real models still defeat it. A document opening with "remove the
+  tolerance" has to say which tolerance. §1.1a and §1.1b now do.
+
+The audit also confirmed about two thirds of the numbers by re-running them,
+several to every digit printed. That is the useful part of the result and
+the reason to keep doing it: a document that has been attacked and mostly
+survived is worth more than one that has not been attacked.
 
 ---
 

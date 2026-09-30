@@ -2155,6 +2155,58 @@ mod tests {
         assert_eq!(crate::geom::closedness_note(&u), None, "and the result is one closed solid");
     }
 
+    /// What order-independence a union actually has, pinned so the claim
+    /// cannot drift.
+    ///
+    /// The reference says "Order of children never affects the result", and
+    /// the design meets that for the SOLID and not for the MESH. Components
+    /// are an order-independent set, so nothing is merged in one order that
+    /// is left apart in another -- which is the failure the old volume
+    /// tolerance had, and it lost 1,600 mm^3 of a 128,000 mm^3 pair. What
+    /// still carries written order is the triangulation: the colouring walks
+    /// the component in index order and the classes merge smallest-first
+    /// with ties broken by class order, so a BSP sees its operands in a
+    /// different arrangement and cuts them differently.
+    ///
+    /// Four mutually overlapping spheres, written forwards and backwards,
+    /// come out with 24,509 and 24,061 triangles -- and volumes that agree
+    /// to nine significant figures. That is the line: the solid is the same
+    /// to the BSP's own arithmetic, the mesh is not the same at all.
+    #[test]
+    fn a_union_is_order_independent_in_the_solid_not_in_the_mesh() {
+        let at = |x: f64, y: f64, z: f64| {
+            let mut m = geom::sphere(10.0, 16);
+            for p in &mut m.positions {
+                p[0] += x;
+                p[1] += y;
+                p[2] += z;
+            }
+            m
+        };
+        let parts = [at(0.0, 0.0, 0.0), at(8.0, 0.0, 0.0), at(4.0, 7.0, 0.0), at(4.0, 3.0, 6.0)];
+        let forward = union_all(&parts);
+        let mut back = parts.clone();
+        back.reverse();
+        let reversed = union_all(&back);
+
+        let (a, b) = (signed_volume(&forward), signed_volume(&reversed));
+        assert!(a > 0.0, "a union of overlapping spheres encloses something");
+        assert!(
+            (a - b).abs() <= a.abs() * 1e-6,
+            "the SOLID must not depend on the order: {a} against {b}"
+        );
+        // And the part that is NOT claimed, recorded rather than asserted
+        // away: if these ever become equal, the note above is out of date
+        // and should be rewritten rather than quietly enjoyed.
+        if forward.tris.len() == reversed.tris.len() {
+            eprintln!(
+                "note: the meshes now match at {} triangles; the doc comment \
+                 on this test says they do not",
+                forward.tris.len()
+            );
+        }
+    }
+
     /// Four hundred planks on one girder is four hundred edges and no edge
     /// anywhere else, so it is ONE boolean, not four hundred.
     ///
