@@ -795,7 +795,41 @@ pub fn weld_tjunctions(mesh: &Mesh) -> Mesh {
             u[2] * v[0] - u[0] * v[2],
             u[0] * v[1] - u[1] * v[0],
         ];
-        for f in face_tris_in(&mesh.positions, &face, Some(plane)) {
+        // Which plane to project in is a choice with no winner, so it is
+        // made by checking rather than by argument. Newell's normal is the
+        // better conditioned of the two for choosing ears -- using the
+        // triangle's own instead tripled a gear's boundary-edge residue,
+        // 89 to 329 -- but on a sliver its area-weighted sum nearly
+        // cancels, and a triangulation done in a plane that is not really
+        // the face's can come out overlapping itself, which winds a piece
+        // backwards. A character model grew two inconsistently wound edges
+        // that way, and those are far worse than a boundary edge: an edge
+        // whose two faces run the same way round makes the mesh
+        // non-orientable, and every boolean on it silently loses geometry.
+        //
+        // So: cut in Newell's plane, then verify every piece against the
+        // triangle's own normal, and only if one disagrees cut again in
+        // that normal's plane. Both models get what they need, and the
+        // retry costs a cross product per piece on the faces that are
+        // split at all.
+        let pieces = face_tris_in(&mesh.positions, &face, None);
+        let backwards = pieces.iter().any(|f| {
+            let (a, b, c) = (
+                mesh.positions[f[0]],
+                mesh.positions[f[1]],
+                mesh.positions[f[2]],
+            );
+            let (x, y) = (sub(b, a), sub(c, a));
+            let m = [
+                x[1] * y[2] - x[2] * y[1],
+                x[2] * y[0] - x[0] * y[2],
+                x[0] * y[1] - x[1] * y[0],
+            ];
+            dot(m, plane) < 0.0
+        });
+        let pieces =
+            if backwards { face_tris_in(&mesh.positions, &face, Some(plane)) } else { pieces };
+        for f in pieces {
             out.push([f[0] as u32, f[1] as u32, f[2] as u32]);
         }
     }
