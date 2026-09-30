@@ -272,11 +272,18 @@ function part_of(sec, i0, i1, m=3) =
 // 1995); the bumps keep flow attached past the angle where a smooth
 // edge stalls. amp is a fraction of local chord, k the count across
 // the span.
+// The fin sweeps along +y with its section laid in (x, z), and (x, z, y) is a
+// LEFT-handed triple: x cross z is -y. So a section that is correctly wound
+// for a sweep up +z arrives here reversed, and every fin built by this module
+// was a closed, consistently wound solid enclosing a NEGATIVE volume. It
+// renders identically, which is why twenty-eight of them went unnoticed
+// across one fleet. Reading the section back to front is the whole fix; the
+// points, and so the shape, are unchanged.
 module tfin(root_c, tip_c, span, sweep, tc=0.12, dih=0, amp=0.045, k=7, n=40) {
     G = [ for (i=[0:n]) let(s=i/n,
              c  = lerp(root_c, tip_c, pow(s,0.75)),
              bump = amp*c*cos(360*k*s),
              xo = sweep*s - bump, yo = span*s, zo = span*s*tan(dih))
-           [ for (p = foil(c + bump, tc)) [ xo+p[0], yo, zo+p[1] ] ] ];
+           [ for (p = rev(foil(c + bump, tc))) [ xo+p[0], yo, zo+p[1] ] ] ];
     smesh(G);
 }

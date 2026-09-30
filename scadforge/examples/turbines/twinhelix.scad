@@ -84,7 +84,7 @@ module leg() {
     tsweep([ for (u=[0:14])
         let( t = u==14 ? P[14]-P[13] : P[u+1]-P[u], tn = t/norm(t),
              sx = [ -tn[2], 0, tn[0] ] )
-        [ for (i=[0:21]) let(a = -360*i/22)
+        [ for (i=[0:21]) let(a = 360*i/22)
             P[u] + D[u]*(cos(a)*sx + sin(a)*[0,1,0]) ] ]);
 }
 

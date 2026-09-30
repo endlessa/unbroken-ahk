@@ -81,7 +81,7 @@ module hull_free_leg() {
         let( t = u==14 ? P[14]-P[13] : P[u+1]-P[u],
              tn = t/norm(t),
              sx = [ -tn[2], 0, tn[0] ] )     // in-plane normal, y is free
-        [ for (i=[0:23]) let(a = -360*i/24)
+        [ for (i=[0:23]) let(a = 360*i/24)
             P[u] + D[u]*(cos(a)*sx + sin(a)*[0,1,0]) ] ]);
 }
 

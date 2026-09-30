@@ -70,8 +70,15 @@ function ama_sec(x) = full_section(half_section(
     [ [0, ama_deck(x)], [abs_(x), azs_(x)], [abc_(x), azc_(x)], [0, azk_(x)] ],
     [ 1.7, 0.35+0.70*x/L, 0.07+1.70*pow(fwd(x/L,0.20),1.3),
       0.05+1.30*pow(fwd(x/L,0.30),1.5) ] ));
-function AG(sy, lo, hi) = [ for (u=[0:NA]) let(x=ax(u))
-    [ for (p = part(ama_sec(x), lo, hi, 10)) [x, sy*(ayc(x) + p[0]), p[1]] ] ];
+// Reversing y to build the other ama reverses the RING as well, and a ring
+// traversed the other way round is a solid turned inside out. It renders the
+// same, so the port ama was inside out for as long as this file has existed,
+// and only its own volume coming back negative showed it. Negating a
+// coordinate is a reflection; putting the points back in the opposite order
+// is what undoes the reflection's effect on the winding.
+function rev(v) = [ for (i = [len(v)-1 : -1 : 0]) v[i] ];
+function AG(sy, lo, hi) = [ for (u=[0:NA]) let(x=ax(u), q = part(ama_sec(x), lo, hi, 10))
+    [ for (p = sy > 0 ? q : rev(q)) [x, sy*(ayc(x) + p[0]), p[1]] ] ];
 
 // ===================================================================
 //  3. THE WING AND ITS CELLS
@@ -114,8 +121,13 @@ function WGRID(sy, inner) = [ for (u=[0:NW]) let(x = wx(u), g = gap(x))
 
 function blade_spine(k, sy) = [ for (i=[0:40]) let(s=i/40)
     [ XB[k] + 1.8*sin(180*s), sy*wy(XB[k],s), wz(XB[k],s) ] ];
-function blade_sec(i) = let(f = pow(abs(2*i/40-1), 2.0))
-    [ for (q = foil(2.6 + 2.4*f, 0.62 + 0.70*f, 0.85, 12)) [q[1], q[0]] ];
+// Swapping a section's two coordinates is a reflection, so the foil arrives
+// wound the other way round and every blade built from it came out inside
+// out -- all eight of them, on both sides, which is why the mirror symmetry
+// hid nothing here. Reading the points back to front restores the winding.
+function blade_sec(i) = let(f = pow(abs(2*i/40-1), 2.0),
+                            q = foil(2.6 + 2.4*f, 0.62 + 0.70*f, 0.85, 12))
+    [ for (j = [len(q)-1 : -1 : 0]) [q[j][1], q[j][0]] ];
 
 // The catwalk that rides the arch crowns.  It closes the tops of the
 // bays, so the air between two ribs reads as a cell rather than a gap.
