@@ -496,6 +496,23 @@ V_BALL  = NBALL*4/3*PI*pow(PC_BALL_D/2, 3);
 // the solid, which is what this kernel's polyhedron wants: the face
 // before it and the face after it traverse every shared edge the other
 // way round.
+// ---- the interface, published so a stack can place a cap ------------
+// Computed from the meridian and the crown's own cone, not restated: the
+// web's z extremes are the meridian's, the bolt ring hangs PC_RING_T
+// below the parting plane, and the crown -- flipped 180 -- reaches
+// LO cos(Ghub) below it and LO sin(ta) above.  The balls stand PC_BALL_D/2
+// proud of the plane, so they are published separately: a cap at the END
+// of a stack has no mate to close the groove and is drawn without them.
+PC_ZLO = min(min([ for (p = PC_MER) p[1] ]), -PC_RING_T, -LO*cos(GHUB));
+PC_ZHI = max(max([ for (p = PC_MER) p[1] ]), 0, LO*sin(CR_TA));
+PC_RAD = max(max([ for (p = PC_MER) p[0] ]), RING_OD, CR_OD/2);
+function pc_if_span()   = [PC_ZLO, PC_ZHI];   // 1 z extent, no balls, mm
+function pc_if_rad()    = PC_RAD;             // 2 outermost radius, mm
+function pc_if_ball()   = PC_BALL_D/2;        // 3 how far a ball stands proud
+function pc_if_crown()  = [NCAP, LO, GHUB];   // 4 cap crown count, cone, back cone
+function pc_if_bolt()   = [R_BC, NBOLT, PC_BOLT_R];   // 5 bolt circle
+function pc_if_spline() = [R_ROOT, R_TIP, PC_SPL_Z, PC_WELL_Z];  // 6 the sun spline
+
 module pc_lathe(P, A, spl) {
     T = len(P); MM = len(A);
     id = function (t,i) ((t % T)*MM + (i % MM));

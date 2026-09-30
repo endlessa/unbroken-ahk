@@ -620,6 +620,8 @@ function em_if_split()  = [EM_SPLIT, GSPL];       // 5 gap mm, gap deg
 function em_if_bc()     = [RBC, EM_NLUG, EM_LUG0];// 6 bolt circle r, lugs, first
 function em_if_bolt()   = [EM_BOLT, EM_RBORE, EM_RLUG];  // 7 M size, bore, boss
 function em_if_pinch()  = [RBC, EM_EARL, EM_EARS];       // 8 pinch bolt seat
+function em_if_span()   = [ZCAN - RCAN, ZTB1];    // 9 z extent about the clamp
+function em_if_rad()    = RMNT + EM_RMNT;         // 10 outermost radius
 
 // ===================================================================
 //  THE SWEPT SHELL.  One polyhedron over a station x profile grid.
