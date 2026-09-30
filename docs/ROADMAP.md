@@ -588,6 +588,37 @@ Two more, both from the 3D lens and both left deliberately:
   geometry. Exporting the same design to OFF and diffing the two settled in
   one command what three speculative repairs could not.
 
+- **What a boolean still gets wrong, after the T-junction weld.**
+  Inserting a stray vertex into the edge it lies on closed most of them --
+  a heart went from 24,289 boundary edges to 1,177, an orc from 19,145 to
+  2,033, two overlapping spheres from 15,919 to 190 -- but not all, and the
+  residue is a different defect wearing the same clothes.
+
+  Measured on the elliptical gear's 89 remaining open edges: 39 of the
+  first 40 have another vertex somewhere in their interior, offset from the
+  edge by 8.9e-06 to 4.9e-02 of the model extent, median 2.1e-04. Those are
+  not points on an edge. They are points the BSP MEANT to put on an edge
+  and missed, which makes them cracks rather than T-junctions.
+
+  The weld cannot reach them and must not try. Sweeping its tolerance
+  makes things worse, not better: at 1e-07 a character model went from
+  1,459 open edges to 1,500 and grew its first inconsistently wound edge,
+  and at 1e-04 to 6,565 open and 75 flipped. A vertex inserted into an edge
+  it is not really on MOVES that edge, and the triangle on the other side,
+  which got no such insertion, stops matching. The fix belongs where the
+  points are computed -- the plane-segment intersection in the BSP split --
+  and probably means snapping a new vertex to an existing one when it lands
+  within the plane tolerance of it, rather than emitting a fresh point.
+
+- **The union budget's basis is now stale.** 25,000 triangles per merged
+  component came from measurements taken before the union was rewritten and
+  before list values were shared: "models up to about 16,000 merge in three
+  to seven seconds". The gear library alone went from 1.74 s to 0.25 s on
+  the second of those changes. The threshold should be re-measured on a
+  quiet machine and probably raised; until then two spheres at $fn = 130
+  are one component of 33,792 triangles and are refused, which is reported
+  but is a worse answer than the merge would be.
+
 ## Working method (established, keep using it)
 
 1. Extract exact semantics for the phase's entries from the reference
