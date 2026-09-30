@@ -373,7 +373,13 @@ for (sg = [-1, 1]) color(CABLE) main_cable(sg*YCAB);
 // CBK is the index of the ring vertex at the bottom, which exists because
 // NCAB is even and the ring's phase puts g = 270 in its set.
 CBK = (270*NCAB - 180)/360;
-function cbot(j) = cring(j, YCAB)[CBK];
+// Built ONCE. `cring` constructs a whole ring, and `hangtop` needs the
+// bottom of every ring to find the segment over its own footprint, so
+// calling it per panel made the evaluation quadratic in the panel count:
+// the bridge went from 2.9 seconds to 84, all of it before the exporter
+// was reached.
+CBOT = [ for (i = [0:NS]) cring(i, YCAB)[CBK] ];
+function cbot(j) = CBOT[j];
 
 // z of the cable's bottom edge at x, on whichever segment spans it.
 function bz(x) =

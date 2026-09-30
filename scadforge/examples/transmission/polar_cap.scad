@@ -17,29 +17,45 @@
 //
 //  Two caps bolt face to face on the parting plane z = 0.  Between
 //  them they make: a face coupling (two crowns, teeth into spaces), a
-//  thrust bearing (two half grooves make one toroidal ball channel),
-//  a spigot pilot, and a bolted joint.  The sun passes through the
-//  middle on a 46 spline that is the same at every slice.
+//  thrust bearing (two half grooves close into one toroidal ball
+//  channel), a socket that shuts round the coupling sleeve, and a
+//  bolted joint.  The sun passes through the middle on a 46 spline
+//  that is the same at every slice.
 //
-//  This kernel's boolean leaves T junctions behind, so a union of
-//  solids that overlap comes back with edges used an odd number of
-//  times.  The cap is therefore drawn the way the library draws its
-//  own demonstration: as members that SHARE NO VOLUME.  That is not a
-//  dodge, it is the assembly -- a cap web, a crown ring on a spigot,
-//  a bolt ring in its seat, and the balls in the race.  Every
-//  interface is a seat with a clearance, and every one of those
-//  clearances is computed and printed below; they are the whole
-//  statement that nothing overlaps.  The export cannot be made to
-//  confirm it, and this file does not pretend otherwise.  At this size
-//  the kernel prints
+//  What LOCATES the pair radially is the crown coupling.  The library
+//  builds a sector's flanks as ruled surfaces through the apex, and
+//  for a gamma = 90 crown the apex sits on the axis in the parting
+//  plane, so the teeth are radial: the engaged pair cannot slide
+//  sideways without riding up a flank.  Nothing else in the joint
+//  locates it -- the two socket walls butt end to end, they do not
+//  pilot, and this file does not claim they do.  The male spline is
+//  recessed below the parting plane on both caps, so the two males
+//  never meet; a floating sleeve, female at both ends, joins them in
+//  the cavity the two sockets make, and the report prints the wall
+//  that sleeve has to live in.
 //
-//      WARNING: 132776 triangles is past the 25000 the export-time
-//      union will merge; overlapping shells were left separate.
+//  The cap is drawn the way the library draws its own demonstration:
+//  as members that SHARE NO VOLUME.  Two reasons, and neither is a
+//  dodge.  It is what the parts are -- a crown ring seated on a spigot
+//  and a tie ring seated in a counterbore are separate parts in any
+//  machine this size, and drawing them with their seats and their
+//  clearances is drawing the machine.  And it keeps the export off the
+//  boolean path entirely, so the mesh is face for face what this file
+//  writes, which is the reason the library gives for its own layout.
 //
-//  and a scene past that threshold that DOES overlap comes back with
-//  holes = 0 and a volume that double counts the overlap, so a clean
-//  leak count is not by itself evidence of anything.  The printed
-//  clearances have to carry it, and they are all computed, not assumed.
+//  What the export CANNOT do is confirm that the members do not
+//  overlap, and this file does not pretend otherwise.  Past 25000
+//  triangles this kernel skips its export-time union and says so:
+//
+//      ... is past the 25000 the export-time union will merge;
+//      overlapping shells were left separate.
+//
+//  A scene past that threshold that DOES overlap therefore comes back
+//  with holes = 0 and a volume that counts the overlap twice -- two
+//  spheres of radius 10 with centres 12 apart export as 8369 mm^3
+//  against a true union of 7506.  So a clean leak count is not by
+//  itself evidence of anything here.  The printed clearances are the
+//  statement, and every one of them is computed, not assumed.
 //
 //  ---------------------------------------------------------------
 //  1.  THE RADIAL STACK-UP, FROM THE AXIS OUT
@@ -51,7 +67,7 @@
 //      r_root = (Ns - 2) m / 2      spline root      (1)
 //      r_tip  = (Ns + 2) m / 2      spline tip
 //      r_well = r_tip  + sleeve wall
-//      r_pilot= r_well + pilot wall
+//      r_pilot= r_well + socket wall
 //      r_shi0 = r_pilot+ land
 //      r_shi1 = r_shi0 + shoulder                    race inner wall
 //      R_race = r_shi1 + groove radius               ball path
@@ -192,6 +208,12 @@
 //  that actually results, which is not the same number as the gap
 //  that was asked for, because n was floored.
 //
+//  The groove is concave, so its chords stand INSIDE the arc and eat
+//  into the ball clearance rather than adding to it.  The report
+//  prints the clearance against the true arc and the tightest clearance
+//  against the chords, r_g - d/2 - r_g(1 - cos(90/n_arc)); the second
+//  is the one a ball would actually feel.
+//
 //  ---------------------------------------------------------------
 //  5.  THE BOLT CIRCLE, AND THE DIVISIBILITY IT CANNOT HAVE
 //
@@ -278,8 +300,8 @@ use <spherical_gear.scad>
 // every angle -- is derived from these and from the library's table.
 PC_BORE_R   = 8.0;    // central bore radius, sun shaft clearance
 PC_SLEEVE_W = 3.0;    // radial room over the spline tip for the coupling sleeve
-PC_PILOT_W  = 4.0;    // pilot (socket) wall thickness
-PC_LAND_W   = 1.4;    // flat land between pilot wall and race inner shoulder
+PC_PILOT_W  = 4.0;    // socket wall thickness (it butts, it does not pilot)
+PC_LAND_W   = 1.4;    // flat land between socket wall and race inner shoulder
 PC_SH_W     = 2.4;    // thrust race shoulder width
 PC_BALL_D   = 6.0;    // thrust ball diameter
 PC_GROOVE_R = 3.2;    // groove arc radius
@@ -409,7 +431,7 @@ BOLT_LIG= BOLT_P - 2*PC_BOLT_R;
 
 // ---- the web's meridian ---------------------------------------------
 // One closed loop, traversed counter-clockwise in (r, z).  The region
-// is a comb: a plate with a hub column, a pilot wall and the race rim
+// is a comb: a plate with a hub column, a socket wall and the race rim
 // standing on it.  Stations flagged SPL carry the spline modulation.
 PC_ARC = [ for (i=[0:PC_NARC])
              let (t = 360 - 180*i/PC_NARC)
@@ -486,7 +508,7 @@ module pc_lathe(P, A, spl) {
       convexity = 12 );
 }
 
-// the cap web: bore, male sun spline, socket pilot, plate, thrust race,
+// the cap web: bore, male sun spline, socket wall, plate, thrust race,
 // bolt ring seat, crown spigot and crown seat -- one closed solid.
 module pc_web() { pc_lathe(PC_MER, PC_AZ, PC_SPLF); }
 
@@ -540,9 +562,9 @@ echo("four members, sharing no volume: web, crown ring, bolt ring, balls.");
 echo("every interface is a seat, and every clearance is computed and");
 echo("printed at the end of this report.  It is the clearances that say");
 echo("nothing overlaps, not the export: past 25000 triangles this kernel");
-echo("skips the export-time union and says so, and a scene that overlaps");
-echo("then comes back with holes = 0 and a volume that counts the overlap");
-echo("twice.  A clean leak count is not evidence here.");
+echo("skips the export-time union and says so, so a scene that DOES");
+echo("overlap comes back at this size with holes = 0 and a volume that");
+echo("counts the overlap twice.  A clean leak count is not evidence here.");
 
 echo("=== 1. the radial chain, from the axis out ===");
 echo(str("   bore radius                 ", PC_BORE_R,
@@ -554,8 +576,13 @@ echo(str("   spline tip   (Ns+2)m/2 = ", R_TIP,
          "   major diameter ", 2*R_TIP, " mm"));
 echo(str("   well bore    r_tip + ", PC_SLEEVE_W, " = ", R_WELL,
          "   sleeve wall over the spline tip = ", R_WELL - R_TIP, " mm"));
-echo(str("   pilot wall   ", R_WELL, " -> ", R_PILOT,
-         "   thickness ", R_PILOT - R_WELL));
+echo(str("   socket wall  ", R_WELL, " -> ", R_PILOT,
+         "   thickness ", R_PILOT - R_WELL,
+         ";  it butts against the facing cap's, it does not pilot"));
+echo(str("   the coupling sleeve lives in r ", R_ROOT, " to ", R_WELL,
+         ": female on the spline root ", R_ROOT,
+         ", outside ", R_WELL, ", so its thinnest wall, over the male tip ",
+         R_TIP, ", is ", R_WELL - R_TIP, " mm"));
 echo(str("   race inner shoulder ", R_SHI0, " -> ", R_SHI1,
          "   land before it ", R_SHI0 - R_PILOT));
 echo(str("   ball path radius  R = r_shi1 + r_g = ", R_SHI1, " + ",
@@ -630,6 +657,15 @@ echo(str("   crown ring bore Li sin(Ghub) = ", CR_BORE,
          " mm asked for -- that surplus IS the rounding up to ", NCAP));
 echo(str("   crown outside diameter over the tips ", CR_OD,
          " mm;  back-cone outer radius ", CR_HUBO, " mm"));
+echo(str("   the sector's apex is its own origin and gamma = 90 makes the",
+         " pitch cone the plane through it, so after the flip the apex is at",
+         " [0,0,0] -- on the axis, in the parting plane.  The library sweeps",
+         " the boundary between two cone distances at FIXED (colatitude,",
+         " azimuth), so the same flank point at Li and at Lo shares an",
+         " azimuth and the flank is a fan of rays from that apex: the teeth",
+         " are radial.  Tip at Li ", LI*sin(CR_TA), " and at Lo ", CR_TIPZ,
+         ", the ratio ", (LO*sin(CR_TA))/(LI*sin(CR_TA)), " = Lo/Li = ",
+         LO/LI, ", which is what a ray fan does."));
 echo(str("   addendum angle sg_ta = ", CR_TA, " deg;  tip stands L sin(ta) proud:",
          " at Li ", LI*sin(CR_TA), " mm, at Lo ", CR_TIPZ, " mm"));
 echo(str("   dedendum angle sg_tf = ", CR_TF, " deg;  root lies L sin(tf) deep:",
@@ -708,7 +744,8 @@ echo(str("   ball path circumference 2 pi R = ", 2*PI*R_RACE,
 
 echo("=== 5. the bolt circle and the divisibility it cannot have ===");
 echo(str("   asked: a count dividing both Ns = ", NS,
-         " and the row's planet count k.  Ns = 2*23, so its divisors are:"));
+         " and the row's planet count k.  Ns = ", NS/NBOLT, "*", NBOLT,
+         ", so its divisors are:"));
 echo(str("      ", [ for (d_=[1:NS]) if (NS % d_ == 0) d_ ]));
 for (r_ = ROWS_)
   echo(str("      ", r_[0], "  k = ", r_[4], "   gcd(Ns,k) = gcd(", NS, ",",
@@ -784,11 +821,23 @@ echo(str("   bolt ring in its seat: radial ", RING_ID - R_SHO1, " inboard, ",
          SEAT_O - RING_OD, " outboard;  axial ", PC_SEAT_D - PC_RING_T,
          " under the ring"));
 echo(str("   crown ring on the spigot: radial ", CR_BORE - R_SPIG,
-         ";  axial under the back cone ", PC_SEAT_Z));
+         ";  vertical under the back cone ", PC_SEAT_Z,
+         ", which perpendicular to that cone is ", PC_SEAT_Z*sin(GHUB)));
 echo(str("   balls in the groove: ", GROOVE_C,
-         " all round;  ball to ball ", BALL_G));
+         " against the true arc;  but the groove is ", PC_NARC,
+         " chords, and a chord stands r_g(1-cos(90/", PC_NARC, ")) = ",
+         PC_GROOVE_R*(1 - cos(90/PC_NARC)),
+         " mm inside its arc, so the tightest real gap is ",
+         GROOVE_C - PC_GROOVE_R*(1 - cos(90/PC_NARC)), " mm"));
+echo(str("   ball to ball ", BALL_G, " mm"));
 echo(str("   spigot top ", PC_SPIG_Z, " mm below the parting plane, crown",
          " bore starts at r = ", CR_BORE, " outside it"));
+echo(str("   in the pair: both male splines stop ", PC_SPL_Z,
+         " mm below their own parting plane, so they face each other ",
+         2*PC_SPL_Z, " mm apart and never meet.  The sleeve that joins them",
+         " has ", SPL_LEN, " mm of spline to engage on each side, ",
+         2*SPL_LEN, " mm across the joint, in a cavity ", 2*PC_WELL_Z,
+         " mm deep and ", 2*R_WELL, " mm across"));
 
 // ===================================================================
 //  THE PART

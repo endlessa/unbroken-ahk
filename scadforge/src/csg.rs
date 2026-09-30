@@ -833,10 +833,26 @@ fn pieces_disjoint(a: &Piece, b: &Piece) -> bool {
         box_contains(outer, inner)
             && (!outer.clean || point_inside(&outer.mesh, inner.on) != Some(false))
     };
+    let trace = std::env::var_os("SCADFORGE_UNION_TRACE").is_some();
     if nested(a, b) || nested(b, a) {
+        if trace {
+            eprintln!(
+                "   not disjoint: nesting not ruled out ({} vs {} tris)",
+                a.mesh.tris.len(),
+                b.mesh.tris.len()
+            );
+        }
         return false;
     }
-    !surfaces_may_touch(&a.mesh, &b.mesh)
+    let touch = surfaces_may_touch(&a.mesh, &b.mesh);
+    if touch && trace {
+        eprintln!(
+            "   not disjoint: surfaces may touch ({} vs {} tris)",
+            a.mesh.tris.len(),
+            b.mesh.tris.len()
+        );
+    }
+    !touch
 }
 
 /// Might these two share volume? The question `absorb` actually asks.
@@ -936,9 +952,45 @@ fn surfaces_may_touch(a: &Mesh, b: &Mesh) -> bool {
         }
         (l, h)
     };
-    // Grid resolution from the triangle count, so cells hold a few triangles
-    // each whatever the model's size.
-    let n = ((a.tris.len().max(b.tris.len()) as f64).cbrt().ceil() as i64).clamp(4, 64);
+    // Grid resolution from the TRIANGLE SIZE, not the triangle count.
+    //
+    // A count-based resolution assumes the triangles are all much the same
+    // size and spread evenly, and a real part is neither. A gear slice put
+    // a body of revolution -- a few large annular faces -- against a toothed
+    // ring of 20,240 small ones: the count said 28 cells per axis, the large
+    // faces each landed in hundreds of them, and the cells they filled then
+    // answered every query with hundreds of candidates. The pair test ran
+    // past 107 MILLION triangle pairs without finishing and gave up, which
+    // is conservative and therefore safe, but it cost the model a clean
+    // export -- eighteen solids that share no volume were declared one
+    // component and refused by the merge budget.
+    //
+    // Sizing the cell to the mean triangle instead makes a cell hold a few
+    // triangles whatever the mix, which is what the grid was always
+    // supposed to do.
+    // Sampled, not summed. The mean only has to be right to within a
+    // factor, and walking every triangle here costs O(triangles) on a test
+    // whose whole job is to be cheaper than the boolean -- a suspension
+    // bridge asks it 125,250 times, and summing took its export from 2.9
+    // seconds to 82.
+    let mean = {
+        let step = (a.tris.len() / 64).max(1);
+        let mut sum = 0.0;
+        let mut seen = 0usize;
+        for t in a.tris.iter().step_by(step) {
+            let v = corners(a, t);
+            let (l, h) = tri_box(&v);
+            sum += (0..3).fold(0.0f64, |m, k| m.max(h[k] - l[k]));
+            seen += 1;
+        }
+        sum / seen.max(1) as f64
+    };
+    let span = (0..3).fold(0.0f64, |m, k| m.max(hi[k] - lo[k]));
+    let n = if mean > 0.0 {
+        ((span / mean).ceil() as i64).clamp(4, 128)
+    } else {
+        ((a.tris.len().max(b.tris.len()) as f64).cbrt().ceil() as i64).clamp(4, 64)
+    };
     let step: Vec<f64> = (0..3).map(|k| ((hi[k] - lo[k]) / n as f64).max(1e-300)).collect();
     let cell = |v: f64, k: usize| (((v - lo[k]) / step[k]).floor() as i64).clamp(0, n - 1);
 
@@ -964,6 +1016,9 @@ fn surfaces_may_touch(a: &Mesh, b: &Mesh) -> bool {
                     grid.entry((x, y, z)).or_default().push(i);
                     inserted += 1;
                     if inserted > budget {
+                        if std::env::var_os("SCADFORGE_UNION_TRACE").is_some() {
+                            eprintln!("     (gave up: grid insert budget {budget})");
+                        }
                         return true;
                     }
                 }
@@ -993,9 +1048,23 @@ fn surfaces_may_touch(a: &Mesh, b: &Mesh) -> bool {
                         let w = corners(a, &a.tris[i]);
                         tested += 1;
                         if tested > pair_budget {
+                            if std::env::var_os("SCADFORGE_UNION_TRACE").is_some() {
+                                eprintln!("     (gave up: pair budget {pair_budget})");
+                            }
                             return true;
                         }
                         if !tris_separated(&w, &v, eps) {
+                            if std::env::var_os("SCADFORGE_UNION_TRACE").is_some() {
+                                let d = |t: &[V3; 3]| {
+                                    let c = [
+                                        (t[0][0] + t[1][0] + t[2][0]) / 3.0,
+                                        (t[0][1] + t[1][1] + t[2][1]) / 3.0,
+                                        (t[0][2] + t[1][2] + t[2][2]) / 3.0,
+                                    ];
+                                    format!("[{:.5} {:.5} {:.5}]", c[0], c[1], c[2])
+                                };
+                                eprintln!("     (a real contact near {} and {})", d(&w), d(&v));
+                            }
                             return true;
                         }
                     }
