@@ -759,6 +759,7 @@ pub fn weld_tjunctions(mesh: &Mesh) -> Mesh {
     let sub = |a: Vec3, b: Vec3| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
     let dot = |a: Vec3, b: Vec3| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
+    let mut positions = mesh.positions.clone();
     let mut out: Vec<[u32; 3]> = Vec::with_capacity(mesh.tris.len());
     let mut splits: Vec<Vec<(f64, u32)>> = vec![Vec::new(); 3];
     for t in &mesh.tris {
@@ -875,11 +876,52 @@ pub fn weld_tjunctions(mesh: &Mesh) -> Mesh {
         });
         let pieces =
             if backwards { face_tris_in(&mesh.positions, &face, Some(plane)) } else { pieces };
+        // And if THAT still disagrees, stop ear clipping and fan from the
+        // triangle's own centroid.
+        //
+        // The polygon here is always a triangle with extra points on its
+        // edges, so it is convex and its centroid is strictly inside it. A
+        // fan from an interior point of a convex polygon covers it exactly
+        // and every piece takes the polygon's own orientation, by
+        // construction rather than by luck -- there is nothing left for an
+        // ear rule to get wrong. It costs one interior vertex and n pieces
+        // instead of n - 2, and it creates NO T-junction, because the
+        // boundary is untouched.
+        //
+        // It is needed. Two ship models grew four and two inconsistently
+        // wound edges with only the two ear-clip tiers, which is the one
+        // defect the weld must not introduce: an edge whose faces run the
+        // same way round makes the mesh non-orientable, and the weld exists
+        // to make meshes sound.
+        let still_backwards = backwards && pieces.iter().any(|f| {
+            let (a, b, c) =
+                (mesh.positions[f[0]], mesh.positions[f[1]], mesh.positions[f[2]]);
+            let (x, y) = (sub(b, a), sub(c, a));
+            let m = [
+                x[1] * y[2] - x[2] * y[1],
+                x[2] * y[0] - x[0] * y[2],
+                x[0] * y[1] - x[1] * y[0],
+            ];
+            dot(m, plane) < 0.0
+        });
+        if still_backwards {
+            let c = [
+                (p0[0] + p1[0] + p2[0]) / 3.0,
+                (p0[1] + p1[1] + p2[1]) / 3.0,
+                (p0[2] + p1[2] + p2[2]) / 3.0,
+            ];
+            let ci = positions.len() as u32;
+            positions.push(c);
+            for k in 0..face.len() {
+                out.push([ci, face[k] as u32, face[(k + 1) % face.len()] as u32]);
+            }
+            continue;
+        }
         for f in pieces {
             out.push([f[0] as u32, f[1] as u32, f[2] as u32]);
         }
     }
-    Mesh { positions: mesh.positions, tris: out }
+    Mesh { positions, tris: out }
 }
 
 /// Report an IMPORTED mesh that is inside out.
