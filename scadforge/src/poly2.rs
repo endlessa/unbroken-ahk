@@ -1369,6 +1369,48 @@ fn push_tri(tris: &mut Vec<[u32; 3]>, q: &[[f64; 3]; 4], base: u32, k: [usize; 3
     }
 }
 
+/// The boundary of the CAP TRIANGULATION, as directed segments.
+///
+/// The walls have to be divided exactly where the cap is divided. A scanline
+/// triangulator cuts the outer boundary at every level a hole starts or
+/// ends, inserting vertices the original contour never had; a wall built
+/// from the contour then meets the cap along one long edge that the cap has
+/// split into several, which is a T-junction. The result is watertight
+/// geometrically and open combinatorially -- a square with a square hole
+/// came out with 32 boundary edges on 32 triangles, its volume exactly
+/// right, and every extruded letter in the example corpus was the same,
+/// because a letter is a polygon with holes and nothing else is.
+///
+/// Taking the walls FROM the triangulation makes the two agree by
+/// construction rather than by coincidence. The directed edges also carry
+/// the orientation already: a boundary edge of a CCW triangulation keeps
+/// the filled region on its left, which is the convention the walls want.
+///
+/// Iteration follows `cap_tris` rather than a hash map, because the mesh
+/// this produces has to be identical from one run to the next.
+fn cap_boundary(cap2: &[Vec2], cap_tris: &[[u32; 3]]) -> Vec<[Vec2; 2]> {
+    use std::collections::HashSet;
+    let mut present: HashSet<(u32, u32)> = HashSet::with_capacity(cap_tris.len() * 3);
+    for t in cap_tris {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            if a != b {
+                present.insert((a, b));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for t in cap_tris {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            if a != b && !present.contains(&(b, a)) {
+                out.push([cap2[a as usize], cap2[b as usize]]);
+            }
+        }
+    }
+    out
+}
+
 /// linear_extrude: stamp the region as slices+1 rings from z0 to z0+height,
 /// each ring scaled (lerp 1→scale) then rotated (-twist·t degrees) about
 /// the origin. Walls connect consecutive rings; the base triangulation
@@ -1433,8 +1475,16 @@ pub fn extrude_linear(
     cap(&mut tris, &mut positions, 0.0, true); // bottom, facing -z
     cap(&mut tris, &mut positions, 1.0, false); // top, facing +z
     // Side walls, one quad per boundary segment per slice (segments carry
-    // the ink on their left, so hole walls face inward).
-    for seg in &wall_segments(poly) {
+    // the ink on their left, so hole walls face inward). The segments come
+    // from the cap's own boundary so the two meet edge for edge; see
+    // `cap_boundary`. A triangulation that produced nothing falls back to
+    // the contours, which is what a degenerate region used to get anyway.
+    let walls = if cap_tris.is_empty() {
+        wall_segments(poly)
+    } else {
+        cap_boundary(&cap2, &cap_tris)
+    };
+    for seg in &walls {
         for i in 0..slices {
             let (t0, t1) = (i as f64 / slices as f64, (i + 1) as f64 / slices as f64);
             let q = [
@@ -1480,7 +1530,21 @@ pub fn extrude_rotate(poly: &Poly2, angle_deg: f64, frags: usize) -> Result<Mesh
     // came out with every face inverted, which the viewer shades as flat
     // ambient grey and an exporter writes as an inside-out solid.
     let flip = (sweep < 0.0) != (maxx <= 0.0 && minx < 0.0);
-    let angle_at = |k: usize| (sweep * k as f64 / frags as f64).to_radians();
+    // A full revolution must CLOSE, and closing means the last ring is the
+    // first ring -- the same coordinates, not coordinates that agree to
+    // within a rounding error. Computed as 360 degrees, the seam misses:
+    // (360f64).to_radians().sin() is -2.4e-16 rather than 0, so at radius 11
+    // the closing ring sat 2.7e-15 off the starting one and the mesh had a
+    // boundary all the way up the seam. Eight boundary edges on a revolved
+    // square, and nothing reported them, because the closedness check runs
+    // on polyhedron() and an extrusion is not one.
+    //
+    // Wrapping the index rather than rounding the angle makes the two rings
+    // bit-identical whatever the trigonometry does.
+    let angle_at = |k: usize| {
+        let k = if full && k == frags { 0 } else { k };
+        (sweep * k as f64 / frags as f64).to_radians()
+    };
     let revolve = |p: Vec2, theta: f64| [p[0] * theta.cos(), p[0] * theta.sin(), p[1]];
     let mut positions: Vec<[f64; 3]> = Vec::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
@@ -1568,6 +1632,114 @@ mod tests {
     /// answer depended on which way the inner loop was wound, which even-odd
     /// filling never may.
     #[test]
+    /// An extruded region with a hole must be CLOSED, not merely watertight.
+    ///
+    /// A scanline triangulator divides the outer boundary at every level a
+    /// hole begins or ends. Walls built from the contour then meet a cap
+    /// that has split the edge they span, which leaves the mesh correct by
+    /// volume and open by topology: a square with a square hole came out
+    /// with 32 boundary edges on 32 triangles, its volume exactly 1200, and
+    /// so did every extruded letter, a letter being a polygon with holes and
+    /// nothing else.
+    #[test]
+    fn extruding_a_region_with_a_hole_leaves_no_boundary_edge() {
+        use std::collections::HashMap;
+        let boundary = |tris: &[[u32; 3]], pos: &[[f64; 3]]| {
+            // Match by POSITION, since caps and walls carry their own copies.
+            let key = |i: u32| {
+                let p = pos[i as usize];
+                (p[0].to_bits(), p[1].to_bits(), p[2].to_bits())
+            };
+            let mut seen: HashMap<_, i32> = HashMap::new();
+            for t in tris {
+                for k in 0..3 {
+                    let (a, b) = (key(t[k]), key(t[(k + 1) % 3]));
+                    if a != b {
+                        *seen.entry((a, b)).or_insert(0) += 1;
+                    }
+                }
+            }
+            seen.iter().filter(|(&(a, b), _)| !seen.contains_key(&(b, a))).count()
+        };
+
+        let holed = Poly2::new(vec![
+            vec![[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]],
+            vec![[5.0, 5.0], [5.0, 15.0], [15.0, 15.0], [15.0, 5.0]],
+        ]);
+        let (pos, tris) = extrude_linear(&holed, 4.0, false, 0.0, 1, [1.0, 1.0]);
+        assert_eq!(boundary(&tris, &pos), 0, "a holed extrusion has a boundary");
+        // And it is still the right solid: 20*20*4 less 10*10*4.
+        let vol: f64 = tris
+            .iter()
+            .map(|t| {
+                let (a, b, c) = (pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]);
+                (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                    + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                    / 6.0
+            })
+            .sum();
+        assert!((vol.abs() - 1200.0).abs() < 1e-9, "volume {vol}");
+
+        // Two holes, so the outer boundary is cut at four different levels.
+        let twice = Poly2::new(vec![
+            vec![[0.0, 0.0], [30.0, 0.0], [30.0, 20.0], [0.0, 20.0]],
+            vec![[3.0, 3.0], [3.0, 9.0], [9.0, 9.0], [9.0, 3.0]],
+            vec![[18.0, 11.0], [18.0, 17.0], [26.0, 17.0], [26.0, 11.0]],
+        ]);
+        let (pos, tris) = extrude_linear(&twice, 2.0, false, 0.0, 1, [1.0, 1.0]);
+        assert_eq!(boundary(&tris, &pos), 0, "two holes leave a boundary");
+
+        // A hole survives twist and scale, where every ring is somewhere new.
+        let (pos, tris) = extrude_linear(&holed, 6.0, true, 35.0, 4, [0.6, 0.8]);
+        assert_eq!(boundary(&tris, &pos), 0, "a twisted holed extrusion has a boundary");
+
+        // And the simple case is untouched: a square is still six quads.
+        let plain = Poly2::new(vec![vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 10.0],
+            [0.0, 10.0],
+        ]]);
+        let (pos, tris) = extrude_linear(&plain, 5.0, false, 0.0, 1, [1.0, 1.0]);
+        assert_eq!(tris.len(), 12);
+        assert_eq!(boundary(&tris, &pos), 0);
+    }
+
+    /// A full revolution must close on itself.
+    #[test]
+    fn a_full_revolution_meets_its_own_seam() {
+        use std::collections::HashMap;
+        let profile = Poly2::new(vec![vec![
+            [8.0, 0.0],
+            [11.0, 0.0],
+            [11.0, 4.0],
+            [8.0, 4.0],
+        ]]);
+        for frags in [3usize, 8, 24, 31] {
+            let (pos, tris) = extrude_rotate(&profile, 360.0, frags).unwrap();
+            let key = |i: u32| {
+                let p = pos[i as usize];
+                (p[0].to_bits(), p[1].to_bits(), p[2].to_bits())
+            };
+            let mut seen: HashMap<_, i32> = HashMap::new();
+            for t in &tris {
+                for k in 0..3 {
+                    let (a, b) = (key(t[k]), key(t[(k + 1) % 3]));
+                    if a != b {
+                        *seen.entry((a, b)).or_insert(0) += 1;
+                    }
+                }
+            }
+            let open = seen.iter().filter(|(&(a, b), _)| !seen.contains_key(&(b, a))).count();
+            // The seam is where the last ring meets the first, and it closes
+            // only if the two are the SAME points. Computed as 360 degrees
+            // the sine comes back at -2.4e-16, which at radius 11 put the
+            // closing ring 2.7e-15 away and left the seam open all the way
+            // up: eight boundary edges, whatever the fragment count.
+            assert_eq!(open, 0, "$fn = {frags} left {open} boundary edges at the seam");
+        }
+    }
+
     fn a_self_touching_contour_is_not_simple() {
         // A 10x10 plate with a 4x2 slot reached through a slit: 100 - 8 = 92.
         let key = |inner_reversed: bool| {
@@ -1595,7 +1767,15 @@ mod tests {
         ]]);
         assert!((tri_area(&spur) - 100.0).abs() < 1e-9);
         let (_, tris) = extrude_linear(&spur, 3.0, false, 0.0, 1, [1.0, 1.0]);
-        assert_eq!(tris.len(), 14, "a clean box is 12 caps+walls... plus none for the spur");
+        // Twelve: four cap triangles and four walls, which is a plain box.
+        // This read 14 while the walls were built from the CONTOUR, because
+        // the contour visits the top edge in two halves either side of the
+        // spur and so raised two wall quads where the region has one edge.
+        // Walls now come from the cap's own boundary, which has the four
+        // edges the box actually has -- the count the comment here always
+        // claimed. The solid is unchanged: 10 x 10 x 3 exactly, closed,
+        // nothing wound against its neighbour.
+        assert_eq!(tris.len(), 12, "a clean box is 12 caps+walls, and none for the spur");
 
         // An ordinary simple polygon still takes the fast path and comes out
         // with the minimum triangle count.
