@@ -856,83 +856,43 @@ pub fn weld_tjunctions(mesh: &Mesh) -> Mesh {
             out.push(*t);
             continue;
         }
-        // Which plane to project in is a choice with no winner, so it is
-        // made by checking rather than by argument. Newell's normal is the
-        // better conditioned of the two for choosing ears -- using the
-        // triangle's own instead tripled a gear's boundary-edge residue,
-        // 89 to 329 -- but on a sliver its area-weighted sum nearly
-        // cancels, and a triangulation done in a plane that is not really
-        // the face's can come out overlapping itself, which winds a piece
-        // backwards. A character model grew two inconsistently wound edges
-        // that way, and those are far worse than a boundary edge: an edge
-        // whose two faces run the same way round makes the mesh
-        // non-orientable, and every boolean on it silently loses geometry.
+        // Fan the polygon from the triangle's own centroid.
         //
-        // So: cut in Newell's plane, then verify every piece against the
-        // triangle's own normal, and only if one disagrees cut again in
-        // that normal's plane. Both models get what they need, and the
-        // retry costs a cross product per piece on the faces that are
-        // split at all.
-        let pieces = face_tris_in(&mesh.positions, &face, None);
-        let backwards = pieces.iter().any(|f| {
-            let (a, b, c) = (
-                mesh.positions[f[0]],
-                mesh.positions[f[1]],
-                mesh.positions[f[2]],
-            );
-            let (x, y) = (sub(b, a), sub(c, a));
-            let m = [
-                x[1] * y[2] - x[2] * y[1],
-                x[2] * y[0] - x[0] * y[2],
-                x[0] * y[1] - x[1] * y[0],
-            ];
-            dot(m, plane) < 0.0
-        });
-        let pieces =
-            if backwards { face_tris_in(&mesh.positions, &face, Some(plane)) } else { pieces };
-        // And if THAT still disagrees, stop ear clipping and fan from the
-        // triangle's own centroid.
+        // Ear clipping was tried here first, in two planes, with a check
+        // that re-cut again if any piece disagreed with the triangle's
+        // normal. It was delicate and it was not sound: on a sliver of area
+        // 1e-09 in a 160-unit model, the check is below its own noise floor
+        // -- the piece's normal is 1e-09 too, so `dot(piece, plane) > 0` can
+        // come out true for a piece that is geometrically reversed. Three
+        // successive repairs aimed at that check and none of them removed
+        // the last two inconsistently wound edges of a lattice hull.
         //
-        // The polygon here is always a triangle with extra points on its
-        // edges, so it is convex and its centroid is strictly inside it. A
-        // fan from an interior point of a convex polygon covers it exactly
-        // and every piece takes the polygon's own orientation, by
-        // construction rather than by luck -- there is nothing left for an
-        // ear rule to get wrong. It costs one interior vertex and n pieces
-        // instead of n - 2, and it creates NO T-junction, because the
-        // boundary is untouched.
+        // The fan needs no check at all. The polygon here is always a
+        // TRIANGLE WITH EXTRA POINTS ON ITS EDGES, so it is convex, its
+        // centroid is strictly inside it, and a fan from an interior point
+        // of a convex polygon covers it exactly with every piece taking the
+        // polygon's own orientation -- by construction, not by luck. It
+        // creates no T-junction, because the boundary is untouched.
         //
-        // It is needed. Two ship models grew four and two inconsistently
-        // wound edges with only the two ear-clip tiers, which is the one
-        // defect the weld must not introduce: an edge whose faces run the
-        // same way round makes the mesh non-orientable, and the weld exists
-        // to make meshes sound.
-        let still_backwards = backwards && pieces.iter().any(|f| {
-            let (a, b, c) =
-                (mesh.positions[f[0]], mesh.positions[f[1]], mesh.positions[f[2]]);
-            let (x, y) = (sub(b, a), sub(c, a));
-            let m = [
-                x[1] * y[2] - x[2] * y[1],
-                x[2] * y[0] - x[0] * y[2],
-                x[0] * y[1] - x[1] * y[0],
-            ];
-            dot(m, plane) < 0.0
-        });
-        if still_backwards {
-            let c = [
-                (p0[0] + p1[0] + p2[0]) / 3.0,
-                (p0[1] + p1[1] + p2[1]) / 3.0,
-                (p0[2] + p1[2] + p2[2]) / 3.0,
-            ];
-            let ci = positions.len() as u32;
-            positions.push(c);
-            for k in 0..face.len() {
-                out.push([ci, face[k] as u32, face[(k + 1) % face.len()] as u32]);
-            }
-            continue;
-        }
-        for f in pieces {
-            out.push([f[0] as u32, f[1] as u32, f[2] as u32]);
+        // It also turns out to leave FEWER holes, which was not the reason
+        // for it and is the better argument for it. An ear clip can cut a
+        // sliver that the export funnel then drops, reopening the hole the
+        // weld had just closed; a fan from the centroid cannot, because its
+        // pieces all reach the middle. Measured against the ear clip:
+        // elliptical 89 boundary edges to 36, a sounding hull 357 to 237, a
+        // lattice hull 9,499 to 7,143, a character 888 to 880. It costs one
+        // interior vertex and n pieces where the ear clip gave n - 2 --
+        // between 5 and 11 per cent more triangles, and only on the faces
+        // that are split at all.
+        let c = [
+            (p0[0] + p1[0] + p2[0]) / 3.0,
+            (p0[1] + p1[1] + p2[1]) / 3.0,
+            (p0[2] + p1[2] + p2[2]) / 3.0,
+        ];
+        let ci = positions.len() as u32;
+        positions.push(c);
+        for k in 0..face.len() {
+            out.push([ci, face[k] as u32, face[(k + 1) % face.len()] as u32]);
         }
     }
     Mesh { positions, tris: out }
@@ -1729,7 +1689,12 @@ mod tests {
         assert!(open.contains(&(1, 2)), "the long edge is unmatched: {open:?}");
 
         let fixed = weld_tjunctions(&mesh);
-        assert_eq!(fixed.tris.len(), 6, "the long triangle is cut in two");
+        // The long triangle becomes a quad -- its own three corners plus the
+        // point on its edge -- and is fanned from its centroid, so it goes
+        // to four pieces rather than the two an ear clip would cut. Five
+        // triangles in, one replaced by four, is eight. The extra vertex is
+        // interior, which is why the rim below is unchanged.
+        assert_eq!(fixed.tris.len(), 8, "the long triangle is fanned, not clipped");
         assert!((area(&fixed) - before).abs() < 1e-12, "and nothing moved");
         // Every interior edge is now shared; only the outer rim is boundary.
         let rim = boundary_edges(&fixed);
