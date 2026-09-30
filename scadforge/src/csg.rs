@@ -698,7 +698,7 @@ impl Piece {
                 acc.lo[k] = acc.lo[k].min(p.lo[k]);
                 acc.hi[k] = acc.hi[k].max(p.hi[k]);
             }
-            acc.mesh = concat(&acc.mesh, &p.mesh);
+            append(&mut acc.mesh, &p.mesh);
             acc.vlo += p.vlo;
             acc.vhi += p.vhi;
             acc.clean &= p.clean;
@@ -1127,7 +1127,7 @@ fn reduce(pieces: Vec<Piece>) -> Mesh {
             }
             made
         };
-        out = concat(&out, &solid.mesh);
+        append(&mut out, &solid.mesh);
     }
     out
 }
@@ -1386,10 +1386,22 @@ fn union_all_raw(meshes: &[Mesh]) -> Mesh {
 /// Concatenate two meshes, rebasing the second's indices.
 fn concat(a: &Mesh, b: &Mesh) -> Mesh {
     let mut out = a.clone();
+    append(&mut out, b);
+    out
+}
+
+/// Append in place, rebasing the second's indices.
+///
+/// The same thing `concat` does without copying the left operand, which
+/// matters wherever a concatenation is built up in a loop: `concat` there is
+/// quadratic in the finished mesh, and the loops that do it are the ones
+/// over a union's components and over a colour class, which is exactly where
+/// the pieces are most numerous. A geodesic of 782 components was copying
+/// about twelve million triangles to assemble thirty thousand.
+fn append(out: &mut Mesh, b: &Mesh) {
     let base = out.positions.len() as u32;
     out.positions.extend_from_slice(&b.positions);
     out.tris.extend(b.tris.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));
-    out
 }
 
 /// difference: the first mesh minus the union of the rest.
