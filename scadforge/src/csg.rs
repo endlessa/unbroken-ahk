@@ -666,6 +666,21 @@ struct Bounded {
     lo: f64,
     /// ...and at most.
     hi: f64,
+    /// Does the mesh hold only solids that share no volume with each other?
+    ///
+    /// A ray cast counts crossings, so it answers "inside the union" only
+    /// while the pieces it passes through do not overlap: a point inside TWO
+    /// stacked solids is crossed an even number of times and reads as
+    /// outside. Every node here is clean except one, the concatenation of a
+    /// pair whose merge was refused, and that one is marked so the
+    /// containment test declines to speak for it.
+    clean: bool,
+    /// One entry per original operand underneath: its box and a point on it.
+    /// Kept separately rather than merged into one, because the whole node's
+    /// box says nothing useful about nesting once a concatenation has put
+    /// several solids in it, and nesting is the one case the surface test
+    /// below cannot see.
+    boxes: Vec<Part>,
 }
 
 impl Bounded {
@@ -675,8 +690,287 @@ impl Bounded {
         // bound honest, while the floor stays at zero because a solid wound
         // the wrong way cannot be claimed to contain anything.
         let v = mesh.signed_volume();
-        Bounded { mesh, lo: v.max(0.0), hi: v.abs() }
+        let boxes = whole(&mesh);
+        Bounded { mesh, lo: v.max(0.0), hi: v.abs(), clean: true, boxes }
     }
+}
+
+/// One operand that went into a union: where it is, and a point on it.
+#[derive(Clone)]
+struct Part {
+    lo: [f64; 3],
+    hi: [f64; 3],
+    /// A vertex of that operand, used to settle containment by a ray cast
+    /// when its box alone cannot.
+    on: V3,
+}
+
+/// Is `inner` inside `outer`, as boxes?
+fn box_contains(outer: &Part, inner: &Part) -> bool {
+    (0..3).all(|k| outer.lo[k] <= inner.lo[k] && inner.hi[k] <= outer.hi[k])
+}
+
+/// Does this point lie inside the closed solid, by crossing parity?
+///
+/// None when the ray could not be trusted: it struck an edge, a vertex, or
+/// the surface itself, where the count is one either way. Four directions are
+/// tried before giving up, and giving up means the caller keeps its boolean.
+fn point_inside(m: &Mesh, p: V3) -> Option<bool> {
+    // Directions with no small integer relationship between components, so a
+    // ray is unlikely to run along an axis-aligned face or an edge of a
+    // regular sweep.
+    const DIRS: [V3; 4] = [
+        [0.577_35, 0.577_36, 0.577_37],
+        [0.801_78, -0.267_26, 0.534_52],
+        [-0.408_25, 0.816_50, 0.408_26],
+        [0.267_25, 0.534_51, -0.801_79],
+    ];
+    for d in DIRS {
+        if let Some(n) = crossings(m, p, d) {
+            return Some(n % 2 == 1);
+        }
+    }
+    None
+}
+
+fn crossings(m: &Mesh, o: V3, d: V3) -> Option<usize> {
+    // Barycentric coordinates are dimensionless, so this tolerance needs no
+    // scaling; the distance along the ray does, and is measured against the
+    // triangle's own size.
+    const BARY: f64 = 1e-9;
+    let mut n = 0usize;
+    for t in &m.tris {
+        let a = m.positions[t[0] as usize];
+        let e1 = sub(m.positions[t[1] as usize], a);
+        let e2 = sub(m.positions[t[2] as usize], a);
+        let pv = cross(d, e2);
+        let det = dot(e1, pv);
+        let scale = (dot(e1, e1) * dot(e2, e2)).sqrt();
+        if scale <= 0.0 {
+            continue; // a degenerate triangle bounds nothing
+        }
+        if det.abs() <= scale * BARY {
+            // The ray lies in the triangle's plane. It contributes no
+            // crossing, but if it is ALSO near the triangle, the parity is
+            // not to be trusted.
+            continue;
+        }
+        let inv = 1.0 / det;
+        let tv = sub(o, a);
+        let u = dot(tv, pv) * inv;
+        let qv = cross(tv, e1);
+        let v = dot(d, qv) * inv;
+        let w = 1.0 - u - v;
+        if u < -BARY || v < -BARY || w < -BARY {
+            continue; // misses
+        }
+        if u < BARY || v < BARY || w < BARY {
+            return None; // grazes an edge or a corner
+        }
+        let along = dot(e2, qv) * inv;
+        if along.abs() <= scale.sqrt() * BARY {
+            return None; // the point is ON the surface
+        }
+        if along > 0.0 {
+            n += 1;
+        }
+    }
+    Some(n)
+}
+
+/// Can these two be shown to share no volume, without running a boolean?
+///
+/// This is worth a good deal of care, because the alternative is measured:
+/// a DNA segment of 44 solids that never touch each other spends 2.1 seconds
+/// being evaluated and 139 seconds in the export-time union, which then
+/// discovers it joined nothing. A suspension bridge of 501 disjoint solids
+/// pays the same toll. Bounding boxes cannot see it -- a backbone helix and a
+/// box girder both have boxes containing most of the model -- so the question
+/// has to be put to the triangles.
+///
+/// Two closed solids share volume only if their surfaces cross, OR one is
+/// wholly inside the other. The second case is ruled out first and by boxes,
+/// since a nested solid's box is inside its container's; that is why the leaf
+/// boxes are carried separately. What remains is a surface-crossing test, and
+/// this is the SUFFICIENT direction only: it answers "certainly not" or
+/// "cannot say", and "cannot say" simply costs what today already costs.
+fn provably_disjoint(a: &Bounded, b: &Bounded) -> bool {
+    if a.boxes.is_empty() || b.boxes.is_empty() {
+        return false;
+    }
+    // A box that contains another says only that nesting is POSSIBLE, and on
+    // the models this exists for it always is: a helical backbone's box
+    // contains every base pair in the molecule, a box girder's contains every
+    // hanger on the bridge. Stopping there gave up on every pair and saved
+    // nothing. Where a box allows nesting, the point settles it.
+    let nested = |outer: &Bounded, inner: &[Part]| {
+        inner.iter().any(|y| {
+            outer.boxes.iter().any(|x| box_contains(x, y))
+                && (!outer.clean || point_inside(&outer.mesh, y.on) != Some(false))
+        })
+    };
+    if nested(&a, &b.boxes) || nested(&b, &a.boxes) {
+        return false;
+    }
+    !surfaces_may_touch(&a.mesh, &b.mesh)
+}
+
+/// Two triangles are separated when some axis separates their projections.
+///
+/// Triangles are convex, so the separating-axis theorem applies exactly, and
+/// the axes that need testing are the two face normals and the nine cross
+/// products of one edge with another. Finding one is a PROOF of separation;
+/// finding none here is treated as "they may touch", which is the safe way
+/// round -- a wrong "separated" leaves two overlapping solids concatenated
+/// and self-intersecting, while a wrong "may touch" only costs the boolean
+/// that would have run anyway.
+fn tris_separated(p: &[V3; 3], q: &[V3; 3], eps: f64) -> bool {
+    let span = |t: &[V3; 3], d: V3| {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for v in t {
+            let x = dot(*v, d);
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+        (lo, hi)
+    };
+    let pe = [sub(p[1], p[0]), sub(p[2], p[1]), sub(p[0], p[2])];
+    let qe = [sub(q[1], q[0]), sub(q[2], q[1]), sub(q[0], q[2])];
+    let mut axes: Vec<V3> = Vec::with_capacity(11);
+    axes.push(cross(pe[0], pe[1]));
+    axes.push(cross(qe[0], qe[1]));
+    for u in &pe {
+        for v in &qe {
+            axes.push(cross(*u, *v));
+        }
+    }
+    for d in axes {
+        let len = dot(d, d).sqrt();
+        // A near-zero axis carries no information: parallel edges, or a
+        // degenerate triangle. Skipping it can only lose a proof, never
+        // invent one.
+        if len < 1e-300 {
+            continue;
+        }
+        let (pl, ph) = span(p, d);
+        let (ql, qh) = span(q, d);
+        let gap = (ql - ph).max(pl - qh);
+        if gap > eps * len {
+            return true;
+        }
+    }
+    false
+}
+
+/// Do any triangle of `a` and any triangle of `b` come close enough to touch?
+///
+/// Answers conservatively: false only when every pair was proved apart.
+fn surfaces_may_touch(a: &Mesh, b: &Mesh) -> bool {
+    use std::collections::HashMap;
+    let (Some((alo, ahi)), Some((blo, bhi))) = (crate::geom::bounds(a), crate::geom::bounds(b))
+    else {
+        return true;
+    };
+    // Only the region the two boxes share can hold a meeting, so everything
+    // outside it is skipped before any arithmetic.
+    let mut lo = [0.0; 3];
+    let mut hi = [0.0; 3];
+    for k in 0..3 {
+        lo[k] = alo[k].max(blo[k]);
+        hi[k] = ahi[k].min(bhi[k]);
+        if lo[k] > hi[k] {
+            return false;
+        }
+    }
+    // Tolerance is relative to the pair's own size, and small: solids that
+    // touch EXACTLY must come out as "may touch", because concatenating two
+    // solids that share a face leaves that face in the mesh twice. Let those
+    // go to the boolean, which is where they are handled today.
+    let extent = (0..3).fold(0.0f64, |m, k| m.max(ahi[k].max(bhi[k]) - alo[k].min(blo[k])));
+    let eps = extent * 1e-9;
+
+    let corners = |m: &Mesh, t: &[u32; 3]| {
+        [m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]]
+    };
+    let tri_box = |v: &[V3; 3]| {
+        let mut l = v[0];
+        let mut h = v[0];
+        for p in &v[1..] {
+            for k in 0..3 {
+                l[k] = l[k].min(p[k]);
+                h[k] = h[k].max(p[k]);
+            }
+        }
+        (l, h)
+    };
+    // Grid resolution from the triangle count, so cells hold a few triangles
+    // each whatever the model's size.
+    let n = ((a.tris.len().max(b.tris.len()) as f64).cbrt().ceil() as i64).clamp(4, 64);
+    let step: Vec<f64> = (0..3).map(|k| ((hi[k] - lo[k]) / n as f64).max(1e-300)).collect();
+    let cell = |v: f64, k: usize| (((v - lo[k]) / step[k]).floor() as i64).clamp(0, n - 1);
+
+    // Insert a's triangles. A triangle spanning a large part of the grid is
+    // cheap to insert once and expensive to insert everywhere, so the budget
+    // gives up rather than thrashing; giving up means "may touch".
+    let budget = 40 * (a.tris.len() + 16);
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    let mut inserted = 0usize;
+    for (i, t) in a.tris.iter().enumerate() {
+        let v = corners(a, t);
+        let (tl, th) = tri_box(&v);
+        if (0..3).any(|k| th[k] < lo[k] - eps || tl[k] > hi[k] + eps) {
+            continue; // outside the shared region entirely
+        }
+        let (c0, c1) = (
+            [cell(tl[0], 0), cell(tl[1], 1), cell(tl[2], 2)],
+            [cell(th[0], 0), cell(th[1], 1), cell(th[2], 2)],
+        );
+        for x in c0[0]..=c1[0] {
+            for y in c0[1]..=c1[1] {
+                for z in c0[2]..=c1[2] {
+                    grid.entry((x, y, z)).or_default().push(i);
+                    inserted += 1;
+                    if inserted > budget {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    if grid.is_empty() {
+        return false;
+    }
+    let mut tested = 0usize;
+    let pair_budget = 400 * (a.tris.len() + b.tris.len() + 16);
+    for t in &b.tris {
+        let v = corners(b, t);
+        let (tl, th) = tri_box(&v);
+        if (0..3).any(|k| th[k] < lo[k] - eps || tl[k] > hi[k] + eps) {
+            continue;
+        }
+        let (c0, c1) = (
+            [cell(tl[0], 0), cell(tl[1], 1), cell(tl[2], 2)],
+            [cell(th[0], 0), cell(th[1], 1), cell(th[2], 2)],
+        );
+        for x in c0[0]..=c1[0] {
+            for y in c0[1]..=c1[1] {
+                for z in c0[2]..=c1[2] {
+                    let Some(list) = grid.get(&(x, y, z)) else { continue };
+                    for &i in list {
+                        let w = corners(a, &a.tris[i]);
+                        tested += 1;
+                        if tested > pair_budget {
+                            return true;
+                        }
+                        if !tris_separated(&w, &v, eps) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 thread_local! {
@@ -759,11 +1053,16 @@ fn union_reduce(mut items: Vec<Bounded>) -> Mesh {
                     mesh: Mesh::empty(),
                     lo: 0.0,
                     hi: 0.0,
+                    clean: true,
+                    boxes: Vec::new(),
                 });
+                let boxes = [a.boxes.clone(), b.boxes.clone()].concat();
                 next.push(Bounded {
                     mesh: concat(&a.mesh, &b.mesh),
                     lo: a.lo.max(b.lo),
                     hi: a.hi + b.hi,
+                    clean: false, // these two overlap; that is why they are here
+                    boxes,
                 });
             }
         }
@@ -776,14 +1075,30 @@ fn union_reduce(mut items: Vec<Bounded>) -> Mesh {
     items.into_iter().next().unwrap().mesh
 }
 
+/// A merged node is one solid again, so it needs one entry, not its
+/// operands' several.
+fn whole(m: &Mesh) -> Vec<Part> {
+    match (crate::geom::bounds(m), m.positions.first()) {
+        (Some((lo, hi)), Some(&on)) => vec![Part { lo, hi, on }],
+        _ => Vec::new(),
+    }
+}
+
 fn union_pair(a: Bounded, b: Bounded) -> Merge {
-    // Disjoint operands of a UNION need no boolean at all (see
-    // `boxes_overlap`), and their volumes simply add.
-    if !boxes_overlap(&a.mesh, &b.mesh) {
+    // Operands that share no volume need no boolean at all, and their volumes
+    // simply add. The box test settles it outright for most pairs; where the
+    // boxes overlap but the solids do not, `provably_disjoint` puts the
+    // question to the triangles rather than paying for a BSP whose answer is
+    // already known.
+    if !boxes_overlap(&a.mesh, &b.mesh) || provably_disjoint(&a, &b) {
+        let clean = a.clean && b.clean;
+        let boxes = [a.boxes, b.boxes].concat();
         return Merge::Made(Bounded {
             mesh: concat(&a.mesh, &b.mesh),
             lo: a.lo + b.lo,
             hi: a.hi + b.hi,
+            clean,
+            boxes,
         });
     }
     let (lo, hi) = (a.lo.max(b.lo), a.hi + b.hi);
@@ -809,13 +1124,18 @@ fn union_pair(a: Bounded, b: Bounded) -> Merge {
         // to say what concatenation says exactly. The volume is already
         // measured, so recognising the case is free.
         if got >= hi * (1.0 - DISJOINT_SLACK) {
+            let clean = a.clean && b.clean;
+            let boxes = [a.boxes, b.boxes].concat();
             return Merge::Made(Bounded {
                 mesh: concat(&a.mesh, &b.mesh),
                 lo: a.lo + b.lo,
                 hi: a.hi + b.hi,
+                clean,
+                boxes,
             });
         }
-        return Merge::Made(Bounded { mesh: merged, lo: got, hi: got });
+        let boxes = whole(&merged);
+        return Merge::Made(Bounded { mesh: merged, lo: got, hi: got, clean: true, boxes });
     }
     // A BSP is not symmetric in its operands: the first supplies the planes
     // the second is cut by, so `a ∪ b` and `b ∪ a` are two different
@@ -826,7 +1146,8 @@ fn union_pair(a: Bounded, b: Bounded) -> Merge {
     if holds(&swapped) {
         note_union(false);
         let got = swapped.signed_volume();
-        return Merge::Made(Bounded { mesh: swapped, lo: got, hi: got });
+        let boxes = whole(&swapped);
+        return Merge::Made(Bounded { mesh: swapped, lo: got, hi: got, clean: true, boxes });
     }
     // The warning can only say how many merges failed -- it has no name for
     // the operands and no units, since the reduction runs in the normalised
@@ -1523,6 +1844,69 @@ mod tests {
         let biggest = mixed.iter().map(|m| signed_volume(m)).fold(0.0, f64::max);
         let u = union_all(&mixed);
         assert!(signed_volume(&u) >= biggest * (1.0 - 1e-6), "{} < {biggest}", signed_volume(&u));
+    }
+
+    /// Proving two solids apart without running a boolean.
+    ///
+    /// The whole value is in the sufficient direction: "certainly not
+    /// touching" must never be said of solids that do touch, because the
+    /// answer is then a concatenation that self-intersects. The other
+    /// direction costs only the boolean that would have run anyway.
+    #[test]
+    fn disjointness_is_proved_only_when_it_holds() {
+        let at = |x: f64, y: f64, z: f64, s: f64| {
+            let mut c = geom::cube([s, s, s], true);
+            for p in &mut c.positions {
+                p[0] += x;
+                p[1] += y;
+                p[2] += z;
+            }
+            c
+        };
+        let pair = |a: Mesh, b: Mesh| provably_disjoint(&Bounded::leaf(a), &Bounded::leaf(b));
+
+        // Clear of each other, boxes not even overlapping.
+        assert!(pair(at(0.0, 0.0, 0.0, 1.0), at(5.0, 0.0, 0.0, 1.0)));
+        // Clear of each other, boxes overlapping: two rods crossing at right
+        // angles with a gap between them. This is the case the whole thing
+        // exists for, and bounding boxes cannot see it.
+        let mut rod_x = geom::cube([8.0, 0.5, 0.5], true);
+        let mut rod_y = geom::cube([0.5, 8.0, 0.5], true);
+        for p in &mut rod_y.positions {
+            p[2] += 1.0; // lift it clear
+        }
+        assert!(pair(rod_x.clone(), rod_y.clone()), "crossed rods with a gap are disjoint");
+        // Lower it until they interpenetrate and the proof must fail.
+        for p in &mut rod_y.positions {
+            p[2] -= 0.8;
+        }
+        assert!(!pair(rod_x.clone(), rod_y.clone()), "interpenetrating rods are not disjoint");
+        // Touching EXACTLY, face to face. Not disjoint: concatenating them
+        // would leave the shared face in the mesh twice.
+        for p in &mut rod_x.positions {
+            p[2] += 0.0;
+        }
+        assert!(!pair(at(0.0, 0.0, 0.0, 1.0), at(1.0, 0.0, 0.0, 1.0)), "face contact is contact");
+        // Overlapping by a sliver.
+        assert!(!pair(at(0.0, 0.0, 0.0, 1.0), at(0.999, 0.0, 0.0, 1.0)));
+        // NESTED, with no surfaces touching at all. The surface test alone
+        // would call this disjoint; the containment ray is what catches it.
+        assert!(!pair(at(0.0, 0.0, 0.0, 4.0), at(0.0, 0.0, 0.0, 1.0)), "a box inside a box");
+        // And nested off-centre, so the inner one's box is nowhere near the
+        // outer one's faces.
+        assert!(!pair(at(0.0, 0.0, 0.0, 6.0), at(1.4, 1.4, 1.4, 1.0)));
+
+        // The union itself must agree: crossed rods with a gap add up, and
+        // the nested pair does not.
+        let mut clear = rod_y.clone();
+        for p in &mut clear.positions {
+            p[2] += 3.0;
+        }
+        let u = union_all(&[rod_x.clone(), clear.clone()]);
+        let want = signed_volume(&rod_x) + signed_volume(&clear);
+        assert!((signed_volume(&u) - want).abs() < 1e-9, "{} vs {want}", signed_volume(&u));
+        let u = union_all(&[at(0.0, 0.0, 0.0, 4.0), at(0.0, 0.0, 0.0, 1.0)]);
+        assert!((signed_volume(&u) - 64.0).abs() < 1e-6, "nested union is the outer one: {}", signed_volume(&u));
     }
 
     #[test]
