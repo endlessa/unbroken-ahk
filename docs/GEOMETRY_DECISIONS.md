@@ -315,43 +315,38 @@ cut, and a face that is not simple falls back to a plain fan. Nothing here
 promises a face can always be triangulated without a zero-area piece, and no
 test claims it.
 
-### 2.3 The weld's projection plane: checked, not argued
+### 2.3 The weld's cut: a construction that needs no check
 
-When a triangle is re-cut (§3), which plane to project in is a choice with
-no winner.
+This section used to describe a three-tier scheme for choosing the plane a
+welded triangle is ear-clipped in — cut in Newell's plane, check each piece
+against the triangle's own normal, re-cut in that plane if one disagreed,
+and fall back to a centroid fan if it still did. It is gone, and how it went
+is worth more than the scheme was.
 
-- Newell's normal is the better conditioned for choosing ears. Using the
-  triangle's own instead tripled a gear's boundary-edge residue, 89 to 329.
-- But on a sliver, Newell's area-weighted sum nearly cancels, and a
-  triangulation done in a plane that is not really the face's can come out
-  overlapping itself and wind a piece backwards. A character model grew two
-  inconsistently wound edges that way.
+**Three commits in a row aimed at the same two inconsistently wound edges in
+a lattice hull, each with a diagnosis, and all three were wrong.** The check
+every tier rested on is the thing that cannot work: on a sliver of area
+1e-09 in a 160-unit model, the piece's normal is 1e-09 too, so
+`dot(piece, plane) > 0` can come out true for a piece that is geometrically
+reversed. It is below its own noise floor exactly where it is needed.
 
-Orienting Newell's normal by the triangle's own does NOT fix the second: the
-fault is in the geometry, not the sign — tried, and gnome still came back
-with two flipped edges.
+**Decision: fan the polygon from the triangle's own centroid.** The polygon
+is always a TRIANGLE WITH EXTRA POINTS ON ITS EDGES, so it is convex, its
+centroid is strictly inside it, and a fan from an interior point of a convex
+polygon covers it exactly with every piece taking the polygon's own
+orientation — by construction, not by luck. There is nothing left for an
+ear rule to get wrong, and no check to be below any floor.
 
-Inconsistent winding is much the worse of the two. An edge whose two faces
-run the same way round makes the mesh non-orientable, and every boolean on
-it silently loses geometry; a boundary edge is merely visible.
+That was the argument. The measurement turned out to be the better one: it
+leaves FEWER holes, everywhere (§3). An ear clip can cut a sliver the export
+funnel then drops, reopening the hole the weld had just closed; a fan from
+the centroid cannot, because every piece reaches the middle.
 
-**Decision: measure the outcome instead of choosing.** Cut in Newell's
-plane, check every piece against the triangle's own normal, and cut again in
-that plane only if one disagrees. It costs a cross product per piece on the
-faces that are split at all.
+It costs one interior vertex and n pieces where the ear clip gave n − 2 —
+between 5 and 11 per cent more triangles, and only on faces that are split.
 
-| | Newell | own plane | checked |
-|---|---|---|---|
-| elliptical | 89 / 2 flipped | 329 / 0 | **89 / 0** |
-| gnome | 2,214 / 2 | 2,239 / 0 | **2,213 / 0** |
-| orc | 2,033 / 0 | 2,062 / 0 | **2,013 / 0** |
-| human | 1,459 / 0 | 1,442 / 0 | **1,424 / 0** |
-| elf | 1,380 / 0 | 1,399 / 0 | **1,377 / 0** |
-| city hall | 102 / 0 | 98 / 0 | **98 / 0** |
-
-Every model at or below both fixed choices.
-
----
+Ear clipping remains where it belongs, in `polyhedron` (§2.2), where the
+face is a genuine polygon and not a triangle with points on its edges.
 
 ## 3. T-junctions
 
@@ -372,17 +367,25 @@ vertex of the mesh, and it lies on the edge to within the tolerance below —
 "Unchanged" would be too strong, for the same reason a looser tolerance fails
 two paragraphs down.
 
-| | before | after |
-|---|---|---|
-| heart | 24,289 | 1,130 |
-| orc | 19,145 | 2,013 |
-| human | 16,557 | 1,424 |
-| gnome | 19,801 | 2,213 |
-| elf | 16,869 | 1,377 |
-| city hall | 6,753 | 98 |
-| elliptical | 2,332 | 89 |
-| two spheres | 15,919 | 190 |
-| the two boxes above | 12 | 0 (28 triangles instead of 24) |
+| | before the weld | ear clip | centroid fan |
+|---|---|---|---|
+| heart | 24,289 | 1,130 | **0** |
+| human | 16,557 | 1,424 | 495 |
+| elliptical | 2,332 | 89 | 36 |
+| gnome | 19,801 | 2,213 | 880 |
+| f2_sounding | 66,301 | 357 | 237 |
+| f1_lattice | 287,709 | 9,499 | 7,143 |
+| orc | 19,145 | 2,013 | — |
+| elf | 16,869 | 1,377 | — |
+| city hall | 6,753 | 98 | — |
+| two spheres | 15,919 | 190 | — |
+| the two boxes above | 12 | 0 | — |
+
+The heart is the one to look at: eleven interpenetrating shells, the model
+that motivated the union's volume bounds in the first place, now exports
+closed, consistently wound, and with no T-junctions at all. (Dashes are
+models measured before the fan landed and not re-run; the ear-clip column is
+the last figure taken for them.)
 
 ### The tolerance was swept, not chosen
 
@@ -457,6 +460,24 @@ what three speculative repairs could not. The OFF export is closed.
 **The lesson, recorded because it will recur: when a mesh is closed on the
 way out of the modeller and open in the file, suspect the writer before the
 geometry.**
+
+### 4.2a And it recurred immediately, on a much larger scale
+
+A lattice hull reports 9,499 boundary edges and 2 inconsistently wound edges
+through a binary STL. Exported to OFF and welded by coordinate, the same
+mesh has **zero** inconsistently wound edges and 2,564 boundary edges.
+
+So both flipped edges and roughly three quarters of the holes are f32
+rounding at export, not geometry: two distinct slivers of area 1e-09 round
+onto the same f32 triangle, and a triangle that appears twice in the same
+cyclic order makes every one of its directed edges look inconsistently
+wound.
+
+This was not applied for three commits. §2.3 chased those two edges into the
+triangulator three times with three different diagnoses, each wrong, when
+one export to a finer grid would have settled it. **Anything measured off a
+binary STL at this scale is measuring the file as much as the model**, and
+the residue analysis of §8.1 should be read with that in mind.
 
 ### 4.3 Say so
 
@@ -587,7 +608,12 @@ Written down rather than guessed at.
 
 ### 8.1 The residue after welding is not T-junctions
 
-On the elliptical gear's 89 remaining open edges, 39 of the first 40 have
+Measured on the elliptical gear, whose extent is 139.6 — so its f32 step is
+1.7e-05 and the offsets below are a hundred to a hundred thousand times
+that, which is what makes them geometry rather than the file. (§4.2a is the
+warning: the same analysis on a lattice hull would have been measuring f32.)
+
+Of the 89 open edges it had under the ear clip, 39 of the first 40 have
 another vertex in their interior — offset from the edge by 8.9e-6 to 4.9e-2
 of the model extent, median 2.1e-4. Those are not points ON an edge. They
 are points the BSP MEANT to put on an edge and missed, which makes them
@@ -692,6 +718,15 @@ recur.
   `UNION_SLACK`, an operand-swap retry and a concatenate-and-warn fallback,
   and real models still defeat it. A document opening with "remove the
   tolerance" has to say which tolerance. §1.1a and §1.1b now do.
+
+Since the audit, a fourth failure of the same kind, and this one was mine
+alone: three successive commits diagnosed two inconsistently wound edges as
+a triangulation fault, each with a different mechanism, each stated in its
+commit message as unverified, and each wrong. The edges were an f32 export
+artifact (§4.2a). The document had already recorded the lesson that would
+have caught it — §4.2's "suspect the writer before the geometry" — and I did
+not apply my own note. Writing something down is not the same as having
+learned it.
 
 The audit also confirmed about two thirds of the numbers by re-running them,
 several to every digit printed. That is the useful part of the result and
