@@ -361,3 +361,313 @@ mod tests {
         assert!(inflate(&[], None).is_none());
     }
 }
+
+// ===================================================================
+//  COMPRESSION (RFC 1951, block type 1 — fixed Huffman)
+//
+//  Only as much as a PNG needs, which is one stream of fixed-Huffman
+//  blocks with LZ77 back-references. Dynamic Huffman would compress
+//  better and costs a code-length tree, two more Huffman tables and a
+//  second pass; fixed codes are in the RFC as constants and need none of
+//  that, and on rendered images the win from matching runs of identical
+//  filtered bytes dwarfs the win from optimal symbol codes.
+//
+//  It is checked against `inflate` above rather than against a reference
+//  library: the decoder was written first, from the RFC, and a stream the
+//  decoder reproduces byte for byte is a correct stream whatever wrote it.
+// ===================================================================
+
+/// The length codes 257..=285: (code, extra bits, smallest length coded).
+const LENGTH_CODES: [(u16, u32, u16); 29] = [
+    (257, 0, 3),
+    (258, 0, 4),
+    (259, 0, 5),
+    (260, 0, 6),
+    (261, 0, 7),
+    (262, 0, 8),
+    (263, 0, 9),
+    (264, 0, 10),
+    (265, 1, 11),
+    (266, 1, 13),
+    (267, 1, 15),
+    (268, 1, 17),
+    (269, 2, 19),
+    (270, 2, 23),
+    (271, 2, 27),
+    (272, 2, 31),
+    (273, 3, 35),
+    (274, 3, 43),
+    (275, 3, 51),
+    (276, 3, 59),
+    (277, 4, 67),
+    (278, 4, 83),
+    (279, 4, 99),
+    (280, 4, 115),
+    (281, 5, 131),
+    (282, 5, 163),
+    (283, 5, 195),
+    (284, 5, 227),
+    (285, 0, 258),
+];
+
+/// The distance codes 0..=29: (extra bits, smallest distance coded).
+const DIST_CODES: [(u32, u16); 30] = [
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (0, 4),
+    (1, 5),
+    (1, 7),
+    (2, 9),
+    (2, 13),
+    (3, 17),
+    (3, 25),
+    (4, 33),
+    (4, 49),
+    (5, 65),
+    (5, 97),
+    (6, 129),
+    (6, 193),
+    (7, 257),
+    (7, 385),
+    (8, 513),
+    (8, 769),
+    (9, 1025),
+    (9, 1537),
+    (10, 2049),
+    (10, 3073),
+    (11, 4097),
+    (11, 6145),
+    (12, 8193),
+    (12, 12289),
+    (13, 16385),
+    (13, 24577),
+];
+
+struct BitWriter {
+    out: Vec<u8>,
+    acc: u32,
+    n: u32,
+}
+
+impl BitWriter {
+    fn new() -> BitWriter {
+        BitWriter { out: Vec::new(), acc: 0, n: 0 }
+    }
+    /// `bits` of `v`, LSB first — how the stream itself is packed.
+    fn put(&mut self, v: u32, bits: u32) {
+        self.acc |= v << self.n;
+        self.n += bits;
+        while self.n >= 8 {
+            self.out.push((self.acc & 0xff) as u8);
+            self.acc >>= 8;
+            self.n -= 8;
+        }
+    }
+    /// A Huffman code, MSB first — the one place the order reverses, and
+    /// the reason a decoder reading bit by bit finds the tree.
+    fn put_code(&mut self, code: u32, bits: u32) {
+        for i in (0..bits).rev() {
+            self.put((code >> i) & 1, 1);
+        }
+    }
+    fn finish(mut self) -> Vec<u8> {
+        if self.n > 0 {
+            self.out.push((self.acc & 0xff) as u8);
+        }
+        self.out
+    }
+}
+
+/// Emit one literal/length symbol in the fixed code.
+fn put_litlen(w: &mut BitWriter, sym: u16) {
+    match sym {
+        0..=143 => w.put_code(0x30 + sym as u32, 8),
+        144..=255 => w.put_code(0x190 + (sym as u32 - 144), 9),
+        256..=279 => w.put_code(sym as u32 - 256, 7),
+        _ => w.put_code(0xc0 + (sym as u32 - 280), 8),
+    }
+}
+
+const MIN_MATCH: usize = 3;
+const MAX_MATCH: usize = 258;
+const WINDOW: usize = 32768;
+const HASH_BITS: usize = 15;
+const CHAIN: usize = 32;
+
+/// Compress with DEFLATE, fixed Huffman, LZ77 over a 32 KiB window.
+pub fn deflate(data: &[u8]) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.put(1, 1); // final block
+    w.put(1, 2); // type 1, fixed Huffman
+
+    // A hash of three bytes to the most recent position that started with
+    // them, and a chain of earlier positions from each. Greedy, shortest
+    // useful chain: this is a compressor for pictures of machine parts, not
+    // an archiver.
+    let mut head = vec![u32::MAX; 1 << HASH_BITS];
+    let mut prev = vec![u32::MAX; data.len().max(1)];
+    let hash = |d: &[u8], i: usize| -> usize {
+        ((d[i] as usize) << 10 ^ (d[i + 1] as usize) << 5 ^ d[i + 2] as usize) & ((1 << HASH_BITS) - 1)
+    };
+
+    let mut i = 0usize;
+    while i < data.len() {
+        let mut best_len = 0usize;
+        let mut best_dist = 0usize;
+        if i + MIN_MATCH <= data.len() {
+            let h = hash(data, i);
+            let mut cand = head[h];
+            let limit = i.saturating_sub(WINDOW);
+            let mut tries = CHAIN;
+            while cand != u32::MAX && (cand as usize) >= limit && tries > 0 {
+                let c = cand as usize;
+                let max = MAX_MATCH.min(data.len() - i);
+                let mut l = 0;
+                while l < max && data[c + l] == data[i + l] {
+                    l += 1;
+                }
+                if l > best_len {
+                    best_len = l;
+                    best_dist = i - c;
+                    if l == max {
+                        break;
+                    }
+                }
+                cand = prev[c];
+                tries -= 1;
+            }
+        }
+        // A three-byte match costs about 24 bits and saves three literals,
+        // so a distant one is not worth its distance code; take the literal.
+        let take = best_len >= MIN_MATCH && !(best_len == 3 && best_dist > 4096);
+        let step = if take { best_len } else { 1 };
+
+        // Register exactly the positions this step CONSUMES, and only after
+        // the decision is made. Registering the match's whole span and then
+        // rejecting the match left positions ahead of `i` in the chains, so
+        // the next round found itself there and computed a distance of zero,
+        // which is not a distance DEFLATE can encode. It showed on
+        // incompressible input, where rejected three-byte matches are common
+        // and matches worth taking are not.
+        for k in 0..step {
+            if i + k + MIN_MATCH <= data.len() {
+                let hh = hash(data, i + k);
+                prev[i + k] = head[hh];
+                head[hh] = (i + k) as u32;
+            }
+        }
+
+        if take {
+            let (code, extra, base) =
+                *LENGTH_CODES.iter().rev().find(|(_, _, b)| *b as usize <= best_len).unwrap();
+            put_litlen(&mut w, code);
+            if extra > 0 {
+                w.put((best_len as u32) - base as u32, extra);
+            }
+            let dcode =
+                DIST_CODES.iter().rposition(|(_, b)| *b as usize <= best_dist).unwrap();
+            let (dextra, dbase) = DIST_CODES[dcode];
+            w.put_code(dcode as u32, 5);
+            if dextra > 0 {
+                w.put((best_dist as u32) - dbase as u32, dextra);
+            }
+        } else {
+            put_litlen(&mut w, data[i] as u16);
+        }
+        i += step;
+    }
+    put_litlen(&mut w, 256); // end of block
+    w.finish()
+}
+
+/// Adler-32, the checksum a zlib stream carries.
+pub fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in data {
+        a = (a + x as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+/// Wrap a DEFLATE stream in the zlib envelope PNG asks for.
+pub fn zlib(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01]; // deflate, 32K window, no preset dictionary
+    out.extend(deflate(data));
+    out.extend(adler32(data).to_be_bytes());
+    out
+}
+
+#[cfg(test)]
+mod compress_tests {
+    use super::*;
+
+    /// The compressor is checked against this file's own decompressor, and
+    /// that is a real check rather than a circular one: the decoder was
+    /// written first, from RFC 1951, to read `.3mf` files produced by other
+    /// programs. A stream it reproduces byte for byte is a conforming stream
+    /// whatever wrote it.
+    fn roundtrip(data: &[u8]) {
+        let packed = deflate(data);
+        let back = inflate(&packed, Some(data.len()))
+            .unwrap_or_else(|| panic!("inflate refused {} bytes of output", data.len()));
+        assert_eq!(back.len(), data.len(), "length");
+        assert!(back == data, "content differs");
+    }
+
+    #[test]
+    fn deflate_streams_read_back_through_our_own_inflate() {
+        roundtrip(b"");
+        roundtrip(b"a");
+        roundtrip(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        roundtrip(b"the quick brown fox jumps over the lazy dog");
+        // Every byte value, so the 8-bit and 9-bit halves of the fixed
+        // literal code are both exercised.
+        let all: Vec<u8> = (0..=255u8).collect();
+        roundtrip(&all);
+        // A long repeat, which is what a rendered image's background is and
+        // the only reason this compresses at all.
+        roundtrip(&vec![0u8; 100_000]);
+        // Matches at every distance class, built by repeating a block of
+        // growing size so back-references of many lengths occur.
+        let mut grow = Vec::new();
+        for n in 1..300usize {
+            let chunk: Vec<u8> = (0..n).map(|i| (i * 31 % 251) as u8).collect();
+            grow.extend(&chunk);
+            grow.extend(&chunk);
+        }
+        roundtrip(&grow);
+        // Something incompressible: a stream where matching never pays.
+        let mut x = 0u32;
+        let noise: Vec<u8> = (0..50_000)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect();
+        roundtrip(&noise);
+    }
+
+    #[test]
+    fn a_run_of_one_byte_compresses_to_almost_nothing() {
+        // The property the PNG writer depends on. Without it an image of a
+        // machine part on a flat background would be written at full size.
+        let flat = vec![7u8; 200_000];
+        let packed = deflate(&flat);
+        assert!(packed.len() < flat.len() / 100, "200 KB of one byte became {}", packed.len());
+    }
+
+    #[test]
+    fn the_zlib_envelope_carries_a_correct_adler32() {
+        // Adler-32 of "abc" is 0x024d0127, which the RFC gives as its worked
+        // example.
+        assert_eq!(adler32(b"abc"), 0x024d_0127);
+        let z = zlib(b"hello hello hello hello");
+        assert_eq!(&z[..2], &[0x78, 0x01]);
+        let n = z.len();
+        let carried = u32::from_be_bytes([z[n - 4], z[n - 3], z[n - 2], z[n - 1]]);
+        assert_eq!(carried, adler32(b"hello hello hello hello"));
+        assert_eq!(inflate(&z[2..n - 4], None).unwrap(), b"hello hello hello hello");
+    }
+}
