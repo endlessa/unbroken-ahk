@@ -233,15 +233,13 @@
 
 use <spherical_gear.scad>
 
-// ---- the contract ---------------------------------------------------
-ROW  = sg_row(0);                       // ["row 1", Nr, D, Np, k]
-NR_  = ROW[1];  D = ROW[2];  NP_ = ROW[3];  K = ROW[4];
-NS_  = sg_ns();  M = sg_m();  PHI = sg_phi();  JT = sg_jt();
-
-GS = asin(NS_/D);   GP = asin(NP_/D);   GR = asin(NR_/D);
-BETA = GS + GP;                                             // (2)
-TA = sg_ta(D);      TF = sg_tf(D);
-LO = D*M/2;                                                 // cone distance
+// ---- which row this file BUILDS -------------------------------------
+// Every derived number below is a FUNCTION of the row index, because the
+// stack needs all four rows in one model and a stack cannot override a
+// used file's variables.  SL_I only picks which row this file draws and
+// reports on; it is a Customizer parameter, so `-D SL_I=3` builds the
+// equator row instead.
+SL_I = 0;
 
 // ---- design choices made HERE, not read from the table --------------
 SL_F     = 0.25;   // face width as a fraction of cone distance, so the
@@ -258,47 +256,111 @@ SL_NRV   = 120;    // facets per revolution, revolved carrier bodies
 SL_NRP   = 48;     // facets per revolution, pins
 SL_ARC   = 1.2;    // degrees per sample on a constant-radius profile edge
 
-LI = LO*(1 - SL_F);                 // inner cone distance
-LM = (LI + LO)/2;                   // mean cone distance
+// ---- the contract, per row ------------------------------------------
+function sl_rowv(i) = sg_row(i);        // ["row n", Nr, D, Np, k]
+function sl_nr(i)   = sg_row(i)[1];
+function sl_dd(i)   = sg_row(i)[2];     // D, the cone-distance scale
+function sl_np(i)   = sg_row(i)[3];
+function sl_k(i)    = sg_row(i)[4];
+
+function sl_gs(i)   = asin(sg_ns()/sl_dd(i));                      // (1)
+function sl_gp(i)   = asin(sl_np(i)/sl_dd(i));
+function sl_gr(i)   = asin(sl_nr(i)/sl_dd(i));
+function sl_beta(i) = sl_gs(i) + sl_gp(i);                         // (2)
+function sl_ta(i)   = sg_ta(sl_dd(i));
+function sl_tf(i)   = sg_tf(sl_dd(i));
+function sl_lo(i)   = sl_dd(i)*sg_m()/2;    // cone distance
+function sl_li(i)   = sl_lo(i)*(1 - SL_F);  // inner cone distance
+function sl_lm(i)   = (sl_li(i) + sl_lo(i))/2;
 
 // ---- the library's back cone rule, reproduced and then checked ------
-function sl_ghub(g, ext) = ext ? max(0.25*g, g - TF - 2.5*(TA+TF))   // (14)
-                               : g + TF + 2.5*(TA+TF);
-GHS = sl_ghub(GS, true);            // sun bore
-GHP = sl_ghub(GP, true);            // planet bore
-GHR = sl_ghub(GR, false);           // ring back cone
+function sl_ghub(g, ext, i) =
+  ext ? max(0.25*g, g - sl_tf(i) - 2.5*(sl_ta(i)+sl_tf(i)))         // (14)
+      : g + sl_tf(i) + 2.5*(sl_ta(i)+sl_tf(i));
+function sl_ghs(i) = sl_ghub(sl_gs(i), true,  i);   // sun bore
+function sl_ghp(i) = sl_ghub(sl_gp(i), true,  i);   // planet bore
+function sl_ghr(i) = sl_ghub(sl_gr(i), false, i);   // ring back cone
 
 // ---- carrier, in (cone distance, colatitude) ------------------------
-GJ    = GHS - deg(SL_CJ/LM);        // sun journal cone
-GHI   = GJ  - deg(SL_THUB/LM);      // carrier hub bore cone
-GPIN  = GHP - deg(SL_CP/LM);        // planet pin cone
-GBORE = GPIN/3;                     // pin lightening / oil bore
+function sl_gj(i)    = sl_ghs(i) - deg(SL_CJ/sl_lm(i));   // sun journal cone
+function sl_ghi(i)   = sl_gj(i)  - deg(SL_THUB/sl_lm(i)); // hub bore cone
+function sl_gpin(i)  = sl_ghp(i) - deg(SL_CP/sl_lm(i));   // planet pin cone
+function sl_gbore(i) = sl_gpin(i)/3;                      // oil bore
+function sl_grim0(i) = sl_beta(i) - 2*sl_gpin(i);         // boss band, inner
+function sl_grim1(i) = sl_beta(i) + 2*sl_gpin(i);         // boss band, outer
 
-GRIM0 = BETA - 2*GPIN;              // pin boss band, inner edge
-GRIM1 = BETA + 2*GPIN;              // pin boss band, outer edge
+function sl_rw1(i)   = sl_li(i) - SL_CA;       // web outer face (a thrust face)
+function sl_rw0(i)   = sl_rw1(i) - SL_TWEB;    // web inner face
+function sl_rr0(i)   = sl_rw0(i) - SL_TBOSS;   // boss band inner face
+function sl_r0(i)    = sl_rr0(i);              // carrier inboard face
+function sl_rhub1(i) = sl_lo(i) + SL_CA;       // hub outboard end
+function sl_rpin0(i) = sl_rw1(i) + SL_CS;      // pin seated end
+function sl_rpin1(i) = sl_lo(i) + SL_CA - SL_CS;   // pin outer end
+function sl_rret0(i) = sl_lo(i) + SL_CA;       // retainer inner face (thrust)
+function sl_rret1(i) = sl_rret0(i) + SL_TRET;  // retainer outer face
 
-RW1   = LI - SL_CA;                 // web outer face (a thrust face)
-RW0   = RW1 - SL_TWEB;              // web inner face
-RR0   = RW0 - SL_TBOSS;             // boss band inner face
-R0    = RR0;                        // carrier inboard face
-RHUB1 = LO + SL_CA;                 // hub outboard end
-RPIN0 = RW1 + SL_CS;                // pin seated end
-RPIN1 = LO + SL_CA - SL_CS;         // pin outer end
-RRET0 = LO + SL_CA;                 // retainer inner face (a thrust face)
-RRET1 = RRET0 + SL_TRET;            // retainer outer face
+// ---- where the row sits on the polar axis ---------------------------
+// The row's ring pitch circle IS a latitude circle of the fundamental
+// sphere: Nr = Dref sin(colat), and that circle's radius Nr m/2 equals
+// R sin(colat) either way you compute it.  The row's own apex frame puts
+// the circle at z = L cos(gamma_r) above the apex, so
+//
+//     z_apex = R cos(colat) - L cos(gamma_r),
+//     colat  = asin(Nr/Dref)                                     (15)
+//
+// and the equator row, where gamma_r = colat = 90, has its apex ON the
+// sphere centre.  Every other apex lies further up the axis.  That is
+// the per-slice apex the contract's section 4 says a stack forces
+// anyway, and (15) is where each one goes: one shaft, one sun count,
+// one sun pitch diameter, stepped cones.
+function sl_colat(i) = asin(sl_nr(i)/sg_dref());
+function sl_apex(i)  = sg_r()*cos(sl_colat(i)) - sl_lo(i)*cos(sl_gr(i));
+
+// ---- published so a stack can place a row without restating anything
+function sl_if_apex(i)  = sl_apex(i);            // 1 z of the apex, mm
+function sl_if_colat(i) = sl_colat(i);           // 2 the ring's latitude
+function sl_if_beta(i)  = sl_beta(i);            // 3 the planet axis cone
+function sl_if_cone(i)  = [sl_li(i), sl_lo(i)];  // 4 inner, outer cone dist
+function sl_if_ring(i)  = [sl_gr(i), sl_ghr(i), sl_clock(i)];
+                                     // 5 ring pitch cone, back cone, clocking
+function sl_if_carrier(i) = [sl_r0(i), sl_rret1(i), sl_ghi(i), sl_grim1(i)];
+                                     // 6 the carrier's own extent
+function sl_if_sun(i)   = [sl_gs(i), sl_ghs(i), sl_gj(i)];
+                                     // 7 sun pitch cone, bore, journal
+
+// ---- the row SL_I, which is what this file draws and reports on -----
+ROW  = sl_rowv(SL_I);
+NR_  = sl_nr(SL_I);  D = sl_dd(SL_I);  NP_ = sl_np(SL_I);  K = sl_k(SL_I);
+NS_  = sg_ns();  M = sg_m();  PHI = sg_phi();  JT = sg_jt();
+
+GS = sl_gs(SL_I);  GP = sl_gp(SL_I);  GR = sl_gr(SL_I);
+BETA = sl_beta(SL_I);
+TA = sl_ta(SL_I);  TF = sl_tf(SL_I);
+LO = sl_lo(SL_I);  LI = sl_li(SL_I);  LM = sl_lm(SL_I);
+GHS = sl_ghs(SL_I);  GHP = sl_ghp(SL_I);  GHR = sl_ghr(SL_I);
+GJ = sl_gj(SL_I);  GHI = sl_ghi(SL_I);
+GPIN = sl_gpin(SL_I);  GBORE = sl_gbore(SL_I);
+GRIM0 = sl_grim0(SL_I);  GRIM1 = sl_grim1(SL_I);
+RW1 = sl_rw1(SL_I);  RW0 = sl_rw0(SL_I);  RR0 = sl_rr0(SL_I);  R0 = sl_r0(SL_I);
+RHUB1 = sl_rhub1(SL_I);  RPIN0 = sl_rpin0(SL_I);  RPIN1 = sl_rpin1(SL_I);
+RRET0 = sl_rret0(SL_I);  RRET1 = sl_rret1(SL_I);
 
 // ---- phasing --------------------------------------------------------
-function sl_frac(x)     = x - floor(x);
-function sl_phase(i)    = (360/NP_)*sl_frac(NS_*i/K + (NP_-1)/2);       // (6)
-function sl_phase_rat(i)= 360*((NS_*i) % K)/(K*NP_);                    // (7)
-function sl_clock()     = (360/NR_)*sl_frac((NP_-2)/2);                 // (10)
+function sl_frac(x)        = x - floor(x);
+function sl_phase(j, i)    = (360/sl_np(i))
+                             *sl_frac(sg_ns()*j/sl_k(i) + (sl_np(i)-1)/2); // (6)
+function sl_phase_rat(j,i) = 360*((sg_ns()*j) % sl_k(i))/(sl_k(i)*sl_np(i));
+                                                                          // (7)
+function sl_clock(i)       = (360/sl_nr(i))*sl_frac((sl_np(i)-2)/2);      // (10)
 
 // ---- small vector helpers -------------------------------------------
 function rz(v,a) = [v[0]*cos(a) - v[1]*sin(a), v[0]*sin(a) + v[1]*cos(a), v[2]];
 function ry(v,a) = [v[0]*cos(a) + v[2]*sin(a), v[1], -v[0]*sin(a) + v[2]*cos(a)];
 // planet i's frame <-> world
-function to_world(u,i)  = rz(ry(rz(u, sl_phase(i)), BETA), 360*i/K);
-function to_planet(u,i) = rz(ry(rz(u, -360*i/K), -BETA), -sl_phase(i));
+function to_world(u,j,i)  = rz(ry(rz(u, sl_phase(j,i)), sl_beta(i)),
+                               360*j/sl_k(i));
+function to_planet(u,j,i) = rz(ry(rz(u, -360*j/sl_k(i)), -sl_beta(i)),
+                               -sl_phase(j,i));
 function colat(u) = acos(max(-1, min(1, u[2])));
 function azim(u)  = atan2(u[1], u[0]);
 function wrapc(x,P) = ((x + P/2) % P + P) % P - P/2;   // to [-P/2, P/2)
@@ -347,28 +409,31 @@ function sl_wedge(r0,r1,G0,G1) = 2*PI*(cos(G0)-cos(G1))*(r1*r1*r1 - r0*r0*r0)/3;
 //  A whole member: N teeth all the way round, one polyhedron, apex at
 //  the origin, axis on +z, clocked by alpha.
 // ===================================================================
-module sl_member(N, ext, alpha = 0) {
-    g  = asin(N/D);  gb = sg_gb(g, PHI);
-    ht = sg_ht(N, JT*M, M);
-    Gh = sl_ghub(g, ext);
-    b0 = [ for (j=[0:N-1]) each (ext ? sg_tooth_e(j,N,g,gb,ht,TA,TF)
-                                     : sg_tooth_i(j,N,g,gb,ht,TA,TF)) ];
+module sl_member(ri, N, ext, alpha = 0) {
+    g  = asin(N/sl_dd(ri));  gb = sg_gb(g, sg_phi());
+    ht = sg_ht(N, sg_jt()*sg_m(), sg_m());
+    Gh = sl_ghub(g, ext, ri);
+    ta = sl_ta(ri);  tf = sl_tf(ri);  lo = sl_lo(ri);  li = sl_li(ri);
+    b0 = [ for (j=[0:N-1]) each (ext ? sg_tooth_e(j,N,g,gb,ht,ta,tf)
+                                     : sg_tooth_i(j,N,g,gb,ht,ta,tf)) ];
     // the triad (d_i, d_j, d_k) has to stay right handed, and d_j flips
     // between an external and an internal member, so the internal
     // boundary is walked the other way round.
-    b  = ext ? b0 : [ for (i=[len(b0)-1:-1:0]) b0[i] ];
+    b  = ext ? b0 : [ for (q=[len(b0)-1:-1:0]) b0[q] ];
     rotate([0,0,alpha])
       sl_tube([ for (p = b)
-                  [ sg_xyz(p[0], p[1], LO), sg_xyz(p[0], p[1], LI),
-                    sg_xyz(Gh,   p[1], LI), sg_xyz(Gh,   p[1], LO) ] ]);
+                  [ sg_xyz(p[0], p[1], lo), sg_xyz(p[0], p[1], li),
+                    sg_xyz(Gh,   p[1], li), sg_xyz(Gh,   p[1], lo) ] ]);
 }
 
 // the member's boundary as unit directions, for the interference test
-function sl_dirs(N, ext, alpha) =
-  let( g = asin(N/D), gb = sg_gb(g, PHI), ht = sg_ht(N, JT*M, M) )
+function sl_dirs(ri, N, ext, alpha) =
+  let( g = asin(N/sl_dd(ri)), gb = sg_gb(g, sg_phi()),
+       ht = sg_ht(N, sg_jt()*sg_m(), sg_m()),
+       ta = sl_ta(ri), tf = sl_tf(ri) )
     [ for (j=[0:N-1])
-        each [ for (p = (ext ? sg_tooth_e(j,N,g,gb,ht,TA,TF)
-                             : sg_tooth_i(j,N,g,gb,ht,TA,TF)))
+        each [ for (p = (ext ? sg_tooth_e(j,N,g,gb,ht,ta,tf)
+                             : sg_tooth_i(j,N,g,gb,ht,ta,tf)))
                  sg_xyz(p[0], p[1] + alpha, 1) ] ];
 
 // ===================================================================
@@ -377,21 +442,26 @@ function sl_dirs(N, ext, alpha) =
 // hub, web and pin boss band are one body of revolution: a conical
 // sleeve carrying the sun, a spherical web, and a deeper band under
 // the seven pins.
-CARRIER = [ [R0,    GHI  ], [RHUB1, GHI  ], [RHUB1, GJ   ], [RW1,  GJ   ],
-            [RW1,   GRIM1], [RR0,   GRIM1], [RR0,   GRIM0], [RW0,  GRIM0],
-            [RW0,   GJ   ], [R0,    GJ   ] ];
-module sl_carrier_body() { sl_revolve(CARRIER, SL_NRV); }
+function sl_carrier(ri) =
+  [ [sl_r0(ri),    sl_ghi(ri)  ], [sl_rhub1(ri), sl_ghi(ri)  ],
+    [sl_rhub1(ri), sl_gj(ri)   ], [sl_rw1(ri),   sl_gj(ri)   ],
+    [sl_rw1(ri),   sl_grim1(ri)], [sl_rr0(ri),   sl_grim1(ri)],
+    [sl_rr0(ri),   sl_grim0(ri)], [sl_rw0(ri),   sl_grim0(ri)],
+    [sl_rw0(ri),   sl_gj(ri)   ], [sl_r0(ri),    sl_gj(ri)   ] ];
+module sl_carrier_body(ri) { sl_revolve(sl_carrier(ri), SL_NRV); }
 
 // one planet pin: a conical journal with an oil bore up the middle
-module sl_pin() {
-    sl_revolve([ [RPIN0, GBORE], [RPIN1, GBORE],
-                 [RPIN1, GPIN ], [RPIN0, GPIN ] ], SL_NRP);
+module sl_pin(ri) {
+    sl_revolve([ [sl_rpin0(ri), sl_gbore(ri)], [sl_rpin1(ri), sl_gbore(ri)],
+                 [sl_rpin1(ri), sl_gpin(ri) ], [sl_rpin0(ri), sl_gpin(ri) ] ],
+               SL_NRP);
 }
 
-// the retainer band that ties the seven pin ends together
-module sl_retainer() {
-    sl_revolve([ [RRET0, GRIM0], [RRET1, GRIM0],
-                 [RRET1, GRIM1], [RRET0, GRIM1] ], SL_NRV);
+// the retainer band that ties the pin ends together
+module sl_retainer(ri) {
+    sl_revolve([ [sl_rret0(ri), sl_grim0(ri)], [sl_rret1(ri), sl_grim0(ri)],
+                 [sl_rret1(ri), sl_grim1(ri)], [sl_rret0(ri), sl_grim1(ri)] ],
+               SL_NRV);
 }
 
 // ===================================================================
@@ -401,26 +471,28 @@ module sl_retainer() {
 //  lands in the other member's root annulus returns -BIG.
 // ===================================================================
 BIG = 1e6;
-function sl_cl_e(u, N, alpha) =
-  let( g = asin(N/D), gb = sg_gb(g,PHI), ht = sg_ht(N, JT*M, M),
-       Gf = g - TF, Ga = g + TA, Gh = sl_ghub(g, true),
+function sl_cl_e(ri, u, N, alpha) =
+  let( g = asin(N/sl_dd(ri)), gb = sg_gb(g,sg_phi()),
+       ht = sg_ht(N, sg_jt()*sg_m(), sg_m()),
+       Gf = g - sl_tf(ri), Ga = g + sl_ta(ri), Gh = sl_ghub(g, true, ri),
        G = colat(u), d = wrapc(azim(u) - alpha, 360/N) )
     (G < Gh || G > Ga) ? BIG : (G <= Gf) ? -BIG
                              : abs(d) - max(0, sg_hw_e(G,g,gb,ht));
-function sl_cl_i(u, N, alpha) =
-  let( g = asin(N/D), gb = sg_gb(g,PHI), ht = sg_ht(N, JT*M, M),
-       Gf = g + TF, Ga = g - TA, Gh = sl_ghub(g, false),
+function sl_cl_i(ri, u, N, alpha) =
+  let( g = asin(N/sl_dd(ri)), gb = sg_gb(g,sg_phi()),
+       ht = sg_ht(N, sg_jt()*sg_m(), sg_m()),
+       Gf = g + sl_tf(ri), Ga = g - sl_ta(ri), Gh = sl_ghub(g, false, ri),
        G = colat(u), d = wrapc(azim(u) - alpha, 360/N) )
     (G > Gh || G < Ga) ? BIG : (G >= Gf) ? -BIG
                              : abs(d) - max(0, sg_hw_i(G,g,gb,ht));
 function sl_engaged(v) = len([ for (x = v) if (x < BIG) 1 ]);
 
-SUN_D  = sl_dirs(NS_, true,  0);
-PLAN_D = sl_dirs(NP_, true,  0);
-RING_D = sl_dirs(NR_, false, sl_clock());
+SUN_D  = sl_dirs(SL_I, NS_, true,  0);
+PLAN_D = sl_dirs(SL_I, NP_, true,  0);
+RING_D = sl_dirs(SL_I, NR_, false, sl_clock(SL_I));
 
 // arc at the outer pitch circle subtended by an azimuthal clearance
-function sl_arc(cldeg, g) = rad(cldeg)*LO*sin(g);
+function sl_arc(ri, cldeg, g) = rad(cldeg)*sl_lo(ri)*sin(g);
 
 // ===================================================================
 //  REPORT
@@ -469,15 +541,15 @@ for (i = [0:K-1])
   echo(str("   planet ", i, "  Psi = ", 360*i/K,
            "   (Ns i) mod k = ", (NS_*i) % K,
            "   ph = 360*", (NS_*i) % K, "/(", K, "*", NP_, ") = ",
-           sl_phase_rat(i), " deg   (6) gives ", sl_phase(i),
-           "   difference ", sl_phase(i) - sl_phase_rat(i)));
+           sl_phase_rat(i,SL_I), " deg   (6) gives ", sl_phase(i,SL_I),
+           "   difference ", sl_phase(i,SL_I) - sl_phase_rat(i,SL_I)));
 echo(str("   (Np-1)/2 = ", (NP_-1)/2, ", a whole number of pitches, which is",
          " why (6) collapses to (7); frac((Np-1)/2) = ", sl_frac((NP_-1)/2),
          ";  the phases are the ", K, " multiples of 360/(k Np) = 360/", K*NP_,
          " = ", 360/(K*NP_), " deg, in the order ",
          [ for (i=[0:K-1]) (NS_*i) % K ]));
-echo(str("ring clocking (10): alpha_r = ", sl_clock(), " deg = 180/", NR_,
-         " = ", 180/NR_, "   Nr alpha_r/360 = ", NR_*sl_clock()/360,
+echo(str("ring clocking (10): alpha_r = ", sl_clock(SL_I), " deg = 180/", NR_,
+         " = ", 180/NR_, "   Nr alpha_r/360 = ", NR_*sl_clock(SL_I)/360,
          "   against 1/2 = ", 0.5));
 
 echo("--- the two mesh rays, in the planet's own frame ---");
@@ -491,21 +563,22 @@ echo(str("   ring-planet ray at colat ", GR, ": angle to the planet axis = ",
          azim(ry(RAY_R, -BETA))));
 
 echo("--- back cone rule (14) checked against the library ---");
-module sl_omega_check(N, ext, label) {
-    g = asin(N/D); gb = sg_gb(g,PHI); ht = sg_ht(N, JT*M, M);
-    Gh = sl_ghub(g, ext);
-    b  = sg_boundary(N, N, g, gb, ht, TA, TF, ext);
+module sl_omega_check(ri, N, ext, label) {
+    g = asin(N/sl_dd(ri)); gb = sg_gb(g,sg_phi());
+    ht = sg_ht(N, sg_jt()*sg_m(), sg_m());
+    Gh = sl_ghub(g, ext, ri);
+    b  = sg_boundary(N, N, g, gb, ht, sl_ta(ri), sl_tf(ri), ext);
     t  = [ for (i=[0:len(b)-2])
              rad(b[i+1][1]-b[i][1]) *
              ( ext ? cos(Gh) - (cos(b[i][0]) + cos(b[i+1][0]))/2
                    : (cos(b[i][0]) + cos(b[i+1][0]))/2 - cos(Gh) ) ];
     echo(str("   ", label, "  Ghub = ", Gh, "  omega from sg_boundary with it = ",
-             sum(t), "   sg_omega = ", sg_omega(N,N,D,ext),
-             "   difference = ", sum(t) - sg_omega(N,N,D,ext)));
+             sum(t), "   sg_omega = ", sg_omega(N,N,sl_dd(ri),ext),
+             "   difference = ", sum(t) - sg_omega(N,N,sl_dd(ri),ext)));
 }
-sl_omega_check(NS_, true,  "sun   ");
-sl_omega_check(NP_, true,  "planet");
-sl_omega_check(NR_, false, "ring  ");
+sl_omega_check(SL_I, NS_, true,  "sun   ");
+sl_omega_check(SL_I, NP_, true,  "planet");
+sl_omega_check(SL_I, NR_, false, "ring  ");
 
 echo("--- radial clearance, equation (12) ---");
 echo(str("   L tan(tf) - L tan(ta) = ", LO*tan(TF), " - ", LO*tan(TA), " = ",
@@ -520,29 +593,32 @@ echo(str("   ring root cone gr+tf = ", GR+TF, "   planet tip reaches colat ",
 echo("--- flank clearance, equation (11), both directions, every pair ---");
 echo(str("    design half backlash jt m/2 = ", JT*M/2, " mm at the outer pitch"));
 for (i = [0:K-1]) {
-  a = [ for (u = PLAN_D) sl_cl_e(to_world(u,i), NS_, 0) ];
-  b = [ for (u = SUN_D)  sl_cl_e(to_planet(u,i), NP_, 0) ];
+  a = [ for (u = PLAN_D) sl_cl_e(SL_I, to_world(u,i,SL_I), NS_, 0) ];
+  b = [ for (u = SUN_D)  sl_cl_e(SL_I, to_planet(u,i,SL_I), NP_, 0) ];
   echo(str("   sun /planet ", i, "  planet pts engaged ", sl_engaged(a),
-           " min ", min(a), " deg = ", sl_arc(min(a), GS), " mm  |  sun pts ",
-           sl_engaged(b), " min ", min(b), " deg = ", sl_arc(min(b), GP), " mm"));
+           " min ", min(a), " deg = ", sl_arc(SL_I, min(a), GS),
+           " mm  |  sun pts ", sl_engaged(b), " min ", min(b), " deg = ",
+           sl_arc(SL_I, min(b), GP), " mm"));
 }
 for (i = [0:K-1]) {
-  a = [ for (u = PLAN_D) sl_cl_i(to_world(u,i), NR_, sl_clock()) ];
-  b = [ for (u = RING_D) sl_cl_e(to_planet(u,i), NP_, 0) ];
+  a = [ for (u = PLAN_D) sl_cl_i(SL_I, to_world(u,i,SL_I), NR_,
+                                  sl_clock(SL_I)) ];
+  b = [ for (u = RING_D) sl_cl_e(SL_I, to_planet(u,i,SL_I), NP_, 0) ];
   echo(str("   ring/planet ", i, "  planet pts engaged ", sl_engaged(a),
-           " min ", min(a), " deg = ", sl_arc(min(a), GR), " mm  |  ring pts ",
-           sl_engaged(b), " min ", min(b), " deg = ", sl_arc(min(b), GP), " mm"));
+           " min ", min(a), " deg = ", sl_arc(SL_I, min(a), GR),
+           " mm  |  ring pts ", sl_engaged(b), " min ", min(b), " deg = ",
+           sl_arc(SL_I, min(b), GP), " mm"));
 }
-SUNRING = [ for (u = SUN_D) sl_cl_i(u, NR_, sl_clock()) ];
+SUNRING = [ for (u = SUN_D) sl_cl_i(SL_I, u, NR_, sl_clock(SL_I)) ];
 echo(str("   sun/ring   sun pts engaged in the ring's colatitude band ",
          sl_engaged(SUNRING), " -- the two never share a colatitude: sun spans ",
-         sl_ghub(GS,true), " to ", GS+TA, ", ring spans ", GR-TA, " to ",
+         sl_ghub(GS,true,SL_I), " to ", GS+TA, ", ring spans ", GR-TA, " to ",
          GHR));
 
 echo("--- neighbouring planets, equation (13) ---");
 SEP = acos(cos(BETA)*cos(BETA) + sin(BETA)*sin(BETA)*cos(360/K));
-P0 = [ for (s=[0:5:len(PLAN_D)-1]) to_world(PLAN_D[s], 0) ];
-P1 = [ for (s=[0:5:len(PLAN_D)-1]) to_world(PLAN_D[s], 1) ];
+P0 = [ for (s=[0:5:len(PLAN_D)-1]) to_world(PLAN_D[s], 0, SL_I) ];
+P1 = [ for (s=[0:5:len(PLAN_D)-1]) to_world(PLAN_D[s], 1, SL_I) ];
 NBR = [ for (u = P0) min([ for (v = P1) acos(max(-1, min(1, u*v))) ]) ];
 echo(str("   axis separation sep = ", SEP, " deg   two tip cones need ",
          2*(GP+TA), " deg   margin = ", SEP - 2*(GP+TA), " deg = ",
@@ -605,6 +681,9 @@ echo(str("   solids in the assembly: 1 sun + ", K, " planets + 1 ring + 1",
 
 // ===================================================================
 //  THE SLICE
+//  Apex at the origin, polar axis on +z.  `ring = false` leaves the ring
+//  out, which is what the equator row wants: its ring IS the equatorial
+//  band, a part of its own.
 // ===================================================================
 C_SUN  = [0.85, 0.70, 0.36];
 C_PLAN = [0.47, 0.63, 0.73];
@@ -612,12 +691,15 @@ C_RING = [0.55, 0.72, 0.51];
 C_CARR = [0.72, 0.53, 0.58];
 C_PIN  = [0.34, 0.37, 0.43];   // pins read as steel, not as gear
 
-color(C_SUN)  sl_member(NS_, true,  0);
-color(C_RING) sl_member(NR_, false, sl_clock());
-for (i = [0:K-1])
-  rotate([0, 0, 360*i/K]) rotate([0, BETA, 0]) {
-    color(C_PLAN) sl_member(NP_, true, sl_phase(i));
-    color(C_PIN)  sl_pin();
-  }
-color(C_CARR) sl_carrier_body();
-color(C_CARR) sl_retainer();
+module sl_slice(ri, ring = true) {
+    color(C_SUN) sl_member(ri, sg_ns(), true, 0);
+    if (ring) color(C_RING) sl_member(ri, sl_nr(ri), false, sl_clock(ri));
+    for (j = [0:sl_k(ri)-1])
+      rotate([0, 0, 360*j/sl_k(ri)]) rotate([0, sl_beta(ri), 0]) {
+        color(C_PLAN) sl_member(ri, sl_np(ri), true, sl_phase(j,ri));
+        color(C_PIN)  sl_pin(ri);
+      }
+    color(C_CARR) sl_carrier_body(ri);
+    color(C_CARR) sl_retainer(ri);
+}
+sl_slice(SL_I);
