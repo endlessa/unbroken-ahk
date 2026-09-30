@@ -632,6 +632,36 @@ Two more, both from the 3D lens and both left deliberately:
   are one component of 33,792 triangles and are refused, which is reported
   but is a worse answer than the merge would be.
 
+- **Passing a list to a function still costs something proportional to its
+  length, and it is NOT the copy.** Sharing list values (`Rc<Vec<Value>>`)
+  took the recursive fold -- the only way to reduce a list in a language
+  without mutation -- from 6.90 s to 0.42 s at n = 8,000. It is not linear
+  yet, and what is left has been narrowed but not found.
+
+  What is measured. Reading a list by index IS linear now: 0.01 s at
+  n = 8,000, 0.03 at 16,000, 0.05 at 32,000. The agent that filed this
+  attributed it to indexing, and that is wrong: a fold that never reads the
+  list costs the same as one that does (0.67 vs 0.64 s at n = 8,000). And a
+  list that is merely VISIBLE to a recursive function costs nothing --
+  0.04, 0.05, 0.12 s for |V| of 1,000 to 128,000 -- while the same list
+  PASSED as an argument costs 0.07, 0.55, 1.90. Mapped in both dimensions,
+  the cost is about k * |V|^0.7.
+
+  What is ruled out, by counting rather than reasoning. A probe on
+  `Value::clone` and on list construction says the list is built exactly
+  ONCE (128,012 elements for |V| = 128,000, the surplus being other lists)
+  and cloned 8,004 times for 4,000 calls -- two per call, and every one of
+  them an `Rc` bump, not a copy. So neither the value clone nor a rebuild
+  is doing it, which is what the obvious two hypotheses were.
+
+  (The probe had to run INSIDE the evaluator thread to see anything: the
+  evaluator runs on its own 256 MB stack, so a thread-local counter read
+  from `main` reports zero and looks like proof of the opposite.)
+
+  What is left is per-call and grows sub-linearly with the length of a list
+  that is never touched -- the signature of memory rather than arithmetic,
+  and the next step is a profiler rather than another hypothesis.
+
 ## Working method (established, keep using it)
 
 1. Extract exact semantics for the phase's entries from the reference
