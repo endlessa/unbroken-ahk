@@ -1079,8 +1079,8 @@ fn surfaces_may_touch(a: &Mesh, b: &Mesh) -> bool {
 ///
 /// A BSP plane is infinite, so every polygon that straddles one is cut
 /// whether or not the boolean touches it, and a merged mesh comes back ten
-/// times the triangle count it went in with -- two spheres of 23,800
-/// triangles came out at 220,531. Past some size that has to be refused,
+/// times the triangle count it went in with -- two spheres of 24,192
+/// triangles come out at 226,088. Past some size that has to be refused,
 /// because an export that never returns is worse than one a validator
 /// complains about.
 ///
@@ -1096,11 +1096,11 @@ fn surfaces_may_touch(a: &Mesh, b: &Mesh) -> bool {
 ///
 /// The refusal is still a refusal: the component is concatenated, which
 /// self-intersects where its parts do, and the caller is told which and how
-/// big. The old behaviour was worse than that -- it skipped SILENTLY past
-/// the threshold in the sense that the clean-looking answer was the wrong
-/// one: two overlapping spheres exported at 8,369 mm^3 against a true union
-/// of 7,506, with holes 0 and two components, while the side of the
-/// threshold that did the work reported 15,919 boundary edges.
+/// big. The old behaviour was worse than that -- the clean-looking answer
+/// was the wrong one: two overlapping spheres exported at 8,369 mm^3
+/// against a true union of 7,506, an error of 11.5%, with holes 0 and two
+/// components, while the side of the threshold that did the work reported
+/// 190 boundary edges once the T-junctions were welded (15,919 before).
 pub const MAX_MERGE_TRIS: usize = 25_000;
 
 thread_local! {
@@ -1293,7 +1293,9 @@ fn merge_component(
     // Only a component that actually went through a BSP can carry
     // T-junctions, so this is asked exactly where it can answer and never
     // of the concatenations, which are the bulk of a large model.
-    acc.mesh = crate::geom::weld_tjunctions(&acc.mesh);
+    if std::env::var_os("SCADFORGE_NO_WELD").is_none() {
+        acc.mesh = crate::geom::weld_tjunctions(&acc.mesh);
+    }
     acc
 }
 

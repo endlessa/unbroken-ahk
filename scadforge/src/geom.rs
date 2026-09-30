@@ -109,6 +109,52 @@ impl Mesh {
         v
     }
 
+    /// Undirected edges used an odd number of times IN THE FILE the chosen
+    /// format will write — coordinates moved onto that format's grid, points
+    /// that land together treated as one, and every triangle kept.
+    ///
+    /// Asking this of the mesh as HELD gives a different answer, and not
+    /// always in the direction you would guess. The rounding that collapses
+    /// a triangle also brings its neighbours' corners together, and can
+    /// close the gap the collapse opened: a cycloidal gear drops 48
+    /// triangles and the f64 mesh left behind has 62 boundary edges, while
+    /// the binary STL it writes is closed.
+    ///
+    /// Degenerate triangles are COUNTED, not dropped, because the file keeps
+    /// them: a facet whose two corners coincide contributes a self-loop
+    /// edge, and any reader tallying edges sees it.
+    pub fn open_edges_as_written(&self, grid: Grid) -> usize {
+        use std::collections::HashMap;
+        let snap = |v: f64| match grid {
+            Grid::Text => (v * 1e6).round() / 1e6,
+            Grid::Binary => v as f32 as f64,
+        };
+        let key = |p: &Vec3| {
+            let b = |v: f64| {
+                let v = snap(v);
+                if v == 0.0 { 0f64.to_bits() } else { v.to_bits() }
+            };
+            [b(p[0]), b(p[1]), b(p[2])]
+        };
+        let mut at: HashMap<[u64; 3], u32> = HashMap::new();
+        let ids: Vec<u32> = self
+            .positions
+            .iter()
+            .map(|p| {
+                let n = at.len() as u32;
+                *at.entry(key(p)).or_insert(n)
+            })
+            .collect();
+        let mut use_count: HashMap<(u32, u32), usize> = HashMap::new();
+        for t in &self.tris {
+            for k in 0..3 {
+                let (a, b) = (ids[t[k] as usize], ids[t[(k + 1) % 3] as usize]);
+                *use_count.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+            }
+        }
+        use_count.values().filter(|c| *c % 2 == 1).count()
+    }
+
     pub fn without_unrepresentable(&self, grid: Grid) -> Mesh {
         /// |cross| -- twice the area -- of a triangle whose vertices have
         /// been moved onto the grid a writer will put them on.

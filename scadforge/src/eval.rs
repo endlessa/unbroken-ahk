@@ -3436,8 +3436,10 @@ pub enum UnionNote {
     Budget(usize),
     Fallback(usize),
     /// The chosen format's coordinate grid could not carry `0` triangles,
-    /// and dropping them left `1` boundary edges in a mesh that was closed.
-    Unwritable(usize, usize),
+    /// dropping them left `1` boundary edges in a mesh that was closed, and
+    /// `2` is the largest coordinate magnitude in the mesh -- which is what
+    /// sets the step, so it has to be carried rather than assumed.
+    Unwritable(usize, usize, f64),
 }
 
 fn union_note(set: Option<UnionNote>) -> Option<UnionNote> {
@@ -3525,14 +3527,22 @@ pub fn export_mesh(out: &EvalOutput, grid: Grid) -> Result<Mesh, String> {
     let combined = combined.without_unrepresentable(grid);
     let dropped = before - combined.tris.len();
     if dropped > 0 && closed_before {
-        if let Some(note) = geom::closedness_note(&combined) {
-            let edges = note
-                .split(|c: char| !c.is_ascii_digit())
-                .filter(|w| !w.is_empty())
-                .next()
-                .and_then(|w| w.parse::<usize>().ok())
-                .unwrap_or(0);
-            union_note(Some(UnionNote::Unwritable(dropped, edges)));
+        // Judge the mesh AS WRITTEN, not as held. The two differ, and not
+        // always in the direction you would guess: the same rounding that
+        // collapsed a triangle also brings its neighbours' corners together,
+        // and can close the gap the drop opened. A cycloidal gear drops 48
+        // triangles and the f64 mesh left behind has 62 boundary edges --
+        // but the binary STL it writes validates CLOSED, because the f32
+        // grid welds the dangling vertices as it rounds them. Warning about
+        // those 62 would be warning about a file that is fine.
+        let edges = combined.open_edges_as_written(grid);
+        if edges > 0 {
+            let mag = combined
+                .positions
+                .iter()
+                .flatten()
+                .fold(0.0f64, |m, v| m.max(v.abs()));
+            union_note(Some(UnionNote::Unwritable(dropped, edges, mag)));
         }
     }
     if combined.tris.is_empty() {
@@ -3751,20 +3761,26 @@ pub fn render_export_bytes_reporting(
             console,
             fmt_num(n as f64)
         ),
-        Some(UnionNote::Unwritable(n, e)) => format!(
+        // The step is THIS model's, computed from the largest coordinate it
+        // reaches. It used to be a literal -- the 3.8e-06 of the letterform
+        // that the case was found on -- so every other model was told a
+        // resolution that was not its own.
+        Some(UnionNote::Unwritable(n, e, mag)) => format!(
             "{}WARNING: {} triangle{} could not be written at this format's \
              coordinate resolution and {} dropped, which left {} boundary edge{} \
              in a mesh that was closed. Binary STL stores 32-bit floats, whose \
-             step at a coordinate of 62 is 3.8e-06, so detail finer than that \
-             collapses; OFF, AMF, 3MF and ASCII STL resolve 1e-06 wherever the \
-             model sits. Export to one of those, move the model nearer the \
-             origin, or coarsen the outline.\n",
+             step at this model's largest coordinate ({}) is {}, so detail \
+             finer than that collapses; OFF, AMF, 3MF and ASCII STL resolve \
+             1e-06 wherever the model sits. Export to one of those, move the \
+             model nearer the origin, or coarsen the outline.\n",
             console,
             fmt_num(n as f64),
             if n == 1 { "" } else { "s" },
             if n == 1 { "was" } else { "were" },
             fmt_num(e as f64),
-            if e == 1 { "" } else { "s" }
+            if e == 1 { "" } else { "s" },
+            fmt_num(mag),
+            fmt_num(mag * f32::EPSILON as f64)
         ),
         None => console,
     };
