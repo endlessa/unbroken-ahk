@@ -352,9 +352,46 @@ module main_cable(y) {
 for (sg = [-1, 1]) color(CABLE) main_cable(sg*YCAB);
 
 // ---- hangers and their brackets -------------------------------------
-// The top of a hanger is the lowest the cable's own surface reaches at
-// that panel point, less a relief so the two solids never share volume.
-function hangtop(j) = min([ for (v = cring(j, YCAB)) v[2] ]) - GAP;
+// The top of a hanger is the lowest the cable's drawn underside reaches
+// anywhere over that hanger's own footprint, less a relief, so the two
+// solids never share volume.
+//
+// "Over its own footprint" is the whole of it, and taking the ring's
+// lowest VERTEX instead is wrong by an amount that grows with the cable's
+// slope.  The ring is perpendicular to the axis, so its bottom vertex sits
+// RCAB*sin(slope) along the cable from the panel point -- 0.21 m where the
+// cable is steepest -- and the tube's underside directly over the hanger
+// is lower than that vertex by RCAB*sin^2/cos.  Measured against the
+// exported mesh, hanger tops were inside the cable by up to 97 mm near the
+// towers, and only at midspan, where the cable is flat, was the 20 mm the
+// header promises actually there.  The union kernel found it: 96 hangers
+// and one cable came back as ONE connected component instead of 97
+// disjoint solids.
+//
+// The underside is read off the same vertices the mesh is drawn from, so
+// this is exact for the drawn tube rather than exact for the ideal one.
+// CBK is the index of the ring vertex at the bottom, which exists because
+// NCAB is even and the ring's phase puts g = 270 in its set.
+CBK = (270*NCAB - 180)/360;
+function cbot(j) = cring(j, YCAB)[CBK];
+
+// z of the cable's bottom edge at x, on whichever segment spans it.
+function bz(x) =
+  min([ for (i = [0 : NS-1])
+          let( p = cbot(i), q = cbot(i+1) )
+            if (p[0] <= x && x <= q[0])
+              p[2] + (q[2] - p[2])*(x - p[0])/(q[0] - p[0]) ]);
+
+// The bottom edge sags, so it is convex, and the lowest it gets over an
+// interval is at one end of the interval unless a vertex of the polyline
+// falls inside -- which happens at midspan, where the low point is.  Both
+// cases are taken.  The footprint uses RHANG rather than the prism's true
+// half width RHANG*cos(180/NHANG), which is conservative by 8%.
+function hangtop(j) =
+  let( a = xs(j) - RHANG, b = xs(j) + RHANG )
+    min(concat([ bz(a), bz(b) ],
+               [ for (i = [0:NS]) if (a < cbot(i)[0] && cbot(i)[0] < b) cbot(i)[2] ]))
+    - GAP;
 function hangbot(j) = zdeck(xs(j)) + GAP;
 
 module prism(cx, cy, z0, z1, n, r, ph) {
@@ -498,6 +535,30 @@ echo("hangers", 2*len(HJ), "in", len(HJ), "planes x 2 cables; shortest",
 echo("identity: hanger length at the tower", CLEAR + SAG + CROWN*sq(XT/XEND),
      "should equal the tower height", TOWER);
 echo("total hanger length", SUMELL, "m; drawn length", LDRAWN, "m");
+
+// The one joint in the model whose clearance is not a constant, checked
+// rather than asserted -- and checked against the IDEAL cable, not the
+// drawn one, so it is not the tautology that testing hangtop against its
+// own definition would be.
+//
+// A circular tube of radius RCAB about an axis at slope theta has its
+// underside, measured straight down from the axis, at RCAB/cos(theta) --
+// not RCAB, and not the RCAB*cos(theta) that the ring's bottom VERTEX sits
+// at. The drawn tube is a NCAB-gon inscribed in that circle, so its
+// underside is the higher of the two, and the difference between the two
+// columns below is exactly the chording. Both must clear the hanger.
+function ctheta(j) = let( t = tref(j) ) atan(t[2]/t[0]);
+function cideal(j) = zcab(xs(j)) - RCAB/cos(ctheta(j));
+RELDRAWN = min([ for (j = HJ) bz(xs(j)) - hangtop(j) ]);
+RELIDEAL = min([ for (j = HJ) cideal(j) - hangtop(j) ]);
+echo("hanger relief, worst of", len(HJ), "panels: under the drawn cable",
+     RELDRAWN*1000, "mm, under the ideal circular cable", RELIDEAL*1000,
+     "mm; GAP is", GAP*1000, "mm and both must be at least that");
+echo("steepest cable at a hanger", max([ for (j = HJ) ctheta(j) ]),
+     "deg, where the ring's bottom vertex is", 
+     RCAB*(1/cos(max([ for (j = HJ) ctheta(j) ]))
+           - cos(max([ for (j = HJ) ctheta(j) ])))*1000,
+     "mm above the underside -- which is why the vertex is not the relief");
 
 echo("arc length main span", SMAIN, " numeric midpoint integral", SNUM,
      " difference", SMAIN - SNUM);

@@ -1094,7 +1094,38 @@ fn reduce(pieces: Vec<Piece>) -> Mesh {
         let solid = if group.len() == 1 {
             pieces[group[0]].take().expect("each piece is taken once")
         } else {
-            merge_component(&group, &adj, &mut pieces)
+            // A model that says its parts share no volume can be held to it,
+            // and this is where the claim is actually decided. Naming the
+            // members that met is worth far more than a count: on a
+            // suspension bridge whose header claims 20 mm of air everywhere
+            // two members meet, it is the difference between "the volume is
+            // 0.08 m^3 under prediction" and "these two boxes overlap".
+            if std::env::var_os("SCADFORGE_UNION_TRACE").is_some() {
+                eprintln!("union component of {} solids:", group.len());
+                for v in group.iter().copied() {
+                    if let Some(q) = pieces[v].as_ref() {
+                        eprintln!(
+                            "   {} tris, box [{:.4} {:.4} {:.4}] .. [{:.4} {:.4} {:.4}], \
+                             meets {}",
+                            q.mesh.tris.len(),
+                            q.lo[0], q.lo[1], q.lo[2],
+                            q.hi[0], q.hi[1], q.hi[2],
+                            adj[v].len()
+                        );
+                    }
+                }
+            }
+            let sum: f64 = group.iter().filter_map(|&v| pieces[v].as_ref()).map(|q| q.vhi).sum();
+            let made = merge_component(&group, &adj, &mut pieces);
+            if std::env::var_os("SCADFORGE_UNION_TRACE").is_some() {
+                eprintln!(
+                    "   -> {:.6} where the parts sum to {:.6}; they share {:.6}",
+                    made.vhi,
+                    sum,
+                    sum - made.vhi
+                );
+            }
+            made
         };
         out = concat(&out, &solid.mesh);
     }
