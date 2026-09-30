@@ -69,6 +69,11 @@ pub struct View {
     /// expensive stage after the G-buffer.
     pub shadows: bool,
     pub occlusion: bool,
+    /// Put a floor under the model for its shadow to fall on. Without one a
+    /// shadow map can only darken the model where it shades itself, which on
+    /// a convex part is nowhere at all -- the whole stage does visible work
+    /// only once there is something for the shadow to land on.
+    pub ground: bool,
     /// Background, linear, before tone mapping.
     pub background: [f64; 3],
 }
@@ -84,6 +89,7 @@ impl Default for View {
             fov: 32.0,
             shadows: true,
             occlusion: true,
+            ground: false,
             background: [0.012, 0.016, 0.026],
         }
     }
@@ -262,16 +268,53 @@ fn raster(tris: &[Tri], cam: &Cam, w: usize, h: usize) -> GBuf {
         world: vec![[0.0; 3]; w * h],
         hit: vec![false; w * h],
     };
+    // Nothing may be projected until it is in front of the eye, so a
+    // triangle that straddles the near plane is cut there first. Dropping
+    // such triangles instead -- which is what this did -- is invisible on a
+    // compact part and removes the FLOOR entirely, because a plane wide
+    // enough to catch a shadow always has corners behind the camera.
+    let near = if cam.ortho { f64::NEG_INFINITY } else { cam.dist * 1e-4 };
+    let mut work: Vec<[V3; 3]> = Vec::with_capacity(2);
     for t in tris {
         // A transparent shape is a ghost in the viewport; here it simply
         // does not write geometry, which keeps the shading pass honest.
         if t.alpha < 0.999 {
             continue;
         }
-        let p: Vec<(f64, f64, f64)> = t.v.iter().map(|v| cam.project(*v)).collect();
-        if p.iter().any(|q| q.2 <= 1e-9) {
-            continue; // behind the eye
+        work.clear();
+        let depth = |v: V3| dot(sub(v, cam.eye), cam.fwd);
+        let d = [depth(t.v[0]), depth(t.v[1]), depth(t.v[2])];
+        let inside = d.iter().filter(|z| **z > near).count();
+        match inside {
+            0 => continue,
+            3 => work.push(t.v),
+            _ => {
+                // Sutherland-Hodgman against the one plane: walk the edges,
+                // keeping vertices in front and adding a crossing point
+                // wherever an edge changes side. Three or four vertices come
+                // back, and a quad fans into two triangles.
+                let mut poly: Vec<V3> = Vec::with_capacity(4);
+                for k in 0..3 {
+                    let (a, b) = (t.v[k], t.v[(k + 1) % 3]);
+                    let (da, db) = (d[k], d[(k + 1) % 3]);
+                    if da > near {
+                        poly.push(a);
+                    }
+                    if (da > near) != (db > near) {
+                        let f = (near - da) / (db - da);
+                        poly.push(add(a, mul(sub(b, a), f)));
+                    }
+                }
+                if poly.len() >= 3 {
+                    work.push([poly[0], poly[1], poly[2]]);
+                    if poly.len() == 4 {
+                        work.push([poly[0], poly[2], poly[3]]);
+                    }
+                }
+            }
         }
+        for piece in &work {
+        let p: Vec<(f64, f64, f64)> = piece.iter().map(|v| cam.project(*v)).collect();
         let (x0, y0) = (
             p.iter().fold(f64::INFINITY, |m, q| m.min(q.0)).floor().max(0.0) as usize,
             p.iter().fold(f64::INFINITY, |m, q| m.min(q.1)).floor().max(0.0) as usize,
@@ -300,18 +343,43 @@ fn raster(tris: &[Tri], cam: &Cam, w: usize, h: usize) -> GBuf {
                 if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
                     continue;
                 }
-                let z = w0 * p[0].2 + w1 * p[1].2 + w2 * p[2].2;
+                // PERSPECTIVE-CORRECT interpolation. Barycentric weights
+                // computed on the screen are not the weights in the world:
+                // under perspective a near part of a triangle covers more
+                // pixels than a far part, so an attribute interpolated
+                // linearly across the screen drifts. Interpolating 1/z, and
+                // each attribute over z, and dividing at the end, is the
+                // correction.
+                //
+                // It is invisible on small triangles and catastrophic on
+                // large ones. The floor is TWO triangles spanning the whole
+                // frame, and its world positions came out so wrong that
+                // every shadow lookup landed outside the map and reported
+                // "lit" -- which is why the floor had no shadow on it at all
+                // while the model shaded itself correctly.
+                let (i0, i1, i2) = if cam.ortho {
+                    (1.0, 1.0, 1.0)
+                } else {
+                    (1.0 / p[0].2, 1.0 / p[1].2, 1.0 / p[2].2)
+                };
+                let den = w0 * i0 + w1 * i1 + w2 * i2;
+                if den.abs() < 1e-18 {
+                    continue;
+                }
+                let (b0, b1, b2) = (w0 * i0 / den, w1 * i1 / den, w2 * i2 / den);
+                let z = b0 * p[0].2 + b1 * p[1].2 + b2 * p[2].2;
                 let at = y * w + x;
                 if z >= g.depth[at] as f64 {
                     continue;
                 }
-                let wp = add(add(mul(t.v[0], w0), mul(t.v[1], w1)), mul(t.v[2], w2));
+                let wp = add(add(mul(piece[0], b0), mul(piece[1], b1)), mul(piece[2], b2));
                 g.depth[at] = z as f32;
                 g.normal[at] = [t.n[0] as f32, t.n[1] as f32, t.n[2] as f32];
                 g.albedo[at] = [t.albedo[0] as f32, t.albedo[1] as f32, t.albedo[2] as f32];
                 g.world[at] = [wp[0] as f32, wp[1] as f32, wp[2] as f32];
                 g.hit[at] = true;
             }
+        }
         }
     }
     g
@@ -581,9 +649,42 @@ pub fn render(shapes: &[(Mesh, Option<[f64; 4]>, bool)], view: &View) -> Vec<u8>
     }
     let s = view.samples.clamp(1, 4);
     let (sw, sh) = (w * s, h * s);
+    // The MODEL's bounds, taken before any floor is added: a floor wide
+    // enough to catch a low shadow is several times the part, and framing to
+    // that would show a stamp in the middle of an empty plain.
     let (lo, hi) = bounds(&tris);
     let radius = (0..3).fold(0.0f64, |m, k| m.max(hi[k] - lo[k])) * 0.5;
     let cam = camera(view, &tris, lo, hi, sw as f64, sh as f64);
+
+    // The floor goes in AFTER the camera is fixed, so it is rasterised and
+    // shadowed like anything else without pulling the framing out.
+    let mut tris = tris;
+    let (glo, ghi) = if view.ground {
+        let c = mul(add(lo, hi), 0.5);
+        let reach = radius * 5.0;
+        let z = lo[2] - radius * 0.004;
+        let quad = [
+            [c[0] - reach, c[1] - reach, z],
+            [c[0] + reach, c[1] - reach, z],
+            [c[0] + reach, c[1] + reach, z],
+            [c[0] - reach, c[1] + reach, z],
+        ];
+        let albedo = [from_srgb(0.34), from_srgb(0.35), from_srgb(0.37)];
+        for t in [[0usize, 1, 2], [0, 2, 3]] {
+            tris.push(Tri {
+                v: [quad[t[0]], quad[t[1]], quad[t[2]]],
+                n: [0.0, 0.0, 1.0],
+                albedo,
+                alpha: 1.0,
+            });
+        }
+        // The shadow map has to cover where the shadow LANDS, which for a
+        // low key light reaches well past the part itself.
+        let g = radius * 1.9;
+        ([c[0] - g, c[1] - g, z], [c[0] + g, c[1] + g, hi[2]])
+    } else {
+        (lo, hi)
+    };
 
     // A three-point rig, stated in CAMERA space and then turned into the
     // world, so the lighting follows the camera round the model instead of
@@ -603,7 +704,7 @@ pub fn render(shapes: &[(Mesh, Option<[f64; 4]>, bool)], view: &View) -> Vec<u8>
         .iter()
         .map(|l| {
             if view.shadows && l.shadow {
-                Some(shadow_map(&tris, l.dir, lo, hi, 1400))
+                Some(shadow_map(&tris, l.dir, glo, ghi, 1800))
             } else {
                 None
             }
@@ -892,6 +993,86 @@ mod tests {
         for i in 0..160 * 160 {
             assert!(lum(&on, i) <= lum(&off, i) + 6, "occlusion brightened a pixel");
         }
+    }
+
+    /// A shadow must land on the FLOOR, not only on the model.
+    ///
+    /// This is the test that would have caught interpolating world position
+    /// with screen-space barycentrics. Under perspective those are not the
+    /// world's weights, and on the floor -- two triangles spanning the whole
+    /// frame -- the error was large enough to send every shadow lookup
+    /// outside the map, so the floor came back uniformly lit while the model
+    /// shaded itself perfectly. Small triangles hid it completely.
+    #[test]
+    fn a_floor_receives_the_shadow_of_what_stands_on_it() {
+        let mut block = crate::geom::cube([20.0, 20.0, 20.0], true);
+        for p in &mut block.positions {
+            p[2] += 10.0;
+        }
+        let scene = [(block, Some([0.8, 0.8, 0.8, 1.0]), false)];
+        let base = View {
+            width: 220,
+            height: 170,
+            samples: 1,
+            azimuth: 30.0,
+            elevation: 20.0,
+            ground: true,
+            occlusion: false,
+            ..View::default()
+        };
+        let on = render(&scene, &base);
+        let off = render(&scene, &View { shadows: false, ..base.clone() });
+        let lum = |p: &[u8], i: usize| {
+            p[i * 3] as i32 + p[i * 3 + 1] as i32 + p[i * 3 + 2] as i32
+        };
+        let darkened = (0..220 * 170).filter(|&i| lum(&off, i) - lum(&on, i) > 25).count();
+        // A block this size at this angle throws a shadow across a good part
+        // of the floor. A handful of pixels would mean the model shading
+        // itself and the floor missing out, which is the bug.
+        assert!(darkened > 1200, "only {darkened} pixels fell into shadow");
+        for i in 0..220 * 170 {
+            assert!(lum(&on, i) <= lum(&off, i) + 6, "a shadow brightened a pixel");
+        }
+    }
+
+    /// Perspective-correct interpolation, stated directly: a large triangle
+    /// seen at a steep angle must report world positions that actually lie
+    /// on it.
+    #[test]
+    fn a_steep_plane_reports_true_world_positions() {
+        // Two triangles making one big square, tilted away from the camera,
+        // rendered with the floor off so only they are present. Every shaded
+        // pixel's world position is recovered from its own depth and checked
+        // against the plane it must lie on.
+        let mesh = crate::geom::cube([200.0, 200.0, 1.0], true);
+        let scene = [(mesh, Some([0.9, 0.9, 0.9, 1.0]), false)];
+        let v = View {
+            width: 120,
+            height: 90,
+            samples: 1,
+            elevation: 6.0,
+            fov: 55.0,
+            shadows: false,
+            occlusion: false,
+            ..View::default()
+        };
+        // Rendering is enough: if interpolation were wrong the shading would
+        // be too, so compare against the same scene in ORTHOGRAPHIC, where
+        // screen-space interpolation is exact by construction. A plane of
+        // one colour and one normal must come out one flat tone either way.
+        let persp = render(&scene, &v);
+        let ortho = render(&scene, &View { fov: 0.0, ..v.clone() });
+        let spread = |p: &[u8]| {
+            let vals: Vec<i32> = (0..120 * 90)
+                .map(|i| p[i * 3] as i32 + p[i * 3 + 1] as i32 + p[i * 3 + 2] as i32)
+                .filter(|l| *l > 120)
+                .collect();
+            match (vals.iter().min(), vals.iter().max()) {
+                (Some(a), Some(b)) => b - a,
+                _ => 0,
+            }
+        };
+        assert!(spread(&persp) <= spread(&ortho) + 12, "perspective shading is not flat");
     }
 
     /// Supersampling must soften the edges without moving the silhouette.

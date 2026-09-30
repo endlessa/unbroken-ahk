@@ -147,6 +147,10 @@ fn main() {
                 image.view.occlusion = false;
                 i += 1;
             }
+            "--ground" => {
+                image.view.ground = true;
+                i += 1;
+            }
             a if a == "--camera" || a.starts_with("--camera=") => {
                 let (spec, step) = match a.strip_prefix("--camera=") {
                     Some(v) => (v.to_string(), 1),
@@ -220,7 +224,7 @@ fn main() {
                      [-D name=value ...] \
                      [--camera=tx,ty,tz,rx,ry,rz,dist] \
                      [--size=WxH] [--view=AZ,EL] [--fov=DEG|--ortho] \
-                     [--samples=1..4] [--no-shadows] [--no-occlusion] INPUT.scad",
+                     [--samples=1..4] [--no-shadows] [--no-occlusion] [--ground] INPUT.scad",
                     other
                 );
                 exit(2);
