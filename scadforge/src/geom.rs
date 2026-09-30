@@ -451,6 +451,19 @@ pub fn matrix_from_rows(rows: &[Vec<f64>]) -> Mat4 {
 /// corner no other vertex of the face lies inside. Ears with area are taken
 /// first, so a degenerate ear is cut only when the face leaves no choice.
 fn face_tris(points: &[Vec3], face: &[usize]) -> Vec<[usize; 3]> {
+    face_tris_in(points, face, None)
+}
+
+/// As `face_tris`, but with the face's plane supplied.
+///
+/// Newell's normal is the right answer when nothing better is known, and
+/// the wrong one when something is: a triangle that has had points inserted
+/// along its edges lies in ITS OWN plane, and for a sliver that plane is
+/// known far more accurately than the area-weighted normal of the polygon,
+/// whose terms nearly cancel. Letting it be re-derived flipped the
+/// projection on two faces of a character model and wound their pieces
+/// backwards.
+fn face_tris_in(points: &[Vec3], face: &[usize], plane: Option<Vec3>) -> Vec<[usize; 3]> {
     let fan = || (1..face.len() - 1).map(|k| [face[0], face[k], face[k + 1]]).collect::<Vec<_>>();
     if face.len() == 3 {
         return vec![[face[0], face[1], face[2]]];
@@ -458,13 +471,15 @@ fn face_tris(points: &[Vec3], face: &[usize]) -> Vec<[usize; 3]> {
     // Newell: the area-weighted normal, which is the face's own plane even
     // when the face does not have one, and which no single corner's cross
     // product can be trusted to give (any corner may be collinear).
-    let mut n = [0.0f64; 3];
-    for i in 0..face.len() {
-        let a = points[face[i]];
-        let b = points[face[(i + 1) % face.len()]];
-        n[0] += (a[1] - b[1]) * (a[2] + b[2]);
-        n[1] += (a[2] - b[2]) * (a[0] + b[0]);
-        n[2] += (a[0] - b[0]) * (a[1] + b[1]);
+    let mut n = plane.unwrap_or([0.0; 3]);
+    if plane.is_none() {
+        for i in 0..face.len() {
+            let a = points[face[i]];
+            let b = points[face[(i + 1) % face.len()]];
+            n[0] += (a[1] - b[1]) * (a[2] + b[2]);
+            n[1] += (a[2] - b[2]) * (a[0] + b[0]);
+            n[2] += (a[0] - b[0]) * (a[1] + b[1]);
+        }
     }
     let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
     if !(nl > 0.0) {
@@ -766,7 +781,21 @@ pub fn weld_tjunctions(mesh: &Mesh) -> Mesh {
         // Ear clipping in the face's own plane, which is what handles the
         // collinear corners the inserted points create. The loop order is
         // the triangle's own, so the pieces keep its winding.
-        for f in face_tris(&mesh.positions, &face) {
+        // The triangle's OWN normal, not one re-derived from the polygon:
+        // the inserted points are on its edges, so the plane is unchanged,
+        // and for a sliver the polygon's Newell sum is mostly cancellation.
+        let (p0, p1, p2) = (
+            mesh.positions[t[0] as usize],
+            mesh.positions[t[1] as usize],
+            mesh.positions[t[2] as usize],
+        );
+        let (u, v) = (sub(p1, p0), sub(p2, p0));
+        let plane = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        for f in face_tris_in(&mesh.positions, &face, Some(plane)) {
             out.push([f[0] as u32, f[1] as u32, f[2] as u32]);
         }
     }
