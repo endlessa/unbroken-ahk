@@ -69,16 +69,24 @@ impl Mesh {
     /// and which no reader can recover, because the three vertices listed
     /// beside it are collinear.
     ///
-    /// The test is the writers' own resolution, not a magic number. The text
-    /// formats print coordinates with `{:.6}`, so they land on a 1e-6 grid;
-    /// binary STL stores f32, whose spacing near a coordinate is about
-    /// `|x| * f32::EPSILON` -- so its step is per-axis, read off each axis's
-    /// own coordinates. On a grid of spacing `res` the thinnest triangle that
-    /// is still a triangle has `|cross| == res * res`, so anything below that
-    /// is collinear as written however it is written. Dropping it
-    /// removes no surface -- volume and area over the whole corpus are
-    /// unchanged to twelve significant digits -- and it happens ONCE, at the
-    /// export funnel, so every format agrees on the triangle list.
+    /// The test is the writers' own resolution, not a magic number, and it is
+    /// the RESOLUTION OF THE FORMAT BEING WRITTEN. The text formats print
+    /// coordinates with `{:.6}`, so they land on a 1e-6 grid; binary STL
+    /// stores f32, whose spacing near a coordinate is about `|x| *
+    /// f32::EPSILON` -- so its step is per-axis, read off each axis's own
+    /// coordinates. On a grid of spacing `res` the thinnest triangle that is
+    /// still a triangle has `|cross| == res * res`, so anything below that is
+    /// collinear as written.
+    ///
+    /// Applying f32's answer to all of them was tidy and wrong. f32's step at
+    /// a coordinate of 1e6 is 0.119, so a millimetre-sized face a kilometre
+    /// from the origin has all three corners land on one f32 point and cannot
+    /// be written to a binary STL at all -- but OFF, AMF, 3MF and ASCII STL
+    /// print it exactly, and were losing it for a limitation none of them
+    /// has. Dropping what the chosen format cannot carry removes no surface
+    /// -- volume and area over the whole corpus are unchanged to twelve
+    /// significant digits -- and it happens ONCE per export, on the merged
+    /// mesh, so a format never disagrees with itself.
     /// The volume the mesh encloses, SIGNED by its orientation: positive
     /// when the faces are wound so the solid is on the inside of them,
     /// negative when the mesh is inside-out.
@@ -101,7 +109,7 @@ impl Mesh {
         v
     }
 
-    pub fn without_unrepresentable(&self) -> Mesh {
+    pub fn without_unrepresentable(&self, grid: Grid) -> Mesh {
         /// |cross| -- twice the area -- of a triangle whose vertices have
         /// been moved onto the grid a writer will put them on.
         fn cross_on_grid(pts: [Vec3; 3], snap: impl Fn(f64) -> f64) -> f64 {
@@ -162,25 +170,38 @@ impl Mesh {
             // `0 0 0`. The old magnitude-scaled floor happened to catch those
             // too, so making that floor honest meant stating this separately.
             let raw = cross_on_grid(pts, |x| x);
-            raw.is_finite()
-                && text.is_finite()
-                && binary.is_finite()
-                && raw >= 1e-12
-                && text >= 1e-12
+            let representable =
+                raw.is_finite() && text.is_finite() && raw >= 1e-12 && text >= 1e-12;
+            match grid {
+                Grid::Text => representable,
                 // The same 1e-12 applies to the f32 form, because that is
                 // the rule the READER applies to it: `triangle_normal` gives
                 // up below it and `read_stl` drops such a triangle on the way
                 // back in. Writing one the reader would refuse is a
                 // disagreement between two halves of this crate, whether or
                 // not any file has hit it yet.
-                && binary >= 1e-12
-                && binary >= floor
+                Grid::Binary => {
+                    representable && binary.is_finite() && binary >= 1e-12 && binary >= floor
+                }
+            }
         };
         Mesh {
             positions: self.positions.clone(),
             tris: self.tris.iter().copied().filter(|t| keep(t)).collect(),
         }
     }
+}
+
+/// The precision an export format writes coordinates at.
+///
+/// The only thing that distinguishes one format from another as far as
+/// geometry goes, and the only reason a triangle may have to be dropped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Grid {
+    /// `{:.6}` decimal: OFF, AMF, 3MF and ASCII STL.
+    Text,
+    /// f32: binary STL.
+    Binary,
 }
 
 /// The most fragments any primitive will tessellate a full circle into.
@@ -496,7 +517,7 @@ pub fn import_note(mesh: &Mesh, what: &str) -> Option<String> {
 /// Edges are matched by POSITION, not index: the reference accepts duplicate
 /// points silently, and two vertices at the same place close a seam just as
 /// well as one does.
-fn closedness_note(mesh: &Mesh) -> Option<String> {
+pub(crate) fn closedness_note(mesh: &Mesh) -> Option<String> {
     use std::collections::HashMap;
     // Weld by position, but KEEP the degenerate triangles. `Mesh::welded`
     // drops them, and dropping one orphans its edges: a quad that closes on
@@ -1012,7 +1033,7 @@ mod tests {
         };
         for dz in [0.0, 1e6, 1e7] {
             let m = at(dz);
-            let clean = m.without_unrepresentable();
+            let clean = m.without_unrepresentable(Grid::Binary);
             assert_eq!(clean.tris.len(), 12, "every face survives at z + {}", dz);
             assert_eq!(
                 closedness_note(&clean),
@@ -1035,7 +1056,7 @@ mod tests {
         flat.positions.push([0.1, 0.0, 1e6]);
         flat.tris.push([n, n + 1, n + 2]);
         assert_eq!(
-            flat.without_unrepresentable().tris.len(),
+            flat.without_unrepresentable(Grid::Binary).tris.len(),
             12,
             "the collinear triangle goes, the twelve real ones stay"
         );
@@ -1054,7 +1075,7 @@ mod tests {
         m.tris.push([n, n + 1, n + 2]);
         assert_eq!(m.tris.len(), 13);
 
-        let clean = m.without_unrepresentable();
+        let clean = m.without_unrepresentable(Grid::Binary);
         assert_eq!(clean.tris.len(), 12, "the sliver is gone and the cube is not");
         // Positions are untouched -- this drops faces, it does not move or
         // renumber anything.
@@ -1071,7 +1092,8 @@ mod tests {
         thin.positions.push([0.75, 0.25, 0.0]);
         thin.positions.push([0.5, 0.25 + 1e-9, 0.0]);
         thin.tris.push([n, n + 1, n + 2]);
-        assert_eq!(thin.without_unrepresentable().tris.len(), 12, "flattened by rounding");
+        let flattened = thin.without_unrepresentable(Grid::Binary);
+        assert_eq!(flattened.tris.len(), 12, "flattened by rounding");
 
         // A triangle that is small but REPRESENTABLE survives: the writers
         // resolve 1e-6, and 1e-3 is a thousand times that.
@@ -1081,15 +1103,56 @@ mod tests {
         ok.positions.push([0.25 + 1e-3, 0.25, 0.0]);
         ok.positions.push([0.25, 0.25 + 1e-3, 0.0]);
         ok.tris.push([n, n + 1, n + 2]);
-        assert_eq!(ok.without_unrepresentable().tris.len(), 13, "a real small face is kept");
+        let kept = ok.without_unrepresentable(Grid::Binary);
+        assert_eq!(kept.tris.len(), 13, "a real small face is kept");
 
         // A triangle with a repeated vertex has no area at all.
         let mut dup = cube([1.0, 1.0, 1.0], false);
         dup.tris.push([0, 1, 1]);
-        assert_eq!(dup.without_unrepresentable().tris.len(), 12);
+        assert_eq!(dup.without_unrepresentable(Grid::Binary).tris.len(), 12);
 
         // An empty mesh has no bounds; it must come back empty, not panic.
-        assert!(Mesh::empty().without_unrepresentable().tris.is_empty());
+        assert!(Mesh::empty().without_unrepresentable(Grid::Binary).tris.is_empty());
+        assert!(Mesh::empty().without_unrepresentable(Grid::Text).tris.is_empty());
+    }
+
+    /// A face binary STL cannot hold is not a face the text formats may drop.
+    ///
+    /// f32's step at a coordinate of 1e6 is 1e6 * f32::EPSILON = 0.119, so a
+    /// one-millimetre face out there has all three corners on ONE f32 point
+    /// and there is no writing it to a binary STL. OFF, AMF, 3MF and ASCII
+    /// STL print `{:.6}`, which resolves it five orders of magnitude over, so
+    /// for them it is an ordinary face. One guard for both lost it from every
+    /// format, for a limitation only one of them has.
+    #[test]
+    fn each_format_drops_only_what_it_cannot_write() {
+        let far = 1.0e6;
+        let mut m = cube([1.0, 1.0, 1.0], false);
+        for p in m.positions.iter_mut() {
+            for k in 0..3 {
+                p[k] += far;
+            }
+        }
+        let n = m.positions.len() as u32;
+        m.positions.push([far, far, far]);
+        m.positions.push([far + 1e-3, far, far]);
+        m.positions.push([far, far + 1e-3, far]);
+        m.tris.push([n, n + 1, n + 2]);
+
+        // The three corners really are one point in f32, so the format that
+        // stores f32 cannot carry the face...
+        let snap = |p: Vec3| [p[0] as f32, p[1] as f32, p[2] as f32];
+        assert_eq!(snap(m.positions[n as usize]), snap(m.positions[n as usize + 1]));
+        assert_eq!(m.without_unrepresentable(Grid::Binary).tris.len(), 12);
+
+        // ...and the formats that print decimals carry it exactly. A
+        // millimetre is a thousand steps of their 1e-6 grid.
+        let text = m.without_unrepresentable(Grid::Text);
+        assert_eq!(text.tris.len(), 13, "OFF, AMF, 3MF and ASCII STL keep it");
+        assert!(
+            crate::io::write_off(&text).contains("1000000.001"),
+            "and write the corner out in full"
+        );
     }
 
     #[test]

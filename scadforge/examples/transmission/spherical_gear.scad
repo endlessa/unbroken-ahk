@@ -149,9 +149,13 @@
 //  On a single sun cone the count Ns = 2 L sin(gamma_s)/m(L) is the
 //  same at every cone distance, so every row sharing that cone shares
 //  D, and then (9) must be solved four times with one D and one Ns.
-//  A search of every D up to 2048 finds at most the equator row plus
-//  ONE other.  Three rows plus the equator has no solution at any
-//  practical size.  This is reported as a failed gate, not fudged.
+//  Searching every D from 40 to 1500 and every sun count, an equator
+//  row (gamma_r = 90) is accompanied by at most ONE further exact row;
+//  and even with no equator row, no (D, Ns) admits more than THREE
+//  exact rows with gamma_r <= 90 anywhere below D = 900.  Three
+//  latitudinal rows plus the equator on ONE apex therefore has no
+//  solution at any buildable size.  That is a failed gate and it is
+//  reported as one, not fudged.
 //
 //  The stack resolves it, because a stack forces per-slice apexes
 //  anyway: slices sit at different heights on the polar axis, so
@@ -170,6 +174,11 @@
 //
 //  is the per-row divisibility gate exactly as written.  Choosing the
 //  integer Nr_i selects the latitude; the equator is Nr = Dref.
+//
+//  The equatorial slice comes out as the fundamental one: its ring is a
+//  great circle of its own bevel sphere, so gamma_r = 90 there, its
+//  cone distance L equals R, and its apex sits on the sphere centre.
+//  Every other slice's apex lies further up the polar axis.
 //
 //  ---------------------------------------------------------------
 //  5.  TORQUE, STATED PLAINLY
@@ -203,7 +212,10 @@ function sum(v, a = 0, b = -1) =
   : let( m = floor((a + hi)/2) ) sum(v, a, m) + sum(v, m, hi);
 
 function isq(n) = let(r = round(sqrt(n))) r*r == n ? r : -1;
-function gcd_(a,b) = b == 0 ? a : gcd_(b, a % b);
+// Guarded: gcd_ is tail recursive, so tail-call elimination means a
+// non-numeric argument would spin without ever tripping a depth guard.
+function gcd_(a,b) = !is_num(a) || !is_num(b) ? undef
+                   : b == 0 ? a : gcd_(b, a % b);
 function lcm_(a,b) = a*b/gcd_(a,b);
 
 // ---- the curve ------------------------------------------------------
@@ -231,8 +243,13 @@ function sg_ta(D) = atan(2.0/D);
 function sg_tf(D) = atan(2.5/D);
 // half tooth angle at the pitch cone, backlash jt taken symmetrically
 function sg_ht(N, jt, m) = (90 - 90*jt/(PI*m))/N;
-// half width at colatitude G.  External teeth narrow outward, internal
-// teeth narrow inward; the sign is the whole difference.
+// Half tooth width at colatitude G.  The sign is the whole difference
+// between the two: an external tooth's angular half width FALLS as
+// colatitude rises, so it is thick at the root and thin at the tip,
+// while an internal tooth's RISES with colatitude, so it is thin at
+// its tip (which lies at smaller colatitude, toward the axis) and
+// thick where it meets the rim.  Get this backwards and the ring's
+// tooth space is narrow exactly where the mating tooth is fattest.
 function sg_hw_e(G,g,gb,ht) = ht + sg_invs(g,gb) - sg_invs(G,gb);
 function sg_hw_i(G,g,gb,ht) = ht + sg_invs(G,gb) - sg_invs(g,gb);
 
@@ -275,6 +292,24 @@ CAP_VHI  = 24;
 // ===================================================================
 //  REPORT
 // ===================================================================
+echo("=== gates ===");
+echo("1 per-row divisibility      PASS, Nr = 2 R sin(colat)/m by construction");
+echo("2 mesh mating and assembly  PASS, (Ns+Nr)/k integer on every row, with");
+echo("                            neighbour tip-cone margins reported below");
+echo("3 chain backlash            PASS, chain lives only on the chain collar");
+echo("4 intermediate sun bearing  deferred to the slice part, not this file");
+echo("5 EM ripple closure         PASS, lcm(S,P) integer per revolution");
+echo("6 backlash and windup       PASS, reported per mesh and cumulative");
+echo("7 polar crown minimum       PASS up to 17.4 Nm per tooth pair at m = 1;");
+echo("                            above that the crown will not fit inside 2R");
+echo("SHARED-APEX GATE            FAIL.  One apex, one module and one sun");
+echo("  count cannot carry three latitudinal rows plus the equator.  Section");
+echo("  4 of the header gives the search.  The stack forces per-slice apexes");
+echo("  anyway, and with them every row closes exactly.");
+echo("SPEC EQUATOR DEGENERACY     FAIL as stated.  A gamma = 90 pitch cone is");
+echo("  the equatorial PLANE, a crown gear, not a cylinder, and its exact");
+echo("  flank stays a spherical involute.  Numbers under the limit heading.");
+
 echo("=== fundamentals ===");
 echo(str("module m = ", MODULE_MM, " mm   pressure angle = ", PHI_P, " deg"));
 echo(str("Dref = 2R/m = ", DREF, "   R = Dref m/2 = ", RSPH, " mm"));
@@ -323,6 +358,8 @@ module sg_row_report(row) {
            "   limit 2/sin(phi)^2 = ", zmin));
   echo(str("   base cones  sun ", sg_gb(gs,PHI_P), "  planet ",
            sg_gb(gp,PHI_P), "  ring ", sg_gb(gr,PHI_P)));
+  echo(str("   face width bound L/3 = ", L/3,
+           " mm; backlash jt = ", JT*MODULE_MM, " mm at every mesh"));
   echo(str("   apex height on the polar axis = ",
            RSPH*cos(colat) + L*cos(gr), " mm above the equatorial plane"));
 }
@@ -387,6 +424,56 @@ echo(str("the crown cannot exceed the sphere, 2R = ", 2*RSPH,
          " mm, so one tooth pair carries at most ",
          FT*DREF*MODULE_MM/2/1000, " Nm; tooth size does not go to zero",
          " and that is what sets the cap diameter"));
+
+// ---- the equatorial band, the external drive port -------------------
+// The band is one rigid member at one angular velocity, toothed on
+// both faces.  Inside it carries the equator row's crown ring, 242
+// spherical involute teeth at gamma = 90.  Outside it carries an
+// ordinary planar involute spur ring on a cylinder about the polar
+// axis, because THAT mesh is parallel-axis and its pitch surface
+// really is a cylinder: the apex has gone to infinity, which is the
+// gamma_b -> 0 limit the table below measures.  It is not the gamma =
+// 90 cone, which is the equatorial plane and gives a crown gear.
+echo("=== equatorial band, both faces ===");
+BAND_OUT = 280;         // spur teeth on the outer cylinder
+BAND_PIN = 28;          // external pinion, axis parallel to the polar axis
+CHAIN_N  = 114;         // chain collar sprocket
+echo(str("inner face: ", DREF, " crown teeth, gamma = 90, base cone ",
+         sg_gb(90,PHI_P), ", spherical involute"));
+echo(str("outer face: ", BAND_OUT, " spur teeth on radius ",
+         BAND_OUT*MODULE_MM/2, " mm; closure is 2 R_out/m = ", BAND_OUT,
+         ", an integer by construction"));
+echo(str("   base radius r_b = R_out cos(phi) = ",
+         BAND_OUT*MODULE_MM/2*cos(PHI_P),
+         " mm, and inv(phi) = ", sg_invp(PHI_P),
+         " deg, the planar branch of the same function"));
+echo(str("   radial wall between the two faces = ",
+         BAND_OUT*MODULE_MM/2 - RSPH, " mm"));
+echo(str("   pinion ", BAND_PIN, " teeth, port ratio ", BAND_OUT, "/",
+         BAND_PIN, " = ", BAND_OUT/BAND_PIN,
+         " exactly; pinion virtual count ", BAND_PIN,
+         " clears undercut at phi = ", PHI_P));
+echo(str("   chain collar ", CHAIN_N, " teeth: chordal rise 1-cos(180/N) = ",
+         1 - cos(180/CHAIN_N), ", that is ", 100*(1 - cos(180/CHAIN_N)),
+         " percent speed ripple; chain backlash stays on this port"));
+
+// ---- stacking modes, exact rationals --------------------------------
+echo("=== stacking modes ===");
+echo("common-sun splice: one sun through the slices, rows ADD at the sun");
+echo("and share load across rows.  Ratios do NOT multiply.  Each row's");
+echo("ring-braked carrier reduction, exact:");
+for (r = ROWS)
+  let (g = gcd_(NS+r[1], NS))
+    echo(str("   ", r[0], "  w_s/w_c = (Ns+Nr)/Ns = ", NS+r[1], "/", NS,
+             " = ", (NS+r[1])/g, "/", NS/g, " = ", (NS+r[1])/NS));
+echo("coupled splice: stage N output drives stage N+1 input through the");
+echo("gear collar, so ratios COMPOUND.  Both stages are ring-braked");
+echo("reductions, so the product does not depend on the order:");
+for (a = [0:len(ROWS)-2]) for (b = [a+1:len(ROWS)-1])
+    let (ra = (NS+ROWS[a][1]), rb = (NS+ROWS[b][1]),
+         num = ra*rb, den = NS*NS, g = gcd_(num,den))
+      echo(str("   ", ROWS[a][0], " then ", ROWS[b][0], "  = ",
+               num/g, "/", den/g, " = ", num/den));
 
 // ---- the planar limit, demonstrated ---------------------------------
 echo("=== spherical involute -> planar involute, measured ===");

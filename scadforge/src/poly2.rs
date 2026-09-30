@@ -1621,17 +1621,6 @@ mod tests {
             .sum()
     }
 
-    /// A contour that TOUCHES itself is not simple, and must not take the
-    /// ear-clipping fast path.
-    ///
-    /// `seg_cross` answers "do these two cross", demanding all four
-    /// orientations be non-zero, and the fast paths were using it to ask "is
-    /// this simple". A keyhole outline walks into a slot and back out,
-    /// touching itself at a vertex without ever crossing, so it was clipped
-    /// as though simple and the inner loop came out covered twice -- and the
-    /// answer depended on which way the inner loop was wound, which even-odd
-    /// filling never may.
-    #[test]
     /// An extruded region with a hole must be CLOSED, not merely watertight.
     ///
     /// A scanline triangulator divides the outer boundary at every level a
@@ -1740,6 +1729,17 @@ mod tests {
         }
     }
 
+    /// A contour that TOUCHES itself is not simple, and must not take the
+    /// ear-clipping fast path.
+    ///
+    /// `seg_cross` answers "do these two cross", demanding all four
+    /// orientations be non-zero, and the fast paths were using it to ask "is
+    /// this simple". A keyhole outline walks into a slot and back out,
+    /// touching itself at a vertex without ever crossing, so it was clipped
+    /// as though simple and the inner loop came out covered twice -- and the
+    /// answer depended on which way the inner loop was wound, which even-odd
+    /// filling never may.
+    #[test]
     fn a_self_touching_contour_is_not_simple() {
         // A 10x10 plate with a 4x2 slot reached through a slit: 100 - 8 = 92.
         let key = |inner_reversed: bool| {

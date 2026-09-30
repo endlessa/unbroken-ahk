@@ -13,7 +13,7 @@ use crate::ast::{Arg, BinOp, Expr, Modifier, Param, Stmt, VecItem};
 use crate::csg;
 use crate::csg2;
 use crate::trig;
-use crate::geom::{self, Mesh};
+use crate::geom::{self, Grid, Mesh};
 use crate::io;
 use crate::poly2::{self, Poly2};
 use crate::value::{FuncVal, Value};
@@ -3465,7 +3465,7 @@ fn concat_all(parts: &[Mesh]) -> Mesh {
     out
 }
 
-pub fn export_mesh(out: &EvalOutput) -> Result<Mesh, String> {
+pub fn export_mesh(out: &EvalOutput, grid: Grid) -> Result<Mesh, String> {
     let mut parts: Vec<Mesh> = Vec::new();
     let mut saw_2d = false;
     for s in &out.shapes {
@@ -3524,9 +3524,9 @@ pub fn export_mesh(out: &EvalOutput) -> Result<Mesh, String> {
         union_note(Some(n));
     }
     // Weld once here rather than per-format, and drop the slivers the 2D
-    // fill sweep leaves behind: they are below the resolution the files can
+    // fill sweep leaves behind: they are below the resolution THIS file can
     // carry, and every one of them wrote `facet normal 0 0 0`.
-    let combined = combined.without_unrepresentable();
+    let combined = combined.without_unrepresentable(grid);
     if combined.tris.is_empty() {
         return Err(if saw_2d {
             "Current top level object is not a 3D object".into()
@@ -3581,7 +3581,7 @@ pub fn export_image(out: &EvalOutput, view: &crate::render::View) -> Vec<u8> {
 pub fn export_bytes(out: &EvalOutput, format: &str) -> Result<Vec<u8>, String> {
     match format {
         "png" => Ok(export_image(out, &crate::render::View::default())),
-        "3mf" => Ok(crate::io::write_3mf(&export_mesh(out)?)),
+        "3mf" => Ok(crate::io::write_3mf(&export_mesh(out, Grid::Text)?)),
         // `.stl` is BINARY. The reference says so three times over — the
         // summary ("binary STL (default for .stl)"), the signature's
         // `--export-format asciistl|binstl`, and the note that the flag is
@@ -3589,8 +3589,8 @@ pub fn export_bytes(out: &EvalOutput, format: &str) -> Result<Vec<u8>, String> {
         // them is VERIFY-marked. Writing ASCII under the .stl extension made
         // every exported file roughly five times the size of the reference's
         // and textually unlike it.
-        "stl" | "binstl" => Ok(crate::io::write_stl_binary(&export_mesh(out)?)),
-        "asciistl" => Ok(crate::io::write_stl_ascii(&export_mesh(out)?).into_bytes()),
+        "stl" | "binstl" => Ok(crate::io::write_stl_binary(&export_mesh(out, Grid::Binary)?)),
+        "asciistl" => Ok(crate::io::write_stl_ascii(&export_mesh(out, Grid::Text)?).into_bytes()),
         other => export_string(out, other).map(String::into_bytes),
     }
 }
@@ -3773,9 +3773,9 @@ pub fn export_string(out: &EvalOutput, format: &str) -> Result<String, String> {
         "svg" => Ok(crate::io::write_svg(&export_2d(out)?)),
         "dxf" => Ok(crate::io::write_dxf_2d(&export_2d(out)?)),
         "pdf" => Ok(crate::io::write_pdf(&export_2d(out)?)),
-        "off" => Ok(crate::io::write_off(&export_mesh(out)?)),
-        "amf" => Ok(crate::io::write_amf(&export_mesh(out)?)),
-        "asciistl" => Ok(crate::io::write_stl_ascii(&export_mesh(out)?)),
+        "off" => Ok(crate::io::write_off(&export_mesh(out, Grid::Text)?)),
+        "amf" => Ok(crate::io::write_amf(&export_mesh(out, Grid::Text)?)),
+        "asciistl" => Ok(crate::io::write_stl_ascii(&export_mesh(out, Grid::Text)?)),
         // Named explicitly rather than falling into the catch-all, so the
         // message says which tag to use instead of "unsupported format".
         "stl" | "binstl" | "3mf" => Err(format!(
@@ -6139,6 +6139,12 @@ mod tests {
     use super::*;
     use crate::parser::parse;
 
+    /// Binary STL is what a bare `.stl` writes, so it is the grid the tests
+    /// below hold the export funnel to.
+    fn export_mesh_bin(out: &EvalOutput) -> Result<Mesh, String> {
+        export_mesh(out, Grid::Binary)
+    }
+
     fn run(src: &str) -> EvalOutput {
         evaluate(&parse(src).unwrap())
     }
@@ -7392,11 +7398,11 @@ mod tests {
 
         // export_mesh: 3D exports; 2D-only and empty are the reference errors;
         // `%` background is excluded from the export.
-        assert!(export_mesh(&run("cube(2, center=true);")).is_ok());
-        assert!(export_mesh(&run("square(5);")).unwrap_err().contains("not a 3D object"));
-        assert!(export_mesh(&run("if (false) cube(1);")).unwrap_err().contains("empty"));
+        assert!(export_mesh_bin(&run("cube(2, center=true);")).is_ok());
+        assert!(export_mesh_bin(&run("square(5);")).unwrap_err().contains("not a 3D object"));
+        assert!(export_mesh_bin(&run("if (false) cube(1);")).unwrap_err().contains("empty"));
         assert!(
-            export_mesh(&run("%cube(2, center=true);")).unwrap_err().contains("empty"),
+            export_mesh_bin(&run("%cube(2, center=true);")).unwrap_err().contains("empty"),
             "an only-% scene exports empty"
         );
 
@@ -7439,7 +7445,7 @@ mod tests {
         // silently, both written out as if fine.
         let check = |src: &str| {
             let out = run(src);
-            let m = export_mesh(&out).expect("exported");
+            let m = export_mesh_bin(&out).expect("exported");
             let whole = m.signed_volume();
             let biggest = out
                 .shapes
@@ -7487,7 +7493,7 @@ mod tests {
     fn the_export_merges_overlapping_shells() {
         let vol = |src: &str| {
             let out = run(src);
-            let m = export_mesh(&out).expect("exported");
+            let m = export_mesh_bin(&out).expect("exported");
             let v: f64 = m
                 .tris
                 .iter()

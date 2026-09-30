@@ -619,95 +619,133 @@ fn reduce_pairwise(mut items: Vec<Mesh>, op: fn() -> Op) -> Mesh {
 /// error and far below any real loss, which runs to halves and tenths.
 const UNION_SLACK: f64 = 1e-3;
 
-/// How close a merged volume must be to the SUM of its operands before the
-/// merge is judged to have joined nothing.
+/// One solid in a union that is still being built.
 ///
-/// Chosen from the measurement, because the two populations it has to
-/// separate are far apart and neither is where theory would put it.
+/// The pieces of a `Sum` share no volume with each other. That invariant is
+/// the whole design, and it is established by proof for every piece that
+/// joins the set, never assumed; it pays for itself twice over.
 ///
-/// Solids that never met have volumes that simply add, so the ideal
-/// threshold is zero. The BSP does not oblige: it rewrites every triangle it
-/// touches, and across the 247 pairwise merges of a suspension bridge whose
-/// 501 solids are provably disjoint -- the model leaves 20 mm of air
-/// everywhere two members meet, precisely so this is checkable -- 239 came
-/// back within 1e-8 of the sum and the remaining eight drifted as far as
-/// 1.2e-5. Meanwhile the smallest REAL overlap anywhere in the example corpus
-/// is 3.2e-4, on a heart whose chambers genuinely interpenetrate. Between
-/// 1.2e-5 and 3.2e-4 there is nothing, and 1e-4 sits in the gap.
+/// It makes the BOUNDS a merge is checked against the bounds of the two
+/// solids being merged and nothing else. A union contains each operand, so
+/// it cannot enclose less than the larger; it is covered by them together,
+/// so it cannot enclose more than their sum. Both hold for any union, need
+/// no oracle and cost one pass over the triangles each, and between them
+/// they catch a boolean that has gone wrong in either direction -- a heart
+/// of eleven shells lost a third of itself, 168,222 mm^3 down to 135,556,
+/// when the aorta was merged in. What they must NOT be is bounds on the
+/// whole accumulated subtree: a fraction of that is a tolerance unrelated
+/// geometry can inflate without limit, which is how a 1.0 mm overlap between
+/// two 40 mm boxes came to vanish in silence when a 300 mm cube 500 mm away
+/// joined the same union -- and vanish for one ordering of the children and
+/// not another, which the language reference forbids outright: "Order of
+/// children never affects the result".
 ///
-/// The threshold has to be that generous because the alternative compounds.
-/// A pair that keeps its BSP result hands a re-tessellated mesh to the next
-/// merge up, whose volume is then further off, so it keeps its BSP result
-/// too. Swept the whole range on the bridge: at 1e-9 the export is 452,007
-/// triangles, at 1e-6 it is 235,420, at 1e-5 it is 49,951, and at 1e-4 it is
-/// 18,808 -- which is the mesh the model actually wrote, face for face.
-const DISJOINT_SLACK: f64 = 1e-4;
-
-/// A partly-reduced union, carrying what is KNOWN about the volume the true
-/// union of everything underneath it encloses.
-///
-/// The bounds are the point. A union contains each of its operands, so it
-/// cannot enclose less than the larger of them; and it is covered by them
-/// together, so it cannot enclose more than their sum. Both hold for any
-/// union whatever -- no oracle, no reference implementation, one pass over
-/// the triangles each -- and between them they catch a boolean that has gone
-/// wrong in either direction.
-///
-/// Carrying the bounds down the reduction is what makes them bite. Checking
-/// only the finished union against the largest single part is far too weak:
-/// a heart of eleven shells lost a third of itself -- 168,222 mm^3 down to
-/// 135,556 -- when the aorta was merged in, and the finished mesh still sat
-/// comfortably above the 123,005 of its largest part, so nothing fired. A
-/// successful merge here REPLACES the bounds with what it measured, so the
-/// next step up is held to what the last one actually achieved.
-struct Bounded {
+/// And it means geometry that never meets never goes near a BSP. That is not
+/// a micro-optimisation: a DNA segment of 44 solids that never touch spends
+/// 2.1 seconds being evaluated and, before this, 139 seconds in the
+/// export-time union, which then discovered it had joined nothing; a
+/// suspension bridge's 501 members came out of the BSP as 695,916 triangles
+/// carrying 52,617 T-junctions, to say what concatenation says exactly.
+struct Piece {
     mesh: Mesh,
-    /// Volume the geometry underneath is known to enclose at least.
-    lo: f64,
-    /// ...and at most.
-    hi: f64,
-    /// Does the mesh hold only solids that share no volume with each other?
+    lo: [f64; 3],
+    hi: [f64; 3],
+    /// A vertex, for the containment test that rules out nesting.
+    on: V3,
+    /// Volume this piece is known to enclose, at least and at most. The two
+    /// are equal for a solid, and apart only for a piece that is the
+    /// concatenation of a refused pair, which encloses less than their sum.
+    vlo: f64,
+    vhi: f64,
+    /// Do no two solids in here overlap?
     ///
-    /// A ray cast counts crossings, so it answers "inside the union" only
-    /// while the pieces it passes through do not overlap: a point inside TWO
-    /// stacked solids is crossed an even number of times and reads as
-    /// outside. Every node here is clean except one, the concatenation of a
-    /// pair whose merge was refused, and that one is marked so the
-    /// containment test declines to speak for it.
+    /// True for one solid and for any number of solids already proved
+    /// pairwise disjoint; false only for the concatenation of a pair whose
+    /// merge was refused. A ray cast counts crossings, so it answers "inside"
+    /// only under exactly that condition: a point inside two STACKED solids
+    /// is crossed an even number of times and reads as outside. A piece that
+    /// is marked unclean declines to speak for its own interior.
     clean: bool,
-    /// One entry per original operand underneath: its box and a point on it.
-    /// Kept separately rather than merged into one, because the whole node's
-    /// box says nothing useful about nesting once a concatenation has put
-    /// several solids in it, and nesting is the one case the surface test
-    /// below cannot see.
-    boxes: Vec<Part>,
 }
 
-impl Bounded {
-    fn leaf(mesh: Mesh) -> Bounded {
+impl Piece {
+    /// One solid, whether it came in as an operand or out of a boolean.
+    fn of(mesh: Mesh) -> Option<Piece> {
+        let (lo, hi) = crate::geom::bounds(&mesh)?;
+        let on = *mesh.positions.first()?;
         // An inside-out operand still encloses |v|; it is only the sign that
         // is wrong. Taking the magnitude for the ceiling keeps the upper
         // bound honest, while the floor stays at zero because a solid wound
         // the wrong way cannot be claimed to contain anything.
         let v = mesh.signed_volume();
-        let boxes = whole(&mesh);
-        Bounded { mesh, lo: v.max(0.0), hi: v.abs(), clean: true, boxes }
+        Some(Piece { mesh, lo, hi, on, vlo: v.max(0.0), vhi: v.abs(), clean: true })
+    }
+
+    /// Several solids already proved to share no volume, carried as one.
+    ///
+    /// This is what makes a hub cheap. A girder that 400 deck planks all rest
+    /// on is 400 pairs in the touch graph and not one pair anywhere else, so
+    /// merging the planks in one at a time re-tessellates the whole growing
+    /// girder 400 times -- measured, and it is the shape of the quadratic:
+    /// 32 triangles into 18,746, then into 24,377, then 30,140, then 37,069.
+    /// The planks share no volume with each other, so their union IS their
+    /// concatenation, and the BSP can take all 400 of them against the girder
+    /// in a single boolean.
+    fn group(mut parts: Vec<Piece>) -> Piece {
+        let mut acc = parts.pop().expect("a group has at least one piece");
+        for p in parts {
+            for k in 0..3 {
+                acc.lo[k] = acc.lo[k].min(p.lo[k]);
+                acc.hi[k] = acc.hi[k].max(p.hi[k]);
+            }
+            acc.mesh = concat(&acc.mesh, &p.mesh);
+            acc.vlo += p.vlo;
+            acc.vhi += p.vhi;
+            acc.clean &= p.clean;
+        }
+        acc
+    }
+
+    /// Two solids that would not merge, kept side by side.
+    ///
+    /// Concatenation is not a union -- the result self-intersects where the
+    /// operands did -- but it is every triangle that went in, which beats a
+    /// merge that dropped some of them, and the caller is told.
+    fn glued(a: Piece, b: Piece) -> Piece {
+        let mut lo = a.lo;
+        let mut hi = a.hi;
+        for k in 0..3 {
+            lo[k] = lo[k].min(b.lo[k]);
+            hi[k] = hi[k].max(b.hi[k]);
+        }
+        Piece {
+            mesh: concat(&a.mesh, &b.mesh),
+            lo,
+            hi,
+            on: a.on,
+            vlo: a.vlo.max(b.vlo),
+            vhi: a.vhi + b.vhi,
+            clean: false,
+        }
     }
 }
 
-/// One operand that went into a union: where it is, and a point on it.
-#[derive(Clone)]
-struct Part {
-    lo: [f64; 3],
-    hi: [f64; 3],
-    /// A vertex of that operand, used to settle containment by a ray cast
-    /// when its box alone cannot.
-    on: V3,
+/// Is `inner` inside `outer`, as boxes?
+fn box_contains(outer: &Piece, inner: &Piece) -> bool {
+    (0..3).all(|k| outer.lo[k] <= inner.lo[k] && inner.hi[k] <= outer.hi[k])
 }
 
-/// Is `inner` inside `outer`, as boxes?
-fn box_contains(outer: &Part, inner: &Part) -> bool {
-    (0..3).all(|k| outer.lo[k] <= inner.lo[k] && inner.hi[k] <= outer.hi[k])
+/// Do two pieces' boxes overlap at all?
+///
+/// Two solids whose boxes do not are already each other's union: nothing to
+/// clip, nothing to split. Taking the BSP anyway is not just slow, it is
+/// destructive -- every polygon that straddles any plane of the other's tree
+/// gets cut, so a union of twenty disjoint spheres came back with seven times
+/// the triangles it went in with. The test is exact, so this is a shortcut,
+/// not an approximation; it is only far too weak on its own, which is what
+/// `pieces_disjoint` is for.
+fn boxes_meet(a: &Piece, b: &Piece) -> bool {
+    (0..3).all(|k| a.lo[k] <= b.hi[k] && b.lo[k] <= a.hi[k])
 }
 
 /// Does this point lie inside the closed solid, by crossing parity?
@@ -780,39 +818,30 @@ fn crossings(m: &Mesh, o: V3, d: V3) -> Option<usize> {
 
 /// Can these two be shown to share no volume, without running a boolean?
 ///
-/// This is worth a good deal of care, because the alternative is measured:
-/// a DNA segment of 44 solids that never touch each other spends 2.1 seconds
-/// being evaluated and 139 seconds in the export-time union, which then
-/// discovers it joined nothing. A suspension bridge of 501 disjoint solids
-/// pays the same toll. Bounding boxes cannot see it -- a backbone helix and a
-/// box girder both have boxes containing most of the model -- so the question
-/// has to be put to the triangles.
+/// Answers in the SUFFICIENT direction only: "certainly not" or "cannot
+/// say", and "cannot say" costs only the boolean that was going to run
+/// anyway. Bounding boxes cannot do it -- a backbone helix and a box girder
+/// both have boxes containing most of their model -- so the question goes to
+/// the triangles.
 ///
 /// Two closed solids share volume only if their surfaces cross, OR one is
-/// wholly inside the other. The second case is ruled out first and by boxes,
-/// since a nested solid's box is inside its container's; that is why the leaf
-/// boxes are carried separately. What remains is a surface-crossing test, and
-/// this is the SUFFICIENT direction only: it answers "certainly not" or
-/// "cannot say", and "cannot say" simply costs what today already costs.
-fn provably_disjoint(a: &Bounded, b: &Bounded) -> bool {
-    if a.boxes.is_empty() || b.boxes.is_empty() {
-        return false;
-    }
-    // A box that contains another says only that nesting is POSSIBLE, and on
-    // the models this exists for it always is: a helical backbone's box
-    // contains every base pair in the molecule, a box girder's contains every
-    // hanger on the bridge. Stopping there gave up on every pair and saved
-    // nothing. Where a box allows nesting, the point settles it.
-    let nested = |outer: &Bounded, inner: &[Part]| {
-        inner.iter().any(|y| {
-            outer.boxes.iter().any(|x| box_contains(x, y))
-                && (!outer.clean || point_inside(&outer.mesh, y.on) != Some(false))
-        })
+/// wholly inside the other. Nesting is ruled out first and by boxes, since a
+/// nested solid's box is inside its container's; where a box allows nesting
+/// the point settles it. What remains is a surface-crossing test.
+fn pieces_disjoint(a: &Piece, b: &Piece) -> bool {
+    let nested = |outer: &Piece, inner: &Piece| {
+        box_contains(outer, inner)
+            && (!outer.clean || point_inside(&outer.mesh, inner.on) != Some(false))
     };
-    if nested(&a, &b.boxes) || nested(&b, &a.boxes) {
+    if nested(a, b) || nested(b, a) {
         return false;
     }
     !surfaces_may_touch(&a.mesh, &b.mesh)
+}
+
+/// Might these two share volume? The question `absorb` actually asks.
+fn may_share(a: &Piece, b: &Piece) -> bool {
+    boxes_meet(a, b) && !pieces_disjoint(a, b)
 }
 
 /// Two triangles are separated when some axis separates their projections.
@@ -867,6 +896,10 @@ fn tris_separated(p: &[V3; 3], q: &[V3; 3], eps: f64) -> bool {
 /// Answers conservatively: false only when every pair was proved apart.
 fn surfaces_may_touch(a: &Mesh, b: &Mesh) -> bool {
     use std::collections::HashMap;
+    // The grid is built over the FIRST mesh and walked with the second, so
+    // the smaller one goes first: a hanger against a girder should pay for
+    // the hanger's triangles, not the girder's.
+    let (a, b) = if a.tris.len() <= b.tris.len() { (a, b) } else { (b, a) };
     let (Some((alo, ahi)), Some((blo, bhi))) = (crate::geom::bounds(a), crate::geom::bounds(b))
     else {
         return true;
@@ -912,7 +945,7 @@ fn surfaces_may_touch(a: &Mesh, b: &Mesh) -> bool {
     // Insert a's triangles. A triangle spanning a large part of the grid is
     // cheap to insert once and expensive to insert everywhere, so the budget
     // gives up rather than thrashing; giving up means "may touch".
-    let budget = 40 * (a.tris.len() + 16);
+    let budget = 400 * (a.tris.len() + b.tris.len() + 16);
     let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
     let mut inserted = 0usize;
     for (i, t) in a.tris.iter().enumerate() {
@@ -941,7 +974,7 @@ fn surfaces_may_touch(a: &Mesh, b: &Mesh) -> bool {
         return false;
     }
     let mut tested = 0usize;
-    let pair_budget = 400 * (a.tris.len() + b.tris.len() + 16);
+    let pair_budget = 4_000 * (a.tris.len() + b.tris.len() + 16);
     for t in &b.tris {
         let v = corners(b, t);
         let (tl, th) = tri_box(&v);
@@ -994,160 +1027,153 @@ fn note_union(fallback: bool) {
     });
 }
 
-/// What a pairwise union came to.
-enum Merge {
-    /// The two are now one solid, inside its bounds.
-    Made(Bounded),
-    /// Neither operand order stood. The pair is handed back untouched, for
-    /// the caller to try against different partners.
-    Refused(Bounded, Bounded),
-}
-
-fn union_reduce(mut items: Vec<Bounded>) -> Mesh {
-    if items.is_empty() {
-        return Mesh::empty();
+/// Reduce a union to the fewest booleans that can express it.
+///
+/// Three observations, in the order they are used.
+///
+/// SOLIDS THAT SHARE NO VOLUME ARE ALREADY THEIR OWN UNION. Their
+/// concatenation is exactly right, and putting them through a BSP is not just
+/// slow but destructive -- every polygon straddling any plane of the other's
+/// tree gets cut, so a union of twenty disjoint spheres came back with seven
+/// times the triangles it went in with, and a suspension bridge's 501 members
+/// came out as 695,916 triangles carrying 52,617 T-junctions to say what
+/// concatenation says exactly. So the first thing built is the graph of which
+/// pieces MIGHT share volume, and the answer comes from a separating axis
+/// between their triangles, not from bounding boxes, which on a long part are
+/// useless -- a girder's box holds every hanger, tower and anchorage in the
+/// model.
+///
+/// WHAT DOES SHARE VOLUME IS A COMPONENT OF THAT GRAPH, AND COMPONENTS ARE
+/// INDEPENDENT. Each is reduced on its own, and the result does not depend on
+/// the order the children were written in -- which the reference requires
+/// ("Order of children never affects the result") and the pairwise tree this
+/// replaced could not manage, because it merged neighbours in written order.
+///
+/// WITHIN A COMPONENT, PIECES THAT DO NOT TOUCH EACH OTHER CAN STILL BE
+/// CONCATENATED. A girder that four hundred deck planks rest on is four
+/// hundred edges and no edge anywhere else; merging the planks in one at a
+/// time re-tessellates the growing girder four hundred times. Colouring the
+/// component so that no two adjacent pieces share a colour puts every plank
+/// in one colour class and the girder in another, and the whole thing is ONE
+/// boolean. Greedy colouring by descending degree needs at most one more
+/// colour than the largest degree, and on a hub it needs two.
+fn reduce(pieces: Vec<Piece>) -> Mesh {
+    let n = pieces.len();
+    // Which pairs might share volume? Boxes settle most of it outright; only
+    // the pairs whose boxes meet pay for a separating axis.
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if may_share(&pieces[i], &pieces[j]) {
+                adj[i].push(j);
+                adj[j].push(i);
+            }
+        }
     }
-    // Passes that merged nothing at all. A refused pair is put back for the
-    // next pass, so a pass that refuses everything would otherwise spin; at
-    // the second such pass the refusals are concatenated instead, which
-    // always shortens the list.
-    let mut stalled = 0usize;
-    while items.len() > 1 {
-        let mut next = Vec::with_capacity(items.len().div_ceil(2));
-        let mut deferred = Vec::new();
-        let mut made = false;
-        let mut it = items.into_iter();
-        while let Some(a) = it.next() {
-            let Some(b) = it.next() else {
-                next.push(a);
-                break;
-            };
-            match union_pair(a, b) {
-                Merge::Made(c) => {
-                    made = true;
-                    next.push(c);
-                }
-                // A pair that will not merge is usually not a doomed pair but
-                // a badly matched one -- two shells that happen to graze each
-                // other where a third would have overlapped either cleanly.
-                // Measured on a character of 42 parts: reducing them in the
-                // order they were written left one merge that failed in both
-                // operand orders, and reducing the same 42 parts in the
-                // reverse order had no failures at all. So `b` goes back in
-                // the queue to meet someone else, and only an operand that
-                // nothing will take is given up on.
-                Merge::Refused(a, b) => {
-                    next.push(a);
-                    deferred.push(b);
+
+    let mut seen = vec![false; n];
+    let mut pieces: Vec<Option<Piece>> = pieces.into_iter().map(Some).collect();
+    let mut out = Mesh::empty();
+    for root in 0..n {
+        if seen[root] {
+            continue;
+        }
+        // One component, by depth-first walk.
+        let mut group = Vec::new();
+        let mut stack = vec![root];
+        seen[root] = true;
+        while let Some(v) = stack.pop() {
+            group.push(v);
+            for &w in &adj[v] {
+                if !seen[w] {
+                    seen[w] = true;
+                    stack.push(w);
                 }
             }
         }
-        if !deferred.is_empty() && (stalled >= 2 || next.len() <= 1) {
-            // Out of partners to try. Concatenation is not a union -- the
-            // result self-intersects where the operands did -- but it is
-            // every triangle that went in, which beats a merge that dropped
-            // some of them, and the caller is told.
-            for b in deferred.drain(..) {
-                note_union(true);
-                let a = next.pop().unwrap_or_else(|| Bounded {
-                    mesh: Mesh::empty(),
-                    lo: 0.0,
-                    hi: 0.0,
-                    clean: true,
-                    boxes: Vec::new(),
-                });
-                let boxes = [a.boxes.clone(), b.boxes.clone()].concat();
-                next.push(Bounded {
-                    mesh: concat(&a.mesh, &b.mesh),
-                    lo: a.lo.max(b.lo),
-                    hi: a.hi + b.hi,
-                    clean: false, // these two overlap; that is why they are here
-                    boxes,
-                });
+        let solid = if group.len() == 1 {
+            pieces[group[0]].take().expect("each piece is taken once")
+        } else {
+            merge_component(&group, &adj, &mut pieces)
+        };
+        out = concat(&out, &solid.mesh);
+    }
+    out
+}
+
+/// Colour a component so no two touching pieces share a colour, concatenate
+/// each colour class, then merge the classes smallest first.
+fn merge_component(
+    group: &[usize],
+    adj: &[Vec<usize>],
+    pieces: &mut [Option<Piece>],
+) -> Piece {
+    // Descending degree: the classic greedy order, and the one that puts a
+    // hub in a class of its own and everything hanging off it in one other.
+    let mut order: Vec<usize> = group.to_vec();
+    order.sort_by_key(|&v| std::cmp::Reverse(adj[v].len()));
+
+    let mut colour: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut classes: Vec<Vec<usize>> = Vec::new();
+    for v in order {
+        let mut taken = vec![false; classes.len() + 1];
+        for &w in &adj[v] {
+            if let Some(&c) = colour.get(&w) {
+                taken[c] = true;
             }
         }
-        // The deferred go to the BACK, where the next pass's pairing -- which
-        // walks a list about half as long -- gives them different partners.
-        next.append(&mut deferred);
-        stalled = if made { 0 } else { stalled + 1 };
-        items = next;
+        let c = taken.iter().position(|&t| !t).expect("one colour is always free");
+        if c == classes.len() {
+            classes.push(Vec::new());
+        }
+        classes[c].push(v);
+        colour.insert(v, c);
     }
-    items.into_iter().next().unwrap().mesh
+
+    let mut solids: Vec<Piece> = classes
+        .into_iter()
+        .map(|c| {
+            Piece::group(c.into_iter().map(|v| pieces[v].take().expect("taken once")).collect())
+        })
+        .collect();
+    // Smallest first, so the growing result meets the big operand last and
+    // is re-tessellated by it once rather than at every step.
+    solids.sort_by_key(|p| p.mesh.tris.len());
+    let mut it = solids.into_iter();
+    let mut acc = it.next().expect("a component has at least one class");
+    for p in it {
+        acc = merge(acc, p);
+    }
+    acc
 }
 
-/// A merged node is one solid again, so it needs one entry, not its
-/// operands' several.
-fn whole(m: &Mesh) -> Vec<Part> {
-    match (crate::geom::bounds(m), m.positions.first()) {
-        (Some((lo, hi)), Some(&on)) => vec![Part { lo, hi, on }],
-        _ => Vec::new(),
-    }
-}
-
-fn union_pair(a: Bounded, b: Bounded) -> Merge {
-    // Operands that share no volume need no boolean at all, and their volumes
-    // simply add. The box test settles it outright for most pairs; where the
-    // boxes overlap but the solids do not, `provably_disjoint` puts the
-    // question to the triangles rather than paying for a BSP whose answer is
-    // already known.
-    if !boxes_overlap(&a.mesh, &b.mesh) || provably_disjoint(&a, &b) {
-        let clean = a.clean && b.clean;
-        let boxes = [a.boxes, b.boxes].concat();
-        return Merge::Made(Bounded {
-            mesh: concat(&a.mesh, &b.mesh),
-            lo: a.lo + b.lo,
-            hi: a.hi + b.hi,
-            clean,
-            boxes,
-        });
-    }
-    let (lo, hi) = (a.lo.max(b.lo), a.hi + b.hi);
+/// Union two solids that are known, or at least suspected, to meet.
+fn merge(a: Piece, b: Piece) -> Piece {
+    let (lo, hi) = (a.vlo.max(b.vlo), a.vhi + b.vhi);
     let holds = |m: &Mesh| {
         let v = m.signed_volume();
         v >= lo * (1.0 - UNION_SLACK) && v <= hi * (1.0 + UNION_SLACK)
     };
 
     let merged = boolean(&a.mesh, &b.mesh, Op::Union);
+    let got_merged = merged.signed_volume();
     if holds(&merged) {
-        let got = merged.signed_volume();
-        // A union that came back holding the SUM of its operands merged
-        // nothing: the two solids never met, and the bounding boxes that
-        // said otherwise were only boxes. Keep the concatenation instead.
-        //
-        // This is not a micro-optimisation. `boxes_overlap` is the only
-        // cheap disjointness test available, and on any model with a long
-        // part it is useless -- a suspension bridge's girder has a bounding
-        // box containing every hanger, tower and anchorage in the model, so
-        // all 501 solids "overlap" and every pair goes to the BSP. The
-        // answer it returns is right, and it costs 18,808 triangles turned
-        // into 695,916, with 52,617 T-junctions that were not there before,
-        // to say what concatenation says exactly. The volume is already
-        // measured, so recognising the case is free.
-        if got >= hi * (1.0 - DISJOINT_SLACK) {
-            let clean = a.clean && b.clean;
-            let boxes = [a.boxes, b.boxes].concat();
-            return Merge::Made(Bounded {
-                mesh: concat(&a.mesh, &b.mesh),
-                lo: a.lo + b.lo,
-                hi: a.hi + b.hi,
-                clean,
-                boxes,
-            });
+        if let Some(p) = Piece::of(merged) {
+            return p;
         }
-        let boxes = whole(&merged);
-        return Merge::Made(Bounded { mesh: merged, lo: got, hi: got, clean: true, boxes });
     }
     // A BSP is not symmetric in its operands: the first supplies the planes
-    // the second is cut by, so `a ∪ b` and `b ∪ a` are two different
+    // the second is cut by, so `a u b` and `b u a` are two different
     // computations of the same answer, and one of them failing says nothing
     // about the other. Trying the swap costs a second boolean only on the
     // designs that needed it.
     let swapped = boolean(&b.mesh, &a.mesh, Op::Union);
+    let got_swapped = swapped.signed_volume();
     if holds(&swapped) {
-        note_union(false);
-        let got = swapped.signed_volume();
-        let boxes = whole(&swapped);
-        return Merge::Made(Bounded { mesh: swapped, lo: got, hi: got, clean: true, boxes });
+        if let Some(p) = Piece::of(swapped) {
+            note_union(false);
+            return p;
+        }
     }
     // The warning can only say how many merges failed -- it has no name for
     // the operands and no units, since the reduction runs in the normalised
@@ -1159,26 +1185,25 @@ fn union_pair(a: Bounded, b: Bounded) -> Merge {
             "union refused: a={} tris [{:.4}, {:.4}]  b={} tris [{:.4}, {:.4}]  \
              merged {:.4}, swapped {:.4}, needed [{:.4}, {:.4}]",
             a.mesh.tris.len(),
-            a.lo,
-            a.hi,
+            a.vlo,
+            a.vhi,
             b.mesh.tris.len(),
-            b.lo,
-            b.hi,
-            merged.signed_volume(),
-            swapped.signed_volume(),
+            b.vlo,
+            b.vhi,
+            got_merged,
+            got_swapped,
             lo,
             hi
         );
-        for (tag, m) in [("a", &a.mesh), ("b", &b.mesh)] {
-            if let Some((blo, bhi)) = crate::geom::bounds(m) {
-                eprintln!(
-                    "   {tag} box [{:.3} {:.3} {:.3}] .. [{:.3} {:.3} {:.3}]",
-                    blo[0], blo[1], blo[2], bhi[0], bhi[1], bhi[2]
-                );
-            }
+        for (tag, p) in [("a", &a), ("b", &b)] {
+            eprintln!(
+                "   {tag} box [{:.3} {:.3} {:.3}] .. [{:.3} {:.3} {:.3}]",
+                p.lo[0], p.lo[1], p.lo[2], p.hi[0], p.hi[1], p.hi[2]
+            );
         }
     }
-    Merge::Refused(a, b)
+    note_union(true);
+    Piece::glued(a, b)
 }
 
 /// The working frame a boolean is solved in.
@@ -1318,29 +1343,13 @@ pub fn union_all(meshes: &[Mesh]) -> Mesh {
 }
 
 fn union_all_raw(meshes: &[Mesh]) -> Mesh {
-    union_reduce(
+    reduce(
         meshes
             .iter()
             .filter(|m| !m.positions.is_empty())
-            .map(|m| Bounded::leaf(m.clone()))
+            .filter_map(|m| Piece::of(m.clone()))
             .collect(),
     )
-}
-
-/// Do two meshes' bounding boxes overlap at all?
-///
-/// Two solids that do not are already each other's union: nothing to clip,
-/// nothing to split. Taking the BSP anyway is not just slow, it is
-/// destructive -- every polygon that straddles any plane of the other's tree
-/// gets cut, so a union of twenty disjoint spheres came back with seven times
-/// the triangles it went in with. The test is exact, so this is a shortcut,
-/// not an approximation.
-fn boxes_overlap(a: &Mesh, b: &Mesh) -> bool {
-    let (Some((alo, ahi)), Some((blo, bhi))) = (crate::geom::bounds(a), crate::geom::bounds(b))
-    else {
-        return false;
-    };
-    (0..3).all(|k| alo[k] <= bhi[k] && blo[k] <= ahi[k])
 }
 
 /// Concatenate two meshes, rebasing the second's indices.
@@ -1863,7 +1872,8 @@ mod tests {
             }
             c
         };
-        let pair = |a: Mesh, b: Mesh| provably_disjoint(&Bounded::leaf(a), &Bounded::leaf(b));
+        let pair =
+            |a: Mesh, b: Mesh| pieces_disjoint(&Piece::of(a).unwrap(), &Piece::of(b).unwrap());
 
         // Clear of each other, boxes not even overlapping.
         assert!(pair(at(0.0, 0.0, 0.0, 1.0), at(5.0, 0.0, 0.0, 1.0)));
@@ -1907,6 +1917,121 @@ mod tests {
         assert!((signed_volume(&u) - want).abs() < 1e-9, "{} vs {want}", signed_volume(&u));
         let u = union_all(&[at(0.0, 0.0, 0.0, 4.0), at(0.0, 0.0, 0.0, 1.0)]);
         assert!((signed_volume(&u) - 64.0).abs() < 1e-6, "nested union is the outer one: {}", signed_volume(&u));
+    }
+
+    /// A union must not lose an overlap for being small, or for what else is
+    /// in the same union, or for meeting exactly at a face.
+    ///
+    /// All three came from measuring the merged volume against a tolerance
+    /// and keeping the concatenation when it looked like the sum. It cannot
+    /// work: two solids that genuinely meet can share arbitrarily little
+    /// volume, and two that meet at a face share none at all, so no threshold
+    /// separates them from solids that never met. The three exports that
+    /// exposed it are reproduced here as they were.
+    #[test]
+    fn a_union_keeps_every_overlap_it_is_given() {
+        let box40 = |dz: f64| {
+            let mut m = geom::cube([40.0, 40.0, 40.0], false);
+            for p in &mut m.positions {
+                p[2] += dz;
+            }
+            m
+        };
+        let vol = |m: &Mesh| signed_volume(m);
+
+        // Six microns of overlap on a 40 mm box: 40*40*0.006 = 9.6 mm^3 out
+        // of 128,000, which is 7.5e-5 of the pair and vanished under a
+        // threshold of 1e-4. The two boxes exported interpenetrating.
+        let u = union_all(&[box40(0.0), box40(40.0 - 0.006)]);
+        assert!(
+            (vol(&u) - (128_000.0 - 9.6)).abs() < 1e-3,
+            "a 9.6 mm^3 overlap is 9.6 mm^3: {}",
+            vol(&u)
+        );
+
+        // A whole millimetre of overlap -- 1,600 mm^3 -- and a 300 mm cube
+        // 500 mm away that shares nothing with either. The threshold was a
+        // fraction of the running total, so the cube raised it past the
+        // overlap and the overlap disappeared; and it disappeared for one
+        // ordering of the children and not the other, which the reference
+        // forbids: "Order of children never affects the result".
+        let mut far = geom::cube([300.0, 300.0, 300.0], false);
+        for p in &mut far.positions {
+            p[0] += 500.0;
+        }
+        let want = 128_000.0 - 1_600.0 + 27_000_000.0;
+        for order in [
+            [box40(0.0), box40(39.0), far.clone()],
+            [box40(0.0), far.clone(), box40(39.0)],
+            [far.clone(), box40(39.0), box40(0.0)],
+        ] {
+            let got = vol(&union_all(&order));
+            assert!((got - want).abs() < 1e-3, "{got} should be {want} in any order");
+        }
+
+        // Two cubes sharing exactly a face. Their union has precisely the
+        // volume of their sum, so no measurement of volume can tell it from a
+        // pair that never met -- and the concatenation that was kept carried
+        // four triangles on the shared plane, an interior wall in a solid the
+        // reference says is one solid ("interior face dissolves").
+        let mut right = geom::cube([40.0, 40.0, 40.0], false);
+        for p in &mut right.positions {
+            p[0] += 40.0;
+        }
+        let u = union_all(&[geom::cube([40.0, 40.0, 40.0], false), right]);
+        assert!((vol(&u) - 128_000.0).abs() < 1e-6, "vol {}", vol(&u));
+        let wall = u
+            .tris
+            .iter()
+            .filter(|t| {
+                t.iter().all(|&i| (u.positions[i as usize][0] - 40.0).abs() < 1e-9)
+            })
+            .count();
+        assert_eq!(wall, 0, "the shared face is interior and must not be in the mesh");
+        assert_eq!(crate::geom::closedness_note(&u), None, "and the result is one closed solid");
+    }
+
+    /// Four hundred planks on one girder is four hundred edges and no edge
+    /// anywhere else, so it is ONE boolean, not four hundred.
+    ///
+    /// Merging them in one at a time re-tessellates the growing girder every
+    /// time; on a suspension bridge that was 32 triangles into 18,746, then
+    /// 24,377, then 30,140, and the export did not finish in ten minutes. The
+    /// planks share no volume with each other, so the colouring puts them all
+    /// in one class and the BSP sees them once.
+    #[test]
+    fn a_hub_costs_one_boolean_not_one_per_spoke() {
+        let mut parts = vec![geom::cube([100.0, 2.0, 2.0], false)];
+        for i in 0..40 {
+            let mut plank = geom::cube([1.0, 6.0, 1.0], false);
+            for p in &mut plank.positions {
+                p[0] += 2.0 * i as f64;
+                p[1] -= 2.0;
+                p[2] += 1.0; // sunk half way into the girder
+            }
+            parts.push(plank);
+        }
+        // The girder is 100 x 2 x 2 = 400. Each plank is 1 x 6 x 1 = 6 and
+        // sits in the girder over 1 x 2 x 1 = 2, so the union is
+        // 400 + 40 * (6 - 2) = 560.
+        let u = union_all(&parts);
+        let got = signed_volume(&u);
+        assert!((got - 560.0).abs() < 1e-6, "{got} should be 560");
+        // 492 triangles go in and 1,926 come out: the cut cost of ONE
+        // boolean over the whole set. Merging the planks in one at a time
+        // cuts the girder again at every step, which is what the suspension
+        // bridge measured -- 32 triangles into 18,746, then 24,377, then
+        // 30,140 -- and the export did not finish in ten minutes. The bound
+        // is loose because the BSP's exact cut count is not the point.
+        assert!(u.tris.len() < 4_000, "one boolean, not forty: {} triangles", u.tris.len());
+
+        // And the planks on their own -- pairwise disjoint, nothing to
+        // merge -- must not go near a BSP at all: their union is exactly
+        // their concatenation, triangle for triangle.
+        let planks = &parts[1..];
+        let loose = union_all(planks);
+        assert_eq!(loose.tris.len(), planks.iter().map(|m| m.tris.len()).sum::<usize>());
+        assert_eq!(crate::geom::closedness_note(&loose), None, "and nothing was cut");
     }
 
     #[test]
