@@ -283,7 +283,8 @@ EM_WC    = 18;      // clamp axial width, mm
 EM_TC    = 8;       // clamp radial wall, mm
 EM_SPLIT = 1.0;     // parting gap, mm of ARC at the seat
 EM_TD    = 2.5;     // tongue depth, mm
-EM_TW    = 10;      // tongue width, mm of arc at the seat
+EM_TW    = 10;      // tongue crest width, mm of arc at the seat
+EM_TCH   = 0.6;     // tongue flank chamfer, mm of arc at the seat
 EM_NLUG  = 6;       // axial bolt lugs, 3 per half
 EM_LUG0  = 30;      // azimuth of the first lug, deg
 EM_BOLT  = 6;       // M6 everywhere on the interface
@@ -294,16 +295,17 @@ EM_EARL  = 8;       // pinch ear length along the bolt, mm
 EM_EARS  = 0.5;     // pinch ear standoff from the parting plane, mm
 EM_JG    = 0.05;    // bookkeeping gap between bodies, mm
 
-EM_RAI   = 176;     // active annulus, inner radius, mm
-EM_RAO   = 202;     // active annulus, outer radius, mm
+EM_RAI   = 177;     // active annulus, inner radius, mm
+EM_RAO   = 203;     // active annulus, outer radius, mm
 EM_WT    = 6.5;     // stator tooth body width, deg
 EM_WSH   = 12.6;    // stator shoe width, deg
 EM_HT    = 12;      // tooth body height, mm
 EM_TSH   = 4;       // shoe thickness, mm
+EM_FIL   = 1.5;     // shoe-to-body fillet, mm of arc at the mean radius
 EM_TBI   = 6;       // stator back iron thickness, mm
-EM_BIX   = 12;      // back iron radial overhang each side, mm
+EM_BIX   = 11;      // back iron radial overhang each side, mm
 EM_RW    = 5.0;     // coil bundle radius, mm
-EM_LIN   = 0.4;     // slot liner clearance, tooth to bundle, mm
+EM_LIN   = 1.0;     // slot liner clearance, tooth to bundle, mm
 EM_AG    = 1.0;     // AIRGAP, shoe face to magnet face, mm
 EM_TM    = 4;       // magnet thickness, mm
 EM_PA    = 0.85;    // magnet arc as a fraction of the pole pitch
@@ -337,7 +339,8 @@ RSEAT = RSPH + EM_OFF;            // (1) clamp bore
 RCO   = RSEAT + EM_TC;            // clamp outer radius
 RTNG  = RSEAT - EM_TD;            // tongue crest radius
 GSPL  = deg(EM_SPLIT/RSEAT);      // (2) parting gap as an angle
-GTNG  = deg(EM_TW/RSEAT);         // tongue width as an angle
+GTNG  = deg(EM_TW/RSEAT);         // tongue crest width as an angle
+GTCH  = deg(EM_TCH/RSEAT);        // tongue flank chamfer as an angle
 RBC   = RCO + EM_JG + EM_RLUG;    // bolt circle radius
 RLGX  = RBC + EM_RLUG;            // outermost radius of the clamp group
 
@@ -365,11 +368,23 @@ RHO   = EM_RW + EM_LIN;           // tooth surface to coil centreline
 ZCOIL = (ZBI1 + ZSH0)/2;          // coil bundle axis: centred in the slot
 CLSLT = (ZSH0 - ZBI1)/2 - EM_RW;  // slot clearance above and below the bundle
 RCIN  = EM_RAI - RHO - EM_RW;     // innermost radius the coil reaches
+// The tightest clearance in the part: the shoe-to-body fillet leans into
+// the slot exactly where the coil bundle is fattest.  Measured, not
+// asserted -- the perpendicular distance from the tooth flank to the
+// bundle surface is RHO - sqrt(rw^2 - (z-ZCOIL)^2) and the fillet face
+// stands at rad(GFIL) r (1 + (z-ZSH0)/EM_HT), worst at r = EM_RAO; the
+// minimum of the difference over the bundle profile is what counts.
+CFIL = min([ for (i = [0:40])
+               let( z = ZCOIL - EM_RW + 2*EM_RW*i/40,
+                    xb = RHO - sqrt(max(0, EM_RW*EM_RW - (z-ZCOIL)*(z-ZCOIL))),
+                    xf = rad(GFIL)*EM_RAO*(1 + (z-ZSH0)/EM_HT) )
+                 xb - xf ]);
 
 GMAG  = EM_PA*360/POLES;          // magnet arc, deg
 GSLOT = 360/SLOTS;                // slot pitch, deg
 GPOLE = 360/POLES;                // pole pitch, deg
 RMEAN = (EM_RAI + EM_RAO)/2;
+GFIL  = deg(EM_FIL/RMEAN);        // shoe-to-body fillet as an angle
 
 // capacitor bank, (13) to (18)
 EUSE  = CAPF*(VHI*VHI - VLO*VLO)/2;
@@ -492,16 +507,26 @@ LCOIL = 2*(EM_RAO-EM_RAI) + 2*PI*RHO + 2*rad(EM_WT/2)*(EM_RAI+EM_RAO);
 // ===================================================================
 
 // One half of the split clamp.  The station list is [azimuth, bore
-// radius]; the tongue is a pair of DUPLICATED azimuths where the bore
-// radius steps from RSEAT to RTNG, which makes its flanks vertical.
+// radius], in five runs: bore, chamfer in, tongue crest, chamfer out,
+// bore.  The chamfer is EM_TCH mm of arc, a real lead-in on the tongue
+// flank -- and it is also what keeps the flank off a duplicated
+// azimuth, which would put a zero-area quad in the shell (see the
+// kernel finding beside this file).  Every run is generated half open
+// so no two stations ever share an azimuth.
 module em_clamp_half(a0, a1, ac) {
     at0 = ac - GTNG/2;  at1 = ac + GTNG/2;
-    n1 = max(2, ceil((at0 - a0)/NAZ));
-    n2 = max(2, ceil(GTNG/NAZ));
-    n3 = max(2, ceil((a1 - at1)/NAZ));
-    S = concat( [ for (i = [0:n1]) [a0  + (at0-a0 )*i/n1, RSEAT] ],
-                [ for (i = [0:n2]) [at0 + (at1-at0)*i/n2, RTNG ] ],
-                [ for (i = [0:n3]) [at1 + (a1 -at1)*i/n3, RSEAT] ] );
+    b0 = at0 - GTCH;    b1 = at1 + GTCH;
+    n1 = max(2, ceil((b0 - a0)/NAZ));
+    nc = 3;
+    n3 = max(2, ceil(GTNG/NAZ));
+    n5 = max(2, ceil((a1 - b1)/NAZ));
+    S = concat( [ for (i = [0:n1-1]) [a0  + (b0-a0 )*i/n1, RSEAT] ],
+                [ for (i = [0:nc-1]) [b0  + GTCH*i/nc,
+                                      RSEAT + (RTNG-RSEAT)*i/nc] ],
+                [ for (i = [0:n3-1]) [at0 + GTNG*i/n3, RTNG] ],
+                [ for (i = [0:nc-1]) [at1 + GTCH*i/nc,
+                                      RTNG + (RSEAT-RTNG)*i/nc] ],
+                [ for (i = [0:n5  ]) [b1  + (a1-b1)*i/n5, RSEAT] ] );
     em_shell([ for (s = S) em_at(em_rect(s[1], RCO, ZC0, ZC1), s[0]) ], true);
 }
 
@@ -534,12 +559,25 @@ module em_magnet(j) {
 // the shoe's own root, the body only over the narrower window, and the
 // two duplicated azimuths between them are the underside of the shoe.
 module em_backiron() { em_annulus(RBI, RBO, ZBI0, ZBI1, ceil(360/NAZ)); }
+// The station list is [azimuth, root z] in five runs: shoe alone, the
+// fillet where the root drops from the shoe underside to the tooth
+// root, the tooth body, the fillet back up, shoe alone.  The fillet is
+// EM_FIL mm of arc at the mean radius and sits OUTSIDE the body window,
+// so the body keeps its full width EM_WT at the root; it is a real
+// lamination fillet and it also keeps the shell free of the zero-area
+// quads a duplicated azimuth would give.
 module em_tooth(i) {
-    n1 = max(2, ceil((EM_WSH-EM_WT)/2/NAZ*4));
-    n2 = max(4, ceil(EM_WT/NAZ*2));
-    S = concat( [ for (j = [0:n1]) [-EM_WSH/2 + (EM_WSH-EM_WT)/2*j/n1, ZSH0] ],
-                [ for (j = [0:n2]) [-EM_WT/2  + EM_WT*j/n2,            ZTT0] ],
-                [ for (j = [0:n1]) [ EM_WT/2  + (EM_WSH-EM_WT)/2*j/n1, ZSH0] ] );
+    w0 = EM_WT/2 + GFIL;
+    n1 = max(2, ceil((EM_WSH/2 - w0)/NAZ*4));
+    nf = 3;
+    n3 = max(4, ceil(EM_WT/NAZ*2));
+    S = concat( [ for (j = [0:n1-1]) [-EM_WSH/2 + (EM_WSH/2-w0)*j/n1, ZSH0] ],
+                [ for (j = [0:nf-1]) [-w0 + GFIL*j/nf,
+                                      ZSH0 + (ZTT0-ZSH0)*j/nf] ],
+                [ for (j = [0:n3-1]) [-EM_WT/2 + EM_WT*j/n3, ZTT0] ],
+                [ for (j = [0:nf-1]) [ EM_WT/2 + GFIL*j/nf,
+                                      ZTT0 + (ZSH0-ZTT0)*j/nf] ],
+                [ for (j = [0:n1  ]) [ w0 + (EM_WSH/2-w0)*j/n1, ZSH0] ] );
     rotate([0,0,GSLOT*i])
       em_shell([ for (s = S) em_at(em_rect(EM_RAI, EM_RAO, s[1], ZSH1), s[0]) ],
                true);
@@ -586,8 +624,9 @@ echo(str("   3 clamp wall     ", EM_TC, " mm, so the clamp outer radius is ",
          RCO, " mm   em_if_wall()"));
 echo(str("   4 tongue         ", EM_TW, " mm wide and ", EM_TD,
          " mm deep, crest radius ", RTNG, " mm; as an angle deg(", EM_TW, "/",
-         RSEAT, ") = ", GTNG, " deg; one per half, at azimuth 90 and 270",
-         "   em_if_tongue()"));
+         RSEAT, ") = ", GTNG, " deg, with a ", EM_TCH,
+         " mm = ", GTCH, " deg chamfer on each flank; one per half, at",
+         " azimuth 90 and 270   em_if_tongue()"));
 echo(str("   5 parting gap    ", EM_SPLIT, " mm of arc at the seat = deg(",
          EM_SPLIT, "/", RSEAT, ") = ", GSPL,
          " deg, so each half spans 180 - ", GSPL, " = ", 180-GSPL,
@@ -683,6 +722,9 @@ echo(str("   slot pitch 360/", SLOTS, " = ", GSLOT, " deg = ", rad(GSLOT)*RMEAN,
          rad(EM_WT)*RMEAN, " mm, shoe ", EM_WSH, " deg = ", rad(EM_WSH)*RMEAN,
          " mm, slot opening ", GSLOT, " - ", EM_WSH, " = ", GSLOT-EM_WSH,
          " deg = ", rad(GSLOT-EM_WSH)*RMEAN, " mm"));
+echo(str("   shoe-to-body fillet ", EM_FIL, " mm of arc at the mean radius = ",
+         GFIL, " deg, sitting outside the body window so the body keeps ",
+         EM_WT, " deg at the root"));
 echo(str("   slot depth (tooth body height) ", EM_HT,
          " mm holds a bundle of diameter ", 2*EM_RW, " mm with ", CLSLT,
          " mm above and below; bundle centreline offset from the tooth ",
@@ -767,6 +809,12 @@ echo(str("   10 mount boss inner ", RMNT-EM_RMNT, " to back iron outer ", RBO,
          ": ", RMNT-EM_RMNT-RBO, " mm"));
 echo(str("   11 pinch ear to its parting plane: ", EM_EARS,
          " mm, and the two halves part by ", EM_SPLIT, " mm of arc"));
+echo(str("   13 shoe-to-body fillet to coil bundle, the tightest clearance in",
+         " the part, minimised over the bundle profile at r = ", EM_RAO, ": ",
+         CFIL, " mm  (fillet ", EM_FIL, " mm of arc at r = ", RMEAN, " = ",
+         GFIL, " deg, so ", rad(GFIL)*EM_RAO,
+         " mm of lean at the shoe underside against a liner clearance of ",
+         EM_LIN, " mm)"));
 echo(str("   12 coil to neighbouring coil at the inner end: 2*", EM_RAI,
          "*sin((", GSLOT, "-", EM_WT, ")/2) - 2*(", RHO, "+", EM_RW, ") = ",
          2*EM_RAI*sin((GSLOT-EM_WT)/2), " - ", 2*(RHO+EM_RW), " = ",
@@ -777,8 +825,13 @@ echo(str("   envelope: radius ", RMNT+EM_RMNT, " mm (diameter ",
 
 echo("--- 6. predicted volumes; the mesh must come in UNDER, because every");
 echo("       chord cuts inside its arc and every bundle section is a polygon ---");
+// clamp half = the plain ring sector, plus the tongue crest, plus the two
+// flank chamfers: for a bore ramping linearly from RSEAT to RTNG over
+// rad(GTCH), the extra area integrates to rad(GTCH)(RSEAT td - td^2/3)/1
+// over the pair, exactly.
 VHALF = rad(180-GSPL)/2*(RCO*RCO - RSEAT*RSEAT)*EM_WC
-      + rad(GTNG)/2*(RSEAT*RSEAT - RTNG*RTNG)*EM_WC;
+      + rad(GTNG)/2*(RSEAT*RSEAT - RTNG*RTNG)*EM_WC
+      + rad(GTCH)*(RSEAT*EM_TD - EM_TD*EM_TD/3)*EM_WC;
 VTUB  = function (ri, ro, L) PI*(ro*ro - ri*ri)*L;
 VLUG  = VTUB(EM_RBORE, EM_RLUG, EM_WC);
 VTAB  = VTUB(EM_RBORE, EM_RLUG, EM_TTAB);
@@ -786,8 +839,12 @@ VEAR  = VTUB(EM_RBORE, EM_RLUG, EM_EARL);
 VDISC = VTUB(RDI, RDO, EM_TROT);
 VMAG  = rad(GMAG)/2*(EM_RAO*EM_RAO - EM_RAI*EM_RAI)*EM_TM;
 VBI   = VTUB(RBI, RBO, EM_TBI);
+// tooth = body + shoe + the pair of fillets, whose extra height falls
+// linearly from EM_HT to 0 across rad(GFIL), so the pair contributes
+// rad(GFIL) EM_HT (Rao^2-Rai^2)/2 exactly.
 VTOOTH= rad(EM_WT)/2*(EM_RAO*EM_RAO - EM_RAI*EM_RAI)*EM_HT
-      + rad(EM_WSH)/2*(EM_RAO*EM_RAO - EM_RAI*EM_RAI)*EM_TSH;
+      + rad(EM_WSH)/2*(EM_RAO*EM_RAO - EM_RAI*EM_RAI)*EM_TSH
+      + rad(GFIL)*EM_HT*(EM_RAO*EM_RAO - EM_RAI*EM_RAI)/2;
 VCOIL = PI*EM_RW*EM_RW*LCOIL;
 VCOILP= NSEC/2*sin(360/NSEC)*EM_RW*EM_RW*LCOIL;
 VMNT  = VTUB(EM_RMB, EM_RMNT, EM_TBI);
