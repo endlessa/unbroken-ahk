@@ -12,11 +12,13 @@
 //  DESIGN block, and printed in the report beside the identity or the
 //  clearance it has to satisfy.
 //
-//  Nothing below is eyeballed and nothing below is asserted without
-//  being printed.  Where a number is an ASSUMPTION rather than a
-//  consequence -- the airgap shear stress, the volumetric energy
-//  density of a supercapacitor can -- it is labelled as one in the
-//  report, with where the figure comes from.
+//  There is no unstated number below: every collar-side choice is
+//  named once in the DESIGN block and printed in the report next to
+//  the identity or the clearance it has to satisfy, and nothing is
+//  asserted here that the file does not print.  Where a number is an
+//  ASSUMPTION rather than a consequence -- the airgap shear stress,
+//  the volumetric energy density of a supercapacitor can -- it is
+//  labelled as one in the report, with where the figure comes from.
 //
 //  ---------------------------------------------------------------
 //  1.  WHERE IT CLAMPS, AND WHAT THE INTERFACE IS
@@ -46,10 +48,12 @@
 //  2.5 mm into a keyway in the band.  Two tangential pinch bolts
 //  close the halves; six axial bolts on one circle carry whatever
 //  collar is fitted.  A collar that repeats those eight numbers
-//  interchanges with this one.  THE CHAIN COLLAR IS NOT PRESENT IN
-//  THIS DIRECTORY as this file is written, so interchangeability is
-//  a published contract here, not a checked one, and the report says
-//  so in those words.
+//  interchanges with this one.  That interchange is a PUBLISHED
+//  CONTRACT here and not a checked one: this file never reads, and
+//  never compares itself against, another collar's file.  When it was
+//  written collar_chain.scad held two statements and published no
+//  interface at all, so these eight numbers are where the shared
+//  interface is defined, and the report says so in those words.
 //
 //  ---------------------------------------------------------------
 //  2.  THE WINDING ARITHMETIC
@@ -118,9 +122,9 @@
 //  lcm_ from the contract, prints the beat order |168 - N|, and says
 //  which ones share a factor: rows 1 and 2 share NOTHING with the
 //  cogging, so their combination with it repeats only once per
-//  revolution -- the long slow beat is the one a rider feels -- while
-//  row 3 shares 4 and the equator row and the sun share 2, so those
-//  combinations repeat 4 and 2 times a revolution instead.  None of
+//  revolution, while row 3 shares 4 and the equator row and the sun
+//  share 2, so those combinations repeat 4 and 2 times a revolution
+//  instead.  None of
 //  this is hidden behind a "closes exactly": the closure the contract
 //  proves under its gate 5 is that lcm(S,P) is an integer, which is
 //  about the collar alone.
@@ -130,8 +134,12 @@
 //
 //  Stator and rotor are flat annuli normal to the stack axis, which
 //  is what makes the machine axial flux: 24 teeth stand up off a
-//  back iron ring, each tooth a body 6.5 degrees wide carrying a shoe
-//  12.6 degrees wide, so the slot opening is 15 - 12.6 = 2.4 degrees.
+//  back iron ring, each tooth a body 6.0 degrees wide carrying a shoe
+//  8.0 degrees wide, so the shoe overhangs the body by 1.0 degree on
+//  each side and the slot opening is 15 - 8 = 7 degrees.  That is a
+//  wider opening than a machine designer would choose, and the reason
+//  is NOT electromagnetic: it is the kernel finding in section 7, and
+//  the file prints the gap the shoes have to keep.
 //  Facing them across a stated airgap of 1.0 mm are 28 magnets, each
 //  an arc of 0.85 of the pole pitch 360/28, of real thickness on a
 //  rotor back iron disc.  The active annulus runs from R_ai to R_ao;
@@ -169,7 +177,7 @@
 //  sg_cap() = [C, Vlo, Vhi] = [12 F, 12 V, 24 V].  Usable energy
 //  between the two rails:
 //
-//      E_use = C (Vhi^2 - Vlo^2)/2 = 6*(576-144) = 2592 J        (13)
+//      E_use = C (Vhi^2 - Vlo^2)/2 = 12*(576-144)/2 = 2592 J     (13)
 //      E_full = C Vhi^2 / 2 = 3456 J                             (14)
 //
 //  so 75 percent of the stored energy is usable over a 2:1 voltage
@@ -188,7 +196,7 @@
 //
 //  The volumetric energy density is an ASSUMPTION, and here is where
 //  it comes from: a commercial 2.7 V, 3000 F cell in a 60 x 138 mm
-//  can holds 0.5*3000*2.7^2 = 10935 J in pi*30^2*138 = 390150 mm^3,
+//  can holds 0.5*3000*2.7^2 = 10935 J in pi*30^2*138 = 390186 mm^3,
 //  which is 0.0280 J/mm^3 = 7.8 Wh/L.  Derated to
 //
 //      e_v = 0.0216 J/mm^3 = 6.0 Wh/L                           (17)
@@ -220,23 +228,29 @@
 //  0 is listed in REVERSED profile order and the cap at the last
 //  station in forward order, for the same reason.
 //
-//  Two station lists at the SAME azimuth with different profiles
-//  give a vertical step face, and that is how the tongue on the
-//  clamp bore and the shoe on the stator tooth are steps rather than
-//  ramps.
+//  Two stations at the SAME azimuth with different profiles would
+//  give a vertical step face, and that is what the tongue on the
+//  clamp bore and the underside of the stator shoe started as.  They
+//  are not built that way: a duplicated azimuth puts a ZERO AREA quad
+//  in the shell, and this kernel drops such triangles during meshing,
+//  which opened 12 boundary edges per affected tooth in a shell that
+//  is closed as written (section 7).  So both
+//  are real ramps instead: the tongue flank is a 0.6 mm lead-in
+//  chamfer, the shoe underside a 1.5 mm lamination fillet, both
+//  printed, both features a real part would have anyway, and every
+//  station in this file sits at its own azimuth.
 //
 //  ADDITIVE ONLY, and no boolean at all.  Every hole in this part is
 //  a bore built as a wall around it: a lug is an annular tube whose
 //  inner cylinder IS the bolt hole, so nothing is ever subtracted.
 //  And nothing overlaps: every body stands a stated 0.05 mm clear of
 //  its neighbours, the same bookkeeping gap slice.scad uses.  In the
-//  real part the clamp, its lugs and its ears are one casting; here
-//  they are separate shells, because this kernel skips its export
-//  time union past 25000 triangles and an overlap would then be
-//  counted twice in the exported volume while still validating with
-//  zero holes.  With no overlap anywhere, the exported volume is the
-//  SUM of the bodies either side of that threshold, and the report
-//  prints that sum to compare against.
+//  real part the clamp, its lugs and its ears are one casting and the
+//  stator core is one lamination stack; here they are separate
+//  shells, 0.05 mm apart, so that the exported volume is the SUM of
+//  the bodies and the fourteen clearances the report prints are the
+//  whole of the fit.  The report prints that sum, and the export must
+//  come in UNDER it.
 //
 //  ---------------------------------------------------------------
 //  6.  WHAT THE FILE CHECKS, AND WHAT IT LEAVES OPEN
@@ -244,16 +258,72 @@
 //  Printed with both sides shown: (1) through (18); the balance gate
 //  (4); that the phase belt holds exactly S/3 slots; every gcd and
 //  lcm of the cogging order against every mesh order; the eight
-//  interface numbers; each of the eleven clearances that keep the
-//  bodies apart, as a subtraction; the predicted volume of every
-//  family of bodies and their total; and the body count, which must
-//  equal the component count validate.py reports.
+//  interface numbers; each of the fourteen clearances that keep the
+//  bodies apart, as a subtraction -- including the two that are not
+//  obvious, the lean of the shoe fillet against the coil bundle
+//  minimised over the bundle profile, and the smallest box gap over
+//  all 276 pairs of teeth; the predicted volume of every family of
+//  bodies and their total; and the body count, which must equal the
+//  component count validate.py reports.
 //
 //  Left open and NOT modelled: the bolts themselves; the stator's
 //  ground path past three mounting lugs; the phase leads, the
 //  terminals and the bus to the cans; the slice housing.  The rotor
 //  is carried by the clamp and the stator is grounded to the housing,
 //  and only the first of those two is geometry in this file.
+//
+//  ---------------------------------------------------------------
+//  7.  TWO KERNEL FINDINGS, AND THE ONE DIMENSION THEY SET
+//
+//  Both were measured on the build of 2026-09-30 21:45 (md5
+//  7cf50742b3dcd7f5fb6e1f571531cf78) and both have a minimal
+//  reproduction beside the renders, in the scratchpad's parts/:
+//  em_kb1_zero_area_quad.scad and em_kb2_coplanar_merge.scad.
+//
+//  (i) A ZERO AREA QUAD COSTS 12 BOUNDARY EDGES, SILENTLY.  A shell
+//  with a duplicated station carries quads of zero area.  They are
+//  harmless in exact arithmetic -- their edges appear twice each way
+//  and cancel in the parity count -- but they do not survive meshing:
+//  a sector written with 44 faces comes out with 32, holes 12, in STL
+//  and in OFF alike, with the volume still right and no warning.  The
+//  twist that made it hard to see: a shell afterwards swept into an
+//  export-time merge (finding ii) comes back CLOSED, because the
+//  merge retessellates it, so in the earlier draft of this file the
+//  20 teeth that were merged validated clean and the 4 that were not
+//  carried 12 edges each, 48 in the model -- the healthy looking ones
+//  were the ones that had been through a boolean.  A mesh that is
+//  closed as written must therefore contain no zero area face at all,
+//  which is why section 5's ramps exist.
+//
+//  (ii) THE DISJOINTNESS PRE-TEST CANNOT SEPARATE COPLANAR FACES.
+//  Before merging two solids at export the kernel asks whether their
+//  surfaces may touch, by a separating axis test over the two face
+//  normals and the nine edge-edge cross products.  That axis set is
+//  short of the edge-cross-normal axes, and those are exactly the
+//  ones that separate two COPLANAR triangles.  Two stator teeth 7.4
+//  mm apart that share the airgap plane are therefore never proved
+//  apart; their axis-aligned boxes do overlap, so they were promoted
+//  into a merge, and although the kernel's own trace reported the
+//  cluster shares 0.000000 volume, the merge came back open.  Two of
+//  these teeth 7.4 mm apart are enough: 4 boundary edges.  Twenty
+//  four of them: 100.  Nothing overlapped and the mesh still leaked.
+//
+//  The dimension this sets is the SHOE WIDTH.  A pair of teeth is
+//  only offered to that test when their boxes overlap, and for
+//  annular sectors of half width w at 15 degree spacing the boxes of
+//  the pair straddling 45 degrees stay apart only while
+//
+//      R_ao sin(30 + w) < R_ai sin(45 - w)                       (19)
+//
+//  which at R_ai/R_ao = 177/203 = 0.872 holds up to w = 4.4 degrees.
+//  The shoe is 8.0 degrees wide, w = 4.0, and the file computes each
+//  tooth's box from the very points its mesh is built from and prints
+//  the smallest gap over all 276 pairs.  The alternative was to keep
+//  a 12.6 degree shoe and shorten the active annulus to about 10 mm
+//  to satisfy (19), which by (11) more than halves the torque; the
+//  wider slot opening is the cheaper of the two.  It is recorded here
+//  so that nobody reads 7 degrees of slot opening as an
+//  electromagnetic choice.
 // ===================================================================
 
 use <spherical_gear.scad>
@@ -297,8 +367,8 @@ EM_JG    = 0.05;    // bookkeeping gap between bodies, mm
 
 EM_RAI   = 177;     // active annulus, inner radius, mm
 EM_RAO   = 203;     // active annulus, outer radius, mm
-EM_WT    = 6.5;     // stator tooth body width, deg
-EM_WSH   = 12.6;    // stator shoe width, deg
+EM_WT    = 6.0;     // stator tooth body width, deg
+EM_WSH   = 8.0;     // stator shoe width, deg -- see header section 7
 EM_HT    = 12;      // tooth body height, mm
 EM_TSH   = 4;       // shoe thickness, mm
 EM_FIL   = 1.5;     // shoe-to-body fillet, mm of arc at the mean radius
@@ -368,6 +438,12 @@ RHO   = EM_RW + EM_LIN;           // tooth surface to coil centreline
 ZCOIL = (ZBI1 + ZSH0)/2;          // coil bundle axis: centred in the slot
 CLSLT = (ZSH0 - ZBI1)/2 - EM_RW;  // slot clearance above and below the bundle
 RCIN  = EM_RAI - RHO - EM_RW;     // innermost radius the coil reaches
+
+GMAG  = EM_PA*360/POLES;          // magnet arc, deg
+GSLOT = 360/SLOTS;                // slot pitch, deg
+GPOLE = 360/POLES;                // pole pitch, deg
+RMEAN = (EM_RAI + EM_RAO)/2;
+GFIL  = deg(EM_FIL/RMEAN);        // shoe-to-body fillet as an angle
 // The tightest clearance in the part: the shoe-to-body fillet leans into
 // the slot exactly where the coil bundle is fattest.  Measured, not
 // asserted -- the perpendicular distance from the tooth flank to the
@@ -380,11 +456,23 @@ CFIL = min([ for (i = [0:40])
                     xf = rad(GFIL)*EM_RAO*(1 + (z-ZSH0)/EM_HT) )
                  xb - xf ]);
 
-GMAG  = EM_PA*360/POLES;          // magnet arc, deg
-GSLOT = 360/SLOTS;                // slot pitch, deg
-GPOLE = 360/POLES;                // pole pitch, deg
-RMEAN = (EM_RAI + EM_RAO)/2;
-GFIL  = deg(EM_FIL/RMEAN);        // shoe-to-body fillet as an angle
+// The axis-aligned box of one tooth, [[xlo,ylo,zlo],[xhi,yhi,zhi]], taken
+// over the very points the mesh is built from, and the smallest gap
+// between the boxes of any two teeth.  This is not decoration: see header
+// section 7.  The gap along one axis is how far apart the intervals are,
+// and two boxes are apart when ANY axis separates them, so the pair
+// figure is the max over the three axes and the fleet figure the min over
+// the pairs.
+function em_tbox(i) =
+  let( P = [ for (s = em_tooth_stations()) each
+               [ [EM_RAI*cos(GSLOT*i + s[0]), EM_RAI*sin(GSLOT*i + s[0]), s[1]],
+                 [EM_RAO*cos(GSLOT*i + s[0]), EM_RAO*sin(GSLOT*i + s[0]), s[1]],
+                 [EM_RAO*cos(GSLOT*i + s[0]), EM_RAO*sin(GSLOT*i + s[0]), ZSH1],
+                 [EM_RAI*cos(GSLOT*i + s[0]), EM_RAI*sin(GSLOT*i + s[0]), ZSH1] ] ] )
+    [ [ min([for (q = P) q[0]]), min([for (q = P) q[1]]), min([for (q = P) q[2]]) ],
+      [ max([for (q = P) q[0]]), max([for (q = P) q[1]]), max([for (q = P) q[2]]) ] ];
+function em_boxgap(A, B) =
+  max( [ for (k = [0:2]) max(B[0][k] - A[1][k], A[0][k] - B[1][k]) ] );
 
 // capacitor bank, (13) to (18)
 EUSE  = CAPF*(VHI*VHI - VLO*VLO)/2;
@@ -566,21 +654,20 @@ module em_backiron() { em_annulus(RBI, RBO, ZBI0, ZBI1, ceil(360/NAZ)); }
 // so the body keeps its full width EM_WT at the root; it is a real
 // lamination fillet and it also keeps the shell free of the zero-area
 // quads a duplicated azimuth would give.
+function em_tooth_stations() =
+  let( w0 = EM_WT/2 + GFIL,
+       n1 = max(2, ceil((EM_WSH/2 - w0)/NAZ*4)),
+       nf = 3,
+       n3 = max(4, ceil(EM_WT/NAZ*2)) )
+    concat( [ for (j = [0:n1-1]) [-EM_WSH/2 + (EM_WSH/2-w0)*j/n1, ZSH0] ],
+            [ for (j = [0:nf-1]) [-w0 + GFIL*j/nf, ZSH0 + (ZTT0-ZSH0)*j/nf] ],
+            [ for (j = [0:n3-1]) [-EM_WT/2 + EM_WT*j/n3, ZTT0] ],
+            [ for (j = [0:nf-1]) [ EM_WT/2 + GFIL*j/nf, ZTT0 + (ZSH0-ZTT0)*j/nf] ],
+            [ for (j = [0:n1  ]) [ w0 + (EM_WSH/2-w0)*j/n1, ZSH0] ] );
 module em_tooth(i) {
-    w0 = EM_WT/2 + GFIL;
-    n1 = max(2, ceil((EM_WSH/2 - w0)/NAZ*4));
-    nf = 3;
-    n3 = max(4, ceil(EM_WT/NAZ*2));
-    S = concat( [ for (j = [0:n1-1]) [-EM_WSH/2 + (EM_WSH/2-w0)*j/n1, ZSH0] ],
-                [ for (j = [0:nf-1]) [-w0 + GFIL*j/nf,
-                                      ZSH0 + (ZTT0-ZSH0)*j/nf] ],
-                [ for (j = [0:n3-1]) [-EM_WT/2 + EM_WT*j/n3, ZTT0] ],
-                [ for (j = [0:nf-1]) [ EM_WT/2 + GFIL*j/nf,
-                                      ZTT0 + (ZSH0-ZTT0)*j/nf] ],
-                [ for (j = [0:n1  ]) [ w0 + (EM_WSH/2-w0)*j/n1, ZSH0] ] );
     rotate([0,0,GSLOT*i])
-      em_shell([ for (s = S) em_at(em_rect(EM_RAI, EM_RAO, s[1], ZSH1), s[0]) ],
-               true);
+      em_shell([ for (s = em_tooth_stations())
+                   em_at(em_rect(EM_RAI, EM_RAO, s[1], ZSH1), s[0]) ], true);
 }
 // The coil on tooth i: a bundle wound round the tooth body, its
 // centreline the exact offset of the tooth footprint at distance RHO.
@@ -606,6 +693,9 @@ module em_can(j) {
 // ===================================================================
 //  REPORT
 // ===================================================================
+TBGAP = min([ for (i = [0:SLOTS-2]) min([ for (j = [i+1:SLOTS-1])
+                em_boxgap(em_tbox(i), em_tbox(j)) ]) ]);
+
 echo("=== collar_em: the regenerative EM collar ===");
 echo("--- read from the contract, not restated ---");
 echo(str("   sg_m() = ", M, " mm    sg_r() = ", RSPH, " mm    sg_ns() = ", NSUN));
@@ -642,10 +732,12 @@ echo(str("   7 bolt           M", EM_BOLT, ", bore radius ", EM_RBORE,
 echo(str("   8 pinch bolts    M", EM_BOLT, " tangential at radius ", RBC,
          " mm and z = 0, one per parting plane, ears ", EM_EARL,
          " mm long standing ", EM_EARS, " mm off the plane   em_if_pinch()"));
-echo("   A collar that repeats 1 to 8 interchanges with this one.  THE CHAIN");
-echo("   COLLAR IS NOT IN THIS DIRECTORY as this file is written, so that");
-echo("   interchange is a published contract here and NOT a checked one:");
-echo("   nothing in this file compares itself against another collar.");
+echo("   A collar that repeats 1 to 8 interchanges with this one.  That");
+echo("   interchange is a PUBLISHED CONTRACT and not a checked one: this");
+echo("   file never reads, and never compares itself against, another");
+echo("   collar's file.  When it was written collar_chain.scad held two");
+echo("   statements and published no interface at all, so the eight numbers");
+echo("   above are where the shared interface is defined.");
 echo(str("   The contract does not publish the band's outer diameter as a",
          " function -- only R = ", RSPH, " -- so the ", EM_OFF,
          " mm offset is a collar-side choice, made to stand outboard of the",
@@ -695,10 +787,12 @@ echo(str("      sun      N = ", NSUN, "   gcd(", NCOG, ",", NSUN, ") = ",
          " times per revolution"));
 echo(str("      ", NCOG, " = 2^3*3*7 = ", 8*3*7, ", so a mesh order shares a",
          " factor with the cogging exactly when it is even or divisible by 3",
-         " or 7.  Rows 1 and 2 (", ROWS[0][1], " prime, ", ROWS[1][1], " = 11*13)",
-         " share nothing; row 3 (", ROWS[2][1], " = 4*47) shares 4; the equator",
-         " row (", ROWS[3][1], " = 2*11^2) and the sun (", NSUN,
-         " = 2*23) share 2."));
+         " or 7.  The factorisations, both sides shown: ", ROWS[0][1],
+         " is prime; ", ROWS[1][1], " = 11*13 = ", 11*13, "; ", ROWS[2][1],
+         " = 4*47 = ", 4*47, "; ", ROWS[3][1], " = 2*11^2 = ", 2*121, "; ",
+         NSUN, " = 2*23 = ", 2*23,
+         ".  So rows 1 and 2 share nothing, row 3 shares 4, the equator row",
+         " and the sun share 2."));
 echo(str("   electrical frequency f = (P/2) rpm/60, cogging f = ", NCOG,
          " rpm/60:"));
 for (n = EM_RPM)
@@ -809,16 +903,21 @@ echo(str("   10 mount boss inner ", RMNT-EM_RMNT, " to back iron outer ", RBO,
          ": ", RMNT-EM_RMNT-RBO, " mm"));
 echo(str("   11 pinch ear to its parting plane: ", EM_EARS,
          " mm, and the two halves part by ", EM_SPLIT, " mm of arc"));
+echo(str("   12 coil to neighbouring coil at the inner end: 2*", EM_RAI,
+         "*sin((", GSLOT, "-", EM_WT, ")/2) - 2*(", RHO, "+", EM_RW, ") = ",
+         2*EM_RAI*sin((GSLOT-EM_WT)/2), " - ", 2*(RHO+EM_RW), " = ",
+         2*EM_RAI*sin((GSLOT-EM_WT)/2) - 2*(RHO+EM_RW), " mm"));
 echo(str("   13 shoe-to-body fillet to coil bundle, the tightest clearance in",
          " the part, minimised over the bundle profile at r = ", EM_RAO, ": ",
          CFIL, " mm  (fillet ", EM_FIL, " mm of arc at r = ", RMEAN, " = ",
          GFIL, " deg, so ", rad(GFIL)*EM_RAO,
          " mm of lean at the shoe underside against a liner clearance of ",
          EM_LIN, " mm)"));
-echo(str("   12 coil to neighbouring coil at the inner end: 2*", EM_RAI,
-         "*sin((", GSLOT, "-", EM_WT, ")/2) - 2*(", RHO, "+", EM_RW, ") = ",
-         2*EM_RAI*sin((GSLOT-EM_WT)/2), " - ", 2*(RHO+EM_RW), " = ",
-         2*EM_RAI*sin((GSLOT-EM_WT)/2) - 2*(RHO+EM_RW), " mm"));
+echo(str("   14 smallest axis-aligned box gap over all ", SLOTS*(SLOTS-1)/2,
+         " tooth pairs = ", TBGAP,
+         " mm, positive, so no two teeth are ever candidates for the kernel's",
+         " disjointness pre-test (header section 7); it is smallest for the",
+         " pairs whose azimuths straddle 45 and 135 degrees"));
 echo(str("   envelope: radius ", RMNT+EM_RMNT, " mm (diameter ",
          2*(RMNT+EM_RMNT), "), z from ", ZCAN-RCAN, " to ", ZROT1, " = ",
          ZROT1-(ZCAN-RCAN), " mm of stack"));
