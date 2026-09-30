@@ -1353,7 +1353,33 @@ pub fn wall_segments(poly: &Poly2) -> Vec<[Vec2; 2]> {
 /// zero and the triangle shades as a dark sliver across whatever it lies
 /// on — worth the check on a ring that a scale=0 taper or a repeated
 /// outline point can pinch flat.
-fn push_tri(tris: &mut Vec<[u32; 3]>, q: &[[f64; 3]; 4], base: u32, k: [usize; 3]) {
+/// Do the quad's four corners lie in one plane?
+///
+/// Measured as the distance of the fourth corner from the plane of the
+/// other three, against the quad's own size, so it is scale-free. The
+/// threshold is loose on purpose: a deviation of a billionth of the quad
+/// contributes nothing to any volume, and calling such a quad bent would
+/// double the triangle count of every extrusion for nothing.
+fn planar(q: &[[f64; 3]; 4]) -> bool {
+    let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let (u, v, w) = (sub(q[1], q[0]), sub(q[2], q[0]), sub(q[3], q[0]));
+    let n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if nl <= 0.0 {
+        return true; // three of the corners are collinear; no bend to see
+    }
+    let dev = (w[0] * n[0] + w[1] * n[1] + w[2] * n[2]).abs() / nl;
+    let size = [u, v, w].iter().fold(0.0f64, |m, e| {
+        m.max((e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt())
+    });
+    dev <= 1e-9 * size
+}
+
+fn push_tri(tris: &mut Vec<[u32; 3]>, q: &[[f64; 3]], base: u32, k: [usize; 3]) {
     let (a, b, c) = (q[k[0]], q[k[1]], q[k[2]]);
     let (u, v) = (
         [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
@@ -1437,13 +1463,39 @@ pub fn extrude_linear(
     let mut positions: Vec<[f64; 3]> = Vec::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
     let (cap2, cap_tris) = triangulate(poly);
-    // A cap triangle can collapse even though its 2D source did not: `scale`
-    // and `twist` move each ring's vertices, and `scale = 0` folds the whole
-    // top cap onto one apex point. The walls have always been culled by
-    // `push_tri`; the caps went out raw, so "scale=0 produces an apex" came
-    // with a fan of zero-area triangles at that apex, where the reference
-    // says "both produce valid, closed meshes ... (degenerate triangles
-    // culled)".
+    // Drop the cap triangles that have NO AREA, once, before anything reads
+    // the list -- because two things read it, and they were disagreeing.
+    //
+    // The 2D sweep resolves crossings numerically, so it can emit a triangle
+    // whose three corners come out exactly collinear. `cap` culled those as
+    // it emitted them (a facet with no normal is not writable), but
+    // `cap_boundary` was still given the UNCULLED list, so the walls were
+    // built along a boundary that included the dead triangle's edges. On a
+    // letterform that put a vertex at (62, 0) in the wall and not in the
+    // cap: the cap spanned (62, -1.522) to (62, 1.522) in one edge while the
+    // walls took it in two, and the mesh had six boundary edges -- three at
+    // each end of a 6 mm extrusion -- that no amount of looking at the wall
+    // code could explain.
+    //
+    // Culling first is not just consistent, it is correct: a triangle with
+    // no area covers nothing, so an edge it shared with a real triangle IS
+    // on the boundary of the covered region, and the walls belong there.
+    let cap_tris: Vec<[u32; 3]> = cap_tris
+        .into_iter()
+        .filter(|t| {
+            let (a, b, c) = (cap2[t[0] as usize], cap2[t[1] as usize], cap2[t[2] as usize]);
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) != 0.0
+        })
+        .collect();
+    // A cap triangle with area in 2D can still collapse in 3D: `scale = 0`
+    // folds the whole top cap onto one apex point, and `scale = [0, 1]` onto
+    // a line. The walls have always been culled by `push_tri`; the caps went
+    // out raw, so "scale=0 produces an apex" came with a fan of zero-area
+    // triangles at that apex, where the reference says "both produce valid,
+    // closed meshes ... (degenerate triangles culled)". That case does not
+    // reopen the seam the 2D cull above closed, because where the ring
+    // transform collapses a cap it collapses the walls onto the same point
+    // or line with it.
     let cap = |tris: &mut Vec<[u32; 3]>, positions: &mut Vec<[f64; 3]>, t: f64, flip: bool| {
         let base = positions.len() as u32;
         positions.extend(cap2.iter().map(|v| ring(*v, t)));
@@ -1494,9 +1546,47 @@ pub fn extrude_linear(
                 ring(seg[0], t1),
             ];
             let b = positions.len() as u32;
-            positions.extend_from_slice(&q);
-            push_tri(&mut tris, &q, b, [0, 1, 2]);
-            push_tri(&mut tris, &q, b, [0, 2, 3]);
+            if planar(&q) {
+                positions.extend_from_slice(&q);
+                push_tri(&mut tris, &q, b, [0, 1, 2]);
+                push_tri(&mut tris, &q, b, [0, 2, 3]);
+            } else {
+                // A twisted wall is a RULED patch, not a plane, and a
+                // diagonal has to pick a side of it. Both sides are wrong by
+                // the same tetrahedron -- the one on the quad's four corners
+                // -- and the error does not cancel around the ring, so it
+                // survives into the volume. A 20 mm square twisted 90
+                // degrees over 10 mm encloses exactly 4,000 mm^3, because a
+                // rotation preserves area at every height; the diagonal gave
+                // 4,408.75 at 4 slices, 4,124.27 at 16, 4,032.32 at 64 and
+                // 4,008.16 at 256 -- a first-order error, still 0.2% after
+                // 256 slices, and OVER, which a chordal approximation of a
+                // convex profile can never honestly be.
+                //
+                // The ruled patch's own volume is exactly halfway between
+                // the two diagonals, so a fan through the corners' mean
+                // straddles it instead of choosing a side. The same square
+                // then gives 3,898.51, 3,993.58, 3,999.60 and 3,999.97: the
+                // error falls as 1/slices^2 and it falls from BELOW. The
+                // square annulus at the default slice count went from
+                // 3,338.45 -- 11.3% over 3,000 -- to 2,980.79.
+                //
+                // Only a wall that is actually bent pays the extra two
+                // triangles. An untwisted extrusion has planar walls, and so
+                // does a uniformly scaled one -- its walls are cone faces
+                // through the apex -- so both keep two triangles per quad,
+                // which is exact for them.
+                let m = [
+                    (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4.0,
+                    (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4.0,
+                    (q[0][2] + q[1][2] + q[2][2] + q[3][2]) / 4.0,
+                ];
+                let f = [q[0], q[1], q[2], q[3], m];
+                positions.extend_from_slice(&f);
+                for k in 0..4 {
+                    push_tri(&mut tris, &f, b, [k, (k + 1) % 4, 4]);
+                }
+            }
         }
     }
     (positions, tris)
@@ -1608,6 +1698,61 @@ pub fn extrude_rotate(poly: &Poly2, angle_deg: f64, frags: usize) -> Result<Mesh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A twisted wall is a RULED patch, and a diagonal picks a side of it.
+    ///
+    /// The two diagonals of a bent quad differ by the tetrahedron on its
+    /// four corners, and around a ring that difference does not cancel, so
+    /// it lands in the volume and stays there. A rotation preserves area at
+    /// every height, so a 20 mm square twisted through any angle encloses
+    /// exactly 4,000 mm^3 over a height of 10 -- and the diagonal gave
+    /// 4,408.75 at 4 slices, falling only as 1/slices. Not just inaccurate
+    /// but the wrong SIGN: no chordal approximation of a convex profile can
+    /// enclose more than the profile does.
+    #[test]
+    fn a_twisted_wall_converges_from_below_and_at_second_order() {
+        let square =
+            Poly2::new(vec![vec![[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]]]);
+        let vol = |m: &Mesh3| {
+            let (p, t) = m;
+            t.iter()
+                .map(|f| {
+                    let (a, b, c) = (p[f[0] as usize], p[f[1] as usize], p[f[2] as usize]);
+                    (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                        / 6.0
+                })
+                .sum::<f64>()
+        };
+        let at = |n: usize| vol(&extrude_linear(&square, 10.0, false, 90.0, n, [1.0, 1.0]));
+
+        let mut prev = f64::INFINITY;
+        for n in [4usize, 16, 64] {
+            let err = 4000.0 - at(n);
+            assert!(err > 0.0, "{n} slices enclose {} > 4000", at(n));
+            if prev.is_finite() {
+                // Second order: sixteenfold for a fourfold refinement. Ten
+                // is well clear of the first-order four and leaves room for
+                // the fan's own higher-order terms.
+                assert!(prev / err > 10.0, "{n} slices: {prev} -> {err} is not second order");
+            }
+            prev = err;
+        }
+
+        // And a wall that is not bent must not pay for the fan. An
+        // untwisted extrusion's walls are planar quads, and two triangles
+        // are exact for them.
+        let straight = extrude_linear(&square, 10.0, false, 0.0, 8, [1.0, 1.0]);
+        assert!((vol(&straight) - 4000.0).abs() < 1e-9);
+        assert_eq!(straight.1.len(), 2 * 4 * 8 + 4, "two triangles a quad, and two caps");
+
+        // A UNIFORM scale bends nothing either: those walls are faces of a
+        // cone through the apex, so they stay planar and stay exact.
+        let taper = extrude_linear(&square, 10.0, false, 0.0, 8, [0.5, 0.5]);
+        let want = 10.0 / 3.0 * (400.0 + 100.0 + (400.0f64 * 100.0).sqrt()); // frustum
+        assert!((vol(&taper) - want).abs() < 1e-9, "{} vs {want}", vol(&taper));
+        assert_eq!(taper.1.len(), 2 * 4 * 8 + 4);
+    }
 
     /// Area of a triangulated region, and of its contours by the shoelace
     /// formula — the two must agree, and the shoelace one is the truth.

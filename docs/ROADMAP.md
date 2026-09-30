@@ -556,28 +556,37 @@ Two more, both from the 3D lens and both left deliberately:
   Making it fire needs a quantised weld whose threshold nothing justifies.
   Recorded rather than guessed at.
 
-- **An almost-flat corner still costs three edges per cap.** With the walls
-  now taken from the cap triangulation's boundary, an extruded region with
-  holes closes exactly -- a letter went from 44 boundary edges to none, a
-  sheet of type from 38,618 to six. The six that remain are one shape: a
-  256-point superellipse plate, whose caps come back with 253 triangles
-  where a 256-gon owes 254, and whose walls are the full 256 segments. Some
-  corner of that outline is flat enough that a vertex is dropped without its
-  triangle being emitted, so the triangulation covers slightly less than the
-  region the walls were raised for, and three edges per cap are left with
-  nothing on the other side.
+- **The last six boundary edges were the FORMAT, not the triangulator.**
+  With the walls taken from the cap triangulation's boundary, an extruded
+  region with holes closes exactly -- a letter went from 44 boundary edges to
+  none, a sheet of type from 38,618 to six. The six were chased for a long
+  time on the assumption that the triangulator was dropping a vertex, and
+  three repairs aimed at that were tried and reverted because none of them
+  moved the number. The assumption was wrong, and so was the note that used
+  to stand here.
 
-  Three repairs were tried and NONE of them moved the number, which is why
-  this is a note rather than a commit: filtering the cap triangles in 2D on
-  a squared cross product, to mirror exactly the test the cap applies to its
-  own 3D normal; emitting the degenerate ear from `ear_clip` instead of
-  dropping the vertex silently; and removing the cap's 3D cull altogether,
-  which also broke `collapsed_cap_triangles_are_culled` and is the wrong
-  trade anyway. The vertex is therefore being dropped somewhere earlier than
-  any of those, most likely in `clean_contours` before `ear_clip` ever sees
-  the ring, and the fix has to reconcile that with the deliberate culling of
-  collapsed caps rather than fight it one site at a time. Six boundary edges
-  in 167,242 triangles is worth doing properly or not at all.
+  What is actually happening: the plate is a 256-point superellipse with
+  a = 62, and near its rightmost point three consecutive outline vertices
+  differ in x by less than ONE f32 STEP, which at a coordinate of 62 is
+  3.8e-06. The cap triangle between them is real in f64 -- its cross product
+  is 6e-06 -- and writes all three corners at exactly 62.0 in a binary STL.
+  No binary STL can carry it, the export funnel drops it, and with it go
+  three edges of each cap. Six boundary edges, from two triangles, in
+  232,458.
+
+  It is not a modelling error and there is nothing to repair in the
+  triangulator. It is settled instead by telling the truth about it in three
+  places. The representability guard is now per-format, so OFF, AMF, 3MF and
+  ASCII STL -- which print `{:.6}` and resolve 2e-06 five hundred times over
+  -- keep the triangle and export the plate CLOSED. Binary STL still drops
+  it, because it must. And the export now warns when a drop opens a mesh
+  that was closed, naming the count, the step, and the three ways out
+  (another format, nearer the origin, a coarser outline).
+
+  The lesson for the next one of these: when a mesh is closed on the way out
+  of the modeller and open in the file, suspect the writer before the
+  geometry. Exporting the same design to OFF and diffing the two settled in
+  one command what three speculative repairs could not.
 
 ## Working method (established, keep using it)
 

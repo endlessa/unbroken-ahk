@@ -3435,6 +3435,9 @@ pub const MAX_UNION_EXPORT_TRIS: usize = 25_000;
 pub enum UnionNote {
     Budget(usize),
     Fallback(usize),
+    /// The chosen format's coordinate grid could not carry `0` triangles,
+    /// and dropping them left `1` boundary edges in a mesh that was closed.
+    Unwritable(usize, usize),
 }
 
 fn union_note(set: Option<UnionNote>) -> Option<UnionNote> {
@@ -3526,7 +3529,33 @@ pub fn export_mesh(out: &EvalOutput, grid: Grid) -> Result<Mesh, String> {
     // Weld once here rather than per-format, and drop the slivers the 2D
     // fill sweep leaves behind: they are below the resolution THIS file can
     // carry, and every one of them wrote `facet normal 0 0 0`.
+    //
+    // Dropping them can OPEN a mesh that was closed, and when it does the
+    // user has to be told, because the fix is theirs and it is easy. The
+    // case is real: a letterform on a 62 x 84 superellipse sampled 256 times
+    // has three consecutive outline points whose x differ by less than one
+    // f32 step at that magnitude -- 3.8e-6 at 62 -- so the cap triangle
+    // between them writes all three corners at exactly 62.0, collinear, and
+    // binary STL cannot hold it. Six boundary edges, three at each end of a
+    // 6 mm extrusion, in a mesh the modeller built closed. The same design
+    // exported to OFF, AMF or 3MF is closed, because `{:.6}` resolves 2e-6
+    // five hundred times over, and the guard is now per-format so those do
+    // keep it. What the binary file cannot be told, the console can.
+    let before = combined.tris.len();
+    let closed_before = geom::closedness_note(&combined).is_none();
     let combined = combined.without_unrepresentable(grid);
+    let dropped = before - combined.tris.len();
+    if dropped > 0 && closed_before {
+        if let Some(note) = geom::closedness_note(&combined) {
+            let edges = note
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|w| !w.is_empty())
+                .next()
+                .and_then(|w| w.parse::<usize>().ok())
+                .unwrap_or(0);
+            union_note(Some(UnionNote::Unwritable(dropped, edges)));
+        }
+    }
     if combined.tris.is_empty() {
         return Err(if saw_2d {
             "Current top level object is not a 3D object".into()
@@ -3742,6 +3771,21 @@ pub fn render_export_bytes_reporting(
              cause.\n",
             console,
             fmt_num(n as f64)
+        ),
+        Some(UnionNote::Unwritable(n, e)) => format!(
+            "{}WARNING: {} triangle{} could not be written at this format's \
+             coordinate resolution and {} dropped, which left {} boundary edge{} \
+             in a mesh that was closed. Binary STL stores 32-bit floats, whose \
+             step at a coordinate of 62 is 3.8e-06, so detail finer than that \
+             collapses; OFF, AMF, 3MF and ASCII STL resolve 1e-06 wherever the \
+             model sits. Export to one of those, move the model nearer the \
+             origin, or coarsen the outline.\n",
+            console,
+            fmt_num(n as f64),
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "was" } else { "were" },
+            fmt_num(e as f64),
+            if e == 1 { "" } else { "s" }
         ),
         None => console,
     };

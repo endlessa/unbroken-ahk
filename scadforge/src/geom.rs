@@ -424,11 +424,167 @@ pub fn matrix_from_rows(rows: &[Vec<f64>]) -> Mat4 {
     m
 }
 
+/// Triangulate one face of a polyhedron.
+///
+/// The reference says ">3-vertex faces are fan/ear triangulated internally"
+/// and marks the exact choice as one to pin against an oracle -- which this
+/// project may not read. So the choice is made on the merits, and a blind
+/// fan from vertex 0 loses on two faces that turn up constantly.
+///
+/// A CONCAVE face fanned from vertex 0 puts triangles outside itself. An
+/// L-shaped face is the smallest example: three of its five fan triangles
+/// cover ground the face does not.
+///
+/// A face with a COLLINEAR VERTEX AT THE FAN APEX produces a zero-area
+/// triangle, and that one is worse, because the mesh looks fine until
+/// export. Take a quad A,B,C,D with A, B, C in a line: the fan is (A,B,C),
+/// which has no area, plus (A,C,D). The degenerate one is dropped at the
+/// export funnel -- no format can write a facet whose three corners are
+/// collinear, and this kernel's own STL reader would refuse it -- and with
+/// it go edges A-B and B-C, which the neighbouring faces still use. Two
+/// boundary edges in a mesh that was closed when it was built. Ear clipping
+/// triangulates the same quad as (D,A,B) + (D,B,C), which keeps B on the
+/// boundary and has no degenerate triangle to lose.
+///
+/// The ear test is the standard one, in the face's own plane by Newell's
+/// normal, which is defined for a non-planar face too: an ear is a convex
+/// corner no other vertex of the face lies inside. Ears with area are taken
+/// first, so a degenerate ear is cut only when the face leaves no choice.
+fn face_tris(points: &[Vec3], face: &[usize]) -> Vec<[usize; 3]> {
+    let fan = || (1..face.len() - 1).map(|k| [face[0], face[k], face[k + 1]]).collect::<Vec<_>>();
+    if face.len() == 3 {
+        return vec![[face[0], face[1], face[2]]];
+    }
+    // Newell: the area-weighted normal, which is the face's own plane even
+    // when the face does not have one, and which no single corner's cross
+    // product can be trusted to give (any corner may be collinear).
+    let mut n = [0.0f64; 3];
+    for i in 0..face.len() {
+        let a = points[face[i]];
+        let b = points[face[(i + 1) % face.len()]];
+        n[0] += (a[1] - b[1]) * (a[2] + b[2]);
+        n[1] += (a[2] - b[2]) * (a[0] + b[0]);
+        n[2] += (a[0] - b[0]) * (a[1] + b[1]);
+    }
+    let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if !(nl > 0.0) {
+        return fan(); // the whole face is degenerate; a fan is as good as anything
+    }
+    let n = [n[0] / nl, n[1] / nl, n[2] / nl];
+    // An in-plane basis, taken from whichever axis is least aligned with the
+    // normal so the cross product is well conditioned.
+    let k = (0..3).fold(0, |m, i| if n[i].abs() < n[m].abs() { i } else { m });
+    let mut ax = [0.0; 3];
+    ax[k] = 1.0;
+    let u = {
+        let c = [
+            n[1] * ax[2] - n[2] * ax[1],
+            n[2] * ax[0] - n[0] * ax[2],
+            n[0] * ax[1] - n[1] * ax[0],
+        ];
+        let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        [c[0] / l, c[1] / l, c[2] / l]
+    };
+    let v = [
+        n[1] * u[2] - n[2] * u[1],
+        n[2] * u[0] - n[0] * u[2],
+        n[0] * u[1] - n[1] * u[0],
+    ];
+    // u x v = n, so the loop comes out counter-clockwise in (u, v).
+    let p2: Vec<[f64; 2]> = face
+        .iter()
+        .map(|&i| {
+            let p = points[i];
+            [
+                p[0] * u[0] + p[1] * u[1] + p[2] * u[2],
+                p[0] * v[0] + p[1] * v[1] + p[2] * v[2],
+            ]
+        })
+        .collect();
+    let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    // A tolerance on the face's own scale, so "has area" means the same
+    // thing on a 1 mm face and a 1 km one.
+    let span = p2.iter().fold(0.0f64, |m, q| {
+        m.max((q[0] - p2[0][0]).abs().max((q[1] - p2[0][1]).abs()))
+    });
+    let eps = (span * span * 1e-12).max(f64::MIN_POSITIVE);
+
+    let mut loopv: Vec<usize> = (0..face.len()).collect();
+    let mut out = Vec::with_capacity(face.len() - 2);
+    let mut guard = 0usize;
+    while loopv.len() > 3 {
+        guard += 1;
+        if guard > face.len() * face.len() + 8 {
+            // Self-intersecting or otherwise unclippable: no triangulation
+            // is right, so fall back rather than spin.
+            return fan();
+        }
+        let m = loopv.len();
+        // How many corners of a loop are flat -- the count a clip is chosen
+        // to drive down, because a flat corner is a triangle that will be
+        // dropped by the writer and take two of the mesh's edges with it.
+        let flats = |l: &[usize]| {
+            let n = l.len();
+            (0..n)
+                .filter(|&j| {
+                    cross(p2[l[(j + n - 1) % n]], p2[l[j]], p2[l[(j + 1) % n]]).abs() <= eps
+                })
+                .count()
+        };
+        // (flats left behind, -area) — smaller is better, so an ear that
+        // leaves no flat corner beats a bigger one that does.
+        let mut best: Option<((usize, f64), usize)> = None;
+        for j in 0..m {
+            let (a, b, c) = (loopv[(j + m - 1) % m], loopv[j], loopv[(j + 1) % m]);
+            let area = cross(p2[a], p2[b], p2[c]);
+            if area < 0.0 {
+                continue; // a reflex corner is never an ear
+            }
+            // No other remaining vertex may lie inside the candidate ear.
+            let clear = loopv.iter().all(|&x| {
+                x == a
+                    || x == b
+                    || x == c
+                    || !(cross(p2[a], p2[b], p2[x]) > eps
+                        && cross(p2[b], p2[c], p2[x]) > eps
+                        && cross(p2[c], p2[a], p2[x]) > eps)
+            });
+            if !clear {
+                continue;
+            }
+            // A clip that removes a flat corner emits the degenerate
+            // triangle itself; one that leaves a flat corner behind only
+            // postpones it, and the last three vertices are emitted with no
+            // choice at all. Looking one step ahead is enough to tell the
+            // two apart, and faces are small.
+            let mut rest = loopv.clone();
+            rest.remove(j);
+            let cost = (
+                if area <= eps { usize::MAX } else { flats(&rest) },
+                -area,
+            );
+            if best.as_ref().is_none_or(|&(w, _)| cost < w) {
+                best = Some((cost, j));
+            }
+        }
+        // If nothing qualified, the face is not simple and the fan is the
+        // honest fallback.
+        let Some((_, j)) = best else { return fan() };
+        let (a, b, c) = (loopv[(j + m - 1) % m], loopv[j], loopv[(j + 1) % m]);
+        out.push([face[a], face[b], face[c]]);
+        loopv.remove(j);
+    }
+    out.push([face[loopv[0]], face[loopv[1]], face[loopv[2]]]);
+    out
+}
+
 /// polyhedron(points, faces): build the mesh exactly as given — no vertex
-/// merging or validation beyond index checks. Faces with >3 vertices are
-/// fan-triangulated. The reference winds faces CW-from-outside; our meshes
-/// are CCW-from-outside, so each fan triangle is reversed. Returns the
-/// mesh plus any per-face warnings.
+/// merging or validation beyond index checks. Faces with >3 vertices are ear
+/// triangulated by `face_tris`. The reference winds faces CW-from-outside;
+/// our meshes are CCW-from-outside, so each triangle is reversed. Returns
+/// the mesh plus any per-face warnings.
 pub fn polyhedron(points: &[Vec3], faces: &[Vec<usize>]) -> (Mesh, Vec<String>) {
     let mut warnings = Vec::new();
     let mut tris = Vec::new();
@@ -441,9 +597,9 @@ pub fn polyhedron(points: &[Vec3], faces: &[Vec<usize>]) -> (Mesh, Vec<String>) 
             warnings.push(format!("polyhedron: point index {} out of bounds; face dropped", bad));
             continue;
         }
-        for k in 1..face.len() - 1 {
-            // Reversed fan (face[0], face[k+1], face[k]) → CCW outward.
-            tris.push([face[0] as u32, face[k + 1] as u32, face[k] as u32]);
+        for t in face_tris(points, face) {
+            // Reversed → CCW outward.
+            tris.push([t[0] as u32, t[2] as u32, t[1] as u32]);
         }
     }
     // Points no face refers to are legal and "silently ignored" per the
@@ -893,6 +1049,76 @@ mod tests {
     /// "A polyhedron that is non-manifold only fails when it participates in
     /// CSG or F6" — and nothing said anything, so a shell with a face missing
     /// went through a difference() and came back as arbitrary triangle soup.
+    /// A face is ear triangulated, because a fan from vertex 0 gets two
+    /// ordinary faces wrong.
+    ///
+    /// A collinear vertex at the apex makes a zero-area triangle, which the
+    /// export funnel then drops -- no format can write a facet whose corners
+    /// are collinear -- taking two edges of a closed mesh with it. And a
+    /// concave face fanned from a reflex corner covers ground outside
+    /// itself, so the solid comes out the wrong shape.
+    #[test]
+    fn a_polyhedron_face_is_ear_triangulated() {
+        // A unit cube whose front face is given as five points, the fifth a
+        // midpoint on its bottom edge. The bottom face uses the same point,
+        // so the two agree edge for edge and the mesh is closed as written.
+        // Fanned from vertex 0 the front face gave (0, 4, 1) -- three points
+        // in a line -- and after the export funnel the cube had two boundary
+        // edges.
+        let pts: Vec<Vec3> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [0.5, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [0.5, 1.0, 0.0],
+        ];
+        // Wound as the reference winds them, clockwise seen from outside.
+        let faces: Vec<Vec<usize>> = vec![
+            vec![3, 2, 1, 4, 0],    // front, with 4 collinear between 0 and 1
+            vec![9, 6, 7, 8, 5],    // back, likewise
+            vec![5, 8, 3, 0],       // left
+            vec![2, 7, 6, 1],       // right
+            vec![8, 7, 2, 3],       // top
+            vec![4, 9, 5, 0],       // bottom, split at 4/9 to match the front
+            vec![1, 6, 9, 4],
+        ];
+        let (mesh, w) = polyhedron(&pts, &faces);
+        assert!(w.is_empty(), "closed as written: {w:?}");
+        assert!((mesh.signed_volume() - 1.0).abs() < 1e-12, "vol {}", mesh.signed_volume());
+        // No triangle has zero area, so the export funnel drops nothing and
+        // the cube is still closed once written.
+        let written = mesh.without_unrepresentable(Grid::Binary);
+        assert_eq!(written.tris.len(), mesh.tris.len(), "nothing to drop");
+        assert_eq!(closedness_note(&written), None, "and it survives the writer closed");
+
+        // A CONCAVE face: an L in the z = 0 plane, as one six-sided face.
+        // Fanned from vertex 0 (the reflex corner at [1,1]) it covers ground
+        // the L does not; ear clipped it covers exactly the L, area 3.
+        let l: Vec<Vec3> = vec![
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 2.0, 0.0],
+            [1.0, 2.0, 0.0],
+        ];
+        let tris = face_tris(&l, &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(tris.len(), 4);
+        let area: f64 = tris
+            .iter()
+            .map(|t| {
+                let (a, b, c) = (l[t[0]], l[t[1]], l[t[2]]);
+                ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) / 2.0
+            })
+            .sum();
+        assert!((area - 3.0).abs() < 1e-12, "the L has area 3, not {area}");
+    }
+
     #[test]
     fn an_open_polyhedron_is_reported() {
         let tet = |faces: &[&[usize]]| {
@@ -1114,6 +1340,56 @@ mod tests {
         // An empty mesh has no bounds; it must come back empty, not panic.
         assert!(Mesh::empty().without_unrepresentable(Grid::Binary).tris.is_empty());
         assert!(Mesh::empty().without_unrepresentable(Grid::Text).tris.is_empty());
+    }
+
+    /// Dropping what a format cannot write can OPEN a mesh that was closed.
+    ///
+    /// This is the whole reason the export says so out loud. A prism whose
+    /// cross-section has three consecutive corners closer together than one
+    /// f32 step -- 3.8e-06 at a coordinate of 62 -- has a cap triangle whose
+    /// three corners write to exactly one f32 line. No binary STL can carry
+    /// it, dropping it takes three edges of each cap with it, and the file
+    /// is open. It is not a modelling error and it is not a bug in the
+    /// triangulator: it is the format's resolution, and the same design in
+    /// OFF, AMF or 3MF is closed.
+    #[test]
+    fn dropping_an_unwritable_face_can_open_a_closed_mesh() {
+        // 61.9999985 is 1.5e-06 below 62, which is inside the f32 half-step
+        // of 1.9e-06, so it writes as 62.0 exactly.
+        let x = 61.999_998_5_f64;
+        assert_eq!(x as f32, 62.0f32, "the near corner writes as 62 in f32");
+        let ring = [[62.0, 0.0], [x, -1.5], [60.0, -1.5], [60.0, 1.5], [x, 1.5]];
+        let mut pts: Vec<Vec3> = Vec::new();
+        for z in [0.0, 1.0] {
+            for p in ring {
+                pts.push([p[0], p[1], z]);
+            }
+        }
+        // Caps hand-triangulated so the thin corner triangle is one of them,
+        // which is what any triangulation of this outline has to produce.
+        let mut faces: Vec<Vec<usize>> = vec![
+            vec![4, 1, 0],
+            vec![4, 2, 1],
+            vec![4, 3, 2],
+            vec![5, 6, 9],
+            vec![6, 7, 9],
+            vec![7, 8, 9],
+        ];
+        for i in 0..5 {
+            let j = (i + 1) % 5;
+            faces.push(vec![j, j + 5, i + 5, i]);
+        }
+        let (mesh, w) = polyhedron(&pts, &faces);
+        assert!(w.is_empty(), "the prism is closed as written: {w:?}");
+
+        let text = mesh.without_unrepresentable(Grid::Text);
+        assert_eq!(text.tris.len(), mesh.tris.len(), "1e-06 resolves 1.5e-06");
+        assert_eq!(closedness_note(&text), None, "so the text formats stay closed");
+
+        let binary = mesh.without_unrepresentable(Grid::Binary);
+        assert_eq!(binary.tris.len(), mesh.tris.len() - 2, "one cap triangle at each end");
+        let note = closedness_note(&binary).expect("and the binary file is open");
+        assert!(note.contains("6 boundary edges"), "{note}");
     }
 
     /// A face binary STL cannot hold is not a face the text formats may drop.
