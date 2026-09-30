@@ -78,7 +78,11 @@
 //  width, nothing eyeballed and nothing restated:
 //
 //      R_gf   = sg_r()                 the groove floor               (3)
-//      R_rib  = R_gf  + rib height     the register rib crest
+//      R_rib  = R_gf  + rib height     the register rib crest -- the
+//                                      height, the two axial widths and
+//                                      the two clearances are READ from
+//                                      equator_band.scad's eb_if_*(),
+//                                      not restated here
 //      R_bore = R_rib + c_r            the collar bore
 //      R_hub  = R_bore + hub wall
 //      R_wmin = R_hub  + web           the LEAST rim base -- a BOUND,
@@ -90,7 +94,8 @@
 //
 //  (5) is the whole of the COUNT's sizing, and only that: the seat
 //  floor is r_p - r_s, and it has to stand a declared rim depth
-//  outside the least rim base.  r_p rises with
+//  outside the least rim base.  r_p rises with N, so (1) turns (5)
+//  into a bound on the count:
 //
 //      N >= 180 / asin( p / (2 r_p_min) )                         (6)
 //
@@ -303,9 +308,23 @@
 //  is an inner path in the pad's own section, so the pad is extruded
 //  around it.  There is no difference() and no intersection() in this
 //  file.
+//
+//  ---------------------------------------------------------------
+//  8.  WHAT AN ASSEMBLY CALLS
+//
+//  collar_chain() is the whole part, drawn about its own axis with the
+//  origin on the register groove's MID-PLANE and the splits at azimuth
+//  90 and 270.  `use` imports modules and functions but never
+//  variables, so every radius, width and azimuth an assembly needs is
+//  published as a cc_if_*() function and echoed in section 12; an
+//  assembly reads them there and restates none of them.  Section 11
+//  prints the envelope the collar occupies, including the bosses that
+//  stand outside the clamped bore, because the band is not modelled
+//  here and whether it leaves that space is the assembly's check.
 // ===================================================================
 
 use <spherical_gear.scad>
+use <equator_band.scad>
 
 // ===================================================================
 //  DECLARED INPUTS
@@ -334,12 +353,19 @@ CC_N2    = 19;      // the pinion this collar drives against
 CC_C0    = 400;     // nominal centre distance, mm
 CC_TOP   = 0.60;    // the standard's topping constant: D_o = p(c + cot(180/N))
 
-// -- the band's register groove ---------------------------------------
-CC_RIBH  = 2.50;    // rib height above the equatorial radius sg_r()
-CC_RIBW  = 7.00;    // axial width of one rib
-CC_GW    = 6.00;    // axial width of the groove between the ribs
-CC_CR    = 0.30;    // radial clearance, tongue to floor and bore to crest
-CC_CA    = 0.20;    // axial clearance, tongue in the groove, per side
+// -- the band's register groove, READ from the band -------------------
+// These five were literals here, restated from the band's echoed report,
+// and they happened to agree with it.  The EM collar restated the same
+// register from the same text and got it wrong by 21 mm, which is what
+// made the band publish eb_if_*().  A number a part must match is read.
+EB_LND   = eb_if_land();     // [land crest radius, one land's axial width]
+EB_GRV   = eb_if_groove();   // [groove axial width, groove centre in z]
+EB_CLR   = eb_if_clear();    // [radial, axial per side]
+CC_RIBH  = EB_LND[0] - eb_if_floor();   // rib height above sg_r()
+CC_RIBW  = EB_LND[1];                   // axial width of one rib
+CC_GW    = EB_GRV[0];                   // axial width of the groove
+CC_CR    = EB_CLR[0];                   // radial clearance
+CC_CA    = EB_CLR[1];                   // axial clearance, per side
 
 // -- the collar's own widths ------------------------------------------
 CC_THUB  = 9.00;    // hub wall, bore to hub outside
@@ -477,6 +503,33 @@ F_HOOP  = CC_NBJ*CC_FB;                             // hoop tension per joint
 P_BORE  = F_HOOP/(R_BORE*L_GRIP);                   // contact pressure
 T_CLAMP = 2*PI*CC_MU*F_HOOP*R_BORE/1000;            // friction torque, Nm
 T_CHAIN = CC_FW*RP/1000;                            // chain's own capacity, Nm
+
+// ===================================================================
+//  THE INTERFACE, PUBLISHED AS FUNCTIONS
+//  `use` imports modules and functions but NOT variables, so an
+//  assembly that reads a radius out of this file must read it HERE.
+//  A restated constant is a constant that can drift, which is the
+//  contract's own argument for publishing its table this way.  Every
+//  one of these is echoed in section 12 below, so the numbers an
+//  assembly gets are the numbers this file prints.
+// ===================================================================
+function cc_if_groove()   = [R_GF, CC_RIBH, CC_RIBW, CC_GW, CC_CR, CC_CA];
+      // what the BAND must provide: groove floor radius, rib height,
+      // rib axial width, groove axial width, radial and axial clearance
+function cc_if_bore()     = R_BORE;              // collar bore, over the rib crests
+function cc_if_tongue()   = [R_TIN, 2*H_TON];    // tongue inner face radius, axial width
+function cc_if_width()    = 2*CC_HHUB;           // clamped bore axial length
+function cc_if_tip()      = RTIP;                // outermost radius of the part
+function cc_if_teeth()    = NCH;                 // sprocket count
+function cc_if_pitch()    = [CC_P, RP];          // chain pitch, pitch radius
+function cc_if_split()    = [90, 270, GAPD];     // the two split azimuths, gap angle
+function cc_if_arc()      = [A0, A1, J0, J1];    // the arguments cc_arc() takes
+function cc_if_bolt()     = [R_BOLT, Z_BOLT, CC_BHOLE, 2*CC_NBJ];
+      // bolt circle radius, bolt axis |z|, clearance bore radius, bolts in all
+function cc_if_envelope() = [Z_PAD0 + CC_PADH,
+                             CC_GAPMM/2 + CC_PADL + CC_BHH + CC_PART];
+      // |z| the bosses reach about the register mid-plane, and how far
+      // a bolt head reaches either side of a split plane
 
 // ===================================================================
 //  THE PROFILE
@@ -671,8 +724,23 @@ echo(str("   chordal rise 1 - cos(180/N) = ", 1 - cos(BETA), " = ",
          RP*(1 - cos(BETA)), " mm of roller rise"));
 
 echo("=== 3. the seat stack-up, from the band out ===");
+echo(str("   the register is READ: eb_if_floor() = ", eb_if_floor(),
+         "   eb_if_land() = ", EB_LND, "   eb_if_groove() = ", EB_GRV,
+         "   eb_if_clear() = ", EB_CLR,
+         ";  the bore this file derives from them is ", R_BORE,
+         " and the band's own eb_if_collar() says ", eb_if_collar()[0],
+         ", difference ", R_BORE - eb_if_collar()[0],
+         ";  tongue face ", R_TIN, " against ", eb_if_collar()[1],
+         ", difference ", R_TIN - eb_if_collar()[1],
+         ";  tongue width ", 2*H_TON, " against ", eb_if_collar()[2],
+         ", difference ", 2*H_TON - eb_if_collar()[2]));
+echo(str("   the hub is ", 2*CC_HHUB, " mm long on a register that allows ",
+         eb_if_hub(), " mm symmetric on the groove: fits ",
+         2*CC_HHUB <= eb_if_hub()));
 echo(str("   groove floor = the equatorial cylinder sg_r() = ", R_GF,
-         " mm; nothing else in this chain is read from the contract"));
+         " mm from the contract; the rib height, the two widths and the",
+         " two clearances are read from the band, and the rest of this",
+         " chain is this file's own"));
 echo(str("   rib crest    floor + ", CC_RIBH, " = ", R_RIB));
 echo(str("   tongue face  floor + ", CC_CR, " = ", R_TIN));
 echo(str("   collar bore  crest + ", CC_CR, " = ", R_BORE));
@@ -965,6 +1033,23 @@ echo(str("   so the collar's full axial envelope is |z| <= ",
          " modelled here, so whether it leaves that space above and below",
          " its groove is the ASSEMBLY's check and this file does not make",
          " it."));
+
+echo("=== 12. the interface, as cc_if_*() publishes it ===");
+echo(str("   cc_if_groove()   = ", cc_if_groove(),
+         "  [floor r, rib h, rib w, groove w, c_r, c_a] -- the BAND's side"));
+echo(str("   cc_if_bore()     = ", cc_if_bore(),
+         "   cc_if_tongue() = ", cc_if_tongue(),
+         "   cc_if_width() = ", cc_if_width()));
+echo(str("   cc_if_tip()      = ", cc_if_tip(), "   cc_if_teeth() = ",
+         cc_if_teeth(), "   cc_if_pitch() = ", cc_if_pitch()));
+echo(str("   cc_if_split()    = ", cc_if_split(),
+         "   cc_if_arc() = ", cc_if_arc()));
+echo(str("   cc_if_bolt()     = ", cc_if_bolt(),
+         "   cc_if_envelope() = ", cc_if_envelope()));
+echo(str("   an assembly places collar_chain() with its origin on the",
+         " band's groove MID-PLANE and its +z on the stack axis; the two",
+         " splits then lie at azimuth 90 and 270 of the assembly frame",
+         " unless it rotates the collar."));
 
 // ===================================================================
 //  THE PART

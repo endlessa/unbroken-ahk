@@ -384,6 +384,22 @@ COL_BORE = R_LAND + EB_CR;      // collar bore, over the land crests
 COL_TONG = R + EB_CR;           // collar tongue inner face, over the floor
 COL_TW   = EB_GRW - 2*EB_CA;    // collar tongue axial width
 
+// ---- the interface, published so a collar can READ it ----------------
+// These three numbers were computed here and printed in the report, and
+// nothing could read them, so each collar sized its clamp by hand
+// against the report.  The chain collar landed on the register; the EM
+// collar landed 21 mm outboard of it, on nothing.  A number a part must
+// match is published as a function or it is not published.
+function eb_if_floor()  = R;                       // 1 groove floor r = sg_r()
+function eb_if_land()   = [R_LAND, EB_LANDW];      // 2 land crest r, one land's width
+function eb_if_groove() = [EB_GRW, (Z_L1+Z_L2)/2]; // 3 groove width, its centre in z
+function eb_if_clear()  = [EB_CR, EB_CA];          // 4 radial, axial per side
+function eb_if_collar() = [COL_BORE, COL_TONG, COL_TW];  // 5 bore, tongue face, width
+function eb_if_span()   = [Z_L3, Z_SB];            // 6 skirt end, flange underside
+function eb_if_hub()    = 2*(Z_SB - (Z_L1+Z_L2)/2);// 7 tallest hub symmetric on the groove
+function eb_if_reach()  = [R_BIN, RA2, Z_L3, CR_ZTIP];  // 8 the band's own envelope
+function eb_if_port()   = ZPORT;                   // 9 the port's line of action
+
 // ===================================================================
 //  THE SPUR BOUNDARY
 //  One tooth, from the space centreline before it to just short of the
@@ -708,6 +724,11 @@ echo(str("   the two members share no volume.  Past 25000 triangles this",
 
 // ===================================================================
 //  THE BAND
+//  Two members that share no volume: the body, and the crown ring
+//  seated in it.  Wrapped in a module so the stack can place one.
 // ===================================================================
-color([0.55, 0.62, 0.70]) eb_lathe(MER, FLG, AZ, RSP);
-color([0.82, 0.68, 0.34]) sg_sector(NR, NR, D, false, EB_F, M_, PHI, JT_);
+module equator_band() {
+    color([0.55, 0.62, 0.70]) eb_lathe(MER, FLG, AZ, RSP);
+    color([0.82, 0.68, 0.34]) sg_sector(NR, NR, D, false, EB_F, M_, PHI, JT_);
+}
+equator_band();

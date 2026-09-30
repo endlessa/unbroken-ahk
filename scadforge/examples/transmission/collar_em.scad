@@ -21,39 +21,52 @@
 //  labelled as one in the report, with where the figure comes from.
 //
 //  ---------------------------------------------------------------
-//  1.  WHERE IT CLAMPS, AND WHAT THE INTERFACE IS
+//  1.  WHERE IT CLAMPS -- READ FROM THE BAND, NOT CHOSEN
 //
-//  The contract publishes the sphere radius R = sg_r() as a function.
-//  It does NOT publish the equatorial band's own outer diameter: its
-//  equatorial-band report prints the outer spur face radius and the
-//  radial wall between the two faces, but as echoed text, not as a
-//  function, so this file cannot read them -- and a restated constant
-//  is a constant that can drift, so it does not copy them either.
-//  The clamp seat is therefore placed by one collar-side offset,
+//  This file used to place its seat by a collar-side offset,
 //
-//      R_seat = R + off                                          (1)
+//      R_seat = R + off,   off = 24 mm,                          (1)
 //
-//  off = 24 mm, chosen to stand outboard of the band's toothed outer
-//  face as the contract's own equatorial-band report prints it.  That
-//  choice, and the seven dimensions that go with it, are the whole
-//  interface; they are published as em_if_*() so a second collar can
-//  READ them rather than copy them, and the report prints all eight.
+//  because the band printed its register in echoed text and published
+//  no function to read it.  Both collars therefore sized their clamps
+//  by hand against that text.  The chain collar landed on the register;
+//  this one landed 21.2 mm outboard of it, over the band's spur teeth,
+//  clamping nothing -- and nothing in either file could notice, because
+//  the interface was published (em_if_*) rather than read.  Assembling
+//  the stack is what noticed.
+//
+//  equator_band.scad now publishes the register as eb_if_*(), so (1) is
+//  gone and every clamp dimension here is READ:
+//
+//      R_seat = eb_if_collar()[0]      bore, over the land crests
+//      R_rib  = eb_if_collar()[1]      rib crest, over the groove floor
+//      w_rib  = eb_if_collar()[2]      rib axial width
+//      w_c    = 2 land + groove        the clamp covers the whole
+//                                      register                  (1)
+//
+//  and off = R_seat - R is now a consequence, printed for comparison
+//  against the 24 mm it replaces.  Three things were wrong at once and
+//  the report prints all three: the radius, the clamp width (18 mm
+//  against a register 20 mm long), and the anti-rotation feature -- an
+//  azimuthal keyway tongue, where the band offers a circumferential
+//  groove.  The tongue is now a circumferential RIB, the same feature
+//  the chain collar uses, so the two collars are interchangeable in
+//  fact and not only in claim.
 //
 //  The clamp is genuinely split: two halves, each spanning
 //
 //      a_half = 180 - deg(gap / R_seat)                          (2)
 //
 //  of azimuth, so the parting gap is a stated 1.0 mm of ARC at the
-//  seat rather than a stated angle, and one tongue per half drops
-//  2.5 mm into a keyway in the band.  Two tangential pinch bolts
-//  close the halves; six axial bolts on one circle carry whatever
-//  collar is fitted.  A collar that repeats those eight numbers
-//  interchanges with this one.  That interchange is a PUBLISHED
-//  CONTRACT here and not a checked one: this file never reads, and
-//  never compares itself against, another collar's file.  When it was
-//  written collar_chain.scad held two statements and published no
-//  interface at all, so these eight numbers are where the shared
-//  interface is defined, and the report says so in those words.
+//  seat rather than a stated angle.  Two tangential pinch bolts close
+//  the halves; six axial bolts on one circle carry the machine.
+//
+//  ONE PLACEMENT FACT, and the report computes it rather than asserting
+//  it.  The collar-side tabs stand 16 mm above the clamp centre out to
+//  r = 143.9, and the band's spur flange is 12 mm above the groove
+//  centre and reaches r = 141.  So the collar cannot be fitted with its
+//  machine towards the flange: it goes on with the machine facing AWAY
+//  from the crown, and the stack places it that way.
 //
 //  ---------------------------------------------------------------
 //  2.  THE WINDING ARITHMETIC
@@ -327,6 +340,7 @@
 // ===================================================================
 
 use <spherical_gear.scad>
+use <equator_band.scad>
 
 // ===================================================================
 //  READ FROM THE CONTRACT.  Nothing in this block is a literal.
@@ -348,13 +362,8 @@ NSUN   = sg_ns();
 //  DESIGN -- collar-side choices.  Each one is printed in the report
 //  next to the identity or clearance it has to satisfy.
 // ===================================================================
-EM_OFF   = 24;      // (1) seat offset outboard of R, mm
-EM_WC    = 18;      // clamp axial width, mm
 EM_TC    = 8;       // clamp radial wall, mm
 EM_SPLIT = 1.0;     // parting gap, mm of ARC at the seat
-EM_TD    = 2.5;     // tongue depth, mm
-EM_TW    = 10;      // tongue crest width, mm of arc at the seat
-EM_TCH   = 0.6;     // tongue flank chamfer, mm of arc at the seat
 EM_NLUG  = 6;       // axial bolt lugs, 3 per half
 EM_LUG0  = 30;      // azimuth of the first lug, deg
 EM_BOLT  = 6;       // M6 everywhere on the interface
@@ -405,17 +414,29 @@ NTUB = 24;          // stations round a bolt tube
 //  DERIVED GEOMETRY.  Everything here follows from the two blocks
 //  above by arithmetic; the report prints each one with its identity.
 // ===================================================================
-RSEAT = RSPH + EM_OFF;            // (1) clamp bore
+// ---- the register, READ from the band ------------------------------
+EB_COL  = eb_if_collar();         // [bore, rib crest, rib axial width]
+EB_LND  = eb_if_land();           // [land crest radius, one land's width]
+EB_GRV  = eb_if_groove();         // [groove width, groove centre in z]
+EB_HUB  = eb_if_hub();            // tallest hub symmetric on the groove
+EB_RCH  = eb_if_reach();          // [r_in, r_out, z_lo, z_hi] of the band
+
+RSEAT = EB_COL[0];                // clamp bore, over the land crests
+RTNG  = EB_COL[1];                // rib crest, over the groove floor
+EM_WRIB = EB_COL[2];              // rib axial width
+EM_WC = 2*EB_LND[1] + EB_GRV[0];  // (1) the clamp covers the whole register
+EM_OFF = RSEAT - RSPH;            // what (1) used to CHOOSE, now derived
+EM_TD  = RSEAT - RTNG;            // rib depth, likewise
+
 RCO   = RSEAT + EM_TC;            // clamp outer radius
-RTNG  = RSEAT - EM_TD;            // tongue crest radius
 GSPL  = deg(EM_SPLIT/RSEAT);      // (2) parting gap as an angle
-GTNG  = deg(EM_TW/RSEAT);         // tongue crest width as an angle
-GTCH  = deg(EM_TCH/RSEAT);        // tongue flank chamfer as an angle
 RBC   = RCO + EM_JG + EM_RLUG;    // bolt circle radius
 RLGX  = RBC + EM_RLUG;            // outermost radius of the clamp group
 
 ZC1   =  EM_WC/2;                 // clamp top    z
 ZC0   = -EM_WC/2;                 // clamp bottom z
+ZG1   =  EM_WRIB/2;               // rib top    z
+ZG0   = -EM_WRIB/2;               // rib bottom z
 ZTB0  = ZC1 + EM_JG;              // collar-side tab, bottom
 ZTB1  = ZTB0 + EM_TTAB;           // collar-side tab, top   = rotor disc top
 ZROT1 = ZTB1;                     // rotor back iron disc, top
@@ -512,7 +533,7 @@ NRIP  = 6*(POLES/2);
 function em_if_seat()   = RSEAT;   // 1 clamp bore radius, mm
 function em_if_width()  = EM_WC;   // 2 clamp axial width, mm
 function em_if_wall()   = EM_TC;   // 3 clamp radial wall, mm
-function em_if_tongue() = [EM_TW, EM_TD, GTNG];   // 4 width mm, depth mm, arc deg
+function em_if_rib()    = [EM_WRIB, EM_TD];       // 4 rib axial width mm, depth mm
 function em_if_split()  = [EM_SPLIT, GSPL];       // 5 gap mm, gap deg
 function em_if_bc()     = [RBC, EM_NLUG, EM_LUG0];// 6 bolt circle r, lugs, first
 function em_if_bolt()   = [EM_BOLT, EM_RBORE, EM_RLUG];  // 7 M size, bore, boss
@@ -528,12 +549,22 @@ module em_shell(P, cap = false) {
     id  = function (i,j) (i % S)*n + (j % n);
     side = [ for (i = [0 : cap ? S-2 : S-1]) for (j = [0:n-1])
                [ id(i,j), id(i,j+1), id(i+1,j+1), id(i+1,j) ] ];
-    c0 = cap ? [ for (j = [1:n-2]) [ id(0,0),   id(0,j+1),   id(0,j)   ] ] : [];
-    c1 = cap ? [ for (j = [1:n-2]) [ id(S-1,0), id(S-1,j), id(S-1,j+1) ] ] : [];
+    // ONE n-gon per cap, not a fan from vertex 0.  The clamp's profile
+    // steps in over the groove, so it is not convex and no single vertex
+    // sees all of it; polyhedron() ear-clips a face in its own plane and
+    // gets it right, and a rectangle is a 4-gon either way.
+    c0 = cap ? [ [ for (j = [n-1:-1:0]) id(0,j)   ] ] : [];
+    c1 = cap ? [ [ for (j = [0:n-1])    id(S-1,j) ] ] : [];
     polyhedron(points = pts, faces = concat(side, c0, c1), convexity = 8);
 }
 // a rectangle in (r,z), counterclockwise
 function em_rect(r0, r1, z0, z1) = [[r0,z0],[r1,z0],[r1,z1],[r0,z1]];
+// The clamp wall in (r,z), counterclockwise: the bore stands on the two
+// land crests and steps in to the groove floor between them, so the rib
+// is one continuous ring and not a key.  Two reflex corners, which is
+// why em_shell caps with an n-gon.
+EM_CPROF = [ [RSEAT, ZC0], [RCO,  ZC0], [RCO,  ZC1], [RSEAT, ZC1],
+             [RSEAT, ZG1], [RTNG, ZG1], [RTNG, ZG0], [RSEAT, ZG0] ];
 // place an (r,z) profile at azimuth a about the z axis
 function em_at(prof, a) = [ for (p = prof) [p[0]*cos(a), p[0]*sin(a), p[1]] ];
 
@@ -594,28 +625,16 @@ LCOIL = 2*(EM_RAO-EM_RAI) + 2*PI*RHO + 2*rad(EM_WT/2)*(EM_RAI+EM_RAO);
 //  THE BODIES
 // ===================================================================
 
-// One half of the split clamp.  The station list is [azimuth, bore
-// radius], in five runs: bore, chamfer in, tongue crest, chamfer out,
-// bore.  The chamfer is EM_TCH mm of arc, a real lead-in on the tongue
-// flank -- and it is also what keeps the flank off a duplicated
-// azimuth, which would put a zero-area quad in the shell (see the
-// kernel finding beside this file).  Every run is generated half open
-// so no two stations ever share an azimuth.
-module em_clamp_half(a0, a1, ac) {
-    at0 = ac - GTNG/2;  at1 = ac + GTNG/2;
-    b0 = at0 - GTCH;    b1 = at1 + GTCH;
-    n1 = max(2, ceil((b0 - a0)/NAZ));
-    nc = 3;
-    n3 = max(2, ceil(GTNG/NAZ));
-    n5 = max(2, ceil((a1 - b1)/NAZ));
-    S = concat( [ for (i = [0:n1-1]) [a0  + (b0-a0 )*i/n1, RSEAT] ],
-                [ for (i = [0:nc-1]) [b0  + GTCH*i/nc,
-                                      RSEAT + (RTNG-RSEAT)*i/nc] ],
-                [ for (i = [0:n3-1]) [at0 + GTNG*i/n3, RTNG] ],
-                [ for (i = [0:nc-1]) [at1 + GTCH*i/nc,
-                                      RTNG + (RSEAT-RTNG)*i/nc] ],
-                [ for (i = [0:n5  ]) [b1  + (a1-b1)*i/n5, RSEAT] ] );
-    em_shell([ for (s = S) em_at(em_rect(s[1], RCO, ZC0, ZC1), s[0]) ], true);
+// One half of the split clamp: the register profile EM_CPROF swept
+// through the half's azimuths, with a cap at each parting plane.  The
+// profile is the same at every station because the rib is a continuous
+// ring, so the azimuth run is a single one and no two stations can
+// share an azimuth -- which is what the five-run tongue version needed
+// its chamfer for (a duplicated azimuth puts a zero-area quad in the
+// shell; see the kernel finding beside this file).
+module em_clamp_half(a0, a1) {
+    n = max(2, ceil((a1 - a0)/NAZ));
+    em_shell([ for (i = [0:n]) em_at(EM_CPROF, a0 + (a1-a0)*i/n) ], true);
 }
 
 // An axial bolt lug: a tube on the bolt circle whose bore IS the hole.
@@ -705,18 +724,24 @@ echo(str("   sg_row(", len(ROWS)-1, ") = the equator row, ", ROWEQ[0],
          ": Nr = ", ROWEQ[1], " D = ", ROWEQ[2], " Np = ", ROWEQ[3],
          " k = ", ROWEQ[4], " -- the band IS this row's ring"));
 
-echo("--- 1. the split clamp interface, DEFINED here, published as em_if_*() ---");
-echo(str("   1 seat bore      R_seat = R + off = ", RSPH, " + ", EM_OFF, " = ",
-         RSEAT, " mm radius, diameter ", 2*RSEAT, " mm   em_if_seat()"));
-echo(str("   2 clamp width    ", EM_WC, " mm, z from ", ZC0, " to ", ZC1,
-         "   em_if_width()"));
+echo("--- 1. the split clamp, READ from the band's published register ---");
+echo(str("   1 seat bore      R_seat = eb_if_collar()[0] = ", RSEAT,
+         " mm radius, diameter ", 2*RSEAT, " mm   em_if_seat()"));
+echo(str("   2 clamp width    2 land + groove = 2*", EB_LND[1], " + ",
+         EB_GRV[0], " = ", EM_WC, " mm (1), z from ", ZC0, " to ", ZC1,
+         "; the band allows a hub ", EB_HUB,
+         " mm tall symmetric on the groove, so this fits: ",
+         EM_WC <= EB_HUB, "   em_if_width()"));
 echo(str("   3 clamp wall     ", EM_TC, " mm, so the clamp outer radius is ",
          RCO, " mm   em_if_wall()"));
-echo(str("   4 tongue         ", EM_TW, " mm wide and ", EM_TD,
-         " mm deep, crest radius ", RTNG, " mm; as an angle deg(", EM_TW, "/",
-         RSEAT, ") = ", GTNG, " deg, with a ", EM_TCH,
-         " mm = ", GTCH, " deg chamfer on each flank; one per half, at",
-         " azimuth 90 and 270   em_if_tongue()"));
+echo(str("   4 rib            ", EM_WRIB, " mm wide and ", EM_TD,
+         " mm deep, crest radius ", RTNG,
+         " mm: a continuous ring in the band's groove, z from ", ZG0, " to ",
+         ZG1, ".  The rib is narrower than the groove by the band's own",
+         " axial clearance, and its crest stands off the groove floor at ",
+         eb_if_floor(), " by ", RTNG - eb_if_floor(),
+         " mm   em_if_rib()"));
+
 echo(str("   5 parting gap    ", EM_SPLIT, " mm of arc at the seat = deg(",
          EM_SPLIT, "/", RSEAT, ") = ", GSPL,
          " deg, so each half spans 180 - ", GSPL, " = ", 180-GSPL,
@@ -732,17 +757,43 @@ echo(str("   7 bolt           M", EM_BOLT, ", bore radius ", EM_RBORE,
 echo(str("   8 pinch bolts    M", EM_BOLT, " tangential at radius ", RBC,
          " mm and z = 0, one per parting plane, ears ", EM_EARL,
          " mm long standing ", EM_EARS, " mm off the plane   em_if_pinch()"));
-echo("   A collar that repeats 1 to 8 interchanges with this one.  That");
-echo("   interchange is a PUBLISHED CONTRACT and not a checked one: this");
-echo("   file never reads, and never compares itself against, another");
-echo("   collar's file.  When it was written collar_chain.scad held two");
-echo("   statements and published no interface at all, so the eight numbers");
-echo("   above are where the shared interface is defined.");
-echo(str("   The contract does not publish the band's outer diameter as a",
-         " function -- only R = ", RSPH, " -- so the ", EM_OFF,
-         " mm offset is a collar-side choice, made to stand outboard of the",
-         " band's toothed outer face as the contract's own equatorial-band",
-         " report prints it.  This file does not restate that radius."));
+echo("   A collar that repeats 1 to 8 interchanges with this one.  Four of");
+echo("   the eight -- the seat, the clamp width, the rib and which way");
+echo("   round it goes on -- are now READ from eb_if_*() rather than");
+echo("   chosen, so on those four the interchange is CHECKED and the check");
+echo("   is above.  The other four (wall, bolt circle, bolt size, pinch");
+echo("   ears) are still collar-side choices this file publishes, and any");
+echo("   second collar has to repeat them; nothing yet compares two");
+echo("   collars' files against each other.");
+echo("--- 1a. what this file used to choose, and what it got wrong ---");
+echo(str("   the seat was R + off with off = 24 mm chosen, giving ", RSPH+24,
+         "; the band's lands crest at ", EB_LND[0], " and a collar bores ",
+         RSEAT, ", so that seat stood ", RSPH+24 - RSEAT,
+         " mm outboard of the register -- clear of it, over the band's spur",
+         " teeth, clamping nothing.  off is now a consequence: R_seat - R = ",
+         EM_OFF, " mm"));
+echo(str("   the clamp was 18 mm wide against a register ",
+         2*EB_LND[1] + EB_GRV[0], " mm long, so it could not have covered",
+         " both lands even at the right radius"));
+echo(str("   and the anti-rotation feature was an azimuthal keyway tongue,",
+         " where the band offers a circumferential groove.  It is now a",
+         " circumferential rib, which is the chain collar's feature, so the",
+         " two collars are interchangeable in fact"));
+echo(str("   none of the three could be noticed while the interface was",
+         " PUBLISHED rather than READ.  Assembling the stack is what",
+         " noticed, and eb_if_*() is what fixed it"));
+
+echo("--- 1b. which way round it goes on, computed ---");
+echo(str("   the collar-side tabs reach z = ", ZTB1, " out to r = ", RLGX,
+         "; the band's spur flange underside stands ",
+         eb_if_span()[1] - EB_GRV[1], " mm above the groove centre, and the",
+         " band reaches r = ", EB_RCH[1], " there.  Tabs towards the flange",
+         " would foul it by ", ZTB1 - (eb_if_span()[1] - EB_GRV[1]),
+         " mm, so the collar is fitted with its machine facing AWAY from the",
+         " crown: mirrored in z about the groove centre.  Fitted that way",
+         " the tabs end at ", EB_GRV[1] - ZTB1, " against the band's skirt",
+         " end at ", EB_RCH[2], ", clear by ", EB_RCH[2] - (EB_GRV[1] - ZTB1),
+         " mm"));
 
 echo("--- 2. the winding arithmetic ---");
 echo(str("   (3) q = S/(3P) = ", SLOTS, "/", 3*POLES, " = ",
@@ -924,13 +975,11 @@ echo(str("   envelope: radius ", RMNT+EM_RMNT, " mm (diameter ",
 
 echo("--- 6. predicted volumes; the mesh must come in UNDER, because every");
 echo("       chord cuts inside its arc and every bundle section is a polygon ---");
-// clamp half = the plain ring sector, plus the tongue crest, plus the two
-// flank chamfers: for a bore ramping linearly from RSEAT to RTNG over
-// rad(GTCH), the extra area integrates to rad(GTCH)(RSEAT td - td^2/3)/1
-// over the pair, exactly.
-VHALF = rad(180-GSPL)/2*(RCO*RCO - RSEAT*RSEAT)*EM_WC
-      + rad(GTNG)/2*(RSEAT*RSEAT - RTNG*RTNG)*EM_WC
-      + rad(GTCH)*(RSEAT*EM_TD - EM_TD*EM_TD/3)*EM_WC;
+// clamp half = the ring sector between the bore and the outer wall over
+// the full clamp width, plus the rib, a second ring sector from the
+// groove floor to the bore over the rib's width.  Both are exact.
+VHALF = rad(180-GSPL)/2*((RCO*RCO - RSEAT*RSEAT)*EM_WC
+                       + (RSEAT*RSEAT - RTNG*RTNG)*EM_WRIB);
 VTUB  = function (ri, ro, L) PI*(ro*ro - ri*ri)*L;
 VLUG  = VTUB(EM_RBORE, EM_RLUG, EM_WC);
 VTAB  = VTUB(EM_RBORE, EM_RLUG, EM_TTAB);
@@ -984,9 +1033,10 @@ STATC  = [0.50,0.54,0.60];   // stator iron
 COILC  = [0.80,0.52,0.24];   // copper
 CANC   = [0.30,0.44,0.56];   // capacitor cans
 
+module collar_em() {
 color(CLAMPC) {
-    em_clamp_half(GSPL/2, 180 - GSPL/2, 90);
-    em_clamp_half(180 + GSPL/2, 360 - GSPL/2, 270);
+    em_clamp_half(GSPL/2, 180 - GSPL/2);
+    em_clamp_half(180 + GSPL/2, 360 - GSPL/2);
     for (i = [0:EM_NLUG-1]) em_lug(EM_LUG0 + 360*i/EM_NLUG, ZC0, ZC1);
     for (s = [0, 180]) { em_ear(s, 1); em_ear(s, -1); }
 }
@@ -1000,3 +1050,5 @@ color(STATC) { em_backiron();
                for (j = [0:EM_NMNT-1]) em_mount(j); }
 color(COILC) for (i = [0:SLOTS-1]) em_coil(i);
 color(CANC)  for (j = [0:NCELL-1]) em_can(j);
+}
+collar_em();
