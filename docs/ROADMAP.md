@@ -335,10 +335,22 @@ assemble a model out of six part files, each of which used a seventh.
 
 **The transmission stack is assembled (2026-10-01).** Seven files in
 `examples/transmission/` now describe one machine rather than six parts and a
-library: `stack.scad` puts four spherical-bevel planetary rows on one polar
-axis with the equatorial band as the bottom row's ring, a swappable collar on
-its register and a polar cap at each end — 1,624,244 triangles, 69 components
-against 69 predicted bodies, 0 holes, 0 flipped edges, 0 T-junctions. The
+library: `stack.scad` bolts spherical-bevel planetary slices end to end on one
+polar axis, each joint a facing PAIR of polar caps — which is what
+`polar_cap.scad` was built for and the one thing no part file can supply,
+because what it needs is the second cap — with a swappable collar on each
+equatorial band, a chain sprocket on one and an axial-flux machine on the
+next. 2,332,492 triangles, 180 components against 180 predicted bodies, 0
+holes, 0 flipped edges, 0 T-junctions, 606.7 mm tall. Its station list is
+data, so the machine is configured rather than hard-coded, and the stack
+ratio is shown independent of the order twice over: every permutation of the
+stations gives the same numerator, and the slices really can be bolted in any
+order because every station presents the same 46 spline and the same
+138-tooth crown. What the stack DOES, though, turns on the one thing not
+modelled — which member of its own slice each cap is bolted to — so both
+readings are printed with the assumption each rests on: a series compound
+reduction, or a two-degree-of-freedom differential in which holding one ring
+selects one of four ratios. The
 assembly found four defects that no part file could see, all of the same
 shape: a number two files have to agree on was *published* by one and
 *copied* by the other, and nothing ever compared the two. `docs/TRANSMISSION.md`
