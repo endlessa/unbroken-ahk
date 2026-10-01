@@ -677,8 +677,31 @@ triangle count cannot be repaired by choosing a different triangle count.
 Whatever replaces it probably has to measure the interpenetration, which is
 what the BSP was going to compute anyway.
 
-The corpus makes the urgency plain: **thirteen models trip this budget**,
-with components from 28,872 to 252,304 triangles. It is not a corner case.
+The corpus makes the urgency plain: **sixteen of the forty models trip this
+budget** (re-measured 2026-10-01 over the whole corpus), with components from
+28,872 to 396,876 triangles:
+
+```
+f2_sounding 28,872   cobra_fighter 31,904   cycloidal 32,196   savonius 32,784
+windmill    36,240   gorlov        40,128   lv_fibres 46,920   polar_cap 57,400
+twinhelix   61,116   gear_sphere   69,656   turbofan  78,672   spiral_bevel 102,238
+ravigneaux 157,880   worm         252,304   equator_band 393,204   stack 396,876
+```
+
+It is not a corner case. Note what does NOT appear: `epicyclic`, at 7,878,404
+triangles the largest model in the corpus, never trips it, because the budget
+weighs a connected component and its components are each small. Size of model
+and size of component are different questions, which is the whole point of
+§1.4.
+
+### 8.3a And two of the corpus's boundary edges are the FORMAT, not the BSP
+
+The same pass found that exactly two models drop triangles at binary STL's
+f32 grid, and both of their boundary-edge counts are that drop and not
+geometry: `epicyclic` loses 1,988 triangles and reports 276 boundary edges
+(largest coordinate 85.2, f32 step 1.02e-05), and `letterform` loses 2 and
+reports 6 — the case §4.2 was found on. Neither is a crack to chase in the
+BSP. §4.2a is the standing warning and this is it recurring twice more.
 
 ### 8.4 The completeness score is stale in the other direction
 
