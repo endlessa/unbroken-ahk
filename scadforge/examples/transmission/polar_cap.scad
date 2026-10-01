@@ -44,18 +44,28 @@
 //  writes, which is the reason the library gives for its own layout.
 //
 //  What the export CANNOT do is confirm that the members do not
-//  overlap, and this file does not pretend otherwise.  Past 25000
-//  triangles this kernel skips its export-time union and says so:
+//  overlap, and this file does not pretend otherwise.  The kernel groups
+//  shells whose bounding boxes meet, and unions a group only when the
+//  shells going INTO it come to under 25000 triangles.  Over that it
+//  concatenates and says so:
 //
 //      ... is past the 25000 the export-time union will merge;
 //      overlapping shells were left separate.
 //
-//  A scene past that threshold that DOES overlap therefore comes back
-//  with holes = 0 and a volume that counts the overlap twice -- two
-//  spheres of radius 10 with centres 12 apart export as 8369 mm^3
-//  against a true union of 7506.  So a clean leak count is not by
-//  itself evidence of anything here.  The printed clearances are the
-//  statement, and every one of them is computed, not assumed.
+//  This cap has such a group, at 57400 triangles, so its union is
+//  skipped.  A scene in that state that DOES overlap comes back with
+//  holes = 0 and a volume that counts the overlap twice, so a clean leak
+//  count is not by itself evidence of anything here.  The printed
+//  clearances are the statement, and every one of them is computed.
+//
+//  The budget is per GROUP and not per model, which is worth stating
+//  because it used to read as per model here, with two spheres of radius
+//  10 at centre distance 12 as the illustration.  Those two are 9216
+//  triangles at $fn = 48, under the budget, so they merge: one
+//  component, 7459.736 mm^3 against the exact union
+//  2(4/3)pi R^3 - (pi/12)(4R+d)(2R-d)^2 = 7506.6, the deficit being
+//  inscribed facets.  So small overlapping shells ARE caught, and the
+//  cap's own 57400-triangle group is the reason this one is not.
 //
 //  ---------------------------------------------------------------
 //  1.  THE RADIAL STACK-UP, FROM THE AXIS OUT
@@ -578,10 +588,12 @@ echo("=== polar cap: what it is made of ===");
 echo("four members, sharing no volume: web, crown ring, bolt ring, balls.");
 echo("every interface is a seat, and every clearance is computed and");
 echo("printed at the end of this report.  It is the clearances that say");
-echo("nothing overlaps, not the export: past 25000 triangles this kernel");
-echo("skips the export-time union and says so, so a scene that DOES");
-echo("overlap comes back at this size with holes = 0 and a volume that");
-echo("counts the overlap twice.  A clean leak count is not evidence here.");
+echo("nothing overlaps, not the export: this kernel unions a group of");
+echo("touching shells only when the shells going into it come to under");
+echo("25000 triangles, and one group here is 57400, so that union is");
+echo("skipped and the export says so.  A scene in that state that DOES");
+echo("overlap comes back with holes = 0 and a volume that counts the");
+echo("overlap twice.  A clean leak count is not evidence here.");
 
 echo("=== 1. the radial chain, from the axis out ===");
 echo(str("   bore radius                 ", PC_BORE_R,
