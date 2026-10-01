@@ -305,10 +305,17 @@ union does not run. Results:
 |---|---|---|---|
 | `collar_chain` | 14 | 43,032 | ALL DISJOINT |
 | `polar_cap` | 40 | 4,301,290 | ALL DISJOINT |
-| `equator_band` | 2 | — | OVERLAP FOUND → fixed |
+| pole joint | 6 | 23,790,749 | ALL DISJOINT |
+| `equator_band` | 2 | 223 | **OVERLAP FOUND** |
+| `equator_band`, fixed | 2 | 111,768,502 | ALL DISJOINT |
 
-So two of those files' central claims are now *proved* rather than argued
-from printed clearances. The check belongs in the kernel — "are these two
+Note the band's two test counts. 223 to find a crossing, because the search
+stops at the first one; 111,768,502 to establish there is none. A negative
+costs everything, which is why this is a tool you run deliberately and not
+a check on every export.
+
+So three of those claims are now *proved* rather than argued from printed
+clearances, and the fourth was false and is now fixed and proved. The check belongs in the kernel — "are these two
 shells disjoint" is what the union is for — and the script is the evidence
 until it gets there.
 

@@ -14,11 +14,18 @@
 # what the union is for -- and this script is the evidence until it gets
 # there.  Results so far, over the transmission parts:
 #
-#   collar_chain   14 bodies    43,032 tests   ALL DISJOINT
-#   polar_cap      40 bodies 4,301,290 tests   ALL DISJOINT
-#   equator_band    2 bodies                   OVERLAP FOUND, and fixed:
-#                  the crown seat was cut from the same rule as the ring's
-#                  own back cone, so the two surfaces coincided exactly.
+#   collar_chain    14 bodies      43,032 tests   ALL DISJOINT
+#   polar_cap       40 bodies   4,301,290 tests   ALL DISJOINT
+#   pole joint       6 bodies  23,790,749 tests   ALL DISJOINT
+#   equator_band     2 bodies         223 tests   OVERLAP FOUND
+#     ...after the fix               111,768,502  ALL DISJOINT
+#
+# The band's crown seat was cut from the same rule as the ring's own back
+# cone, so the two surfaces coincided exactly: a contact fit the file had
+# declared and printed, invisible to volume, to the component count and to
+# the export-time union alike.  Note the two test counts on it -- 223 to
+# find a crossing, because the search stops at the first one, against
+# 111,768,502 to establish there is none.  A negative costs everything.
 #
 # Two CLOSED surfaces share space iff an edge of one crosses a face of the
 # other, OR one is wholly inside the other with no crossing at all.  The
