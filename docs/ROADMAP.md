@@ -83,9 +83,12 @@ keeps per-shape colour and modifier flags alive for the viewer — and the
 EXPORT merges them for real, because the reference is explicit that
 "export always operates on fully rendered (F6-equivalent) geometry" and
 concatenated overlapping shells make a self-intersecting file. Disjoint
-parts cost nothing (a pair whose bounding boxes miss is concatenated),
-so only genuinely overlapping solids pay. Above
-`eval::MAX_UNION_EXPORT_TRIS` the merge is skipped with a console line:
+parts cost nothing: the export builds the adjacency graph of the shells
+that could touch, splits it into connected components, and merges each
+component on its own, greedily two-colouring it so a hub of n spokes is
+one boolean and not n. A shell that touches nothing is copied. Above
+`csg::MAX_MERGE_TRIS`, counted over the shells going INTO one component,
+that component's merge is skipped with a console line:
 a BSP plane is infinite, so every polygon straddling one is cut whether
 the boolean touches it or not, and the cost turns vertical with how
 deeply the parts interpenetrate — measured on this corpus, 16k triangles
