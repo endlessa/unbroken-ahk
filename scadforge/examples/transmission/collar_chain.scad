@@ -299,10 +299,14 @@
 //  Not modelled, and not claimed: the bolt thread and its nut -- the
 //  shank is drawn at its major diameter, and BOTH pad bores are
 //  clearance bores, so the joint takes a nut, which is neither drawn
-//  nor counted in any volume here -- and the band itself: its register groove is declared here, as this
-//  collar's own interface to it, with the floor put on sg_r() because
-//  that is the one radius the contract fixes.  The report prints
-//  sg_r() against Dref m/2 with a zero residual.
+//  nor counted in any volume here -- and the band itself.  The band's
+//  register groove used to be DECLARED here, as this collar's own
+//  interface to it; it is now READ from equator_band.scad's eb_if_*().
+//  Those five numbers are the ones this file used to restate, and they
+//  agreed -- every difference the report prints against its own
+//  derivation is 0, which is why the mesh is unchanged.  The EM collar
+//  restated the same register from the same echoed text and got it
+//  wrong by 21 mm, which is what made the band publish them.
 //
 //  Every hole in this part is walled, never subtracted: the bolt bore
 //  is an inner path in the pad's own section, so the pad is extruded
@@ -333,9 +337,8 @@ use <equator_band.scad>
 //  one (2, 90, 180, 360), a unit conversion, an integer count, a mesh
 //  index or a colour.  The groups are:
 //  the chain, which is a standard part; the band's register groove,
-//  declared here as this collar's own interface to the band, with its
-//  floor put on the one radius the contract fixes, sg_r(); the
-//  collar's own widths; the two clamp inputs, friction and preload;
+//  READ from equator_band.scad rather than declared here, its floor on
+//  the one radius the contract fixes, sg_r(); the collar's own widths; the two clamp inputs, friction and preload;
 //  two figures quoted from the library's REPORT for comparison and
 //  used for nothing else; and the mesh density.  Everything with a
 //  dimension that is not in this list is derived below and printed.
