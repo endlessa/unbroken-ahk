@@ -314,6 +314,38 @@ rather than the modeling language: GUI-viewport PNG export and DXF-era
 deprecated metadata functions (`dxf_dim`/`dxf_cross`). Each gets a per-entry
 decision — web-app equivalent, or documented as intentionally out of scope.
 
+**`use` now works more than one level deep (2026-10-01).** A used file's
+top-level constants are evaluated so its functions can see them, and all the
+definitions land in one flat table the evaluator walks IN ORDER — so that
+table has to be a topological order of the use graph. It was breadth-first:
+dependents first, dependencies after. One level deep there is nothing to
+order, which is why it stood from the day `use` was written. Two levels deep
+it broke everything: a part file opening with `M = sg_m();`, reading the
+contract it uses, was evaluated before the contract's own constants were
+assigned, and every number it took from that contract came back `undef` with
+a warning naming a private spelling the author never wrote — `Ignoring
+unknown variable '__use1__MODULE_MM'`. The walk is now depth-first and
+post-order; `used_seen` is inserted before recursing so a cycle terminates
+and a diamond is read once, and the depth check comes first so a file refused
+for depth on one route can still arrive by a shorter one. Found by trying to
+assemble a model out of six part files, each of which used a seventh.
+
+**The transmission stack is assembled (2026-10-01).** Seven files in
+`examples/transmission/` now describe one machine rather than six parts and a
+library: `stack.scad` puts four spherical-bevel planetary rows on one polar
+axis with the equatorial band as the bottom row's ring, a swappable collar on
+its register and a polar cap at each end — 1,624,244 triangles, 69 components
+against 69 predicted bodies, 0 holes, 0 flipped edges, 0 T-junctions. The
+assembly found four defects that no part file could see, all of the same
+shape: a number two files have to agree on was *published* by one and
+*copied* by the other, and nothing ever compared the two. `docs/TRANSMISSION.md`
+is the record. The one worth repeating here is that the placement rule the
+design states in words — each row's ring pitch circle on the fundamental
+sphere at its own latitude — is not buildable, and the file proves it rather
+than asserting it: each row's sun has a solid hub band, two of them sharing a
+point of the (r, z) half-plane is a collision outright, and 109 of 169 sampled
+points of row 1's sun land inside row 3's.
+
 **The `$vp*` quartet now lands (2026-09-11).** `$vpr`/`$vpt`/`$vpd`/`$vpf`
 carry the reference's defaults ([55, 0, 25], origin, 140, 22.5), and the
 read/assign model is the interesting part: the viewport writes its live
