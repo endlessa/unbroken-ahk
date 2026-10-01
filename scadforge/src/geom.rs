@@ -733,8 +733,6 @@ pub fn weld_tjunctions(mesh: &Mesh) -> Mesh {
     }
     // A point this far off an edge is on it as far as any writer is
     // concerned, and inserting it moves the surface by no more than that.
-    // A point this far off an edge is on it as far as any writer is
-    // concerned, and inserting it moves the surface by no more than that.
     //
     // Tight on purpose, and swept to find out: at 1e-7 a character model
     // went from 1,459 boundary edges to 1,500 and grew its first
@@ -743,8 +741,12 @@ pub fn weld_tjunctions(mesh: &Mesh) -> Mesh {
     // inserted into an edge it is not really on moves that edge, and the
     // triangle on the other side, which did not get the same insertion, no
     // longer matches. The residue at 1e-9 is not a T-junction problem at
-    // all: those vertices sit 1e-5 to 1e-4 of the model off the edge, which
-    // is a crack in the BSP's arithmetic and wants fixing there.
+    // all: measured over the elliptical gear's open edges, 39 of the first
+    // 40 have another vertex in their interior, offset from the edge by
+    // 8.9e-6 to 4.9e-2 of the model extent with a median of 2.1e-4. Those
+    // are points the BSP MEANT to put on an edge and missed, so they are
+    // cracks rather than junctions, and they want fixing in the
+    // plane-segment intersection that computes them.
     let eps = extent * 1e-9;
 
     // Vertices on a grid, so an edge asks only its own neighbourhood.

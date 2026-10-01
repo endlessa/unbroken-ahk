@@ -624,9 +624,10 @@ points are computed — the plane-segment intersection in the BSP split — and
 probably means snapping a new vertex to an existing one when it lands within
 the plane tolerance of it, rather than emitting a fresh point.
 
-(A source comment in `weld_tjunctions` still gives the range as 1e-5 to
-1e-4, which was the first estimate. The distribution above supersedes it and
-the comment is stale.)
+(The source comment in `weld_tjunctions` gave the range as 1e-5 to 1e-4,
+which was the first estimate, and said it twice — the first two lines were
+duplicated verbatim. Both are fixed; the comment now carries the
+distribution above.)
 
 ### 8.2 Passing a list to a function still costs O(|V|^0.7) per call
 
