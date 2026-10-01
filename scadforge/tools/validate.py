@@ -19,6 +19,12 @@ Reports, in order:
 
 Exit status is 1 if the mesh is inside out, leaks, or is inconsistently wound.
 """
+# Die quietly on a closed pipe: `validate.py x.stl | head` otherwise
+# ends in a BrokenPipeError traceback, which looks like the mesh is
+# broken when it is only the reader that went away.
+import signal
+try: signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except (AttributeError, ValueError): pass   # not POSIX, or not the main thread
 import struct, sys
 from collections import defaultdict
 

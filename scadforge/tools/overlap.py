@@ -39,8 +39,12 @@
 # with a fixed +/-3 degree window, which silently drops a triangle wider
 # than the window -- a large annular face is exactly that, and a false
 # "disjoint" is the worst answer a checker can give.)
-import sys, struct, math
+# Die quietly on a closed pipe: `overlap.py x.stl | head` otherwise ends in
+# a BrokenPipeError traceback, which reads like a failure of the check.
+import signal, sys, struct, math
 from collections import defaultdict
+try: signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except (AttributeError, ValueError): pass   # not POSIX, or not the main thread
 
 def read_stl(p):
     d = open(p, 'rb').read()

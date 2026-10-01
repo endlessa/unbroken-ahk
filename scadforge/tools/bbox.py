@@ -8,6 +8,12 @@ range.  Written for the transmission parts, where almost every clearance is
 stated as a radius or a z station, so the mesh's own extents are what you
 check a published envelope against.
 """
+# Die quietly on a closed pipe: `validate.py x.stl | head` otherwise
+# ends in a BrokenPipeError traceback, which looks like the mesh is
+# broken when it is only the reader that went away.
+import signal
+try: signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except (AttributeError, ValueError): pass   # not POSIX, or not the main thread
 import struct, sys, math
 for f in sys.argv[1:]:
     d = open(f,'rb').read()
