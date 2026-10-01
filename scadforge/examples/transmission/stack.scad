@@ -210,12 +210,33 @@
 //
 //      i = w_sun / w_carrier = (Ns + Nr) / Ns,                   (18)
 //
-//  an exact rational.  Bolt the slices in series -- each slice's
-//  carrier driving the next slice's sun, which is what the 46 spline
-//  through the pole joint is for -- and the stack's reduction is the
-//  PRODUCT of the (18)s:
+//  an exact rational.  Bolt the slices IN SERIES -- each slice's
+//  carrier driving the next slice's sun -- and the stack's reduction is
+//  the PRODUCT of the (18)s:
 //
 //      i_stack = prod_i (Ns + Nr_i) / Ns^n.                      (19)
+//
+//  AND THAT IS AN ASSUMPTION, not something the geometry here settles.
+//  It has to be said plainly, because (19) is the headline number and
+//  it is only true under it.  What the pole joint actually couples is
+//  CAP TO CAP: crown to crown, and spline to spline through the
+//  floating sleeve.  Which member of its own slice each cap is bolted
+//  to -- the carrier, or the sun -- is NOT MODELLED in any file here,
+//  and it is exactly that choice which decides the machine:
+//
+//    * cap bolted to the carrier on one side of a joint and carrying
+//      the sun through on the other: the slices are in series and the
+//      stack is the single compound reduction (19).
+//    * every cap taking the sun through, carriers tied to one output
+//      member: one sun, one output, four live rings.  Then the stack is
+//      not a reduction at all but a two-degree-of-freedom differential,
+//      and holding one ring at a time SELECTS a ratio (18).  Section 7
+//      prints those as well.
+//
+//  The same hardware gives both.  Section 7 prints (19) and the
+//  selection table side by side with the assumption each rests on, and
+//  the missing part -- the cap-to-slice attachment -- is named in the
+//  not-modelled list of section 9 where it belongs.
 //
 //  (19) is computed in section 7 as a pair of integers, numerator and
 //  denominator, and reduced once at the end.  Both directions are
@@ -290,6 +311,17 @@ STK_NCL  = 40;     // samples across the crown tooth for section 4
 // declared inputs for the clamp-grip model of section 6.  These are
 // NOT read from any part file and are NOT design allowables; they are
 // named here so the model's output can be read as what it is.
+// Render selection.  These change WHAT IS DRAWN and nothing else: no
+// number in the report depends on them, and the model that is exported
+// and validated is the default pair below, the whole machine.  They
+// exist because this kernel's renderer always fits the camera to the
+// scene, so the only way to take a close view of one interface is to
+// draw that interface on its own:
+//     -D STK_ONLY=1 -D STK_BARE=true   the EM collar on its band
+//     -D STK_ONLY=3                     the lower pole joint
+STK_ONLY = -1;     // -1 everything;  0..NST-1 one station;
+                   // NST + j  one pole joint, its two caps
+STK_BARE = false;  // true drops the slices and leaves the bands and collars
 STK_MU   = 0.15;   // assumed dry steel-on-steel friction coefficient
 STK_SIG  = 400;    // assumed bolt assembly stress, N/mm^2
 STK_AS3  = 5.03;   // M3 thread stress area, mm^2  (declared, not read)
@@ -474,7 +506,7 @@ EM_T   = stk_grip(EM_NPL, EM_FPL, em_if_seat());
 // ===================================================================
 module stk_station(n) {
     translate([0, 0, stk_apex(n)]) {
-        sl_slice(stk_row(n), stk_ring(stk_row(n)));
+        if (!STK_BARE) sl_slice(stk_row(n), stk_ring(stk_row(n)));
         if (stk_band(n)) equator_band();
         if (stk_col(n) == 1) translate([0, 0, COLZ]) collar_chain();
         if (stk_col(n) == 2) translate([0, 0, COLZ]) collar_em();
@@ -489,12 +521,16 @@ module stk_pole_joint(z) {
 }
 
 module stack() {
-    for (n = [0:NST-1]) stk_station(n);
-    for (n = [0:NST-2]) stk_pole_joint(stk_joint(n));
+    for (n = [0:NST-1])
+      if (STK_ONLY < 0 || STK_ONLY == n) stk_station(n);
+    for (n = [0:NST-2])
+      if (STK_ONLY < 0 || STK_ONLY == NST + n) stk_pole_joint(stk_joint(n));
     // the two end caps, parting planes facing outward: no mate, and so
     // no balls
-    translate([0, 0, Z_B]) rotate([180, 0, 0]) polar_cap(false);
-    translate([0, 0, Z_T]) polar_cap(false);
+    if (STK_ONLY < 0) {
+        translate([0, 0, Z_B]) rotate([180, 0, 0]) polar_cap(false);
+        translate([0, 0, Z_T]) polar_cap(false);
+    }
 }
 stack();
 
@@ -838,7 +874,10 @@ for (n = [0:NST-1])
              sl_nr(i), ")/", NS, " = ", a, "/", NS, " = ", a/g, "/", NS/g,
              " = ", a/NS, "   assembly gate (Ns+Nr)/k = ", a/sl_k(i),
              ", integer: ", a % sl_k(i) == 0));
-echo("   (19) the stack, carriers in series through the 46 spline:");
+echo(str("   (19) ASSUMING THE SLICES ARE IN SERIES -- each carrier",
+         " driving the next sun.  The pole joint couples cap to cap;",
+         " which member of its own slice a cap is bolted to is not",
+         " modelled, so this is the assumption and not a result:"));
 echo(str("      numerator    prod(Ns + Nr_i) over ", STK_NUMS, " = ",
          stk_istr(STK_NUM)));
 echo(str("      denominator  Ns^", NST, " = ", stk_istr(STK_DEN)));
@@ -873,6 +912,32 @@ echo(str("   so the stack as built is a ", NST, "-slice reduction of ",
          " at once splits torque by drag current rather than by",
          " kinematics.  The contract says that plainly under its section 5",
          " and this file does not improve on it."));
+echo(str("   THE OTHER ASSUMPTION, same hardware: every cap takes the sun",
+         " through and the carriers are tied to one output.  Then the",
+         " stack is a two-degree-of-freedom differential, not a",
+         " reduction: fix any two of {sun, carrier, one ring} and every",
+         " other speed follows, and HOLDING one ring selects (18)."));
+for (i = [0:NROW-1])
+  echo(str("      hold ", ROWS[i][0], "'s ring:  w_sun/w_carrier = ",
+           NS + sl_nr(i), "/", NS, " = ", (NS + sl_nr(i))/NS));
+echo(str("      so that reading is a ", NROW, "-speed of ",
+         [ for (i = [0:NROW-1]) (NS + sl_nr(i))/NS ],
+         ", spread ", (NS + sl_nr(NROW-1))/(NS + sl_nr(0)),
+         ", in steps of ",
+         [ for (i = [1:NROW-1]) (NS + sl_nr(i))/(NS + sl_nr(i-1)) ],
+         " -- uneven, and said so: the counts were chosen to make each",
+         " row close exactly, not to space the ratios"));
+echo(str("      and with no ring held it is a torque-split: power balance",
+         " with the sun held gives T_carrier = -sum T_ring_i (Ns+Nr_i)",
+         "/Nr_i, so each collar is worth ",
+         [ for (i = [0:NROW-1]) (NS + sl_nr(i))/sl_nr(i) ],
+         " Nm at the output per Nm at the collar.  The SMALL row's",
+         " collar is worth the most -- ", (NS + sl_nr(0))/sl_nr(0),
+         " against ", (NS + sl_nr(NROW-1))/sl_nr(NROW-1),
+         " -- while the equator row is the only one with the diameter to",
+         " carry a large machine, ", sl_nr(NROW-1)*M/2, " mm of pitch",
+         " radius against ", sl_nr(0)*M/2, ".  That trade runs the wrong",
+         " way round and is worth knowing before anyone sizes a motor."));
 echo(str("   the ratios the whole table offers, as decimals: ",
          [ for (i = [0:NROW-1]) (NS + sl_nr(i))/NS ],
          ";  sun held instead, w_ring/w_carrier = (Ns+Nr)/Nr = ",
@@ -920,10 +985,17 @@ echo(str("   the sphere placement also fails for a reason the sun test",
          " space the other rows' rings need."));
 
 echo("--- 9. not modelled ---");
-echo("   the polar shaft and the floating spline sleeve that tie one");
-echo("   slice's carrier to the next slice's sun through the joint: the");
-echo("   cavity for it is polar_cap's and polar_cap prints the wall the");
-echo("   sleeve has to live in, but no sleeve is drawn here;");
+echo("   THE CAP-TO-SLICE ATTACHMENT, which is the important one: the");
+echo("   pole joint drawn here couples cap to cap, crown to crown and");
+echo("   spline to spline, and nothing here says which member of its own");
+echo("   slice a cap is bolted to.  That choice is what decides whether");
+echo("   the stack is the series reduction (19) or the differential of");
+echo("   section 7, and both are printed because the geometry does not");
+echo("   settle it.  Drawing it is the next piece of work;");
+echo("   the polar shaft and the floating spline sleeve that would make");
+echo("   the series reading real: the cavity for the sleeve is");
+echo("   polar_cap's and polar_cap prints the wall it has to live in,");
+echo("   but no sleeve is drawn here;");
 echo("   the bolts, at the pole joints and at both collars;");
 echo("   the balls of the pole joint, for the reason section 4 gives;");
 echo("   the housing, and the EM stator's ground path to it;");
