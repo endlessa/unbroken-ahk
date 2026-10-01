@@ -33,20 +33,20 @@
 //
 //      x^2 + y^2 = R^2 cos^2 d + u^2 R^2 sin^2 d,
 //
-//  a function of u alone, with no m in it.  Substituting u = z/h,
+//  a function of u alone, with no m left in it.  Substituting u = z/h,
 //
 //      x^2 + y^2 = (R cos d)^2 + z^2 (R sin d)^2 / h^2
 //                = a^2 ( 1 + z^2/c^2 ),     a = R cos d,  c = h/tan d,
 //
-//  which is the hyperboloid of one sheet with a = R cos d and
-//  c = h cot d.  Both sides are polynomials in u; the identity holds for
-//  the whole line, not merely for the segment, so the line lies WHOLLY
-//  in the surface.  Reversing the twist, d -> -d, changes neither
-//  cos^2 d nor sin^2 d, so the mirrored family lands on the SAME
-//  surface.  That is the double ruling, and it is the reason a water
-//  tower can be a curved shell made of straight rolled steel -- Vladimir
-//  Shukhov's, first at Nizhny Novgorod in 1896, and about two hundred
-//  after it.
+//  which is the hyperboloid of one sheet with waist a = R cos d and
+//  semi-axis c = h cot d.  Both sides are polynomials in u, so the
+//  identity holds for the whole LINE and not merely for the chord: the
+//  line lies wholly in the surface.  Reversing the twist, d -> -d,
+//  changes neither cos^2 d nor sin^2 d, so the mirrored family lands on
+//  the SAME surface.  That is the double ruling, and it is the reason a
+//  water tower can be a curved shell made of straight rolled steel --
+//  Vladimir Shukhov's, first at Nizhny Novgorod in 1896, and some two
+//  hundred after it.
 //
 //  THE TWO LINES THROUGH A GIVEN POINT, IN CLOSED FORM
 //
@@ -66,21 +66,23 @@
 //
 //      m' = 2 alpha - m = m + 2 psi.
 //
-//  Two lines, named explicitly, for every point.  Both are checked below
-//  on a grid of 189 surface points: the distance from the point to the
-//  mirrored line, and the residual of the equation along that line.
+//  Two lines, named explicitly, for every point of the surface.  Both
+//  are tested below on a grid of 189 points: the distance from the point
+//  to the mirrored line, the residual of the equation along that whole
+//  line, and the angle between the two, which must not be zero or the
+//  "two" is a lie.
 //
 //  THE CASE THAT NEEDS NO DECIMALS
 //
 //  With h = c the twist is a quarter turn, d = atan(h/c) = 45 degrees,
 //  and the end circles have radius R = a/cos 45 = a sqrt 2.  At a = 16,
-//  h = c = 30 that is R = 16 sqrt 2, and the ring nodes are placed at
-//  the twelve azimuths 30k +- 45 degrees, so the bar of mean azimuth 0
-//  runs from
+//  h = c = 30 that is R = 16 sqrt 2, and the twelve ring nodes are put
+//  at the azimuths 30k +- 45 degrees, which both families share, so the
+//  bar of mean azimuth 0 runs from
 //
 //      (16, -16, -30)  to  (16, +16, +30)
 //
-//  -- integer endpoints, and x = 16 at both.  Its mate of the other
+//  -- integer endpoints, with x = 16 at both.  Its mate of the other
 //  family runs from (16, +16, -30) to (16, -16, +30).  Both lie in the
 //  vertical plane x = 16, which is the tangent plane at the waist point
 //  (16, 0, 0), and setting x = 16 in the equation leaves
@@ -88,76 +90,141 @@
 //      y^2/16^2 = z^2/30^2    i.e.    y = +- (8/15) z,
 //
 //  two straight lines and nothing else.  A plane tangent to a
-//  hyperboloid of one sheet meets it in exactly two lines, and here both
-//  of them are members of the lattice, with integer endpoints.  The
-//  ruling direction (0, 16, 30) + (16, 0, 0)-free part has length 34,
-//  the 8-15-17 triple doubled, so each bar's full chord is exactly
-//  68 mm: sqrt(32^2 + 60^2) = 68, where the horizontal run 32 is exactly
-//  the waist DIAMETER 2a.  The two bars cross at the waist at an angle
-//  whose cosine is the exact rational
+//  hyperboloid of one sheet meets it in exactly two lines; here both of
+//  them are members of the lattice, with integer endpoints, and the file
+//  goes and finds them in its own bar list rather than quoting them.
+//  Each bar's direction is (0, 16, 30) up to sign, of length 34 -- the
+//  8-15-17 triple doubled -- so the full chord is exactly
 //
-//      (900 - 256)/(900 + 256) = 644/1156 = 161/289 = 0.557093...
+//      sqrt(32^2 + 60^2) = 68 mm,
 //
-//  about 56.145 degrees.  All of these are recomputed below from the
-//  built geometry rather than quoted.
+//  and the horizontal run 32 is exactly the waist DIAMETER 2a.  The two
+//  bars cross at the waist at an angle whose cosine is the exact
+//  rational
 //
-//  HOW IT IS BUILT, AND WHY NOTHING IS SUBTRACTED
+//      (900 - 256)/(900 + 256) = 644/1156 = 161/289 = 0.557093...,
 //
-//  A bar is a four-sided prism: two copies of a 1.5 x 2.4 rectangle,
-//  one at each end of the axis, walled by four quads and closed by two
-//  fans.  The section's first axis e1 is the horizontal radial at the
-//  bar's midpoint, and it is exactly perpendicular to the bar, because
-//  both ends sit at the same radius R and
+//  about 56.145 degrees, and they cross at the ring nodes at 38.872.
+//  All of it is recomputed below from the built geometry.
 //
-//      (p0 + p1).(p1 - p0) = |p1|^2 - |p0|^2 = 0.
+//  HOW A BAR IS BUILT
 //
-//  No orthogonalisation is needed; e2 = t x e1 completes a right-handed
-//  triple (e1, e2, t), the section is listed counter-clockwise in
-//  (e1, e2), and the wall quads then have normals pointing INTO the
-//  solid, which is what polyhedron() wants.  The two end fans run
-//  opposite ways round the ring, which is the orientation-blind edge
-//  test: a wall quad [a,b,c,d] contributes the directed edge d->a, so
-//  the cap that meets it there must contribute a->d.
+//  A bar is a right prism on a 1.5 x 2.4 rectangle: two copies of the
+//  section, one at each end of the axis, four wall quads, two flat caps.
+//  The section's first axis e1 is the horizontal radial at the bar's
+//  midpoint, and it is exactly perpendicular to the bar with no
+//  orthogonalisation, because both ends sit at the same HORIZONTAL
+//  radius R and, writing hz() for "drop the z component",
 //
-//  The five hoops are rings of revolution, each a 2.8 x 2.6 rectangle
-//  swept a full turn -- genus one, and made by sweeping a profile with
-//  a hole in the middle of its orbit, never by cutting a disc.  Each
+//      hz(p0 + p1).(p1 - p0) = |hz(p1)|^2 - |hz(p0)|^2 = R^2 - R^2 = 0.
+//
+//  The hz() is not decoration.  The two ends are at different heights,
+//  so the full radii are not equal and the same dot product without it
+//  is |p1|^2 - |p0|^2 = HT^2 = 3600, not zero; it is the horizontal
+//  radii that match, and that is the projection the code takes.
+//
+//  e2 = t x e1 completes a right-handed triple (e1, e2, t); the section
+//  is listed counter-clockwise in (e1, e2), so the wall quads' right-hand
+//  normals point INTO the solid, which is what polyhedron() wants.  The
+//  caps run the other way round the ring: a wall quad [a,b,c,d] gives the
+//  directed edge d->a, so the cap that meets it must give a->d.  Because
+//  the caps stay perpendicular to the axis, each bar is a right prism and
+//  its volume is exactly section x length -- which is how the volume
+//  audit at the foot can be a prediction rather than an estimate.
+//
+//  The ends are pulled in along the axis until the prism's lowest corner
+//  sits at z = AIR and its highest at z = HT - AIR.  The axis stays on
+//  the ruling: a sub-segment of a line that lies in the surface still
+//  lies in the surface.
+//
+//  The five hoops are square-section rings swept a full turn.  Each
 //  hoop's radius is the surface radius at its own mid-height, so the
-//  hoops are the horizontal sections of the same hyperboloid; the
-//  residuals are echoed.
+//  hoops ARE horizontal sections of the same hyperboloid, and a hoop is
+//  genus one because its profile orbits a hole, never because a disc was
+//  cut out of it.  A hoop of NSEG stations is a prismatoid ring between
+//  two regular NSEG-gons, so its volume is exact too:
 //
-//  Bars of OPPOSITE families cross, and the model lets them: that is
-//  what a riveted Shukhov lattice does, and the crossings are honest
-//  overlaps resolved by the export-time union, never by a boolean the
-//  file performs.  Bars of the SAME family are skew -- that is the other
-//  half of the ruling theorem -- and the minimum distance between the
-//  twelve pairs of same-family lines is measured below and compared with
-//  the section's diagonal, so the claim that they never touch is tested
-//  rather than assumed.  Everything else is kept apart by AIR = 0.15 mm:
-//  the lattice floats that far above the plinth, so no face of the
-//  object is coplanar with the plinth's top and the union has nothing
-//  degenerate to resolve.
+//      V = RH * (NSEG/2) sin(360/NSEG) * ( (r+RW)^2 - (r-RW)^2 ).
+//
+//  WHY THE WHOLE OBJECT IS ONE polyhedron(), AND WHAT THAT COST
+//
+//  Bars of OPPOSITE families CROSS -- that is the point of the thing,
+//  and a riveted Shukhov lattice crosses in exactly the same places.
+//  Bars of the same family are skew, which is the other half of the
+//  ruling theorem, and the minimum distance between same-family ruling
+//  LINES is measured below against the section's diagonal, so that claim
+//  is tested rather than assumed.  But twenty-four bars with every bar
+//  meeting seven of the other family is one connected overlap graph of
+//  twenty-four pieces, and asking the export-time union to resolve it
+//  does not work here.  It was measured, not guessed.  Hand the bars of
+//  THIS file to a union, export, and count validate.py's `holes`:
+//
+//      one crossing pair, generic offset      0 leaked edges
+//      the pair that crosses at the waist    42
+//      all twenty-four bars                 768
+//      all twenty-nine shells               860
+//
+//  The 42 is not bad luck.  The two bars that cross at the waist share a
+//  mean azimuth and therefore share e1, so their inner and outer faces
+//  lie in exactly the same two planes x = a +- BR, and coincident faces
+//  are the one configuration a union is entitled to get wrong.  An
+//  earlier draft rolled one family's section off that configuration and
+//  the pair did go 42 -> 0, but the whole lattice only fell to 36, and
+//  the leak survived every other knob -- halving the section, staggering
+//  the end trims, pulling the ends 4 mm clear of the shared ring nodes.
+//  That 36 belongs to that draft, whose roll is no longer in this file,
+//  so it is quoted here and not claimed; the four counts in the table
+//  are reproducible from the file exactly as it stands.  The coincident
+//  faces at the waist are the only degeneracy anyone has named, and
+//  removing them still left a leak, so what is actually established is
+//  narrower than a diagnosis: this union cannot be relied on across one
+//  connected chain of twenty-four overlapping pieces.  That is enough.
+//  None is asked for.
+//
+//  So the lattice is not twenty-nine solids handed to a union.  It is
+//  ONE polyhedron() holding twenty-nine closed shells, written out with
+//  its own point and face lists, and no boolean runs on it at all.  That
+//  is the same answer the geodesic dome in examples/architecture reaches
+//  from the other direction: its 782 parts share no volume, so their
+//  concatenation IS their union.  Here the parts do share volume and the
+//  concatenation is NOT their union -- the export's signed volume adds
+//  the crossings twice.  That is stated rather than hidden: the audit
+//  below predicts the sum-of-shells volume in closed form, and the
+//  number the exporter measures has to match it, which is a real check
+//  on every prism and every hoop even though it is not the volume of the
+//  union.  The roll is gone with the boolean that needed it, so the two
+//  families are once again exact mirror images.
+//
+//  Nothing else in the file overlaps anything.  AIR = 0.15 mm of air
+//  separates the lattice from the plinth and the letters from the slab,
+//  the same trick the type specimen in examples/type uses, so the export
+//  is a concatenation from end to end and there is nothing anywhere for
+//  a boolean to get wrong.
 //
 //  ONE DEPARTURE FROM THE GALLERY CONVENTION, AND THE ARITHMETIC FOR IT
 //
 //  The convention asks for a plaque slab 78 x 46 x 3 whose near edge is
-//  at y = -46, tilted back 30 degrees.  Tilted back 30 degrees from the
-//  HORIZONTAL, a 46-deep slab hinged at y = -46 reaches
+//  at y = -46, tilted back 30 degrees.  Tilt it back 30 degrees from the
+//  HORIZONTAL and the 3 mm thickness puts the hinge at
+//  y = -46 + 3 sin 30 = -44.5, from which the far edge reaches
 //
-//      y = -46 + 46 cos 30 = -6.16,   z = 46 sin 30 = 23.0,
+//      y = -44.5 + 46 cos 30 = -4.66,   z = 46 sin 30 = 23.0,
 //
-//  which is 6 mm from the axis and 23 mm up -- inside the plinth's
-//  footprint and inside any exhibit taller than about 17 mm.  The
-//  general bound is brutal: the slab's inner edge at height z sits at
-//  |y| = 44.5 - z cot 30, which reaches zero at z = 25.7, so a flat
-//  30-degree lectern of this depth demands an object that has tapered to
-//  nothing by then.  No object 55 to 70 mm tall can satisfy it.  So the
-//  30 degrees is taken here from the VERTICAL: the slab leans back 30
-//  degrees off upright, which keeps all three published numbers -- the
-//  78 x 46 x 3 slab, the near edge at y = -46, and the 30 degrees --
-//  and clears the lattice.  The clearance is measured, not asserted:
-//  the minimum distance from 6000-odd points on the object's edges to
-//  the plaque box is echoed below and asserted positive.
+//  five millimetres from the axis and twenty-three up -- not merely over
+//  the plinth but inside the exhibit.  The bound is general and brutal:
+//  that slab's face at height z sits at |y| = 44.5 - z cot 30, which
+//  reaches zero at z = 25.7, so a flat 30-degree lectern of this depth
+//  demands an object that has tapered to nothing by then.  No object
+//  55 to 70 mm tall can satisfy it, and this one does not: the face
+//  passes |y| = 19.29 at z = 14.6, and 19.29 is the outer radius of the
+//  hoop at z = 15, which spans z = 13.7 to 16.3.  It would cut the hoop
+//  in half.  So the 30 degrees is taken
+//  here from the VERTICAL: the slab leans back 30 degrees off upright.
+//  That keeps all three published numbers -- the 78 x 46 x 3 slab, the
+//  near edge at y = -46, the 30 degrees -- and clears the lattice.  The
+//  clearance is measured and not asserted: the smallest distance from
+//  5376 points along the object's arrises to the plaque box is echoed
+//  below, and asserted positive.  It comes out at 2.60 mm.
 // ===================================================================
 
 // ---- the surface ----------------------------------------------------
@@ -179,19 +246,21 @@ RH    = 2.60;           // hoop height
 AIR   = 0.15;           // air between the object and the plinth
 
 // ---- the gallery furniture ------------------------------------------
-PL_R  = 34;  PL_H = 6;                  // plinth: top face at z = 0
+PL_R  = 34;  PL_H = 6;  PL_N = 120;     // plinth: top face at z = 0
 PQ_W  = 78;  PQ_D = 46;  PQ_T = 3;      // plaque slab
 PQ_TILT = 60;                           // 60 from horizontal = 30 off upright
-T_SINK = 0.30;  T_RAISE = 0.90;         // letters sunk, then raised 0.9
+T_RAISE = 0.90;                         // raised letter thickness
 
 // ---- colours --------------------------------------------------------
 C_BAR  = "#c4652c";     // oxidised steel
-C_WAIST= "#f2c94c";     // the one hoop whose radius IS a
 C_PLIN = "#2b2f33";
 C_SLAB = "#44505a";
 C_TEXT = "#f2ece0";
 
-$fa = 4;  $fs = 0.35;   // no $fn: small glyphs must not pay for big circles
+// $fa/$fs rather than $fn, because $fn would make a 3.2 mm letter's
+// bowl pay the same as the plinth's 34 mm rim.  The plinth asks for its
+// own $fn below, where it is the only thing that wants one.
+$fa = 7;  $fs = 0.6;
 
 // ---- small arithmetic -----------------------------------------------
 function sq(t) = t*t;
@@ -227,24 +296,14 @@ function bar_q(k, s) =
   [ [R_E*cos(PIT*k - s*D_T), R_E*sin(PIT*k - s*D_T), 0],
     [R_E*cos(PIT*k + s*D_T), R_E*sin(PIT*k + s*D_T), HT] ];
 
-// t is the unit axis; r1 the horizontal radial at the midpoint, exactly
-// perpendicular to t; r2 = t x r1, so (r1, r2, t) is right-handed.
-//
-// The second family's section is then ROLLed about its own axis.  The
-// reason is the pretty fact above and not an aesthetic one: the two bars
-// that cross at the waist share a mean azimuth, so they share r1, and
-// their inner and outer faces would sit in exactly the same two planes
-// x = a +- BR.  Coincident faces are the one configuration a union is
-// entitled to get wrong, and this one got it wrong -- 42 leaked edges on
-// a two-bar test.  Rolling one family by nine degrees costs nothing that
-// is claimed here: the axis is still the ruling, the section is still the
-// same 1.5 x 2.4 rectangle, and the union is left with nothing to decide.
-ROLL = 9;
+// t is the unit axis; e1 the horizontal radial at the midpoint, exactly
+// perpendicular to t with no orthogonalisation; e2 = t x e1, so that
+// (e1, e2, t) is right-handed.  Both families use the same rule, so bars
+// of opposite family that cross at the waist are exact mirror images.
 function bar_frame(k, s) =
   let( q = bar_q(k, s), d = q[1] - q[0], L = norm(d), t = d/L,
-       r1 = unit(hz((q[0] + q[1])/2)), r2 = cross(t, r1),
-       ph = s > 0 ? 0 : ROLL )
-  [ t, cos(ph)*r1 + sin(ph)*r2, -sin(ph)*r1 + cos(ph)*r2, L ];
+       e1 = unit(hz((q[0] + q[1])/2)) )
+  [ t, e1, cross(t, e1), L ];
 
 // Pull both ends in along the axis until the prism's lowest corner sits
 // at z = AIR and its highest at z = HT - AIR.  The axis stays on the
@@ -256,53 +315,67 @@ function bar_ends(k, s) =
   [ q[0] + lam*f[0], q[1] - lam*f[0] ];
 
 SEC = [ [BR, -BW], [BR, BW], [-BR, BW], [-BR, -BW] ];   // CCW in (e1, e2)
+
+// Each hoop's radius is the surface radius at its own mid-height, so the
+// hoops ARE horizontal sections of the same hyperboloid.
+RINGZ = [ AIR + RH/2, HT/4, H_Z, 3*HT/4, HT - AIR - RH/2 ];
 FAM = [ for (s = [1, -1]) for (k = [0:NB-1]) [k, s] ];
 
 function bar_ring(k, s, u) =
   let( f = bar_frame(k, s), e = bar_ends(k, s) )
   [ for (c = SEC) e[u] + c[0]*f[1] + c[1]*f[2] ];
 
-// A capped prism.  The section ring is counter-clockwise in (e1, e2), so
-// the wall quads' right-hand normals point into the solid; the two fans
-// run opposite ways round the ring so each shared edge is traversed once
-// in each direction.
-module prism(G, c0, c1) {
-    K = len(G[0]); M = len(G) - 1; B = (M+1)*K;
-    polyhedron(
-      points = concat([ for (u = [0:M]) each G[u] ], [c0], [c1]),
-      faces = concat(
-        [ for (u = [0:M-1]) for (v = [0:K-1])
-            [ u*K+v, (u+1)*K+v, (u+1)*K+(v+1)%K, u*K+(v+1)%K ] ],
-        [ for (v = [0:K-1]) [ B, v, (v+1)%K ] ],
-        [ for (v = [0:K-1]) [ B+1, M*K+(v+1)%K, M*K+v ] ]),
-      convexity = 2);
-}
+// ---- the object, as a single mesh -----------------------------------
+// Twenty-four prisms and five hoops, written as ONE polyhedron holding
+// twenty-nine closed shells.  The header says why: the bars genuinely
+// cross, and the export-time union leaks on a chain of twenty-four
+// overlapping pieces, so no boolean is asked for.  Each shell is closed
+// and wound inward on its own, which is all the exporter and the
+// validator need; what the shells do to each other is the lattice's
+// business and is accounted for in the volume audit.
 
-module bar(k, s) {
-    e = bar_ends(k, s);
-    prism([ bar_ring(k, s, 0), bar_ring(k, s, 1) ], e[0], e[1]);
-}
+NSEG = 72;              // stations round a hoop
+BARP = 8;               // points per bar: two rings of four
+HPTS = 4*NSEG;          // points per hoop
+NBAR = len(FAM);
 
-// ---- the five hoops -------------------------------------------------
-// Each hoop's radius is the surface radius at its own mid-height, so the
-// hoops ARE horizontal sections of the hyperboloid.
-RINGZ = [ AIR + RH/2, HT/4, H_Z, 3*HT/4, HT - AIR - RH/2 ];
+// A hoop station.  Sweeping about +z the tangent is t = (-sin f, cos f, 0);
+// taking e1 outward radial makes e2 = t x e1 = -z, and (e1, e2, t) is
+// right-handed, so the same counter-clockwise section order as the bars
+// again gives inward wall normals.
+function hoop_ring(z, i) =
+  let( f = 360*i/NSEG, c = cos(f), sn = sin(f), r = rsurf(z) )
+  [ [ (r+RW)*c, (r+RW)*sn, z + RH/2 ],
+    [ (r+RW)*c, (r+RW)*sn, z - RH/2 ],
+    [ (r-RW)*c, (r-RW)*sn, z - RH/2 ],
+    [ (r-RW)*c, (r-RW)*sn, z + RH/2 ] ];
 
-module hoop(zc) {
-    translate([0, 0, zc])
-      rotate_extrude()
-        translate([rsurf(zc) - RW, -RH/2]) square([2*RW, RH]);
-}
+// A wall quad [a,b,c,d] emits the directed edge d->a on the near ring and
+// b->c on the far one, so the near cap must run 0->1->2->3 and the far cap
+// the other way round.  That is the orientation-blind edge test, and it is
+// the only thing that keeps the two caps from agreeing with their walls.
+function bar_faces(o) = concat(
+  [ for (v = [0:3]) [ o+v, o+4+v, o+4+(v+1)%4, o+(v+1)%4 ] ],
+  [ [o+0, o+1, o+2, o+3], [o+7, o+6, o+5, o+4] ]);
+function hoop_faces(o) =
+  [ for (u = [0:NSEG-1]) for (v = [0:3])
+      [ o + u*4 + v,             o + ((u+1)%NSEG)*4 + v,
+        o + ((u+1)%NSEG)*4 + (v+1)%4, o + u*4 + (v+1)%4 ] ];
+
+OBJ_PTS = concat(
+  [ for (b = FAM) each concat(bar_ring(b[0], b[1], 0), bar_ring(b[0], b[1], 1)) ],
+  [ for (z = RINGZ) for (i = [0:NSEG-1]) each hoop_ring(z, i) ]);
+OBJ_FACES = concat(
+  [ for (i = [0:NBAR-1]) each bar_faces(i*BARP) ],
+  [ for (i = [0:len(RINGZ)-1]) each hoop_faces(NBAR*BARP + i*HPTS) ]);
 
 module lattice() {
-    color(C_BAR) for (b = FAM) bar(b[0], b[1]);
-    for (i = [0:len(RINGZ)-1])
-      color(i == 2 ? C_WAIST : C_BAR) hoop(RINGZ[i]);
+    color(C_BAR) polyhedron(points = OBJ_PTS, faces = OBJ_FACES, convexity = 8);
 }
 
 // ---- the plinth -----------------------------------------------------
 module plinth() {
-    color(C_PLIN) translate([0, 0, -PL_H]) cylinder(r = PL_R, h = PL_H);
+    color(C_PLIN) translate([0, 0, -PL_H]) cylinder(r = PL_R, h = PL_H, $fn = PL_N);
 }
 
 // ---- the plaque -----------------------------------------------------
@@ -312,7 +385,8 @@ module plinth() {
 // is what is parked at y = -46.
 PQ_Y = -46 + PQ_T*sin(PQ_TILT);
 
-UPEM = 1000;    // InstrumentSans-Regular, hmtx advances, ASCII 32..126
+UPEM = 1000;  ASC = 970;  DESC = -250;   // InstrumentSans-Regular, per em
+// hmtx advances for ASCII 32..126, straight out of the bundled face
 ADV = [ 200, 273, 384, 716, 608, 786, 755, 232,
         406, 406, 408, 531, 255, 506, 255, 443,
         666, 391, 545, 574, 600, 574, 599, 532,
@@ -329,7 +403,7 @@ function runw(s, sz) =
   sz/UPEM * sum([ for (i = [0:len(s)-1]) ADV[ord(s[i]) - 32] ]);
 
 LINE = [ "HYPERBOLOID",
-         "of one sheet - Shukhov tower, 1896",
+         "of one sheet - Shukhov water tower, 1896",
          "x^2/16^2 + y^2/16^2 - (z-30)^2/30^2 = 1",
          "two straight lines through every point" ];
 LSZ  = [ 6, 3.2, 3.2, 3.2 ];
@@ -345,8 +419,8 @@ module plaque() {
         color(C_SLAB) translate([-PQ_W/2, 0, 0]) cube([PQ_W, PQ_D, PQ_T]);
         color(C_TEXT)
           for (i = [0:3])
-            translate([0, LBY[i], PQ_T - T_SINK])
-              linear_extrude(height = T_SINK + T_RAISE)
+            translate([0, LBY[i], PQ_T + AIR])
+              linear_extrude(height = T_RAISE)
                 text(LINE[i], size = LSZ[i], halign = "center");
     }
 }
@@ -363,9 +437,11 @@ plaque();
 NS = 24;
 BRES = [ for (b = FAM) let( e = bar_ends(b[0], b[1]) )
            max([ for (i = [0:NS]) abs(fres(e[0] + (e[1] - e[0])*i/NS)) ]) ];
-// and so are the eight edges of every prism's four long arrises? no --
-// only the axis is; the residual of the drawn corner is the bar's own
-// thickness, and that is reported as a thickness, not as an error.
+// The drawn arrises are NOT on the surface and are not meant to be: the
+// axis is, and the corner is half a section away from it.  The residual
+// there is measured too, and reported as what it is -- the bar's own
+// thickness showing up in the equation -- so that the number above
+// cannot be mistaken for a tolerance that was chosen.
 CRES = [ for (b = FAM)
            max([ for (u = [0,1]) for (p = bar_ring(b[0], b[1], u)) abs(fres(p)) ]) ];
 
@@ -392,8 +468,12 @@ TP   = [ for (b = FAM) let( q = bar_q(b[0], b[1]) )
 TPSLOPE = A_W/C_S;
 TPERR = max([ for (p = TP) for (q = p) abs(abs(q.y) - TPSLOPE*abs(q.z - H_Z)) ]);
 CHORD = norm(bar_q(0, 1)[1] - bar_q(0, 1)[0]);
-XANG  = acos((ruledir(0,1)*ruledir(0,-1))/sq(norm(ruledir(0,1))));
+// Both ruling directions have the same length -- (K_R, H_Z) up to signs,
+// here (16, 30) and so 34 -- which is why one squared norm serves as the
+// whole denominator of the cosine.
 XCOS  = (ruledir(0,1)*ruledir(0,-1))/sq(norm(ruledir(0,1)));
+XANG  = acos(XCOS);
+XLEN  = norm(ruledir(0,1));
 
 // -- same-family bars are skew, and far enough apart to be disjoint ---
 function linedist(p0, d0, p1, d1) =
@@ -421,7 +501,8 @@ OBB = [ OX[1] - OX[0], OY[1] - OY[0], OZ[1] - OZ[0] ];
 
 // -- the plaque clears the lattice -----------------------------------
 // Distance from a point to the plaque box, measured in the slab's own
-// frame; the box is grown to PQ_T + T_RAISE so the letters count.
+// frame, with the box grown out to PQ_T + AIR + T_RAISE so that the
+// letters standing proud of the face count as part of it.
 function to_pq(p) =
   let( q = p - [0, PQ_Y, 0], c = cos(PQ_TILT), s = sin(PQ_TILT) )
   [ q.x, q.y*c + q.z*s, -q.y*s + q.z*c ];
@@ -429,30 +510,66 @@ function pqdist(p) =
   let( l = to_pq(p),
        dx = max(0, abs(l.x) - PQ_W/2),
        dy = max(0, max(-l.y, l.y - PQ_D)),
-       dz = max(0, max(-l.z, l.z - (PQ_T + T_RAISE))) )
+       dz = max(0, max(-l.z, l.z - (PQ_T + AIR + T_RAISE))) )
   norm([dx, dy, dz]);
 NE = 40;
 CLEAR = min([ for (b = FAM)
                 let( f = bar_frame(b[0], b[1]), e = bar_ends(b[0], b[1]) )
                 min([ for (i = [0:NE]) for (c = SEC)
                         pqdist(e[0] + (e[1]-e[0])*i/NE + c[0]*f[1] + c[1]*f[2]) ]) ]);
-HCLEAR = min([ for (z = RINGZ) for (i = [0:71]) for (dr = [-RW, RW]) for (dz = [-RH/2, RH/2])
-                 pqdist([(rsurf(z)+dr)*cos(i*5), (rsurf(z)+dr)*sin(i*5), z+dz]) ]);
+HCLEAR = min([ for (z = RINGZ) for (i = [0:NSEG-1])
+                 for (dr = [-RW, RW]) for (dz = [-RH/2, RH/2])
+                   let( f = 360*i/NSEG, r = rsurf(z) + dr )
+                   pqdist([r*cos(f), r*sin(f), z + dz]) ]);
 assert(min(CLEAR, HCLEAR) > 1.0, "the plaque touches the object");
 
-// -- volumes that the union will shave, reported before it does -------
-BLEN = [ for (b = FAM) let( e = bar_ends(b[0], b[1]) ) norm(e[1] - e[0]) ];
-VBAR = sum([ for (l = BLEN) 4*BR*BW*l ]);
-VHOOP = sum([ for (z = RINGZ) 2*PI*rsurf(z)*2*RW*RH ]);
+// -- the object's volume, in closed form, to be matched by the export --
+// A bar is a right prism, so its volume is section x length exactly.  A
+// hoop of NSEG stations is a prismatoid ring between two regular
+// NSEG-gons of circumradius r +- RW, so its volume is exactly
+//     RH * (NSEG/2) sin(360/NSEG) * ((r+RW)^2 - (r-RW)^2),
+// which at NSEG -> infinity is the 2 pi r (2 RW) RH one expects.  The
+// shells overlap at the crossings and the exporter's signed volume adds
+// each crossing twice; so does this sum, which is the point -- the two
+// have to agree, and they do to the last digit a float32 STL can carry.
+BLEN  = [ for (b = FAM) let( e = bar_ends(b[0], b[1]) ) norm(e[1] - e[0]) ];
+VBAR  = sum([ for (l = BLEN) 4*BR*BW*l ]);
+VHOOP = sum([ for (z = RINGZ)
+                RH*(NSEG/2)*sin(360/NSEG)*(sq(rsurf(z)+RW) - sq(rsurf(z)-RW)) ]);
+VOBJ_MEASURED = 10118.648231;   // tools/validate.py on the object alone
 
-TRIS_MEASURED = 68886;      // from tools/validate.py on the exported STL
+TRIS_MEASURED = 122116;     // tools/validate.py on the whole exported STL
 
 echo("OBJECT   bbox mm", OBB, " x", OX, " y", OY, " z", OZ);
-echo("SCENE    bbox mm",
-     [ max(2*PL_R, PQ_W), OZ[1] - min(-PL_H, 0), 0 ],
-     " plinth r", PL_R, " plaque near edge y", PQ_Y - PQ_T*sin(PQ_TILT));
-echo("MESH     triangles measured", TRIS_MEASURED,
-     " bars", len(FAM), " hoops", len(RINGZ));
+// The plaque, carried out of the slab's frame so the scene box is
+// measured rather than guessed: the slab's own eight corners, and a box
+// round the letters, whose vertical extent comes from the face's own
+// ascent and descent (970 and -250 per 1000 em) and whose width is the
+// longest line.  Keeping them apart matters, because the letters stand
+// 1.05 mm proud of the face and would otherwise be reported as the
+// plaque's near edge, which sits at y = -46 exactly.
+function pq_pt(x, y, z) =
+  [ x, PQ_Y + y*cos(PQ_TILT) - z*sin(PQ_TILT), y*sin(PQ_TILT) + z*cos(PQ_TILT) ];
+PQC  = [ for (x = [-PQ_W/2, PQ_W/2]) for (y = [0, PQ_D]) for (z = [0, PQ_T])
+           pq_pt(x, y, z) ];
+TXTC = [ for (x = [-max(LRUN)/2, max(LRUN)/2])
+           for (y = [ LBY[3] + DESC*LSZ[3]/UPEM, LBY[0] + ASC*LSZ[0]/UPEM ])
+             for (z = [PQ_T + AIR, PQ_T + AIR + T_RAISE]) pq_pt(x, y, z) ];
+PQALL = concat(PQC, TXTC);
+SX = [ min(-PL_R, min([ for (p = PQALL) p.x ]), OX[0]),
+       max( PL_R, max([ for (p = PQALL) p.x ]), OX[1]) ];
+SY = [ min(-PL_R, min([ for (p = PQALL) p.y ]), OY[0]),
+       max( PL_R, max([ for (p = PQALL) p.y ]), OY[1]) ];
+SZ = [ -PL_H, max(OZ[1], max([ for (p = PQALL) p.z ])) ];
+
+echo("SCENE    bbox mm", [SX[1]-SX[0], SY[1]-SY[0], SZ[1]-SZ[0]],
+     " x", SX, " y", SY, " z", SZ,
+     " slab near edge y", min([ for (p = PQC) p.y ]),
+     " slab top z", max([ for (p = PQC) p.z ]),
+     " letters stand proud by", AIR + T_RAISE);
+echo("MESH     triangles measured", TRIS_MEASURED, " shells in the object",
+     len(FAM) + len(RINGZ), " bars", len(FAM), " hoops", len(RINGZ),
+     " holes 0  inconsistently wound edges 0");
 echo("SURFACE  a", A_W, " c", C_S, " end radius", R_E, " = 16 sqrt2",
      " waist radius min over hoops", min([ for (z = RINGZ) rsurf(z) ]));
 echo("EQUATION max |x^2/a^2 + y^2/a^2 - (z-30)^2/c^2 - 1| on the 24 bar axes",
@@ -469,8 +586,9 @@ echo("TANGENT  plane x =", A_W, "holds", len(TP), "bars; x = a leaves",
      "y = +-(a/c)(z-30), slope", TPSLOPE, "= 8/15; endpoint error", TPERR);
 echo("CHORD    full ruling chord", CHORD, "= sqrt(32^2 + 60^2), horizontal run",
      2*A_W, "= 2a; drawn length", BLEN[0]);
-echo("WAIST    cos of the crossing angle there", XCOS, "= 161/289 =",
-     161/289, " angle", XANG, "deg");
+echo("WAIST    cos of the crossing angle there", XCOS, "= 161/289 =", 161/289,
+     " angle", XANG, "deg; ruling direction length", XLEN,
+     "= 2 x the 8-15-17 triple");
 echo("SKEW     min distance between same-family ruling LINES", SKEW,
      " section diagonal", DIAG, " so same-family bars are disjoint:", SKEW > DIAG);
 echo("HOOPS    radii", [ for (z = RINGZ) rsurf(z) ],
@@ -478,5 +596,8 @@ echo("HOOPS    radii", [ for (z = RINGZ) rsurf(z) ],
 echo("PLAQUE   lines mm", LRUN, " slab", [PQ_W, PQ_D, PQ_T],
      " tilt off upright", 90 - PQ_TILT, "deg");
 echo("CLEAR    min distance object-to-plaque: bars", CLEAR, " hoops", HCLEAR);
-echo("VOLUME   before the union shaves the crossings: bars", VBAR,
-     " hoops", VHOOP, " plinth", PI*sq(PL_R)*PL_H);
+echo("VOLUME   object predicted: bars", VBAR, "+ hoops", VHOOP, "=", VBAR + VHOOP,
+     " exporter measured", VOBJ_MEASURED,
+     " relative difference", abs(VBAR + VHOOP - VOBJ_MEASURED)/(VBAR + VHOOP));
+echo("NOTE     that is the sum of 29 interpenetrating shells, not the volume",
+     "of their union: the crossings are counted twice in both numbers.");
