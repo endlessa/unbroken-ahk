@@ -246,7 +246,7 @@ than buried.
 
 ## 5. What assembling it found
 
-Four defects, none visible from inside a part file.
+Five defects, none visible from inside a part file.
 
 **1. `use` two levels deep.** Described in section 1. Every number a part
 read from the contract came back `undef` the moment a third file used the
@@ -279,11 +279,54 @@ collar's tabs 16.05. **Either one's lugs fouled the flange.** The relief is
 now 10.5 mm: the flange stands 20.5 mm up, clearing the taller of the two by
 1.3 mm. The register grows from 22 to 30.5 mm.
 
-One pattern in all four, and it is the lesson: *a number that two files have
-to agree on was published by one and copied by the other, and the copy was
-never compared with the original.* An assembly is where the comparison
-happens. Until there was an assembly, every one of these was invisible, and
-three of them had been sitting in files that validate clean.
+**5. The band's crown seat had no clearance at all** — and this one was
+found by a different method, which is the point of it. The seat and the
+crown ring's own back cone were cut from the *same rule* at `GHUB`, so
+without an offset they are the same cone and the two members touch over the
+whole annulus. The file said so deliberately: *"the seat fit is a CONTACT,
+not a clearance."* As a statement about the joint that is right — a seat
+carries load through contact. As a statement about the model it was the one
+claim the file could not back up. Two coincident surfaces share no volume,
+so *"the members share no volume"* stayed literally true, no printed
+clearance could catch it, and exact contact is precisely the case the
+export-time union is documented to fail on. `polar_cap.scad` draws the
+identical feature — a crown ring seated on a back cone — with
+`PC_SEAT_Z = 0.4` and always has. The band now takes the cap's answer.
+
+What found it is `scadforge/tools/overlap.py`: an exact edge-crosses-face
+test between every pair of bodies whose bounding boxes meet, with a ray cast
+afterwards for the nesting case that crosses no surface at all. It is the
+check every one of these files raises and then has to leave open, because
+the component count cannot answer it — two shells that interpenetrate
+without sharing a vertex still count as two — and past the merge budget the
+union does not run. Results:
+
+| part | bodies | segment-triangle tests | verdict |
+|---|---|---|---|
+| `collar_chain` | 14 | 43,032 | ALL DISJOINT |
+| `polar_cap` | 40 | 4,301,290 | ALL DISJOINT |
+| `equator_band` | 2 | — | OVERLAP FOUND → fixed |
+
+So two of those files' central claims are now *proved* rather than argued
+from printed clearances. The check belongs in the kernel — "are these two
+shells disjoint" is what the union is for — and the script is the evidence
+until it gets there.
+
+**The first four share one pattern, and it is the lesson:** *a number that
+two files have to agree on was published by one and copied by the other, and
+the copy was never compared with the original.* An assembly is where the
+comparison happens.
+
+**The fifth is a different lesson and a harder one.** Nothing was copied and
+nothing disagreed; one file made a decision, stated it, and printed the
+residual. What it could not do was *check* it, because the thing it had
+decided — exact contact — is invisible to every check the project had.
+Volume cannot see it, the component count cannot see it, and the export-time
+union is documented to fail on it. It took a check of a kind that did not
+exist here before.
+
+Until there was an assembly, none of the five was visible, and four of them
+had been sitting in files that validate clean.
 
 ---
 

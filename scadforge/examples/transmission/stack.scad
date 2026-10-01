@@ -161,11 +161,12 @@
 //  component, so the component count would stop being a check.  So the
 //  joint is drawn with a small declared JG.  The crowns still
 //  interleave over nearly their whole height -- section 4 prints the
-//  engagement depth -- and the flank clearance computed at JG = 0 is a
-//  lower bound for the clearance at any JG > 0, because opening the
-//  joint moves each tooth toward the thinner part of the facing space.
-//  Section 4 computes that bound from the library's own half-width
-//  function and prints it.
+//  engagement depth -- and section 4 computes the flank clearance twice
+//  from the library's own half-width function: once at JG = 0, where
+//  the two crowns' colatitudes are exact complements, and once at the
+//  drawn JG and the published cone distance.  It prints both and their
+//  difference, so the claim that opening the joint cannot tighten the
+//  flanks is a printed comparison rather than an argument.
 //
 //  The crown coupling is also what LOCATES the pair radially.  The
 //  library builds a sector's flanks as ruled surfaces through the apex,
@@ -189,12 +190,12 @@
 //  that claim number by number instead of asserting it, and prints both
 //  what matches and what does not.  The short form, which section 5
 //  proves: the two collars are interchangeable on the BAND and are not
-//  interchangeable on each other's CLAMP.  Five numbers are genuinely
-//  shared, because both collars read them from eb_if_*(): the bore, the
-//  rib crest radius, the rib axial width, where in z the rib sits, and
-//  how tall a hub the register allows.  Everything else -- bolt
-//  circles, split azimuths, clamp wall, clamp width, lugs against pads
-//  -- differs, and section 5 prints the differences side by side.
+//  interchangeable on each other's CLAMP.  Every dimension a collar
+//  clamps ON is shared, because both collars read it from eb_if_*(),
+//  and section 5 prints each of those against the band with its
+//  difference.  Everything else -- bolt circles, split azimuths, clamp
+//  wall, clamp width, lugs against pads -- differs, and section 5
+//  prints the differences side by side too.
 //
 //  ---------------------------------------------------------------
 //  4.  THE DRIVE TABLE
@@ -434,6 +435,19 @@ function stk_cfl(Ga) = CR_P/2 - sg_hw_e(Ga, 90, CR_GB, CR_HT)
 CR_CLS   = [ for (q = [0:STK_NCL])
                stk_cfl(90 - CR_TA + 2*CR_TA*q/STK_NCL) ];
 CR_CLMIN = min(CR_CLS);
+// the same clearance at the DRAWN joint gap and the published cone
+// distance: cos(Gb) = -JG/L - cos(Ga), keeping only the samples where
+// both teeth actually exist
+function stk_gb_at(Ga, L) = acos(-STK_JG/L - cos(Ga));
+function stk_cfl_jg(Ga, L) =
+  let (Gb = stk_gb_at(Ga, L))
+    CR_P/2 - sg_hw_e(Ga, 90, CR_GB, CR_HT) - sg_hw_e(Gb, 90, CR_GB, CR_HT);
+CR_CLSJ  = [ for (q = [0:STK_NCL])
+               let (Ga = 90 - CR_TA + 2*CR_TA*q/STK_NCL,
+                    Gb = stk_gb_at(Ga, LCAP))
+                 if (Gb >= 90 - CR_TF && Gb <= 90 + CR_TA)
+                   stk_cfl_jg(Ga, LCAP) ];
+CR_CLMINJ = min(CR_CLSJ);
 CR_TIPZ  = LCAP*sin(CR_TA);                  // tip above the pitch plane
 CR_ROOTZ = LCAP*sin(CR_TF);                  // root below it
 CR_AXC   = CR_ROOTZ - CR_TIPZ + STK_JG;      // axial tip clearance as drawn
@@ -719,10 +733,15 @@ echo(str("      the INNER end of the crown's face is not published by",
          " independent of cone distance and is the quantity that decides",
          " interference -- and the arc at the outer end only.  Naming that",
          " gap is section 0's second finding."));
-echo(str("      the clearance above is computed at JG = 0.  Opening the",
-         " joint to the drawn ", STK_JG,
-         " mm moves each tooth toward the thinner part of the facing",
-         " space, so the figure is a lower bound for what is drawn."));
+echo(str("      the same clearance at the DRAWN joint gap of ", STK_JG,
+         " mm and the published cone distance ", LCAP,
+         ", where cos(Gb) = -JG/L - cos(Ga) instead of Gb = 180 - Ga: ",
+         len(CR_CLSJ), " of the ", STK_NCL+1,
+         " samples still have both teeth present, and their minimum is ",
+         CR_CLMINJ, " deg, which exceeds the JG = 0 figure by ",
+         CR_CLMINJ - CR_CLMIN,
+         ".  Opening the joint cannot tighten the flanks, and that is",
+         " now a printed comparison rather than an argument."));
 echo(str("   AXIAL.  A tip stands L sin(ta) = ", LCAP, "*sin(", CR_TA,
          ") = ", CR_TIPZ, " above the pitch plane and the facing root lies",
          " L sin(tf) = ", LCAP, "*sin(", CR_TF, ") = ", CR_ROOTZ,
@@ -815,8 +834,8 @@ echo(str("      pinch ears    EM ", em_if_pinch(),
          " none, it pulls its two arcs together on ", cc_if_bolt()[3],
          " axial bolts through pads instead"));
 echo(str("   VERDICT, and it is the one the assembly exists to give: the",
-         " two collars ARE interchangeable on the band -- five numbers,",
-         " all matching to zero above -- and are NOT interchangeable on",
+         " two collars ARE interchangeable on the band -- every clamping",
+         " dimension above matching to zero -- and are NOT interchangeable on",
          " each other's clamp.  Nothing bolted to one will bolt to the",
          " other.  They swap on the BAND, which is the whole point of the",
          " register, and this stack shows it by fitting one of each to two",

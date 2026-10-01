@@ -224,12 +224,26 @@
 //      the body         one closed meridian swept through one closed
 //                       ring of azimuths -- a torus, so no end walls
 //
-//  and the crown ring seats in the body: its back cone lands on a seat
-//  cut to the same cone, and its sphere stands in a bore cut at
-//  sg_r().  Both seats are computed, and the file prints both fits:
-//  the cone is a CONTACT, the two surfaces coincide to 0 mm and the
-//  file prints that residual, and the bore is a locating fit of
+//  and the crown ring seats in the body: its back cone stands over a
+//  seat cut to the same cone and dropped EB_SEATZ clear of it, and its
+//  sphere stands in a bore cut at sg_r().  Both seats are computed, and
+//  the file prints both fits: the cone is a clearance of 0.4 mm of z,
+//  0.399355 mm perpendicular, and the bore is a locating fit of
 //  0.016529 mm at its lip opening to 0.195248 mm at the seat.
+//
+//  The cone used to be a CONTACT -- seat and back cone the same surface,
+//  coinciding to 0 mm, and the file said so and printed that residual.
+//  As a statement about the JOINT that is right: a seat carries load
+//  through contact.  As a statement about the MODEL it was the one thing
+//  this file could not back up.  Two coincident surfaces share no
+//  volume, so the claim below stayed literally true and no printed
+//  clearance could catch it -- while an exact edge-crosses-face test
+//  over the two meshes reports them intersecting, and exact contact is
+//  the one case this kernel's export-time union is documented to fail
+//  on.  polar_cap.scad draws the identical feature with PC_SEAT_Z = 0.4
+//  and always has; the two files disagreed about one joint, and this is
+//  the band taking the cap's answer so that the separation is a number
+//  both files print and a checker can confirm.
 //
 //  This is what the parts are -- a fine-pitch crown ring at m = 1 is a
 //  wear part and is made separately from the member that carries the
@@ -320,6 +334,27 @@ EB_RELG  = 10.50;   // relief between the spur flange and the upper land.
                     // flange 20.5 mm up, which clears the taller of the
                     // two by 1.3 mm.  A collar taller than that is a gate
                     // failure the stack will print.
+EB_SEATZ = 0.40;    // clearance under the crown ring's back cone, mm of z.
+                    // This was 0, DELIBERATELY: the seat and the sector's
+                    // back cone are cut from the same rule at GHUB, and the
+                    // report said so -- "the seat fit is a CONTACT, not a
+                    // clearance".  As a statement about the JOINT that is
+                    // right; a seat carries load through contact.  As a
+                    // statement about the MODEL it is the one thing this
+                    // file could not back up.  Two coincident surfaces
+                    // share no volume, so the claim stayed literally true
+                    // and no printed clearance could catch it, while an
+                    // exact edge-crosses-face test over the two meshes
+                    // reports them intersecting and the export-time union
+                    // is documented to fail on exactly this case --
+                    // "solids that touch exactly, rather than overlapping,
+                    // are the usual cause".
+                    // polar_cap.scad draws the identical feature -- a crown
+                    // ring seated on a back cone -- with PC_SEAT_Z = 0.4 and
+                    // has from the start.  The two files disagreed about one
+                    // joint; this is the band adopting the cap's answer, so
+                    // that the separation is a number both files can print
+                    // and a checker can confirm.
 EB_CR    = 0.30;    // radial clearance the collar is to use
 EB_CA    = 0.20;    // axial clearance the collar is to use, per side
 
@@ -437,17 +472,28 @@ R_BORE = R;                     // the crown ring's bore seat = sg_r()
 R_LAND = R + EB_LANDH;
 R_SKIN = R - EB_SKW;
 R_BIN  = CR_HUBI - EB_LIP;
+// the seat, dropped EB_SEATZ of z clear of the cone the crown's back cone
+// lies on.  Declared after the two radii it is taken at, which is where it
+// has to be: a reference above them reads undef, and the body it builds
+// then vanishes from the export with nothing but a warning.
+Z_SEAT0 = R_BIN*COTH  - EB_SEATZ;
+Z_SEAT1 = R_BORE*COTH - EB_SEATZ;
 Z_SH   = CR_ZROOT - EB_REL;     // wall top face, clear of the crown root
 Z_SB   = Z_SH - EB_SPURB;       // spur flange underside
 Z_RT   = Z_SB - EB_RELG;        // top of the upper land
 Z_L1   = Z_RT - EB_LANDW;       // upper land bottom = groove top
 Z_L2   = Z_L1 - EB_GRW;         // groove bottom
 Z_L3   = Z_L2 - EB_LANDW;       // skirt bottom face
-Z_WEB  = LI*cos(GHUB) - EB_WEBT;
+// EB_WEBT is declared as "web thickness under the seat's inner end", and
+// this took it from the CROWN's inner end instead -- LI cos(GHUB) rather
+// than the seat.  The two were 0.11 mm apart before the seat was dropped
+// and would be 0.51 after, so the constant is now measured from the thing
+// its own comment names.
+Z_WEB  = Z_SEAT0 - EB_WEBT;
 ZPORT  = (Z_SH + Z_SB)/2;       // spur mid-plane: the port's line of action
 REGL   = Z_SB - Z_L3;           // register length, flange underside to skirt end
 
-MER = [ [R_BIN,  R_BIN*COTH],   [R_BORE, R_BORE*COTH], [R_BORE, Z_SH],
+MER = [ [R_BIN,  Z_SEAT0],      [R_BORE, Z_SEAT1],     [R_BORE, Z_SH],
         [0,      Z_SH],         [0,      Z_SB],
         [R,      Z_SB],         [R,      Z_RT],
         [R_LAND, Z_RT],         [R_LAND, Z_L1],        [R,      Z_L1],
@@ -470,7 +516,7 @@ SEP_SEAT = max([ for (i=[0:1]) let( L = i == 0 ? LI : LO )
                    abs(L*cos(GHUB) - L*sin(GHUB)*COTH) ]);
 // the crown ring's bore fit, as the least radial gap over the bore's run
 EB_NBG   = 24;
-BORE_GAP = min([ for (i=[0:EB_NBG]) let( z = Z_SH + (R_BORE*COTH - Z_SH)*i/EB_NBG )
+BORE_GAP = min([ for (i=[0:EB_NBG]) let( z = Z_SH + (Z_SEAT1 - Z_SH)*i/EB_NBG )
                    R_BORE - sqrt(LO*LO - z*z) ]);
 
 // what the collar must be built to
@@ -827,10 +873,15 @@ echo(str("   seat: the sector's back cone is at GHUB = ", GHUB_L,
          " deg; the seat runs from r = ", R_BIN, " to ", R_BORE,
          " and the crown ring's back cone from ", CR_HUBI, " to ", CR_HUBO,
          ", so the lip stands ", CR_HUBI - R_BIN, " mm inboard"));
-echo(str("   the seat fit is a CONTACT, not a clearance: the crown's back",
-         " cone and this file's seat cone are the same surface, and the",
-         " worst residual over the crown's two end radii is ", SEP_SEAT,
-         " mm.  The bore fit is ", BORE_GAP, " mm least, against the ",
+echo(str("   the seat is cut ", EB_SEATZ, " mm of z BELOW the cone the",
+         " crown's back cone lies on, which perpendicular to that cone is ",
+         EB_SEATZ*sin(GHUB), " mm -- the same offset polar_cap.scad uses",
+         " for the same feature.  It used to be cut ON that cone, a",
+         " contact fit, and then the two surfaces were coincident: no",
+         " volume shared, so the claim held, but nothing could confirm it",
+         " and the export-time union is documented to fail on exactly",
+         " that.  The residual of the cone identity itself is still ",
+         SEP_SEAT, " mm.  The bore fit is ", BORE_GAP, " mm least, against the ",
          EB_CR, " mm this file gives the collar: the bore locates the",
          " crown ring and the cone carries it."));
 echo(str("   the crown ring's widest mesh vertex is at r = ", CR_RMAX,
