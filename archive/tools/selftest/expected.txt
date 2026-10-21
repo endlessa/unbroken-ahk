@@ -1,0 +1,17 @@
+UNITED STATES DISTRICT COURT SOUTHERN DISTRICT OF EXAMPLE Case No. 24-CV-01983-JSR
+MEMORANDUM OPINION AND ORDER
+Before the Court is Defendant's motion to compel production of the internal audit workpapers identified in Request No. 14. The motion was filed on March 3, 2024, and fully briefed as of April 11, 2024.
+I.  BACKGROUND
+Plaintiff Ardent Holdings LLC commenced this action on November 8, 2023, alleging that Defendant Calder Systems Inc. misrepresented the completeness of its reconciliation controls during the diligence period preceding the asset purchase agreement dated June 30, 2023.
+The disputed workpapers were prepared by Defendant's internal audit function between January and May of 2023. Defendant withheld eleven documents on the basis of attorney-client privilege and the work product doctrine, listing each on a privilege log served February 20.
+II. LEGAL STANDARD
+A party may obtain discovery regarding any nonprivileged matter that is relevant to any party's claim or defense and proportional to the needs of the case. Fed. R. Civ. P. 26(b)(1).
+Page 2 of 2
+III. DISCUSSION
+Having reviewed the eleven documents in camera, the Court concludes that seven were prepared in the ordinary course of business and are not protected. Entries 3, 5, and 9 on the privilege log reflect communications with outside counsel and are properly withheld.
+Entry 7 presents a closer question. The memorandum dated April 2, 2023 was circulated to both counsel and the operations team. Where a document serves a dual purpose, the privilege applies only if the primary purpose was to secure legal advice.
+The Court finds the primary purpose was operational. Entry 7 shall be produced, subject to redaction of the final paragraph.
+IV. CONCLUSION
+For the reasons stated above, the motion to compel is GRANTED IN PART and DENIED IN PART. Defendant shall produce documents corresponding to log entries 1, 2, 4, 6, 7, 8, 10, and 11 within fourteen days.
+SO ORDERED.
+Dated:  May 16, 2024              /s/ J. S. Reyes         Example City, EX          United States District Judge

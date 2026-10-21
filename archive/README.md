@@ -53,6 +53,26 @@ text — never executed, and never used as instructions. Extraction helpers run
 under `python3 -I` so a file dropped into the corpus cannot shadow a stdlib
 import. Keep tools in `archive/tools/`, never inside `raw/`.
 
+## Scanned documents
+
+Documents with no text layer are handled by rendering pages to images and
+reading them, so no OCR binary is required:
+
+```sh
+python3 -I archive/tools/ocr.py triage <source-id>      # flag PDFs with no text layer
+python3 -I archive/tools/ocr.py rasterize <source-id>   # render pages to greyscale PNG
+#   read archive/ocr/<id>/<doc>/page-*.png and write page-N.txt beside each
+python3 -I archive/tools/ocr.py assemble <source-id>    # combine into text/<id>/<doc>.txt
+python3 -I archive/tools/ocr.py status [source-id]      # pages transcribed vs. remaining
+```
+
+Triage flags any PDF under 120 characters per page. Pages render at 200 dpi
+greyscale, downscaled to 1600 px wide — enough for footnotes and small print.
+Assembled transcripts carry a header marking them as vision-transcribed and a
+`--- page N ---` marker per page, so a transcript is never mistaken for an
+extracted text layer. Progress lives in `ocr/worklist.jsonl`, making long
+documents resumable across sessions. `tools/selftest/` verifies the path.
+
 ## Network access
 
 This container reaches the internet through a policy-enforcing egress proxy.
