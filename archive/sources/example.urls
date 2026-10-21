@@ -1,0 +1,4 @@
+# One URL per line. Blank lines and # comments are ignored.
+# An optional second field overrides the saved filename:
+#
+#   https://example.org/docket/1234/opinion.pdf   opinion-1234.pdf
