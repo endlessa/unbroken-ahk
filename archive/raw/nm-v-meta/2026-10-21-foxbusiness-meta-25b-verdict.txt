@@ -1,0 +1,103 @@
+SOURCE: Fox Business (foxbusiness.com), Technology section
+HEADLINE: Meta ordered to pay $25B after jury finds it misled users on data privacy
+SUBHEAD: New Mexico Attorney General Raul Torrez said the ruling was one of the
+         largest ever against Meta by a single state
+BYLINE: Sophia Compton, FOX Business ("Reuters contributed to this report.")
+PUBLISHED: October 21, 2026 5:09pm EDT
+PROVENANCE: Supplied by the user as pasted article text on 2026-10-22. Not
+            retrieved over the network; no URL, no hash of an original served
+            document. Treat as a transcript of the article, not as a capture.
+
+---
+
+Meta Platforms has been ordered to pay $25 billion after a New Mexico jury
+found the company misled Facebook users over its handling of personal data and
+other practices in a case stemming from the Cambridge Analytica scandal.
+
+New Mexico Judge Francis Mathew issued the penalty Wednesday after jurors found
+last month that Meta made dozens of misleading statements to users.
+
+"Facebook's wrongdoing - over the course of years and systematically broadcast
+to the public - goes to the heart of Facebook's core business practices,"
+Mathew wrote in his order.
+
+[PHOTO CAPTION: Meta CEO Mark Zuckerberg makes a keynote speech during the Meta
+Connect annual event at the company's headquarters in Menlo Park, Calif.
+(Manuel Orbegozo/Reuters)]
+
+The now-defunct Cambridge Analytica, which worked for President Donald Trump's
+2016 campaign, obtained information from as many as 87 million Facebook users
+through a third-party app without their consent.
+
+[INLINE LINK: META PUTS POPULAR NEW TOOL IN HANDS OF SMALL BUSINESSES]
+
+New Mexico sued Meta in 2021, accusing the company of misleading users about
+who could access their personal information and how it handled harmful content
+on the platform.
+
+Jurors found that 26 of 29 statements examined during the trial were misleading
+and determined that Meta committed more than 43 million violations of New
+Mexico's consumer protection laws.
+
+Mathew said the violations could have resulted in a penalty of more than $219
+billion under state law but ultimately reduced the amount to $25 billion. Meta
+had urged Mathew to limit the penalty to $3.45 billion.
+
+[PHOTO CAPTION: Meta Platforms has been ordered to pay $25 billion after a New
+Mexico jury found the company misled Facebook users over its handling of
+personal data and other practices. (Samuel Boivin/NurPhoto via Getty Images)]
+
+New Mexico Attorney General Raul Torrez said the ruling was one of the largest
+ever against Meta by a single state.
+
+"It has been a long time coming holding Big Tech accountable," Torrez said.
+
+"I think today's judgment is a clear break with that past and a very clear
+warning to those in this space and beyond that we intend to protect our people
+and protect our consumers."
+
+[INLINE LINK: META SETTLES FEDERAL TRIAL OVER CLAIMS FACEBOOK, INSTAGRAM ADDICT
+CHILDREN]
+
+Meta said it plans to appeal the ruling.
+
+"This ruling, and the Attorney General's approach to this enforcement, makes it
+all but impossible to do business in the state of New Mexico," C.J. Mahoney,
+Meta's chief legal officer, said in a statement.
+
+"At its core, this lawsuit seeks to impose a tax on speech to enforce new rules
+for what people can say online. We are confident we will prevail on appeal. In
+the meantime, Meta will continue to build a safe and free platform to connect
+millions of Americans, grow small businesses, and help the country maintain its
+competitive edge."
+
+[MARKET WIDGET: META / META PLATFORMS INC. / 697.52 / +3.27 / +0.47%]
+
+Monte Mann, a business litigation partner at Armstrong Teasdale, said in a
+statement to FOX Business that the size of the penalty highlights the potential
+exposure major technology companies face under state consumer protection laws.
+
+[INLINE LINK: META'S $18B SETTLEMENT COULD BE FIRST 'DOMINO' FOR BIG TECH,
+TENNESSEE AG SAYS]
+
+"The $25 billion figure is staggering, even for a company like Meta," Mann
+said. "But the bigger story is what this case tells us about the exposure that
+large technology companies face under state consumer protection laws. New
+Mexico took on one of the most powerful companies in the world and won.
+
+"And what's particularly interesting is how the penalties for individual
+violations can add up to an extraordinary amount when you're dealing with
+millions of consumers. I wouldn't assume, though, that Meta is going to end up
+paying anything close to $25 billion."
+
+Mann said he expects Meta to mount a "serious fight on appeal."
+
+"There will undoubtedly be a serious fight on appeal over the size of the
+penalty and whether it's legally sustainable. But even if that number gets
+reduced substantially, the case sends a powerful message.
+
+"Companies need to be careful about the promises they make to consumers,
+particularly when it comes to privacy. Those promises can come back to haunt
+them in a courtroom, and the consequences can be enormous."
+
+Reuters contributed to this report.

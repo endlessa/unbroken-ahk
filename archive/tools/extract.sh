@@ -39,4 +39,6 @@ while IFS= read -r -d '' src; do
 done < <(find "$root" -type f ! -name '.gitkeep' -print0)
 
 echo "extracted $done_n, skipped $skip_n, needing OCR $ocr_n"
-[ "$ocr_n" -gt 0 ] && echo "run: python3 -I archive/tools/ocr.py triage${scope:+ $scope}"
+if [ "$ocr_n" -gt 0 ]; then
+  echo "run: python3 -I archive/tools/ocr.py triage${scope:+ $scope}"
+fi
